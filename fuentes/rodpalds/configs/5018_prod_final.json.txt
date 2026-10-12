@@ -1,0 +1,53 @@
+{
+  "dataset": "ds3003_rank_extra.parquet",
+  "clase": "clase_binaria2",
+  "escalar_min_data_in_leaf": true,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "modo": "produccion",
+  "meses_train": [
+    202103,
+    202104,
+    202105,
+    202106
+  ],
+  "mes_prediccion": 202108,
+  "experimento": 5018,
+  "nombre": "prod_final",
+  "variables": null,
+  "hiperparametros": {
+    "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+  },
+  "n_semillas": 50,
+  "descripcion": "Modelo final: ds3003 (receta del profesor + proceso de muerte) con lag2, train 202103-202106, hiperparametros de la prueba 23, min_data_in_leaf final 40496, 580 arboles, 50 semillas. Reglas R3-R5 fijadas de antemano.",
+  "usar_lag2": true,
+  "sobrescribir": true,
+  "arboles": 580,
+  "min_data_in_leaf_final": 40496
+}

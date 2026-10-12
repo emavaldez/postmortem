@@ -1,0 +1,229 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–19] Importa las mismas piezas que `run_screening.py` y lee dos planes:
+#   `plan_s3_confirm_c3.json` (fold, 20 semillas, cortes y regla de decisión) y `plan_s2_familias.json` (qué
+#   bloques forman cada familia).
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, gc, hashlib, json, sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import yaml
+
+HERE=Path(__file__).resolve().parent
+ROOT=HERE.parent
+FE=HERE/"fe_amplia"
+sys.path.insert(0,str(FE))
+from cargar_bloques import cargar_bloques
+from generar_fe import sha256_file
+
+PLAN=json.loads((HERE/"plan_s3_confirm_c3.json").read_text())
+S2PLAN=json.loads((HERE/"plan_s2_familias.json").read_text())
+KEYS=["numero_de_cliente","foto_mes"]
+TARGET="clase_ternaria"
+
+# [Anotación · líneas 21–26] Dos utilidades: escribir un JSON y calcular el SHA-256 de una lista serializada.
+def write_json(path,obj):
+    p=Path(path);p.parent.mkdir(parents=True,exist_ok=True)
+    p.write_text(json.dumps(obj,ensure_ascii=False,indent=2))
+
+def hash_list(xs):
+    return hashlib.sha256(json.dumps(xs,ensure_ascii=False).encode()).hexdigest()
+
+# [Anotación · líneas 28–46] `select_features` arma C3 desde el catálogo del banco: de la familia S2_HIST_CORE
+#   (bloques `historia_numerica`, `transiciones_numericas`, `recencia`, `categoricas` e `historia_relaciones`)
+#   toma las variables que piden al menos un mes de historia; de S2_TARJETAS_RATIOS (bloques `tarjetas` y
+#   `ratios`), las que no piden historia. C3 es la unión sin repetidos; se detiene si alguna parte queda vacía.
+def select_features(bank):
+    cat=pd.read_csv(bank/"catalogo_features.csv")
+    cat=cat[cat.status.eq("generated")].copy()
+    mh=pd.to_numeric(cat.min_history,errors="coerce").fillna(0)
+
+    hist=S2PLAN["arms"]["S2_HIST_CORE"]
+    d=cat[cat.block.isin(hist["blocks"])].copy()
+    mh_d=pd.to_numeric(d.min_history,errors="coerce").fillna(0)
+    hist_features=d.loc[mh_d.ge(1),"feature"].drop_duplicates().tolist()
+
+    tr=S2PLAN["arms"]["S2_TARJETAS_RATIOS"]
+    d2=cat[cat.block.isin(tr["blocks"])].copy()
+    mh2=pd.to_numeric(d2.min_history,errors="coerce").fillna(0)
+    card_features=d2.loc[mh2.eq(0),"feature"].drop_duplicates().tolist()
+
+    c3=list(dict.fromkeys(hist_features+card_features))
+    if not hist_features or not card_features or not c3:
+        raise ValueError("C3 quedó sin features")
+    return hist_features,card_features,c3
+
+# [Anotación · líneas 48–63] `load_arm` carga los meses del fold (202103 y 202104 para entrenar, 202106 para
+#   evaluar) con las variables originales y las derivadas pedidas, junto con las etiquetas, y repite los
+#   controles de alineación y de 152 variables originales.
+def load_arm(bank,derived):
+    fold=PLAN["fold"]
+    months=sorted(set(fold["train"]+[fold["eval"]]))
+    if derived:
+        df,_=cargar_bloques(bank,meses=months,incluir_raw=True,features=derived)
+    else:
+        df=pd.read_parquet(bank/"raw.parquet")
+        df=df[df.foto_mes.isin(months)].reset_index(drop=True)
+    lab=pd.read_parquet(bank/"etiquetas.parquet")
+    lab=lab[lab.foto_mes.isin(months)].reset_index(drop=True)
+    if not df[KEYS].equals(lab[KEYS]):raise ValueError("X/y desalineados")
+    raw=[c for c in df.columns if c not in KEYS and not c.startswith("fe__")]
+    if len(raw)!=152:raise ValueError(f"RAW != 152: {len(raw)}")
+    feats=raw+derived
+    if len(feats)!=len(set(feats)):raise ValueError("Features duplicadas")
+    return df,lab,feats
+
+# [Anotación · líneas 65–82] `gains` calcula ganancia y cantidad de BAJA+2 incluidos en los cortes 10.500,
+#   11.000 y 11.500; `fit_model` entrena un LightGBM de 300 rondas con la semilla indicada y
+#   `deterministic=True`.
+def gains(ids,y,scores):
+    order=np.lexsort((np.asarray(ids,np.int64),-np.asarray(scores,float)))
+    out={}
+    for n in PLAN["cuts"]:
+        z=np.asarray(y,np.int8)[order[:n]]
+        hits=int(z.sum())
+        out[n]={
+            "ganancia":int(hits*1072500-(n-hits)*27500),
+            "hits_baja2":hits
+        }
+    return out
+
+def fit_model(x,y,params,seed,threads):
+    import lightgbm as lgb
+    p=dict(params)
+    p.update(seed=int(seed),num_threads=int(threads),deterministic=True)
+    ds=lgb.Dataset(x,label=y,free_raw_data=False)
+    return lgb.train(p,ds,num_boost_round=int(PLAN["rounds"]))
+
+# [Anotación · líneas 84–135] `run_arm` entrena un brazo con clase binaria BAJA+2. Escribe `features.json` con
+#   la lista ordenada de variables (las 152 originales seguidas de las derivadas) y su hash. Para cada una de
+#   las 20 semillas entrena o reutiliza el `.npz`, que guarda puntajes de 202106, importancia, clientes y clase.
+#   Deja `por_seed.csv`, `importancias.csv` y `ensemble.json` con la ganancia del promedio de semillas.
+def run_arm(bank,out,name,derived,params,threads):
+    fold=PLAN["fold"]
+    df,lab,feats=load_arm(bank,derived)
+    tr=df.foto_mes.isin(fold["train"]).to_numpy()
+    ev=df.foto_mes.eq(fold["eval"]).to_numpy()
+    ytr=lab.loc[tr,TARGET].eq("BAJA+2").to_numpy(np.int8)
+    yev=lab.loc[ev,TARGET].eq("BAJA+2").to_numpy(np.int8)
+    ids=df.loc[ev,"numero_de_cliente"].to_numpy(np.int64)
+    root=out/name
+    root.mkdir(parents=True,exist_ok=True)
+    write_json(root/"features.json",{
+        "arm":name,"features":feats,"derived":derived,
+        "n_raw":152,"n_derived":len(derived),"hash":hash_list(feats)
+    })
+    xtr=df.loc[tr,feats];xev=df.loc[ev,feats]
+    rows=[];imps=[];scores_all=[]
+    for seed in PLAN["seeds"]:
+        cp=root/f"seed_{seed}.npz"
+        if cp.exists():
+            z=np.load(cp,allow_pickle=False)
+            scores=z["scores"];imp=z["gain"]
+            print("REUSAR",name,seed,flush=True)
+        else:
+            print("ENTRENAR",name,seed,"features",len(feats),flush=True)
+            model=fit_model(xtr,ytr,params,seed,threads)
+            scores=model.predict(xev,num_threads=threads)
+            imp=model.feature_importance(importance_type="gain").astype(float)
+            np.savez_compressed(cp,scores=scores,gain=imp,ids=ids,y=yev)
+            del model
+        g=gains(ids,yev,scores)
+        rows.append({
+            "seed":seed,
+            "ganancia_10500":g[10500]["ganancia"],
+            "ganancia_11000":g[11000]["ganancia"],
+            "ganancia_11500":g[11500]["ganancia"],
+            "ganancia_banda":float(np.mean([g[10500]["ganancia"],g[11000]["ganancia"],g[11500]["ganancia"]]))
+        })
+        imps.append(imp);scores_all.append(scores)
+    pd.DataFrame(rows).to_csv(root/"por_seed.csv",index=False)
+    imp=np.vstack(imps)
+    pd.DataFrame({
+        "feature":feats,
+        "gain_medio":imp.mean(0),
+        "seeds_gain_positivo":(imp>0).sum(0),
+        "es_derivada":[f in set(derived) for f in feats]
+    }).sort_values("gain_medio",ascending=False).to_csv(root/"importancias.csv",index=False)
+    ens=np.mean(np.vstack(scores_all),axis=0)
+    write_json(root/"ensemble.json",{
+        "cuts":{str(n):gains(ids,yev,ens)[n] for n in PLAN["cuts"]}
+    })
+    del df,lab,xtr,xev,imp,imps,scores_all
+    gc.collect()
+
+# [Anotación · líneas 137–172] `compare` calcula por semilla la diferencia C3 − M1_RAW en la ganancia promedio
+#   de los tres cortes y en el corte 11.000, guarda `deltas_pareados.csv` y escribe `confirmacion_c3.json` con
+#   medias, mediana, semillas a favor y `promote_to_tuning`, que es verdadero si la media y la mediana de la
+#   diferencia de banda y la media en 11.000 son positivas y al menos 60 % de las semillas da diferencia
+#   positiva.
+def compare(out):
+    a=pd.read_csv(out/"M1_RAW"/"por_seed.csv").set_index("seed")
+    b=pd.read_csv(out/"C3_HIST_MAS_TARJETAS"/"por_seed.csv").set_index("seed")
+    seeds=PLAN["seeds"]
+    if set(seeds)!=set(a.index) or set(seeds)!=set(b.index):
+        raise ValueError("Seeds incompletas o incompatibles")
+    d=(b.loc[seeds,"ganancia_banda"]-a.loc[seeds,"ganancia_banda"]).astype(float)
+    d11=(b.loc[seeds,"ganancia_11000"]-a.loc[seeds,"ganancia_11000"]).astype(float)
+    per=pd.DataFrame({
+        "seed":seeds,
+        "delta_banda":d.to_numpy(),
+        "delta_11000":d11.to_numpy()
+    })
+    per.to_csv(out/"deltas_pareados.csv",index=False)
+    summary={
+        "n_seeds":len(seeds),
+        "delta_banda_medio":float(d.mean()),
+        "delta_banda_sd":float(d.std(ddof=1)),
+        "delta_banda_mediana":float(d.median()),
+        "positive_seed_fraction":float((d>0).mean()),
+        "wins":int((d>0).sum()),
+        "ties":int((d==0).sum()),
+        "losses":int((d<0).sum()),
+        "delta_11000_medio":float(d11.mean()),
+        "delta_11000_mediana":float(d11.median())
+    }
+    promote=(
+        summary["delta_banda_medio"]>0 and
+        summary["delta_11000_medio"]>0 and
+        summary["delta_banda_mediana"]>0 and
+        summary["positive_seed_fraction"]>=0.60
+    )
+    summary["promote_to_tuning"]=bool(promote)
+    summary["rule"]=PLAN["decision"]["promote_if_all"]
+    write_json(out/"confirmacion_c3.json",summary)
+    return summary
+
+# [Anotación · líneas 174–199] `main` verifica el SHA-256 del dataset y que el banco del paso anterior esté
+#   completo, selecciona las variables, guarda `00_c3_features.json`, lee los parámetros `lightgbm.base` de
+#   `config.yaml`, entrena el brazo M1_RAW (sólo variables originales) y el brazo C3_HIST_MAS_TARJETAS, compara
+#   e imprime el resumen.
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--data",required=True,type=Path)
+    ap.add_argument("--s1-root",required=True,type=Path)
+    ap.add_argument("--out",required=True,type=Path)
+    ap.add_argument("--threads",type=int,default=6)
+    a=ap.parse_args()
+    if sha256_file(a.data)!=PLAN["dataset_sha256"]:raise ValueError("Dataset distinto")
+    bank=a.s1_root/"fe_bank_dev"
+    m=json.loads((bank/"manifest.json").read_text())
+    if m.get("status")!="completed":raise ValueError("Banco FE S1 incompleto")
+    hist,cards,c3=select_features(bank)
+    a.out.mkdir(parents=True,exist_ok=True)
+    write_json(a.out/"00_c3_features.json",{
+        "historia_n":len(hist),"tarjetas_ratios_n":len(cards),
+        "c3_n":len(c3),"historia":hist,"tarjetas_ratios":cards,"c3":c3
+    })
+    params=yaml.safe_load((ROOT/"vendor/comun/config.yaml").read_text())["lightgbm"]["base"]
+    run_arm(bank,a.out,"M1_RAW",[],params,a.threads)
+    run_arm(bank,a.out,"C3_HIST_MAS_TARJETAS",c3,params,a.threads)
+    summary=compare(a.out)
+    print("\n=== S3 CONFIRMACION C3 ===")
+    print(json.dumps(summary,ensure_ascii=False,indent=2))
+    print("\nNo usa agosto, no tunea y no genera submits.")
+
+if __name__=="__main__":main()

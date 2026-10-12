@@ -1,0 +1,14 @@
+{
+  "experimento": 6004,
+  "nombre": "zulip_semillas_5008",
+  "descripcion": "20 archivos, uno por semilla de 5008 (receta del profesor), para ver media y desvio en el publico.",
+  "modo": "semillas",
+  "fuente": "5008_prod_rank_total_bo4104",
+  "envios": 13000,
+  "max_archivos": 20,
+  "clientes_esperados": 164647,
+  "_config": "6004_zulip_semillas_rank.json",
+  "_fecha_inicio": "2026-10-09 02:19:07",
+  "_script": "10_entrega_zulip.py",
+  "_git_commit": "sin_git"
+}

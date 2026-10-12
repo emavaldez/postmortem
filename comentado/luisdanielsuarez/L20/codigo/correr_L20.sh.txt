@@ -1,0 +1,75 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–10] Comentarios de uso: comando con y sin --apagar, cómo seguir el log y que la
+#   corrida se puede relanzar tras un corte.
+#!/bin/bash
+# correr_L20.sh — corre el paso 1 y, si termina bien, el paso 2. Opcionalmente apaga la VM al final.
+#
+# Uso (desde ~/dmeyf, con los dos .py en la misma carpeta):
+#     nohup bash correr_L20.sh --apagar > /dev/null 2>&1 &     # corre todo y apaga la VM
+#     nohup bash correr_L20.sh           > /dev/null 2>&1 &    # corre todo y la deja encendida
+#
+# Seguimiento (estos comandos devuelven el prompt):   tail -n 30 L20_todo.log
+# Es reanudable: si la VM spot se corta, encenderla y relanzar el mismo comando; cada script
+# saltea lo que ya terminó.
+# [Anotación · líneas 11–16] Se ubica en la carpeta del script, lee la opción --apagar, define el bucket y
+#   redirige toda la salida a L20_todo.log.
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+APAGAR=0
+[ "$1" = "--apagar" ] && APAGAR=1
+BUCKET=gs://luisdsuarez_buckito2026
+LOG=L20_todo.log
+exec >> "$LOG" 2>&1                       # todo lo que sigue va al log
+
+# [Anotación · líneas 18–29] Toma un candado con flock sobre /tmp/correr_dmeyf.lock y termina si ya hay una
+#   corrida; también termina si pgrep encuentra en ejecución algún script python con nombre 01_, 02_ o 03_ de
+#   algún volumen.
+# Candado: impide lanzar una segunda corrida mientras la primera sigue viva
+# (dos procesos sobre el mismo estudio se pisan los núcleos y la RAM, y todo se vuelve lentísimo).
+exec 9> /tmp/correr_dmeyf.lock                 # mismo candado para todos los volúmenes
+if ! flock -n 9; then
+    echo "$(date '+%F %T') YA HAY UNA CORRIDA EN CURSO: esta se cancela"
+    exit 1
+fi
+# además: no arrancar si quedó algún script de CUALQUIER volumen todavía vivo (p. ej. L15)
+if pgrep -f "^([^ ]*/)?python[0-9.]* +(\./)?0[123]_[a-z0-9_]*_L[0-9]+\.py" > /dev/null; then
+    echo "$(date '+%F %T') HAY OTRO SCRIPT DE UN VOLUMEN ANTERIOR TODAVÍA CORRIENDO: esta corrida se cancela"
+    exit 1
+fi
+
+# [Anotación · líneas 31–50] Copia el propio script a exp/L20/codigo y ejecuta el preprocesamiento; si
+#   devuelve 0 ejecuta la etapa 1 y, si ésta devuelve 0, la etapa 2. Registra el código de salida y, si alguno
+#   no fue 0, que las etapas siguientes no se corrieron.
+mkdir -p exp/L20/codigo
+cp "$(readlink -f "$0")" exp/L20/codigo/        # copia del código para reproducibilidad
+
+echo "$(date '+%F %T') === inicio (apagar al final: $APAGAR)"
+python 01_preprocesamiento_L20.py
+RC=$?
+if [ $RC -eq 0 ]; then
+    echo "$(date '+%F %T') === paso 1 (preprocesamiento) OK; empieza la etapa 1"
+    python 02_etapa1_L20.py
+    RC=$?
+fi
+if [ $RC -eq 0 ]; then
+    echo "$(date '+%F %T') === etapa 1 OK; empieza la etapa 2"
+    python 03_etapa2_L20.py
+    RC=$?
+fi
+if [ $RC -ne 0 ]; then
+    echo "$(date '+%F %T') === algo falló (código $RC): las etapas siguientes NO se corrieron"
+fi
+echo "$(date '+%F %T') === fin (código $RC)"
+
+# [Anotación · líneas 52–60] Copia el log a exp/L20, sincroniza esa carpeta con el bucket y, si se pasó
+#   --apagar, apaga la máquina.
+# respaldo del log junto al experimento (si el paso 1 falló, igual queda el diagnóstico)
+mkdir -p exp/L20
+cp "$LOG" exp/L20/
+gsutil -q -m rsync -r exp/L20 "$BUCKET/exp/L20"
+
+if [ $APAGAR -eq 1 ]; then
+    echo "$(date '+%F %T') apagando la VM"
+    sudo shutdown -h now
+fi

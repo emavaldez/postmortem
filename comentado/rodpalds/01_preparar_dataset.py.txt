@@ -1,0 +1,171 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–20] Docstring con el propósito del script y cómo correrlo; imprime un aviso de
+#   arranque e importa numpy, pandas y las funciones de exp_utils.
+"""
+01_preparar_dataset.py
+DMEyF 2026 - Primera Competencia
+
+Lee el dataset crudo, construye la clase ternaria (misma logica que el
+script R de la catedra), agrega las dos clases binarias y guarda todo en
+Parquet. Al final valida que el archivo grabado sea identico al de memoria.
+
+Uso:  python 01_preparar_dataset.py   (exp_utils.py tiene que estar en la misma carpeta)
+Requiere:  pip install pandas pyarrow
+"""
+
+print("Arrancando 01_preparar_dataset.py ...", flush=True)
+
+import time
+
+import numpy as np
+import pandas as pd
+
+from exp_utils import DIR_DATA, cerrar_experimento, iniciar_experimento
+
+# [Anotación · líneas 22–36] PARAM del experimento 1001 (dataset_base): entrada competencia_01_crudo.csv y
+#   salida ds1001_base.parquet, ambas en data/. Inicia el experimento y arma las dos rutas.
+# ---------------------------------------------------------------------------
+# PARAM: todo lo que define este experimento
+# ---------------------------------------------------------------------------
+PARAM = {
+    "experimento": 1001,
+    "nombre": "dataset_base",
+    "descripcion": "Crudo -> clase_ternaria (logica catedra) + clase_binaria1 (BAJA+2) "
+                   "+ clase_binaria2 (BAJA+1 y BAJA+2). Sin feature engineering.",
+    "dataset_entrada": "competencia_01_crudo.csv",
+    "dataset_salida": "ds1001_base.parquet",   # el id del experimento que lo genero va en el nombre
+}
+
+exp = iniciar_experimento(PARAM)
+ARCH_CRUDO = DIR_DATA / PARAM["dataset_entrada"]
+ARCH_SALIDA = DIR_DATA / PARAM["dataset_salida"]
+
+# [Anotación · líneas 38–54] Lee el CSV con el motor pyarrow. Detiene la corrida si el archivo ya trae
+#   clase_ternaria o si hay filas repetidas de numero_de_cliente y foto_mes; lista los meses presentes.
+# ---------------------------------------------------------------------------
+# 1. Lectura
+# ---------------------------------------------------------------------------
+t0 = time.time()
+print(f"Leyendo {ARCH_CRUDO} ...")
+df = pd.read_csv(ARCH_CRUDO, engine="pyarrow")
+print(f"  {len(df):,} filas x {df.shape[1]} columnas  ({time.time() - t0:.1f} s)")
+
+if "clase_ternaria" in df.columns:
+    raise ValueError("El crudo ya trae clase_ternaria. ¿Seguro que es el archivo crudo?")
+
+meses = sorted(int(m) for m in df["foto_mes"].unique())
+print(f"  Meses: {meses}")
+
+dups = df.duplicated(["numero_de_cliente", "foto_mes"]).sum()
+if dups:
+    raise ValueError(f"Hay {dups} filas repetidas de cliente-mes. Revisar el crudo antes de seguir.")
+
+# [Anotación · líneas 56–88] Arma la clase ternaria: convierte foto_mes en un período consecutivo (año × 12 +
+#   mes), ordena por cliente y período y toma los dos períodos siguientes de cada cliente. Asigna CONTINUA a los
+#   períodos anteriores al anteúltimo, BAJA+1 cuando falta el registro del mes siguiente y BAJA+2 cuando existe
+#   el mes siguiente y falta el de dos meses después; luego vuelve al orden original de las filas.
+# ---------------------------------------------------------------------------
+# 2. Clase ternaria
+#    Traduccion directa del codigo R de la catedra:
+#    - periodo0 = mes como numero consecutivo (anio*12 + mes)
+#    - periodo1 y periodo2 = los dos registros siguientes del MISMO cliente
+#    - un hueco (periodo1 > periodo0 + 1) cuenta como baja
+# ---------------------------------------------------------------------------
+t0 = time.time()
+aux = pd.DataFrame({
+    "pos": np.arange(len(df)),
+    "numero_de_cliente": df["numero_de_cliente"].to_numpy(),
+    "periodo0": (df["foto_mes"] // 100) * 12 + df["foto_mes"] % 100,
+})
+aux = aux.sort_values(["numero_de_cliente", "periodo0"], kind="mergesort")
+
+g = aux.groupby("numero_de_cliente", sort=False)["periodo0"]
+aux["periodo1"] = g.shift(-1)
+aux["periodo2"] = g.shift(-2)
+
+periodo_ultimo = aux["periodo0"].max()
+periodo_anteultimo = periodo_ultimo - 1
+
+p0, p1, p2 = aux["periodo0"], aux["periodo1"], aux["periodo2"]
+clase = pd.Series(pd.NA, index=aux.index, dtype="string")
+
+# orden igual al de la catedra: primero CONTINUA, despues se pisa con las bajas
+clase[p0 < periodo_anteultimo] = "CONTINUA"
+clase[(p0 < periodo_ultimo) & (p1.isna() | (p0 + 1 < p1))] = "BAJA+1"
+clase[(p0 < periodo_anteultimo) & (p0 + 1 == p1) & (p2.isna() | (p0 + 2 < p2))] = "BAJA+2"
+
+aux["clase_ternaria"] = clase
+aux = aux.sort_values("pos")                       # vuelvo al orden original
+df["clase_ternaria"] = aux["clase_ternaria"].to_numpy()
+
+# [Anotación · líneas 90–98] Crea clase_binaria1 (1 si la clase es BAJA+2) y clase_binaria2 (1 si es BAJA+1 o
+#   BAJA+2), en tipo Int8 y con nulo donde la ternaria es nula.
+# ---------------------------------------------------------------------------
+# 3. Clases binarias (quedan nulas donde la ternaria es nula)
+#    clase_binaria1: BAJA+2 vs resto                 (la del libro)
+#    clase_binaria2: BAJA+1 y BAJA+2 vs CONTINUA     (la del z601)
+# ---------------------------------------------------------------------------
+ct = df["clase_ternaria"]
+df["clase_binaria1"] = (ct == "BAJA+2").astype("Int8").where(ct.notna())
+df["clase_binaria2"] = ct.isin(["BAJA+1", "BAJA+2"]).astype("Int8").where(ct.notna())
+print(f"Clases construidas ({time.time() - t0:.1f} s)")
+
+# [Anotación · líneas 100–125] Arma la tabla de clientes por mes y clase y la graba en CSV. Verifica por
+#   aserciones que el último mes quede sin clase, que el anteúltimo sólo tenga BAJA+1 y que los demás tengan
+#   clase completa; imprime el porcentaje de cada clase por mes.
+# ---------------------------------------------------------------------------
+# 4. Controles de la clase
+# ---------------------------------------------------------------------------
+tabla = (df.assign(clase=df["clase_ternaria"].fillna("(sin clase)"))
+           .pivot_table(index="foto_mes", columns="clase", values="numero_de_cliente",
+                        aggfunc="count", fill_value=0))
+print("\nClientes por mes y clase:")
+print(tabla.to_string())
+tabla.to_csv(exp.ruta("clientes_por_mes_y_clase"))
+
+ult, anteult = meses[-1], meses[-2]
+assert df.loc[df["foto_mes"] == ult, "clase_ternaria"].isna().all(), \
+    "El ultimo mes deberia quedar 100% sin clase"
+assert set(df.loc[df["foto_mes"] == anteult, "clase_ternaria"].dropna()) <= {"BAJA+1"}, \
+    "El anteultimo mes solo puede tener BAJA+1 (el resto sin clase)"
+for m in meses[:-2]:
+    assert df.loc[df["foto_mes"] == m, "clase_ternaria"].notna().all(), \
+        f"El mes {m} deberia tener clase completa"
+print(f"\nOK: meses con clase completa = {meses[:-2]}; "
+      f"{anteult} solo BAJA+1; {ult} sin clase (es el 'futuro').")
+
+tasa = (df[df["foto_mes"].isin(meses[:-2])]
+        .groupby("foto_mes")["clase_ternaria"]
+        .value_counts(normalize=True).unstack().mul(100).round(3))
+print("\nPorcentaje de cada clase por mes (meses completos):")
+print(tasa.to_string())
+
+# [Anotación · líneas 127–150] Graba el dataset en Parquet con compresión zstd, lo relee y verifica que
+#   conserve la forma y la cantidad de nulos por columna. Cierra el experimento registrando filas, columnas,
+#   meses, meses con clase completa y cantidad de BAJA+2 por mes.
+# ---------------------------------------------------------------------------
+# 5. Grabacion y verificacion de ida y vuelta
+# ---------------------------------------------------------------------------
+t0 = time.time()
+df.to_parquet(ARCH_SALIDA, engine="pyarrow", compression="zstd", index=False)
+print(f"\nGrabado {ARCH_SALIDA}  ({ARCH_SALIDA.stat().st_size / 1e6:.0f} MB, {time.time() - t0:.1f} s)")
+
+t0 = time.time()
+chk = pd.read_parquet(ARCH_SALIDA)
+print(f"Releido en {time.time() - t0:.1f} s")
+
+assert chk.shape == df.shape, "Cambio la forma del dataset al grabar"
+assert chk["clase_ternaria"].isna().sum() == df["clase_ternaria"].isna().sum(), \
+    "Los nulos de clase_ternaria no sobrevivieron al grabado"
+assert (chk.isna().sum() == df.isna().sum()).all(), "Cambio la cantidad de nulos en alguna columna"
+print("OK: el Parquet conserva filas, columnas y nulos (no se repite el problema fwrite/fread).")
+
+cerrar_experimento(exp, {
+    "filas": len(df),
+    "columnas": df.shape[1],
+    "meses": meses,
+    "meses_clase_completa": meses[:-2],
+    "baja2_por_mes": {int(m): int(n) for m, n in tabla["BAJA+2"].items()},
+})

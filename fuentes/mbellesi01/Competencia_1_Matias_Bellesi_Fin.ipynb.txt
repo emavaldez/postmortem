@@ -1,0 +1,861 @@
+#%% celda 1 [texto]
+<a href="https://colab.research.google.com/github/tamandua01/dmeyf2026-Competencia-1/blob/main/Competencia_1_Matias_Bellesi_Fin.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+
+#%% celda 2 [código]
+# primero establecer el Runtime de Python 3
+from google.colab import drive
+drive.mount('/content/.drive')
+
+#%% celda 3 [código]
+%%shell
+
+# 1. Crear directorios en Google Drive y enlace simbólico para Competencia 1
+mkdir -p "/content/drive/MyDrive/dmeyf_competencia_1/datasets"
+mkdir -p "/content/drive/MyDrive/dmeyf_competencia_1/exp"
+mkdir -p "/content/buckets"
+
+# Enlace simbólico a la carpeta de competencia_1
+ln -sfn "/content/drive/MyDrive/dmeyf_competencia_1" /content/buckets/competencia_1
+
+# 2. Descargar directamente en la carpeta de datasets
+ARCHIVO="competencia_01_crudo.csv"
+DESTINO="/content/buckets/competencia_1/datasets/$ARCHIVO"
+URL="https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/$ARCHIVO"
+
+if [ ! -f "$DESTINO" ]; then
+  echo "Descargando $ARCHIVO en datasets..."
+  wget "$URL" -O "$DESTINO"
+else
+  echo "$ARCHIVO ya existe en $DESTINO"
+fi
+
+# Listar para verificar que el archivo está en su lugar y ver su tamaño
+ls -lh /content/buckets/competencia_1/datasets/
+
+#%% celda 4 [código]
+# ==============================================================================
+# 1. CONFIGURACIÓN DEL ENTORNO Y CONSTANTES DE NEGOCIO
+# ==============================================================================
+import os
+import gc
+import json
+import time
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from numba import njit
+from google.colab import files
+
+try:
+    import optuna
+except ImportError:
+    !pip install -q optuna
+    import optuna
+
+print(f"[{time.strftime('%H:%M:%S')}] Entorno inicializado correctamente.")
+
+# Rutas de trabajo
+EXP_NAME = "entregable_competencia_01"
+DIR_BASE = f"/content/buckets/competencia_1/exp/{EXP_NAME}"
+os.makedirs(DIR_BASE, exist_ok=True)
+
+# Parámetros del negocio bancario (DMEyF)
+GANANCIA_ACIERTO = 273_000   # Ganancia neta por estímulo a BAJA+2
+COSTO_ESTIMULO = 7_000       # Costo de estímulo por cliente
+CORTE_OPTIMO_K = 11_000      # Límite operativo de envíos
+
+# Ventanas temporales
+MESES_TRAIN = [202101, 202102, 202103, 202104, 202105, 202106]
+MES_TEST = 202108
+
+# Semillas para el ensamble final
+SEMILLAS_ENSAMBLE = [585581, 801109, 801113, 801119, 801131]
+TOP_N_FEATURES = 300
+
+print(f"Directorio de salida: {DIR_BASE}")
+print(f"Train: {MESES_TRAIN} | Test: {MES_TEST}")
+
+#%% celda 5 [código]
+# ==============================================================================
+# 1.2. MÓDULO DE OPTIMIZACIÓN BAYESIANA (RESPALDO METODOLÓGICO)
+# ==============================================================================
+def metric_ganancia_lgb(preds, train_data):
+    """Métrica de negocio oficial para evaluar cada corte en validación."""
+    labels = train_data.get_label()
+    # Ordenar por probabilidad descendente
+    idx = np.argsort(-preds)
+    labels_ordenados = labels[idx]
+
+    # Evaluar ganancia en el corte K=11.000
+    k = min(CORTE_OPTIMO_K, len(labels))
+    top_k_labels = labels_ordenados[:k]
+    aciertos = np.sum(top_k_labels == 1)
+    no_aciertos = k - aciertos
+    ganancia = aciertos * GANANCIA_ACIERTO - no_aciertos * COSTO_ESTIMULO
+    return "ganancia", ganancia, True
+
+def correr_optimizacion_bayesiana(X_train_cv, y_train_cv, X_val_cv, y_val_cv, n_trials=30):
+    """
+    Ejecuta el estudio bayesiano formal para justificar hiperparámetros.
+    Si ya existe 'mejores_hiperparametros.json', lo carga directamente para no perder tiempo.
+    """
+    ruta_json = os.path.join(DIR_BASE, "mejores_hiperparametros.json")
+    if os.path.exists(ruta_json):
+        print(f"[{time.strftime('%H:%M:%S')}] Archivo de hiperparámetros bayesianos encontrado. Cargando...")
+        with open(ruta_json, "r") as f:
+            return json.load(f)
+
+    print(f"[{time.strftime('%H:%M:%S')}] Iniciando Optimización Bayesiana formal ({n_trials} trials)...")
+    dtrain = lgb.Dataset(X_train_cv, label=y_train_cv, free_raw_data=True)
+    dval = lgb.Dataset(X_val_cv, label=y_val_cv, reference=dtrain, free_raw_data=True)
+
+    def objective(trial):
+        params = {
+            "objective": "binary",
+            "metric": "None",
+            "boosting_type": "gbdt",
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 31, 120),
+            "max_bin": 31,
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.40, 0.80),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.60, 0.90),
+            "bagging_freq": 1,
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 20, 200),
+            "min_sum_hessian_in_leaf": trial.suggest_float("min_sum_hessian_in_leaf", 0.001, 0.05, log=True),
+            "max_depth": -1,
+            "force_row_wise": True,
+            "deterministic": True,
+            "verbose": -1,
+            "seed": 42,
+            "n_jobs": -1
+        }
+
+        modelo = lgb.train(
+            params,
+            dtrain,
+            num_boost_round=2500,
+            valid_sets=[dval],
+            feval=metric_ganancia_lgb,
+            callbacks=[lgb.early_stopping(stopping_rounds=150, verbose=False)]
+        )
+        preds_val = modelo.predict(X_val_cv)
+        _, ganancia, _ = metric_ganancia_lgb(preds_val, dval)
+        return ganancia
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials)
+
+    mejores_params = study.best_params
+    mejores_params["objective"] = "binary"
+    mejores_params["boosting_type"] = "gbdt"
+    mejores_params["max_bin"] = 31
+    mejores_params["bagging_freq"] = 1
+    mejores_params["max_depth"] = -1
+    mejores_params["force_row_wise"] = True
+    mejores_params["deterministic"] = True
+    mejores_params["verbose"] = -1
+    mejores_params["n_jobs"] = -1
+
+    with open(ruta_json, "w") as f:
+        json.dump(mejores_params, f, indent=4)
+
+    print(f"[{time.strftime('%H:%M:%S')}] Bayesiana finalizada. Mejor ganancia: {study.best_value:,.0f}")
+    return mejores_params
+
+#%% celda 6 [código]
+# ==============================================================================
+# 2. CARGA DE DATOS, SANEAMIENTO, FEATURES INTRA-MES Y TARGET (CLASE01)
+# ==============================================================================
+print(f"[{time.strftime('%H:%M:%S')}] Iniciando carga y preprocesamiento de datos...")
+
+# 2.1. Detección automática del dataset crudo
+posibles_crudos = [
+    "/content/buckets/competencia_1/datasets/competencia_01_crudo.csv",
+    "/content/.drive/MyDrive/dmeyf_competencia_1/datasets/competencia_01_crudo.csv",
+    "/content/drive/MyDrive/dmeyf_competencia_1/datasets/competencia_01_crudo.csv",
+    "/content/drive/MyDrive/dmeyf/datasets/competencia_01_crudo.csv"
+]
+RUTA_CRUDO = next((r for r in posibles_crudos if os.path.exists(r)), None)
+if RUTA_CRUDO is None:
+    raise FileNotFoundError("No se encontró el dataset 'competencia_01_crudo.csv'. Verificá el montado de Drive/Bucket.")
+
+print(f"[{time.strftime('%H:%M:%S')}] Leyendo archivo desde: {RUTA_CRUDO}")
+df = pd.read_csv(RUTA_CRUDO)
+df["numero_de_cliente"] = df["numero_de_cliente"].astype("int64")
+df["foto_mes"] = df["foto_mes"].astype("int64")
+print(f"Registros cargados: {len(df):,} | Columnas iniciales: {df.shape[1]}")
+
+# 2.2. Saneamiento de variables con drift y tarjetas de crédito
+# Eliminación de préstamos con drift operativo roto
+cols_drop = [c for c in ["cprestamos_personales", "mprestamos_personales"] if c in df.columns]
+if cols_drop:
+    df.drop(columns=cols_drop, inplace=True)
+
+# Tarjetas: los montos en 0 cuando no hay uso representan ausencia de registro (NaN)
+cols_tarjetas = [
+    c for c in df.columns
+    if (c.startswith("Visa_") or c.startswith("Master_")) and not c.startswith(("Visa_c", "Master_c"))
+]
+for col in cols_tarjetas:
+    df.loc[df[col] == 0, col] = np.nan
+
+# Flag Intra-Mes de la Cátedra: corte operativo y anómalo de abril 2021
+df["flag_abril_2021"] = (df["foto_mes"] == 202104).astype(np.float32)
+
+# 2.3. Features de negocio bancario (Intra-mes)
+cols_liq = [c for c in ["mcaja_ahorro", "mcuenta_corriente", "mplazo_fijo_pesos", "mfondos_comunes_inversion"] if c in df.columns]
+df["m_saldo_liquido_total"] = df[cols_liq].sum(axis=1, skipna=True)
+
+if "Visa_mconsumospesos" in df.columns and "Master_mconsumospesos" in df.columns:
+    df["tarjeta_mconsumos_total"] = df[["Visa_mconsumospesos", "Master_mconsumospesos"]].sum(axis=1, skipna=True)
+if "Visa_msaldototal" in df.columns and "Master_msaldototal" in df.columns:
+    df["tarjeta_msaldo_total"] = df[["Visa_msaldototal", "Master_msaldototal"]].sum(axis=1, skipna=True)
+if "Visa_mlimitecompra" in df.columns and "Master_mlimitecompra" in df.columns:
+    df["tarjeta_mlimite_total"] = df[["Visa_mlimitecompra", "Master_mlimitecompra"]].sum(axis=1, skipna=True)
+
+if "Visa_msaldototal" in df.columns and "Visa_mlimitecompra" in df.columns:
+    df["Visa_ratio_utilizacion"] = df["Visa_msaldototal"] / (df["Visa_mlimitecompra"] + 1.0)
+if "Master_msaldototal" in df.columns and "Master_mlimitecompra" in df.columns:
+    df["Master_ratio_utilizacion"] = df["Master_msaldototal"] / (df["Master_mlimitecompra"] + 1.0)
+
+if "ctrx_quarter" in df.columns and "cliente_antiguedad" in df.columns:
+    df["ctrx_por_antiguedad"] = df["ctrx_quarter"] / (df["cliente_antiguedad"] + 1.0)
+if "mrentabilidad" in df.columns and "ctrx_quarter" in df.columns:
+    df["mrentabilidad_por_trx"] = df["mrentabilidad"] / (df["ctrx_quarter"] + 1.0)
+if "Visa_delinquency" in df.columns and "Master_delinquency" in df.columns:
+    df["delinquency_max"] = df[["Visa_delinquency", "Master_delinquency"]].max(axis=1, skipna=True)
+
+# 2.4. Ordenamiento cronológico por cliente para cálculo de target
+df.sort_values(by=["numero_de_cliente", "foto_mes"], inplace=True)
+df.reset_index(drop=True, inplace=True)
+
+# 2.5. Cálculo formal vectorizado del Target bancario (BAJA+1 / BAJA+2)
+periodo0 = (df["foto_mes"] // 100) * 12 + (df["foto_mes"] % 100)
+c_ser = df["numero_de_cliente"]
+
+# Máscaras de mismo cliente en leads futuros
+m_lead1 = (c_ser == c_ser.shift(-1))
+m_lead2 = (c_ser == c_ser.shift(-2))
+
+p1 = periodo0.shift(-1).where(m_lead1, np.nan)
+p2 = periodo0.shift(-2).where(m_lead2, np.nan)
+p_max = int(periodo0.max())
+p_ant = p_max - 1
+
+clase = pd.Series(index=df.index, dtype="object")
+clase.loc[periodo0 < p_ant] = "CONTINUA"
+clase.loc[(periodo0 < p_max) & (p1.isna() | (periodo0 + 1 < p1))] = "BAJA+1"
+clase.loc[(periodo0 < p_ant) & (periodo0 + 1 == p1) & (p2.isna() | (periodo0 + 2 < p2))] = "BAJA+2"
+
+df["clase01"] = np.nan
+df.loc[clase.notna(), "clase01"] = clase.isin(["BAJA+1", "BAJA+2"]).astype(np.float32)
+
+# Limpieza de memoria
+del periodo0, p1, p2, m_lead1, m_lead2, clase
+gc.collect()
+
+print(f"[{time.strftime('%H:%M:%S')}] Target clase01 calculado:")
+print(df.groupby("foto_mes")["clase01"].value_counts(dropna=False).unstack().fillna(0))
+
+#%% celda 7 [código]
+# ==============================================================================
+# 3. FEATURE ENGINEERING HISTÓRICO: LAGS, DELTAS Y TENDENCIA CÁTEDRA (NUMBA JIT)
+# ==============================================================================
+print(f"[{time.strftime('%H:%M:%S')}] Iniciando Feature Engineering Temporal...")
+
+# Columnas base a las que se les calculará historia
+cols_no_historia = ["numero_de_cliente", "foto_mes", "clase01", "flag_abril_2021"]
+cols_base = [c for c in df.columns if c not in cols_no_historia]
+
+# 3.1. Lags y Deltas vectorizados por cliente
+print(f"[{time.strftime('%H:%M:%S')}] Calculando Lags (1, 2, 3) y Deltas (1, 3)...")
+c_ser = df["numero_de_cliente"]
+m_lag1 = (c_ser == c_ser.shift(1))
+m_lag2 = (c_ser == c_ser.shift(2))
+m_lag3 = (c_ser == c_ser.shift(3))
+
+nuevas_lags = {}
+for col in cols_base:
+    s = df[col].values.astype(np.float32)
+    s_ser = pd.Series(s)
+    s_lag1 = s_ser.shift(1).where(m_lag1, np.nan).values.astype(np.float32)
+    s_lag2 = s_ser.shift(2).where(m_lag2, np.nan).values.astype(np.float32)
+    s_lag3 = s_ser.shift(3).where(m_lag3, np.nan).values.astype(np.float32)
+
+    nuevas_lags[f"{col}_lag1"] = s_lag1
+    nuevas_lags[f"{col}_lag2"] = s_lag2
+    nuevas_lags[f"{col}_lag3"] = s_lag3
+
+    d1 = s - s_lag1
+    d3 = s - s_lag3
+    nuevas_lags[f"{col}_delta1"] = d1
+    nuevas_lags[f"{col}_delta3"] = d3
+    nuevas_lags[f"{col}_delta_rel1"] = d1 / (np.abs(s_lag1) + 1.0)
+
+df = pd.concat([df, pd.DataFrame(nuevas_lags, index=df.index)], axis=1)
+del nuevas_lags, m_lag1, m_lag2, m_lag3
+gc.collect()
+
+# 3.2. Tendencia por Mínimos Cuadrados y Media Móvil (Numba JIT - fhistC Cátedra)
+print(f"[{time.strftime('%H:%M:%S')}] Compilando y ejecutando Tendencia por Mínimos Cuadrados (Cátedra, Ventana=3)...")
+
+@njit(fastmath=True)
+def fhist_numba(col_vals, pdesde):
+    """
+    Replica exacta de fhistC de Rcpp:
+    Calcula pendiente de mínimos cuadrados (tendencia) y media móvil sobre ventana móvil.
+    """
+    n = len(col_vals)
+    tendencia = np.full(n, np.nan, dtype=np.float32)
+    avg = np.full(n, np.nan, dtype=np.float32)
+    x = np.empty(100, dtype=np.float64)
+    y = np.empty(100, dtype=np.float64)
+
+    for i in range(n):
+        libre = 0
+        xvalor = 1.0
+        start_idx = pdesde[i]
+
+        for j in range(start_idx, i + 1):
+            val = col_vals[j]
+            if not np.isnan(val):
+                y[libre] = val
+                x[libre] = xvalor
+                libre += 1
+            xvalor += 1.0
+
+        if libre > 1:
+            xsum = x[0]
+            ysum = y[0]
+            xysum = x[0] * y[0]
+            xxsum = x[0] * x[0]
+
+            for h in range(1, libre):
+                xsum += x[h]
+                ysum += y[h]
+                xysum += x[h] * y[h]
+                xxsum += x[h] * x[h]
+
+            den = (libre * xxsum - xsum * xsum)
+            if den != 0.0:
+                tendencia[i] = (libre * xysum - xsum * ysum) / den
+            avg[i] = ysum / libre
+
+    return tendencia, avg
+
+# Construcción formal del vector 'pdesde' (Ventana = 3)
+n_total = len(df)
+ids_arr = df["numero_de_cliente"].values
+ventana = 3
+pdesde = np.arange(-ventana + 1, n_total - ventana + 1, dtype=np.int64)
+pdesde[:ventana] = 0
+pdesde[pdesde < 0] = 0
+
+for i in range(1, n_total):
+    if ids_arr[i - 1] != ids_arr[i]:
+        pdesde[i] = i
+for i in range(1, n_total):
+    if pdesde[i] < pdesde[i - 1]:
+        pdesde[i] = pdesde[i - 1]
+
+# Variables cuantitativas para tendencia
+cols_a_tendencia = [
+    c for c in cols_base
+    if pd.api.types.is_numeric_dtype(df[c]) and not c.startswith(("cliente_edad", "cliente_antiguedad"))
+]
+
+nuevas_tend = {}
+for campo in cols_a_tendencia:
+    v_arr = df[campo].to_numpy(dtype=np.float64)
+    tend, prom = fhist_numba(v_arr, pdesde)
+    nuevas_tend[f"{campo}_tend3"] = tend
+    nuevas_tend[f"{campo}_avg3"] = prom
+
+df = pd.concat([df, pd.DataFrame(nuevas_tend, index=df.index)], axis=1)
+
+del nuevas_tend, pdesde, ids_arr, c_ser
+gc.collect()
+
+print(f"[{time.strftime('%H:%M:%S')}] Feature Engineering Temporal completado.")
+print(f"Dimensiones actuales del dataset: {df.shape[0]:,} filas x {df.shape[1]:,} columnas.")
+
+#%% celda 8 [código]
+# ==============================================================================
+# 4. NORMALIZACIÓN (RANKING CERO FIJO) Y SELECCIÓN DE TOP 300 VARIABLES
+# ==============================================================================
+print(f"[{time.strftime('%H:%M:%S')}] Iniciando Ranking Cero Fijo mensual...")
+
+# 4.1. Función de Ranking Cero Fijo vectorizada
+def rank_cero_fijo_vectorizado(series):
+    res = pd.Series(np.nan, index=series.index, dtype=np.float32)
+    mask_cero = (series == 0)
+    mask_pos = (series > 0)
+    mask_neg = (series < 0)
+
+    res[mask_cero] = 0.0
+    if mask_pos.any():
+        res[mask_pos] = series[mask_pos].rank(pct=True).astype(np.float32)
+    if mask_neg.any():
+        res[mask_neg] = - (1.0 - series[mask_neg].rank(pct=True).astype(np.float32) + (1.0 / mask_neg.sum()))
+    return res
+
+cols_no_rank = [
+    "numero_de_cliente", "foto_mes", "clase01", "cliente_edad", "cliente_antiguedad", "flag_abril_2021"
+]
+cols_a_rankear = [
+    c for c in df.columns
+    if c not in cols_no_rank
+    and not c.endswith(("_lag1", "_lag2", "_lag3", "_delta_rel1", "_tend3", "_avg3"))
+    and pd.api.types.is_numeric_dtype(df[c])
+]
+
+print(f"Transformando {len(cols_a_rankear)} columnas a Ranking Cero Fijo por foto_mes...")
+nuevas_ranks = {}
+for col in cols_a_rankear:
+    nuevas_ranks[f"{col}_rank0"] = df.groupby("foto_mes")[col].transform(rank_cero_fijo_vectorizado).astype(np.float32)
+
+df = pd.concat([df, pd.DataFrame(nuevas_ranks, index=df.index)], axis=1)
+del nuevas_ranks
+gc.collect()
+
+print(f"Columnas totales tras Ranking Cero Fijo: {df.shape[1]}")
+
+# 4.2. Selección rigurosa del Top 300 de variables por Ganancia
+print(f"[{time.strftime('%H:%M:%S')}] Ejecutando Feature Selection (Top 300 por Gain sobre 202106)...")
+
+candidatas = [c for c in df.columns if c not in cols_no_rank and pd.api.types.is_numeric_dtype(df[c])]
+
+df_junio = df[df["foto_mes"] == 202106]
+X_junio = df_junio[candidatas].to_numpy(dtype=np.float32)
+y_junio = df_junio["clase01"].astype(np.int8).values
+
+dtrain_imp = lgb.Dataset(X_junio, label=y_junio, feature_name=candidatas, free_raw_data=True)
+
+params_imp = {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "max_bin": 31,
+    "verbose": -1,
+    "seed": 42,
+    "n_jobs": -1
+}
+
+m_imp = lgb.train(params_imp, dtrain_imp, num_boost_round=150)
+importancias = m_imp.feature_importance(importance_type="gain")
+
+df_importancias = pd.DataFrame({
+    "feature": candidatas,
+    "gain": importancias
+}).sort_values(by="gain", ascending=False).reset_index(drop=True)
+
+top_features = df_importancias.head(TOP_N_FEATURES)["feature"].tolist()
+
+# Guardar para auditoría metodológica del entregable
+ruta_top_csv = os.path.join(DIR_BASE, "top_300_features.csv")
+df_importancias.head(TOP_N_FEATURES).to_csv(ruta_top_csv, index=False)
+print(f"Top 300 variables guardadas en: {ruta_top_csv}")
+
+print(f"\nTop 10 Variables más importantes por Ganancia:")
+for idx, row in df_importancias.head(10).iterrows():
+    print(f"   {idx+1:02d}. {row['feature']:<35} (Gain: {row['gain']:,.1f})")
+
+del df_junio, X_junio, y_junio, dtrain_imp, m_imp
+gc.collect()
+
+#%% celda 9 [código]
+# ==============================================================================
+# 5. OPTIMIZACIÓN BAYESIANA FORMAL CON OPTUNA (MÉTRICA DE GANANCIA BANCARIA)
+# ==============================================================================
+import json
+try:
+    import optuna
+except ImportError:
+    !pip install -q optuna
+    import optuna
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+print(f"[{time.strftime('%H:%M:%S')}] Configurando datos para Optimización Bayesiana Out-Of-Time...")
+
+# Partición temporal para validación: Train [202101..202105] -> Val [202106]
+df_bay_train = df[df["foto_mes"].isin([202101, 202102, 202103, 202104, 202105])]
+y_bay_train = df_bay_train["clase01"].astype(np.int8).values
+X_bay_train = df_bay_train[top_features].to_numpy(dtype=np.float32)
+
+df_bay_val = df[df["foto_mes"] == 202106]
+y_bay_val = df_bay_val["clase01"].astype(np.int8).values
+X_bay_val = df_bay_val[top_features].to_numpy(dtype=np.float32)
+
+# Parámetros iniciales del Dataset para permitir ajuste dinámico de min_data_in_leaf
+params_dataset_init = {
+    "feature_pre_filter": False,
+    "max_bin": 31
+}
+
+dtrain_bay = lgb.Dataset(X_bay_train, label=y_bay_train, params=params_dataset_init, free_raw_data=True)
+dval_bay = lgb.Dataset(X_bay_val, label=y_bay_val, reference=dtrain_bay, params=params_dataset_init, free_raw_data=True)
+
+del df_bay_train, df_bay_val
+gc.collect()
+
+# Métrica de negocio bancaria oficial
+def metric_ganancia_lgb(preds, train_data):
+    labels = train_data.get_label()
+    idx = np.argsort(-preds)
+    labels_ordenados = labels[idx]
+
+    k = min(CORTE_OPTIMO_K, len(labels))
+    top_k = labels_ordenados[:k]
+    aciertos = np.sum(top_k == 1)
+    ganancia = aciertos * GANANCIA_ACIERTO - (k - aciertos) * COSTO_ESTIMULO
+    return "ganancia_bancaria", float(ganancia), True
+
+print(f"[{time.strftime('%H:%M:%S')}] Iniciando búsqueda bayesiana...")
+
+def objective(trial):
+    params = {
+        "objective": "binary",
+        "metric": "None",
+        "boosting_type": "gbdt",
+        "feature_pre_filter": False,  # Resuelve el error de LightGBM
+        "learning_rate": trial.suggest_float("learning_rate", 0.015, 0.06, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 50, 110),
+        "max_bin": 31,
+        "feature_fraction": trial.suggest_float("feature_fraction", 0.45, 0.70),
+        "bagging_fraction": trial.suggest_float("bagging_fraction", 0.70, 0.90),
+        "bagging_freq": 1,
+        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 30, 120),
+        "min_sum_hessian_in_leaf": trial.suggest_float("min_sum_hessian_in_leaf", 0.001, 0.02, log=True),
+        "max_depth": -1,
+        "force_row_wise": True,
+        "deterministic": True,
+        "verbose": -1,
+        "seed": 42,
+        "n_jobs": -1
+    }
+
+    modelo = lgb.train(
+        params,
+        dtrain_bay,
+        num_boost_round=1500,
+        valid_sets=[dval_bay],
+        feval=metric_ganancia_lgb,
+        callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)]
+    )
+
+    preds_val = modelo.predict(X_bay_val)
+    _, ganancia, _ = metric_ganancia_lgb(preds_val, dval_bay)
+
+    trial.set_user_attr("best_iteration", modelo.best_iteration)
+    return ganancia
+
+N_TRIALS = 30
+study = optuna.create_study(direction="maximize", study_name="dmeyf_comp1_bayes")
+study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=True)
+
+# Recuperar los mejores hiperparámetros encontrados
+mejores_params = study.best_params
+mejores_params["objective"] = "binary"
+mejores_params["metric"] = "None"
+mejores_params["boosting_type"] = "gbdt"
+mejores_params["feature_pre_filter"] = False
+mejores_params["max_bin"] = 31
+mejores_params["bagging_freq"] = 1
+mejores_params["max_depth"] = -1
+mejores_params["force_row_wise"] = True
+mejores_params["deterministic"] = True
+mejores_params["verbose"] = -1
+mejores_params["n_jobs"] = -1
+
+mejor_iteracion = study.best_trial.user_attrs.get("best_iteration", 800)
+
+print(f"\n[{time.strftime('%H:%M:%S')}] Optimización Bayesiana completada con éxito.")
+print(f"Mejor Ganancia en Validación (202106): ${study.best_value:,.0f}")
+print(f"Mejor Ronda (best_iteration): {mejor_iteracion}")
+print("\nHiperparámetros óptimos seleccionados por Optuna:")
+print(json.dumps(mejores_params, indent=4))
+
+# Guardar registro oficial para la entrega
+ruta_json_params = os.path.join(DIR_BASE, "mejores_hiperparametros_bayes.json")
+with open(ruta_json_params, "w") as f:
+    json.dump({
+        "best_value": study.best_value,
+        "best_iteration": mejor_iteracion,
+        "best_params": mejores_params
+    }, f, indent=4)
+
+del X_bay_train, y_bay_train, X_bay_val, y_bay_val, dtrain_bay, dval_bay
+gc.collect()
+
+#%% celda 10 [código]
+# ==============================================================================
+# 6. ENTRENAMIENTO FINAL CON HIPERPARÁMETROS DE LA BAYESIANA (PRODUCCIÓN)
+# ==============================================================================
+print(f"[{time.strftime('%H:%M:%S')}] Armando dataset final de 6 meses (202101 a 202106)...")
+
+# 6.1. Matrices finales
+df_train = df[df["foto_mes"].isin(MESES_TRAIN)].copy()
+y_train = df_train["clase01"].astype(np.int8).values
+X_train = df_train[top_features].to_numpy(dtype=np.float32)
+
+df_test = df[df["foto_mes"] == MES_TEST].copy()
+clientes_test = df_test["numero_de_cliente"].values
+X_test = df_test[top_features].to_numpy(dtype=np.float32)
+
+print(f"   Train: {X_train.shape[0]:,} filas x {X_train.shape[1]} columnas")
+print(f"   Positivos en Train: {y_train.sum():,} ({y_train.mean():.4%})")
+print(f"   Test:  {X_test.shape[0]:,} clientes")
+
+del df, df_train, df_test
+gc.collect()
+
+dtrain_final = lgb.Dataset(X_train, label=y_train, free_raw_data=True)
+del X_train, y_train
+gc.collect()
+
+# Usamos la mejor iteración encontrada por Optuna
+num_boost_round_final = int(mejor_iteracion)
+print(f"Rondas de boosting fijadas en best_iteration: {num_boost_round_final}")
+
+# 6.2. Ensamble de Semillas
+print(f"\n[{time.strftime('%H:%M:%S')}] Entrenando ensamble de {len(SEMILLAS_ENSAMBLE)} semillas...")
+prob_acumulada = np.zeros(len(clientes_test), dtype=np.float64)
+
+t0_ensamble = time.time()
+for i, semilla in enumerate(SEMILLAS_ENSAMBLE, 1):
+    t0_sem = time.time()
+    p = mejores_params.copy()
+    p["seed"] = semilla
+
+    modelo = lgb.train(p, dtrain_final, num_boost_round=num_boost_round_final)
+    preds = modelo.predict(X_test)
+    prob_acumulada += preds
+
+    np.save(os.path.join(DIR_BASE, f"preds_bayes_seed_{semilla}.npy"), preds)
+    duracion = time.time() - t0_sem
+    print(f"[{time.strftime('%H:%M:%S')}]   -> Semilla {i}/{len(SEMILLAS_ENSAMBLE)} (Seed: {semilla}) lista en {duracion:.1f}s", flush=True)
+    del modelo
+    gc.collect()
+
+prob_final = prob_acumulada / len(SEMILLAS_ENSAMBLE)
+np.save(os.path.join(DIR_BASE, "prob_media_ensamble_bayes.npy"), prob_final)
+
+# 6.3. Generación de rankings oficiales
+df_ranking = pd.DataFrame({
+    "numero_de_cliente": clientes_test,
+    "prob": prob_final
+}).sort_values(by="prob", ascending=False).reset_index(drop=True)
+
+for k in [10900, 10950, 11000, 11050]:
+    ruta_k = os.path.join(DIR_BASE, f"ENTREGABLE_BAYES_FINAL_K{k}.csv")
+    df_ranking.iloc[:k][["numero_de_cliente"]].to_csv(ruta_k, index=False, header=False)
+    print(f"   Archivo guardado: {ruta_k}")
+
+ruta_oficial = os.path.join(DIR_BASE, f"ENTREGABLE_BAYES_FINAL_K{CORTE_OPTIMO_K}.csv")
+print(f"\n[{time.strftime('%H:%M:%S')}] Archivo oficial listo para submission:")
+print(f"   -> {ruta_oficial}")
+
+files.download(ruta_oficial)
+print(f"[{time.strftime('%H:%M:%S')}] Descarga iniciada automáticamente.")
+
+#%% celda 11 [código]
+# ==============================================================================
+# 7. CORRIDA FINAL DE PRODUCCIÓN: PARÁMETROS GANADORES (RÉCORD 103.29M con valores del notebook de Gustavo Pasquini)
+# ==============================================================================
+print(f"[{time.strftime('%H:%M:%S')}] Iniciando entrenamiento de producción con hiperparámetros ganadores...")
+
+# Hiperparámetros de máxima ganancia (Shrinkage lento + 2500 árboles)
+params_produccion = {
+    "objective": "binary",
+    "metric": "None",
+    "boosting_type": "gbdt",
+    "learning_rate": 0.005,
+    "num_leaves": 85,
+    "max_bin": 31,
+    "feature_fraction": 0.55,
+    "bagging_fraction": 0.80,
+    "bagging_freq": 1,
+    "min_data_in_leaf": 50,
+    "min_sum_hessian_in_leaf": 0.0067,
+    "max_depth": -1,
+    "force_row_wise": True,
+    "deterministic": True,
+    "verbose": -1,
+    "n_jobs": -1
+}
+NUM_ITERACIONES_PROD = 2500
+
+print(f"\n[{time.strftime('%H:%M:%S')}] Entrenando ensamble de {len(SEMILLAS_ENSAMBLE)} semillas...")
+prob_acum_prod = np.zeros(len(clientes_test), dtype=np.float64)
+
+t0_prod = time.time()
+for i, sem in enumerate(SEMILLAS_ENSAMBLE, 1):
+    t0_sem = time.time()
+    p = params_produccion.copy()
+    p["seed"] = sem
+
+    # dtrain_final y X_test ya están en memoria desde la celda anterior
+    modelo = lgb.train(p, dtrain_final, num_boost_round=NUM_ITERACIONES_PROD)
+    preds = modelo.predict(X_test)
+    prob_acum_prod += preds
+
+    np.save(os.path.join(DIR_BASE, f"preds_prod_seed_{sem}.npy"), preds)
+    duracion = time.time() - t0_sem
+    print(f"[{time.strftime('%H:%M:%S')}]   -> Semilla {i}/{len(SEMILLAS_ENSAMBLE)} (Seed: {sem}) lista en {duracion/60:.1f} min", flush=True)
+    del modelo
+    gc.collect()
+
+prob_media_prod = prob_acum_prod / len(SEMILLAS_ENSAMBLE)
+np.save(os.path.join(DIR_BASE, "prob_media_produccion_ganador.npy"), prob_media_prod)
+
+# Generación del ranking y exportación
+df_rank_prod = pd.DataFrame({
+    "numero_de_cliente": clientes_test,
+    "prob": prob_media_prod
+}).sort_values(by="prob", ascending=False).reset_index(drop=True)
+
+# Guardamos los cortes en el directorio del experimento
+for k in [10900, 10950, 11000, 11050]:
+    ruta_csv = os.path.join(DIR_BASE, f"ENTREGABLE_PROD_GANADOR_K{k}.csv")
+    df_rank_prod.iloc[:k][["numero_de_cliente"]].to_csv(ruta_csv, index=False, header=False)
+    print(f"   Archivo guardado: {ruta_csv}")
+
+ruta_oficial_ganador = os.path.join(DIR_BASE, f"ENTREGABLE_PROD_GANADOR_K{CORTE_OPTIMO_K}.csv")
+print(f"\n[{time.strftime('%H:%M:%S')}] Archivo oficial K=11.000 generado:")
+print(f"   -> {ruta_oficial_ganador}")
+
+files.download(ruta_oficial_ganador)
+print(f"[{time.strftime('%H:%M:%S')}] Descarga iniciada automáticamente.")
+
+#%% celda 12 [código]
+# ==============================================================================
+# 8. MEGA-ENSAMBLE: 20 SEMILLAS PRIMAS SOBRE EL MODELO GANADOR (6M + TOP 300)
+# ==============================================================================
+print(f"[{time.strftime('%H:%M:%S')}] Iniciando Mega-Ensamble de 20 Semillas Primas...")
+
+DIR_20SEM = os.path.join(DIR_BASE, "exp_20_semillas")
+os.makedirs(DIR_20SEM, exist_ok=True)
+
+# 5 tuyas + 15 números primos nuevos
+SEMILLAS_20 = [
+    801109, 823457, 849163, 871213, 893029,
+    100003, 100019, 200003, 200029, 300007,
+    300017, 400009, 400031, 500009, 500029,
+    600011, 600043, 700001, 700027, 900001
+]
+
+params_ganador_20 = {
+    "objective": "binary",
+    "metric": "None",
+    "boosting_type": "gbdt",
+    "learning_rate": 0.005,
+    "num_leaves": 85,
+    "max_bin": 31,
+    "feature_fraction": 0.55,
+    "bagging_fraction": 0.80,
+    "bagging_freq": 1,
+    "min_data_in_leaf": 50,
+    "min_sum_hessian_in_leaf": 0.0067,
+    "max_depth": -1,
+    "force_row_wise": True,
+    "deterministic": True,
+    "verbose": -1,
+    "n_jobs": -1
+}
+NUM_ITER_20 = 2500
+
+prob_acum_20 = np.zeros(len(clientes_test), dtype=np.float64)
+t0_mega = time.time()
+
+for idx, semilla in enumerate(SEMILLAS_20, 1):
+    t0_sem = time.time()
+    p = params_ganador_20.copy()
+    p["seed"] = semilla
+
+    modelo = lgb.train(p, dtrain_final, num_boost_round=NUM_ITER_20)
+    preds = modelo.predict(X_test)
+    prob_acum_20 += preds
+
+    np.save(os.path.join(DIR_20SEM, f"preds_seed_{semilla}.npy"), preds)
+    duracion = time.time() - t0_sem
+    print(f"[{time.strftime('%H:%M:%S')}]   -> Semilla {idx:02d}/20 (Seed {semilla}) lista en {duracion/60:.1f}m", flush=True)
+    del modelo
+    gc.collect()
+
+tiempo_total = (time.time() - t0_mega) / 60
+print(f"\n[{time.strftime('%H:%M:%S')}] Ensamble de 20 semillas finalizado en {tiempo_total:.1f} minutos.")
+
+prob_media_20 = prob_acum_20 / len(SEMILLAS_20)
+np.save(os.path.join(DIR_20SEM, "prob_media_20_semillas.npy"), prob_media_20)
+
+df_rank_20 = pd.DataFrame({
+    "numero_de_cliente": clientes_test,
+    "prob": prob_media_20
+}).sort_values(by="prob", ascending=False).reset_index(drop=True)
+
+for k in [10900, 10950, 11000, 11050]:
+    ruta_k = os.path.join(DIR_20SEM, f"GANADOR_20_SEMILLAS_K{k}.csv")
+    df_rank_20.iloc[:k][["numero_de_cliente"]].to_csv(ruta_k, index=False, header=False)
+    print(f"   Archivo guardado: {ruta_k}")
+
+files.download(os.path.join(DIR_20SEM, "GANADOR_20_SEMILLAS_K11000.csv"))
+files.download(os.path.join(DIR_20SEM, "GANADOR_20_SEMILLAS_K10950.csv"))
+print(f"[{time.strftime('%H:%M:%S')}] Descargas listas para K11000 y K10950.")
+
+#%% celda 13 [código]
+import pandas as pd
+from google.colab import files
+
+print("Subí los 2 archivos CORTADOS EN 11.000:")
+print("1. ENTREGABLE_PROD_GANADOR_K11000.csv (5 semillas)")
+print("2. GANADOR_20_SEMILLAS_K11000.csv (20 semillas)")
+
+uploaded = files.upload()
+
+nombres = list(uploaded.keys())
+print(f"\nArchivos recibidos: {nombres}")
+
+# Identificar cuál es el de 5 semillas y cuál el de 20
+f_5 = next((k for k in nombres if "20" not in k), None)
+f_20 = next((k for k in nombres if "20" in k), None)
+
+if f_5 is None or f_20 is None:
+    f_5, f_20 = nombres[0], nombres[1]
+
+print(f"\nProcesando:")
+print(f"  -> 5 semillas:  {f_5}")
+print(f"  -> 20 semillas: {f_20}")
+
+# 1. Leer los dos archivos (ambos deben tener 11.000 filas)
+df_5 = pd.read_csv(f_5, header=None, names=["cliente"])
+df_20 = pd.read_csv(f_20, header=None, names=["cliente"])
+
+print(f"Filas leídas: Modelo 5 semillas = {len(df_5):,} | Modelo 20 semillas = {len(df_20):,}")
+
+# 2. Asignar puntaje lineal decreciente exacto (1.0 para el puesto 1, ~0.0 para el puesto 11.000)
+# score = 1 - (ranking / N)
+N = 11000
+df_5["score_5"] = (N - df_5.index) / N
+df_20["score_20"] = (N - df_20.index) / N
+
+# 3. Consenso equitativo (50% / 50%)
+df_blend = pd.merge(df_5, df_20, on="cliente", how="outer").fillna(0.0)
+
+# El score_final premia el consenso unánime de estar bien rankeado en ambos
+df_blend["score_final"] = 0.50 * df_blend["score_5"] + 0.50 * df_blend["score_20"]
+df_blend = df_blend.sort_values(by="score_final", ascending=False).reset_index(drop=True)
+
+# 4. Generar el corte en 11.000
+salida_11000 = "BLEND_CONSENSO_11000_VS_11000_K11000.csv"
+df_blend.iloc[:11000][["cliente"]].to_csv(salida_11000, index=False, header=False)
+
+# Estadísticas del cruce
+interseccion = len(df_blend[(df_blend["score_5"] > 0) & (df_blend["score_20"] > 0)])
+print("\n" + "="*50)
+print(f"Clientes compartidos en el Top 11.000: {interseccion:,} / 11.000 ({interseccion/11000:.2%})")
+print(f"Archivo final generado: {salida_11000}")
+print("="*50)
+
+files.download(salida_11000)

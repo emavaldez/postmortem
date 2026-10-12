@@ -1,0 +1,103 @@
+
+===== 021 2026-10-08 17:01 | 2 semillas | grilla 3x2 x 2 brazos =====
+[A s=676057] ref Optuna 231.1M (1 min)
+[A s=676057] sin_us hojas=128 hess=0.05: mejor 246.4M a 800 rondas (84s, total 2 min)
+[A s=676057] sin_us hojas=128 hess=2.0: mejor 235.9M a 800 rondas (86s, total 4 min)
+[A s=676057] sin_us hojas=256 hess=0.05: mejor 241.0M a 300 rondas (144s, total 6 min)
+[A s=676057] sin_us hojas=256 hess=2.0: mejor 240.8M a 800 rondas (148s, total 9 min)
+[A s=676057] sin_us hojas=512 hess=0.05: mejor 239.5M a 500 rondas (263s, total 13 min)
+[A s=676057] sin_us hojas=512 hess=2.0: mejor 239.1M a 200 rondas (246s, total 17 min)
+[A s=676057] us_0.1 hojas=128 hess=0.05: mejor 235.5M a 800 rondas (68s, total 18 min)
+[A s=676057] us_0.1 hojas=128 hess=2.0: mejor 238.4M a 800 rondas (69s, total 20 min)
+[A s=676057] us_0.1 hojas=256 hess=0.05: mejor 234.3M a 800 rondas (127s, total 22 min)
+[A s=676057] us_0.1 hojas=256 hess=2.0: mejor 235.0M a 800 rondas (126s, total 24 min)
+[A s=676057] us_0.1 hojas=512 hess=0.05: mejor 231.1M a 200 rondas (244s, total 28 min)
+[A s=676057] us_0.1 hojas=512 hess=2.0: mejor 232.1M a 800 rondas (187s, total 31 min)
+[A s=482687] ref Optuna 237.9M (32 min)
+[A s=482687] sin_us hojas=128 hess=0.05: mejor 239.7M a 800 rondas (84s, total 33 min)
+[A s=482687] sin_us hojas=128 hess=2.0: mejor 238.2M a 500 rondas (87s, total 35 min)
+[A s=482687] sin_us hojas=256 hess=0.05: mejor 244.1M a 500 rondas (144s, total 37 min)
+[A s=482687] sin_us hojas=256 hess=2.0: mejor 236.6M a 800 rondas (144s, total 40 min)
+[A s=482687] sin_us hojas=512 hess=0.05: mejor 241.4M a 300 rondas (262s, total 44 min)
+[A s=482687] sin_us hojas=512 hess=2.0: mejor 236.2M a 300 rondas (249s, total 48 min)
+[A s=482687] us_0.1 hojas=128 hess=0.05: mejor 241.3M a 800 rondas (67s, total 49 min)
+[A s=482687] us_0.1 hojas=128 hess=2.0: mejor 245.2M a 800 rondas (69s, total 50 min)
+[A s=482687] us_0.1 hojas=256 hess=0.05: mejor 241.3M a 800 rondas (128s, total 52 min)
+[A s=482687] us_0.1 hojas=256 hess=2.0: mejor 242.1M a 800 rondas (122s, total 54 min)
+[A s=482687] us_0.1 hojas=512 hess=0.05: mejor 235.1M a 800 rondas (242s, total 59 min)
+[A s=482687] us_0.1 hojas=512 hess=2.0: mejor 239.8M a 800 rondas (184s, total 62 min)
+[B s=676057] ref Optuna 406.7M (63 min)
+[B s=676057] sin_us hojas=128 hess=0.05: mejor 390.6M a 800 rondas (90s, total 64 min)
+[B s=676057] sin_us hojas=128 hess=2.0: mejor 401.2M a 800 rondas (94s, total 66 min)
+[B s=676057] sin_us hojas=256 hess=0.05: mejor 399.9M a 800 rondas (150s, total 68 min)
+[B s=676057] sin_us hojas=256 hess=2.0: mejor 408.1M a 800 rondas (157s, total 71 min)
+[B s=676057] sin_us hojas=512 hess=0.05: mejor 404.8M a 500 rondas (269s, total 75 min)
+[B s=676057] sin_us hojas=512 hess=2.0: mejor 410.2M a 800 rondas (292s, total 80 min)
+[B s=676057] us_0.1 hojas=128 hess=0.05: mejor 391.6M a 800 rondas (76s, total 81 min)
+[B s=676057] us_0.1 hojas=128 hess=2.0: mejor 398.3M a 800 rondas (70s, total 83 min)
+[B s=676057] us_0.1 hojas=256 hess=0.05: mejor 397.1M a 800 rondas (131s, total 85 min)
+[B s=676057] us_0.1 hojas=256 hess=2.0: mejor 400.3M a 800 rondas (137s, total 87 min)
+[B s=676057] us_0.1 hojas=512 hess=0.05: mejor 388.9M a 800 rondas (257s, total 91 min)
+[B s=676057] us_0.1 hojas=512 hess=2.0: mejor 397.2M a 800 rondas (246s, total 95 min)
+[B s=482687] ref Optuna 404.7M (97 min)
+[B s=482687] sin_us hojas=128 hess=0.05: mejor 390.5M a 800 rondas (101s, total 98 min)
+[B s=482687] sin_us hojas=128 hess=2.0: mejor 400.5M a 800 rondas (99s, total 100 min)
+[B s=482687] sin_us hojas=256 hess=0.05: mejor 402.5M a 800 rondas (150s, total 102 min)
+[B s=482687] sin_us hojas=256 hess=2.0: mejor 406.3M a 800 rondas (153s, total 105 min)
+[B s=482687] sin_us hojas=512 hess=0.05: mejor 407.4M a 800 rondas (267s, total 109 min)
+[B s=482687] sin_us hojas=512 hess=2.0: mejor 405.5M a 800 rondas (278s, total 114 min)
+[B s=482687] us_0.1 hojas=128 hess=0.05: mejor 393.5M a 800 rondas (67s, total 115 min)
+[B s=482687] us_0.1 hojas=128 hess=2.0: mejor 396.7M a 800 rondas (69s, total 116 min)
+[B s=482687] us_0.1 hojas=256 hess=0.05: mejor 396.1M a 800 rondas (125s, total 118 min)
+[B s=482687] us_0.1 hojas=256 hess=2.0: mejor 398.6M a 800 rondas (124s, total 121 min)
+[B s=482687] us_0.1 hojas=512 hess=0.05: mejor 394.9M a 500 rondas (245s, total 125 min)
+[B s=482687] us_0.1 hojas=512 hess=2.0: mejor 395.3M a 500 rondas (239s, total 129 min)
+[Bh s=676057] ref Optuna 392.7M (129 min)
+[Bh s=676057] sin_us hojas=128 hess=0.05: mejor 395.9M a 800 rondas (77s, total 131 min)
+[Bh s=676057] sin_us hojas=128 hess=2.0: mejor 394.6M a 800 rondas (79s, total 132 min)
+[Bh s=676057] sin_us hojas=256 hess=0.05: mejor 400.5M a 500 rondas (135s, total 134 min)
+[Bh s=676057] sin_us hojas=256 hess=2.0: mejor 399.2M a 500 rondas (138s, total 137 min)
+[Bh s=676057] sin_us hojas=512 hess=0.05: mejor 399.3M a 500 rondas (247s, total 141 min)
+[Bh s=676057] sin_us hojas=512 hess=2.0: mejor 393.9M a 500 rondas (228s, total 145 min)
+[Bh s=676057] us_0.1 hojas=128 hess=0.05: mejor 389.7M a 800 rondas (68s, total 146 min)
+[Bh s=676057] us_0.1 hojas=128 hess=2.0: mejor 388.6M a 800 rondas (68s, total 147 min)
+[Bh s=676057] us_0.1 hojas=256 hess=0.05: mejor 386.4M a 800 rondas (126s, total 149 min)
+[Bh s=676057] us_0.1 hojas=256 hess=2.0: mejor 384.9M a 800 rondas (123s, total 151 min)
+[Bh s=676057] us_0.1 hojas=512 hess=0.05: mejor 381.3M a 300 rondas (243s, total 155 min)
+[Bh s=676057] us_0.1 hojas=512 hess=2.0: mejor 387.3M a 800 rondas (183s, total 158 min)
+[Bh s=482687] ref Optuna 393.8M (159 min)
+[Bh s=482687] sin_us hojas=128 hess=0.05: mejor 389.9M a 800 rondas (77s, total 160 min)
+[Bh s=482687] sin_us hojas=128 hess=2.0: mejor 391.3M a 500 rondas (79s, total 162 min)
+[Bh s=482687] sin_us hojas=256 hess=0.05: mejor 393.9M a 800 rondas (135s, total 164 min)
+[Bh s=482687] sin_us hojas=256 hess=2.0: mejor 400.0M a 500 rondas (137s, total 166 min)
+[Bh s=482687] sin_us hojas=512 hess=0.05: mejor 399.2M a 800 rondas (246s, total 170 min)
+[Bh s=482687] sin_us hojas=512 hess=2.0: mejor 389.9M a 300 rondas (227s, total 174 min)
+[Bh s=482687] us_0.1 hojas=128 hess=0.05: mejor 392.4M a 800 rondas (67s, total 175 min)
+[Bh s=482687] us_0.1 hojas=128 hess=2.0: mejor 391.5M a 500 rondas (68s, total 176 min)
+[Bh s=482687] us_0.1 hojas=256 hess=0.05: mejor 388.4M a 800 rondas (126s, total 178 min)
+[Bh s=482687] us_0.1 hojas=256 hess=2.0: mejor 390.5M a 500 rondas (124s, total 180 min)
+[Bh s=482687] us_0.1 hojas=512 hess=0.05: mejor 391.3M a 500 rondas (244s, total 185 min)
+[Bh s=482687] us_0.1 hojas=512 hess=2.0: mejor 391.7M a 300 rondas (184s, total 188 min)
+
+Referencia Optuna (M ARS): A 234.5, B 405.7, Bh 393.2
+Mejores 12 configuraciones de la receta (diferencia contra la referencia):
+fold                           A      B     Bh  A_vs_ref  B_vs_ref  Bh_vs_ref  media_vs_ref
+config             rondas                                                                  
+sin_us_h512_hs0.05 800     238.6  405.8  399.2       4.1       0.1        6.0           3.4
+                   500     240.0  404.9  397.8       5.5      -0.8        4.5           3.1
+sin_us_h256_hs2.0  800     238.7  407.2  396.3       4.2       1.5        3.0           2.9
+                   500     238.2  403.5  399.6       3.7      -2.2        6.3           2.6
+sin_us_h256_hs0.05 800     241.3  401.2  395.5       6.8      -4.5        2.3           1.5
+sin_us_h512_hs2.0  800     235.3  407.8  391.3       0.8       2.1       -1.9           0.3
+                   500     235.5  405.6  391.6       1.0      -0.1       -1.6          -0.3
+sin_us_h256_hs0.05 500     242.0  393.9  396.6       7.5     -11.8        3.3          -0.3
+sin_us_h512_hs0.05 300     240.2  396.2  394.4       5.7      -9.5        1.1          -0.9
+sin_us_h128_hs2.0  800     236.8  400.9  393.0       2.3      -4.8       -0.3          -0.9
+us_0.1_h128_hs2.0  800     241.8  397.5  390.0       7.3      -8.2       -3.3          -1.4
+sin_us_h512_hs2.0  300     237.2  400.8  389.7       2.7      -4.9       -3.5          -1.9
+
+Mejor por brazo:
+            config  rondas     A     B    Bh  A_vs_ref  B_vs_ref  Bh_vs_ref  media_vs_ref  brazo
+sin_us_h512_hs0.05     800 238.6 405.8 399.2       4.1       0.1        6.0           3.4 sin_us
+ us_0.1_h128_hs2.0     800 241.8 397.5 390.0       7.3      -8.2       -3.3          -1.4 us_0.1
+[021] terminado

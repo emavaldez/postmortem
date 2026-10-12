@@ -1,0 +1,238 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–28] Texto de encabezado: indica los dos usos (`--rondas 2000` para un ensamble de 20
+#   modelos; `--rondas 1000 2000` para uno de 40), enumera tres candidatos con su ganancia pública y su SHA-256
+#   según el propio archivo, y resume la receta común: 750 predictoras, columnas excluidas, clase con pesos,
+#   meses 202103–202106, 20 semillas, ensamble por rango y 14.000 envíos.
+"""Reproduce la entrega final desde el dataset original.
+
+La materia lo exige: «scripts/notebooks que partiendo del dataset original permitan a los
+profesores replicar exactamente sus entregas finales, esto incluye a las semillas aleatorias».
+
+    python reproducir.py --rondas 2000 --salida entrega_final.csv        # ensamble de 20 a 2.000 rondas
+    python reproducir.py --rondas 1000 2000 --salida entrega_final.csv   # ensamble de 40 (20 a 1.000 + 20 a 2.000)
+
+Parte de `data/competencia_01_crudo.csv` (el CSV tal cual se baja de la catedra, SIN clase_ternaria),
+construye la clase, arma el dataset con historia, entrena las 20 semillas y escribe el CSV que se le
+manda al bot. Imprime el SHA-256 para compararlo con el entregado. Tarda ~2 horas en 8 cores.
+
+LOS TRES CANDIDATOS (9-oct-2026), misma receta, mismos datos, mismas 20 semillas; cambia solo num_boost_round:
+  --rondas 1000       -> `c201_lags_ens20_14000`      104,17 publico   sha 5157ac24...
+  --rondas 2000       -> `c241_rondas2000_ens20_14000` 103,79 publico   sha 657d747a...
+  --rondas 1000 2000  -> `c272_ens40_14000`            103,02 publico   sha 7ace9c16...
+El SHA esperado se elige segun --rondas. LA ENTREGA FINAL se fija en SHA_FINAL cuando se decida.
+
+LA RECETA COMUN:
+  - variables: las 150 crudas + lag 1, delta 1, lag 2 y delta 2 de cada una (750 predictoras),
+    con `ccajas_depositos` en NULL en 202105 (es todo cero ese mes)
+  - fuera: id, foto_mes, clase, las columnas de baja, Visa_Finiciomora y Master_Finiciomora
+  - clase: positivo = BAJA+1 o BAJA+2, con BAJA+1 pesando 0,25
+  - entrena 202103..202106, 20 semillas por cada valor de --rondas, receta de hiperparametros de Denicolay
+  - ensamble por RANGO de todas las predicciones sobre 202108; se envian los 14.000 mejores
+
+Todo lo que decide el resultado esta aca arriba, explicito. Nada depende de modelos guardados.
+"""
+# [Anotación · líneas 29–42] Importa argparse, hashlib, lightgbm, numpy y pandas; agrega `src/` al path e
+#   importa el módulo `fe_panel` y la función `verificar_seleccion` de `competencia`.
+import argparse
+import hashlib
+import sys
+import time
+from pathlib import Path
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+RAIZ = Path(__file__).resolve().parent
+sys.path.insert(0, str(RAIZ / "src"))
+import fe_panel as fe  # noqa: E402
+from competencia import verificar_seleccion  # noqa: E402
+
+# [Anotación · líneas 44–52] Define las rutas del CSV crudo, del parquet base y del parquet con lags (todas
+#   bajo `data/`), un diccionario con el SHA-256 esperado para cada combinación de rondas (1.000; 2.000; 1.000 y
+#   2.000) y `SHA_FINAL`, igual al de 2.000 rondas.
+CRUDO = RAIZ / "data" / "competencia_01_crudo.csv"
+PANEL = RAIZ / "data" / "competencia_01.parquet"
+LAGS = RAIZ / "data" / "competencia_01_lags12.parquet"
+SHA_POR_RONDAS = {
+    (1000,): "5157ac244673de5f50a4531373b4164fd58d5d9905edc5fd7f99e0bfe64b4ae9",       # c201_lags_ens20_14000
+    (2000,): "657d747addc61efad64145ec9cef550c29c50c5ce283745f176d243270bb9d2e",       # c241_rondas2000_ens20_14000
+    (1000, 2000): "7ace9c160cbc47ab047af41da18ee1774c2d3c71626cc3ba599c140d37e1643d",  # c272_ens40_14000
+}
+SHA_FINAL = "657d747addc61efad64145ec9cef550c29c50c5ce283745f176d243270bb9d2e"   # c241_rondas2000_ens20_14000: 20 semillas x 2.000 rondas, corte 14.000 (decidido 10-oct)
+
+# [Anotación · líneas 54–67] Parámetros de la corrida: meses de entrenamiento 202103 a 202106, mes a predecir
+#   202108, peso 0,25 para BAJA+1, 2.000 rondas por defecto, corte en 14.000, 20 semillas y las cinco semillas
+#   propias. `FUERA` reúne las columnas que no entran al modelo: las cinco columnas de baja,
+#   `numero_de_cliente`, `foto_mes`, `clase_ternaria`, `clase_binaria`, `Visa_Finiciomora` y
+#   `Master_Finiciomora`.
+# ---------------------------------------------------------------- la receta
+MESES_TRAIN = [202103, 202104, 202105, 202106]
+MES_PREDECIR = 202108
+PESO_BAJA1 = 0.25         # BAJA+2 pesa 1,0; BAJA+1 pesa esto
+RONDAS_DEFAULT = [2000]       # --rondas lo cambia; ver SHA_POR_RONDAS
+CORTE = 14_000            # publico: meseta 13.500-14.500; fold B a horizonte 2: minimax 13.500, esperado 14.000
+N_SEMILLAS = 20
+SEMILLAS_PROPIAS = [261431, 269281, 429899, 560771, 749401]
+
+FUERA = (
+    fe.COLUMNAS_DE_BAJA          # miran el futuro: es_baja ES la respuesta
+    + [fe.ID, fe.MES, fe.CLASE, "clase_binaria"]
+    + ["Visa_Finiciomora", "Master_Finiciomora"]   # ceros inyectados en 202105 y 202108
+)
+
+
+# [Anotación · líneas 70–81] `params` devuelve los hiperparámetros de LightGBM: objetivo binario, gbdt,
+#   métrica AUC, max_bin 31, min_data_in_leaf 0, feature_fraction 0,5, feature_fraction_bynode 0,2,
+#   learning_rate 0,005, 83 hojas, sin bagging, 8 hilos, `force_col_wise` y `deterministic` activados.
+#   `min_sum_hessian_in_leaf` se calcula como 12,791817 × filas de entrenamiento / 326.184.
+def params(n_filas: int) -> dict:
+    """Receta de Denicolay (Zulip, J-Clase 08 > En Limpio, 2026-10-06)."""
+    return {
+        "objective": "binary", "boosting_type": "gbdt", "metric": "auc",
+        "boost_from_average": True, "feature_pre_filter": False,
+        "max_bin": 31, "min_data_in_leaf": 0,
+        "feature_fraction": 0.5, "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005, "num_leaves": 83,
+        "min_sum_hessian_in_leaf": 12.791817 * n_filas / 326_184,
+        "bagging_fraction": 1.0, "bagging_freq": 0,
+        "num_threads": 8, "force_col_wise": True, "deterministic": True, "verbose": -1,
+    }
+
+
+# [Anotación · líneas 84–87] `semillas` fija `np.random.seed(261431)`, sortea 15 enteros distintos menores a
+#   1.000.000 y devuelve las cinco semillas propias seguidas de esas 15.
+def semillas() -> list[int]:
+    np.random.seed(SEMILLAS_PROPIAS[0])      # sin esto cambian en cada corrida
+    extra = np.random.choice(1_000_000, size=15, replace=False).tolist()
+    return (SEMILLAS_PROPIAS + [int(x) for x in extra])[:N_SEMILLAS]
+
+
+# [Anotación · líneas 90–111] `construir_lags` crea una vista sobre el parquet base, toma las columnas
+#   numéricas que no están en `FUERA` y para cada una genera cuatro columnas FLOAT: valor del mes anterior
+#   (`__lag1`), diferencia con el mes anterior (`__delta1`), valor de dos meses atrás (`__lag2`) y diferencia
+#   con ese valor (`__delta2`), con una ventana por cliente ordenada por mes. En el mismo SELECT reemplaza
+#   `ccajas_depositos` por NULL en 202105; los lags de esa variable se calculan sobre la vista sin anular, como
+#   indica el comentario. Escribe el resultado en parquet con compresión ZSTD.
+def construir_lags(con) -> None:
+    """Las 150 crudas + lag1/delta1/lag2/delta2 de cada una, en FLOAT. Igual que scripts/c200 del 7-oct.
+
+    OJO: la version que entreno la entrega anula ccajas_depositos en 202105 SOLO en la columna del mes;
+    sus lags van sobre los ceros crudos. Se reproduce tal cual (scripts/c200 corrige esto para
+    datasets futuros, pero la entrega es esta).
+    """
+    con.execute(f"create or replace view base as select * from read_parquet('{PANEL}')")
+    campos = [x for x in fe.columnas_numericas(con, "base", excluir=("Visa_Finiciomora", "Master_Finiciomora"))
+              if x not in FUERA]
+    nuevas = []
+    for x in campos:
+        nuevas.append(f"lag({x}, 1) over historia :: FLOAT as {x}__lag1")
+        nuevas.append(f"({x} - lag({x}, 1) over historia) :: FLOAT as {x}__delta1")
+        nuevas.append(f"lag({x}, 2) over historia :: FLOAT as {x}__lag2")
+        nuevas.append(f"({x} - lag({x}, 2) over historia) :: FLOAT as {x}__delta2")
+    sql = (
+        "select * exclude (ccajas_depositos)"
+        f"\n  , case when {fe.MES} = 202105 then null else ccajas_depositos end as ccajas_depositos"
+        + fe._fragmento(nuevas) + "\nfrom base" + fe.clausula_ventana("historia")
+    )
+    con.execute(f"copy ({sql}) to '{LAGS}' (format PARQUET, COMPRESSION ZSTD)")
+
+
+# [Anotación · líneas 114–127] `datos` abre DuckDB; si falta el parquet base lo construye desde el CSV crudo
+#   con `fe.construir_base` y si falta el de lags llama a `construir_lags`. Lee el parquet con pandas, descarta
+#   las columnas de baja, convierte `numero_de_cliente` a int64 y ordena las filas por cliente y mes con
+#   mergesort.
+def datos() -> pd.DataFrame:
+    con = fe.conectar()
+    if not PANEL.exists():
+        print(f"  {PANEL.name} no existe: reconstruyendo desde {CRUDO.name}")
+        fe.construir_base(con, str(CRUDO), str(PANEL))
+    if not LAGS.exists():
+        print(f"  {LAGS.name} no existe: construyendo la historia")
+        construir_lags(con)
+    con.close()
+    d = pd.read_parquet(LAGS)
+    d = d.drop(columns=fe.COLUMNAS_DE_BAJA, errors="ignore")
+    d[fe.ID] = d[fe.ID].astype("int64")      # viene DOUBLE: 48000000 -> 4.8e+07 rompe el submit
+    # DuckDB no garantiza el orden de las filas y LightGBM depende de el.
+    return d.sort_values([fe.ID, fe.MES], kind="mergesort").reset_index(drop=True)
+
+
+# [Anotación · líneas 130–136] `main` define tres argumentos: `--salida` (por defecto `entrega_final.csv`),
+#   `--semillas` (por defecto 20) y `--rondas` (uno o más valores, por defecto 2000).
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--salida", type=Path, default=Path("entrega_final.csv"))
+    ap.add_argument("--semillas", type=int, default=N_SEMILLAS, help="menos semillas = prueba rapida (no reproduce el SHA)")
+    ap.add_argument("--rondas", type=int, nargs="+", default=RONDAS_DEFAULT, help="num_boost_round de cada bloque de 20 semillas; varios valores = ensamble de todos")
+    args = ap.parse_args()
+    t0 = time.time()
+
+# [Anotación · líneas 138–151] Carga los datos y arma la lista de predictoras (todas las columnas que no están
+#   en `FUERA`); verifica con `assert` que sean 750 y que el dataset tenga 983.061 filas. Con las filas de
+#   202103–202106 arma `y` = 1 si la clase es BAJA+1 o BAJA+2 y el peso por fila: 0,25 para BAJA+1 y 1,0 para el
+#   resto. Separa las filas de 202108 con sus ids e imprime los tamaños.
+    d = datos()
+    pred = [x for x in d.columns if x not in FUERA]
+    assert len(pred) == 750, f"{len(pred)} predictoras, se esperaban 750"
+    assert len(d) == 983_061, f"{len(d):,} filas, se esperaban 983.061"
+    tr = d[d[fe.MES].isin(MESES_TRAIN)]
+    clase = tr[fe.CLASE].to_numpy()
+    y = np.isin(clase, ["BAJA+1", "BAJA+2"]).astype("int8")
+    w = np.where(clase == "BAJA+1", PESO_BAJA1, 1.0)
+    X = tr[pred]
+    fut = d[d[fe.MES] == MES_PREDECIR]
+    ids = fut[fe.ID].to_numpy()
+    Xfut = fut[pred]
+    print(f"  train {MESES_TRAIN} ({len(X):,} filas, {int(y.sum()):,} positivos) -> {MES_PREDECIR} ({len(fut):,}) "
+          f"| {len(pred)} predictoras [{time.time()-t0:.0f}s]", flush=True)
+
+# [Anotación · líneas 153–164] Para cada valor de rondas y cada semilla entrena un modelo con un `lgb.Dataset`
+#   nuevo (el comentario explica que los bins se construyen con una muestra de 200.000 filas sorteada con la
+#   semilla), predice sobre 202108 y convierte la predicción en rango percentil. Al terminar promedia los rangos
+#   de todos los modelos.
+    P = params(len(X))
+    rangos = []
+    for nbr in args.rondas:
+        for i, s in enumerate(semillas()[:args.semillas], 1):
+            # Un Dataset NUEVO por semilla, igual que el pipeline que entreno la entrega: los bins se
+            # construyen sobre una muestra de 200.000 filas sorteada con la semilla, asi que compartir
+            # el Dataset entre semillas entrena 19 modelos distintos de los registrados (10-oct: 157 ids
+            # de diferencia en el ensamble).
+            m = lgb.train({**P, "seed": s}, lgb.Dataset(X, label=y, weight=w), num_boost_round=nbr)
+            rangos.append(pd.Series(m.predict(Xfut)).rank(pct=True).to_numpy())
+            print(f"    {nbr} rondas, semilla {s} ({i}/{args.semillas}) [{time.time()-t0:.0f}s]", flush=True)
+    ens = np.mean(rangos, axis=0)            # ensamble por RANGO, no por score, de todos los modelos
+
+# [Anotación · líneas 166–173] Toma los 14.000 clientes de mayor promedio de rangos con un orden estable, los
+#   ordena por id y los escribe como enteros, uno por línea. Relee el archivo y verifica que no tenga notación
+#   científica ni puntos y que tenga 14.000 filas. Llama a `verificar_seleccion` e imprime, por marcador, la
+#   proporción entre los elegidos, entre el resto y el cociente.
+    elegidos = np.sort(ids[np.argsort(-ens, kind="stable")[:CORTE]]).astype("int64")   # empates: por orden de id
+    args.salida.parent.mkdir(parents=True, exist_ok=True)
+    np.savetxt(args.salida, elegidos, fmt="%d")
+    texto = args.salida.read_text()
+    assert "e+" not in texto and "." not in texto, "notacion cientifica en el CSV"
+    assert len(np.loadtxt(args.salida, dtype="int64")) == CORTE
+    for nombre, (p_sel, p_resto, lift) in verificar_seleccion(elegidos, d).items():
+        print(f"  {nombre:22s} {p_sel:6.1%} vs {p_resto:6.1%}   x{lift:.2f}")
+# [Anotación · líneas 174–188] Calcula el SHA-256 del archivo, busca el esperado para la combinación de rondas
+#   pedida e imprime si coincide con el envío registrado y si es la entrega final; con menos de 20 semillas o
+#   una combinación sin referencia lo avisa. Cierra con el punto de entrada del script.
+    sha = hashlib.sha256(args.salida.read_bytes()).hexdigest()
+    esperado = SHA_POR_RONDAS.get(tuple(args.rondas))
+    print(f"\n  {args.salida}: {CORTE:,} envios, rondas {args.rondas}, {len(rangos)} modelos  [{time.time()-t0:.0f}s]")
+    print(f"  sha256: {sha}")
+    if args.semillas < N_SEMILLAS or esperado is None:
+        print("  (sin SHA de referencia para esta combinacion)")
+    else:
+        print("  " + ("COINCIDE con el submit registrado" if sha == esperado else
+                      f"NO coincide con el submit registrado ({esperado[:12]}...): revisar version de LightGBM, hilos y orden de filas"))
+        if SHA_FINAL:
+            print("  " + ("ES LA ENTREGA FINAL" if sha == SHA_FINAL else "no es la entrega final"))
+
+
+if __name__ == "__main__":
+    main()

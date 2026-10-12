@@ -1,0 +1,62 @@
+{
+  "_fuente": "Transcripción del MANIFEST.json original obtenida desde Cloud Storage en Cloud Shell el 10/10/2026, archivo aportado por la usuaria: Texto pegado(6).txt. Es una transcripción de campos, NO prueba de una nueva ejecución.",
+  "_verificacion": "Parámetros, identity, hash del CSV y pesos cotejados con el texto del manifiesto histórico. El script de auditoría histórico consta como AUDIT_OK en el REGISTRO de entrega. No se comprobó el CSV en esta sesión.",
+  "status": "READY_NOT_SUBMITTED",
+  "run": "c1clusteraware01",
+  "identity": "2c065771c95c864cb793e97c23d92486871b058445fa4d8d675db67b77f7ab1b",
+  "parent_superfinal_identity": "443bfe946db263f99b65e4290ccacd74df269a4c2e82bc70fe86ec34585a445f",
+  "arm": "BALANCED_CAPPED",
+  "n_models": 20,
+  "n_august": 164647,
+  "n": 13500,
+  "file": {
+    "file": "C1CLAW2C065771C9ENS13500.csv",
+    "rows": 13500,
+    "sha256": "a1ced864e5e6de15fbd3c65a12c29506387d1bece5f6a87435b45ff907f549ff",
+    "header": false
+  },
+  "submit_message": "submit C1CLAW2C065771C9ENS13500",
+  "params": {
+    "objective": "binary",
+    "metric": "binary_logloss",
+    "boosting_type": "gbdt",
+    "learning_rate": 0.015386775172063426,
+    "num_leaves": 79,
+    "min_data_in_leaf": 551,
+    "feature_fraction": 0.6866382166758678,
+    "bagging_fraction": 0.6525364259464963,
+    "bagging_freq": 1,
+    "max_bin": 63,
+    "verbosity": -1,
+    "force_col_wise": true,
+    "num_threads": 6,
+    "deterministic": true,
+    "lambda_l1": 0.00000572231579234109,
+    "lambda_l2": 0.013648797015113241
+  },
+  "rounds": 361,
+  "policy": "EXPANDING",
+  "weight_detail": {
+    "arm": "BALANCED_CAPPED",
+    "raw_recipe": {
+      "1": 0.66953125,
+      "2": 0.7544014084507042,
+      "3": 1,
+      "4": 1.4801381692573403,
+      "5": 3.986046511627907
+    },
+    "normalization_scale": 0.949124854142357,
+    "effective_recipe": {
+      "1": 0.63546875,
+      "2": 0.7160211267605634,
+      "3": 0.949124854142357,
+      "4": 1.4048359240069086,
+      "5": 3.783255813953488
+    },
+    "positive_mass_before": 4067,
+    "positive_mass_after": 4066.9999999999995
+  },
+  "cluster_labels_used_at_scoring": false,
+  "cluster_labels_used_only_for_historical_positive_weights": true,
+  "automatic_submit": false
+}

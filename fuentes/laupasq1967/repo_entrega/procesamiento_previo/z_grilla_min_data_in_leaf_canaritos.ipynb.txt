@@ -1,0 +1,206 @@
+#%% celda 1 [texto]
+# Grilla de `min_data_in_leaf` — reduciendo overfitting a canaritos sin perder ganancia
+
+Para cada valor de `min_data_in_leaf` que probamos (dejando todo lo demás fijo), medimos DOS cosas por separado:
+
+1. **% de Gain que se llevan los canaritos** (diagnóstico, un solo entrenamiento con 151 canaritos agregados, semilla fija) -- mientras más bajo, menos ruido está ajustando el modelo.
+2. **Ganancia validada a 10 semillas con corte fijo** (entrenamiento normal, sin canaritos, igual que en el ensamble) -- para asegurarnos de no perder ganancia real al endurecer el hiperparámetro.
+
+La idea es encontrar, para Modelo A y Modelo B por separado, el `min_data_in_leaf` donde el % de canaritos baja sensiblemente sin que la ganancia a 10 semillas empeore (o incluso mejore, si el `min_data_in_leaf` actual estaba genuinamente sobreajustando).
+
+Advertencia: esta notebook entrena bastantes modelos (11 por cada valor de la grilla: 1 diagnóstico + 10 semillas), así que puede tardar bastante -- conviene dejarla correr e ir viendo los prints a medida que salen.
+
+#%% celda 2 [texto]
+### Setup del ambiente
+
+#%% celda 3 [código]
+PARAM_carpeta_datasets <- "C:/Users/Laura/Documents/DMEyF/datasets/"
+PARAM_carpeta_exp      <- "C:/Users/Laura/Documents/DMEyF/exp/"
+
+dir.create(PARAM_carpeta_datasets, showWarnings = FALSE, recursive = TRUE)
+dir.create(PARAM_carpeta_exp, showWarnings = FALSE, recursive = TRUE)
+
+require("data.table")
+require("lightgbm")
+
+#%% celda 4 [texto]
+### Carga de datos y target estándar (BAJA+1 + BAJA+2)
+
+#%% celda 5 [código]
+dataset <- fread(paste0(PARAM_carpeta_datasets, "competencia_01.csv"), stringsAsFactors = TRUE)
+
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+campos_reales <- setdiff(
+  colnames(dataset),
+  c("clase_ternaria", "clase01", "numero_de_cliente")
+)
+# Salsa Magica: saco las 2 variables con Data Drifting
+campos_reales <- setdiff(campos_reales, c("cprestamos_personales", "mprestamos_personales"))
+
+dataset_train <- dataset[foto_mes == 202104]
+dfuture       <- dataset[foto_mes == 202106]
+
+CORTE_FIJO <- 12000
+SEMILLAS_10 <- c(585581, 249449, 655649, 503039, 798191,
+                  112909, 334667, 421303, 667021, 887923)
+SEMILLA_CANARITOS <- 585581
+
+cat("Filas de entrenamiento:", nrow(dataset_train), "\n")
+cat("Variables reales:", length(campos_reales), "\n")
+
+#%% celda 6 [texto]
+### Función: para un valor de min_data_in_leaf, mide % canaritos y ganancia a 10 semillas
+
+#%% celda 7 [código]
+evaluar_min_data <- function(param_base, valores_min_data, tag) {
+
+  n_canaritos <- length(campos_reales)
+  resultados <- data.table(
+    min_data_in_leaf = integer(), pct_gain_canaritos = numeric(),
+    ganancia_media = numeric(), ganancia_desvio = numeric()
+  )
+
+  for (mdl in valores_min_data) {
+
+    param_mdl <- modifyList(param_base, list(min_data_in_leaf = mdl))
+
+    # --- 1) Diagnostico de canaritos (un solo entrenamiento, semilla fija) ---
+    set.seed(SEMILLA_CANARITOS)
+    m_canaritos <- matrix(runif(nrow(dataset_train) * n_canaritos), ncol = n_canaritos)
+    colnames(m_canaritos) <- paste0("canarito", 1:n_canaritos)
+
+    dtrain_diag <- lgb.Dataset(
+      data = cbind(data.matrix(dataset_train[, campos_reales, with = FALSE]), m_canaritos),
+      label = dataset_train[, clase01]
+    )
+
+    param_diag <- param_mdl
+    param_diag$seed <- SEMILLA_CANARITOS
+    modelo_diag <- lgb.train(data = dtrain_diag, param = param_diag)
+
+    tb_imp <- as.data.table(lgb.importance(modelo_diag))
+    tb_imp[, es_canarito := Feature %like% "^canarito"]
+    pct_canaritos <- 100 * tb_imp[es_canarito == TRUE, sum(Gain)] / tb_imp[, sum(Gain)]
+
+    rm(modelo_diag, dtrain_diag, m_canaritos)
+    gc(full = TRUE, verbose = FALSE)
+
+    # --- 2) Validacion a 10 semillas, SIN canaritos, ganancia real con corte fijo ---
+    dtrain_real <- lgb.Dataset(
+      data = data.matrix(dataset_train[, campos_reales, with = FALSE]),
+      label = dataset_train[, clase01]
+    )
+
+    ganancias <- numeric(length(SEMILLAS_10))
+    for (s in seq_along(SEMILLAS_10)) {
+      sem <- SEMILLAS_10[s]
+      param_val <- param_mdl
+      param_val$seed <- sem
+
+      set.seed(sem, "L'Ecuyer-CMRG")
+      modelo_val <- lgb.train(data = dtrain_real, param = param_val)
+
+      pred <- predict(modelo_val, data.matrix(dfuture[, campos_reales, with = FALSE]))
+      tb <- dfuture[, list(clase_ternaria)]
+      tb[, prob := pred]
+      setorder(tb, -prob)
+      tb[, Predicted := 0L]
+      tb[1:CORTE_FIJO, Predicted := 1L]
+      ganancias[s] <- tb[Predicted == 1L, sum(ifelse(clase_ternaria == "BAJA+2", 1072500, -27500))]
+
+      rm(modelo_val)
+      gc(full = TRUE, verbose = FALSE)
+    }
+    rm(dtrain_real)
+    gc(full = TRUE, verbose = FALSE)
+
+    cat(tag, " min_data_in_leaf=", mdl,
+        "  pct_canaritos=", round(pct_canaritos, 2), "%",
+        "  ganancia_media=", mean(ganancias),
+        "  desvio=", sd(ganancias), "\n", sep = "")
+
+    resultados <- rbindlist(list(resultados, data.table(
+      min_data_in_leaf = mdl, pct_gain_canaritos = pct_canaritos,
+      ganancia_media = mean(ganancias), ganancia_desvio = sd(ganancias)
+    )))
+  }
+
+  return(resultados)
+}
+
+#%% celda 8 [texto]
+### Hiperparámetros base (todo fijo salvo min_data_in_leaf) para Modelo A y Modelo B
+
+#%% celda 9 [código]
+param_comun <- list(
+  boosting= "gbdt", objective= "binary", metric= "auc",
+  first_metric_only= FALSE, boost_from_average= TRUE, feature_pre_filter= FALSE,
+  force_row_wise= TRUE, verbosity= -100,
+  max_depth= -1L, max_bin= 31L,
+  min_sum_hessian_in_leaf = 0.001,
+  pos_bagging_fraction= 1.0, neg_bagging_fraction= 1.0, is_unbalance= FALSE,
+  drop_rate= 0.1, max_drop= 50, skip_drop= 0.5, extra_trees= FALSE
+)
+
+# Modelo A: Salsa Magica + grilla -- min_data_in_leaf actual = 1
+param_A_base <- modifyList(param_comun, list(
+  num_iterations = 1351,
+  learning_rate = 0.02,
+  feature_fraction = 0.5153582,
+  num_leaves = 1601,
+  scale_pos_weight = 0.5,
+  min_gain_to_split = 0.2654667,
+  lambda_l1 = 3.26227,
+  lambda_l2 = 7.540213,
+  bagging_fraction = 0.8329823,
+  bagging_freq = 5
+))
+
+# Modelo B: Trial 2 + grilla -- min_data_in_leaf actual = 460
+param_B_base <- modifyList(param_comun, list(
+  num_iterations = 930,
+  learning_rate = 0.02,
+  feature_fraction = 0.1541961,
+  num_leaves = 1684,
+  scale_pos_weight = 0.5,
+  min_gain_to_split = 0.2158453,
+  lambda_l1 = 1.520327,
+  lambda_l2 = 7.548036,
+  bagging_fraction = 0.8425105,
+  bagging_freq = 6
+))
+
+valores_min_data_A <- c(1, 50, 150, 460, 1000, 2000)
+valores_min_data_B <- c(460, 1000, 2000, 3500)
+
+#%% celda 10 [texto]
+### Corro la grilla para Modelo A
+
+#%% celda 11 [código]
+resultados_A <- evaluar_min_data(param_A_base, valores_min_data_A, "Modelo A")
+
+fwrite(resultados_A, file = paste0(PARAM_carpeta_exp, "grilla_min_data_ModeloA.txt"), sep = "\t")
+cat("\n--- Resumen Modelo A ---\n")
+print(resultados_A)
+
+#%% celda 12 [texto]
+### Corro la grilla para Modelo B
+
+#%% celda 13 [código]
+resultados_B <- evaluar_min_data(param_B_base, valores_min_data_B, "Modelo B")
+
+fwrite(resultados_B, file = paste0(PARAM_carpeta_exp, "grilla_min_data_ModeloB.txt"), sep = "\t")
+cat("\n--- Resumen Modelo B ---\n")
+print(resultados_B)
+
+#%% celda 14 [texto]
+### Cómo elegir el ganador
+
+Para cada modelo, se mira la tabla y se busca el `min_data_in_leaf` que:
+
+1. Tiene `ganancia_media` igual o mejor que el valor actual (1 para A, 460 para B) -- no se acepta un `min_data_in_leaf` nuevo si hace perder ganancia validada real.
+2. Entre los que empatan o mejoran la ganancia, se elige el que tenga **menor `pct_gain_canaritos`** -- ese es el modelo más simple y menos sobreajustado, a igualdad de ganancia.
+3. Mirar también el `ganancia_desvio` -- si dos valores dan ganancia similar pero uno tiene menos desvío entre semillas, ese es más confiable.
+
+Si el mejor punto queda en el extremo de la grilla que probamos (por ejemplo `2000` en A o `3500` en B), es la misma señal de siempre: hay que ensanchar la grilla en esa dirección y volver a correr, igual que con los grids de `learning_rate`/`scale_pos_weight`.

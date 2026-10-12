@@ -1,0 +1,317 @@
+#%% celda 1 [texto]
+# 01 · Pipeline base desde el crudo
+
+**Etapa 1 del plan** (`fichas/etapa_1_pipeline_base.md`). Este notebook:
+
+- parte del dataset original de la cátedra (`competencia_01_crudo.csv`);
+- agrega la clase `clase_ternaria`, con el mismo criterio que el código oficial (`z470`);
+- verifica todo contra valores conocidos;
+- guarda el dataset base en parquet, junto con una tabla de calidad por mes.
+
+**No** limpia ni saca variables, **no** arma variables nuevas y **no** entrena. Todo eso se decide después, con experimentos.
+
+Decisiones de esta etapa: `decisiones.md`.
+
+#%% celda 2 [texto]
+## 1. Parámetros
+
+Las rutas son relativas a la carpeta del notebook, `TPs/competencia_1/notebook/`. Las salidas van a `TPs/competencia_1/data/` (dataset base) y a `TPs/competencia_1/exp/` (tablas de cada experimento), fuera de la carpeta de notebooks.
+
+`CRUDO` es **lo único que se cambia** al pasar a Google Cloud. El link oficial del crudo está en el libro de la materia, 1.2.
+
+#%% celda 3 [código]
+from pathlib import Path
+import time
+import warnings
+
+import duckdb
+import pandas as pd
+
+# --- Parámetros -------------------------------------------------------------
+CRUDO = Path('../../dataset/competencia_01_crudo.csv')
+DATA = Path('../data')   # salidas fuera de notebook/
+EXP = Path('../exp')
+BASE_PARQUET = DATA / 'competencia_01_base.parquet'
+CALIDAD_CSV = EXP / '01_calidad_por_mes.csv'
+
+SEMILLA_PRIMIGENIA = 979201  # <- tu primo de 6 dígitos (de ella salen todas las demás semillas)
+# -----------------------------------------------------------------------------
+
+# Falso positivo conocido de pandas 2.2 con Python 3.14 (no afecta resultados)
+warnings.filterwarnings('ignore', message='.*ChainedAssignmentError.*')
+
+DATA.mkdir(exist_ok=True)
+EXP.mkdir(exist_ok=True)
+
+
+def es_primo(n):
+    return n > 1 and all(n % d for d in range(2, int(n ** 0.5) + 1))
+
+
+assert CRUDO.exists(), f'No encuentro el crudo en {CRUDO.resolve()}'
+assert isinstance(SEMILLA_PRIMIGENIA, int) and 100_000 <= SEMILLA_PRIMIGENIA <= 999_999 \
+    and es_primo(SEMILLA_PRIMIGENIA), 'SEMILLA_PRIMIGENIA tiene que ser un primo de 6 dígitos'
+
+#%% celda 4 [texto]
+## 2. Valores esperados
+
+Estos números se verificaron sobre el crudo el 2026-10-03 y el 2026-10-05. El notebook se **frena** si algo no coincide, para no seguir con datos distintos de los esperados.
+
+Las clases siguen el criterio de la cátedra: los 15 clientes que se van un mes y vuelven al siguiente (1 → 0 → 1) cuentan como `BAJA+1`.
+
+#%% celda 5 [código]
+ESPERADO_FILAS = 983_061
+ESPERADO_COLUMNAS_CRUDO = 154
+ESPERADO_CLIENTES = 169_727
+
+ESPERADO_FILAS_POR_MES = {
+    202103: 162_900, 202104: 163_284, 202105: 163_768,
+    202106: 164_114, 202107: 164_348, 202108: 164_647,
+}
+
+# None = sin clase (falta el futuro para saberla)
+ESPERADO_CLASES = {
+    202103: {'BAJA+1': 1_019, 'BAJA+2': 960,   'CONTINUA': 160_921},
+    202104: {'BAJA+1': 964,   'BAJA+2': 1_139, 'CONTINUA': 161_181},
+    202105: {'BAJA+1': 1_143, 'BAJA+2': 870,   'CONTINUA': 161_755},
+    202106: {'BAJA+1': 874,   'BAJA+2': 1_098, 'CONTINUA': 162_142},
+    202107: {'BAJA+1': 1_103, None: 163_245},
+    202108: {None: 164_647},
+}
+
+# IDs que Python o R pueden escribir en notación científica (Zulip, Denicolay)
+IDS_TRAICIONEROS = [48_000_000, 31_100_000]
+
+#%% celda 6 [texto]
+## 3. Carga del crudo
+
+- **Por qué se declara el tipo del ID:** el crudo trae `4.8e+07` en 6 filas, una por mes (es el cliente 48000000). Sin declararlo, DuckDB lee `numero_de_cliente` como decimal; con `types={'numero_de_cliente': 'BIGINT'}` queda entero.
+- **`sample_size=-1`:** DuckDB recorre el archivo entero antes de decidir el tipo de cada columna.
+
+#%% celda 7 [código]
+t0 = time.time()
+con = duckdb.connect()
+
+con.execute(f"""
+    create or replace table crudo as
+    select *
+    from read_csv('{CRUDO.as_posix()}', sample_size=-1,
+                  types={{'numero_de_cliente': 'BIGINT'}})
+""")
+
+filas = con.execute("select count(*) from crudo").fetchone()[0]
+columnas = len(con.execute("describe crudo").fetchall())
+clientes = con.execute("select count(distinct numero_de_cliente) from crudo").fetchone()[0]
+duplicados = con.execute("""
+    select count(*) from (
+        select numero_de_cliente, foto_mes from crudo group by all having count(*) > 1)
+""").fetchone()[0]
+
+print(f'{filas:,} filas · {columnas} columnas · {clientes:,} clientes · '
+      f'{duplicados} claves duplicadas · {time.time() - t0:.0f} s')
+
+assert (filas, columnas, clientes, duplicados) == \
+    (ESPERADO_FILAS, ESPERADO_COLUMNAS_CRUDO, ESPERADO_CLIENTES, 0)
+
+#%% celda 8 [código]
+por_mes = dict(con.execute("select foto_mes, count(*) from crudo group by 1 order by 1").fetchall())
+print(por_mes)
+assert por_mes == ESPERADO_FILAS_POR_MES
+
+#%% celda 9 [texto]
+## 4. Clase ternaria
+
+Es la misma lógica que el código oficial de la cátedra (`z470`, en R), escrita en SQL.
+
+1. **Período consecutivo:** `p0 = año × 12 + mes`. Así el mes siguiente es siempre `p0 + 1`, incluso de diciembre a enero.
+2. **Para cada cliente** se miran sus dos períodos siguientes en el dataset: `p1` y `p2`, con `lead`.
+3. **Se asigna la clase:**
+
+| Clase | Condición |
+|---|---|
+| `BAJA+2` | está el mes siguiente (`p1 = p0 + 1`) pero no el subsiguiente (`p2` no existe o es mayor que `p0 + 2`) |
+| `BAJA+1` | no está el mes siguiente (`p1` no existe o es mayor que `p0 + 1`) |
+| `CONTINUA` | el resto, siempre que haya dos meses de futuro para saberlo |
+| `NULL` | falta el futuro: `202108` entero, y `202107` salvo los `BAJA+1` |
+
+**La lógica de tres valores** (bug de la Clase 01): si `p2` es `NULL`, `p2 > p0 + 2` da `NULL` y no `TRUE`. Por eso se pregunta explícitamente `p2 is null`. Si no, la fila caería por defecto en otra clase.
+
+#%% celda 10 [código]
+ultimo = con.execute("select max((foto_mes // 100) * 12 + foto_mes % 100) from crudo").fetchone()[0]
+
+con.execute(f"""
+    create or replace table con_clase as
+    with periodos as (
+        select *, (foto_mes // 100) * 12 + foto_mes % 100 as p0
+        from crudo
+    ),
+    futuros as (
+        select *,
+               lead(p0, 1) over w as p1,
+               lead(p0, 2) over w as p2
+        from periodos
+        window w as (partition by numero_de_cliente order by p0)
+    )
+    select * exclude (p0, p1, p2),
+           case
+               when p0 < {ultimo} - 1 and p1 = p0 + 1 and (p2 is null or p2 > p0 + 2) then 'BAJA+2'
+               when p0 < {ultimo}     and (p1 is null or p1 > p0 + 1)                  then 'BAJA+1'
+               when p0 < {ultimo} - 1                                                    then 'CONTINUA'
+               else null
+           end as clase_ternaria
+    from futuros
+""")
+
+tabla_clases = con.execute("""
+    select foto_mes, clase_ternaria, count(*) as n
+    from con_clase group by all order by all
+""").df()
+tabla_clases.pivot(index='foto_mes', columns='clase_ternaria', values='n').fillna(0).astype(int)
+
+#%% celda 11 [código]
+def clases_por_mes(tabla):
+    """{foto_mes: {clase: n}}, con None para las filas sin clase."""
+    salida = {}
+    for mes, clase, n in tabla[['foto_mes', 'clase_ternaria', 'n']].itertuples(index=False):
+        salida.setdefault(int(mes), {})[None if pd.isna(clase) else clase] = int(n)
+    return salida
+
+
+assert clases_por_mes(tabla_clases) == ESPERADO_CLASES, 'La tabla de clases no coincide con la esperada'
+print('Clases OK: coinciden con el código oficial de la cátedra')
+
+#%% celda 12 [texto]
+## 5. Tipos
+
+Decisión de la etapa:
+- `numero_de_cliente` queda en `int64` (`BIGINT`);
+- `foto_mes` pasa a entero de 32 bits;
+- `clase_ternaria` queda como texto;
+- **todo el resto pasa a `float32`** (`FLOAT` en DuckDB).
+
+**Por qué:**
+- Reduce a la mitad la memoria de las 152 variables. Hay 16 GB de RAM y después vienen las variables nuevas.
+- LightGBM trabaja internamente en `float32`, así que el modelo no pierde nada.
+- Los `NULL` se mantienen: no hay ningún `fillna` ni ninguna imputación.
+
+**Cuidado con lo que redondea `float32`:** guarda unos 7 dígitos significativos, así que montos de millones con centavos pierden los últimos decimales. Para ordenar y cortar (lo que hacen los árboles) no importa.
+
+#%% celda 13 [código]
+columnas_crudo = [c[0] for c in con.execute("describe con_clase").fetchall()]
+claves = ['numero_de_cliente', 'foto_mes', 'clase_ternaria']
+variables = [c for c in columnas_crudo if c not in claves]
+
+select_tipado = ',\n    '.join(
+    ['numero_de_cliente::BIGINT as numero_de_cliente', 'foto_mes::INTEGER as foto_mes']
+    + [f'"{c}"::FLOAT as "{c}"' for c in variables]
+    + ['clase_ternaria']
+)
+con.execute(f"create or replace table base as select\n    {select_tipado}\nfrom con_clase")
+
+tipos = con.execute("describe base").df().set_index('column_name')['column_type']
+print(tipos.value_counts().to_string())
+assert tipos['numero_de_cliente'] == 'BIGINT' and tipos['foto_mes'] == 'INTEGER'
+assert tipos['clase_ternaria'] == 'VARCHAR'
+assert (tipos[variables] == 'FLOAT').all() and len(variables) == 152
+
+#%% celda 14 [texto]
+## 6. Controles del dataset base
+
+Estos controles corresponden a la tabla de verificación de la ficha:
+- **6 y 7:** clase y meses sin futuro;
+- **2 y 7:** IDs y clave única.
+
+#%% celda 15 [código]
+# 202107: solo BAJA+1 o sin clase; 202108: todo sin clase
+clases_jul = dict(con.execute("""select coalesce(clase_ternaria, 'NULL'), count(*) from base
+                                 where foto_mes = 202107 group by 1""").fetchall())
+clases_ago = dict(con.execute("""select coalesce(clase_ternaria, 'NULL'), count(*) from base
+                                 where foto_mes = 202108 group by 1""").fetchall())
+print('202107:', clases_jul, '· 202108:', clases_ago)
+assert clases_jul == {'BAJA+1': 1_103, 'NULL': 163_245}
+assert clases_ago == {'NULL': 164_647}
+
+# IDs traicioneros: enteros, 6 apariciones cada uno (una por mes)
+for id_ in IDS_TRAICIONEROS:
+    n = con.execute(f"select count(*) from base where numero_de_cliente = {id_}").fetchone()[0]
+    print(f'{id_}: {n} filas')
+    assert n == 6
+
+# Ningún ID con decimales y clave única
+no_enteros = con.execute("""select count(*) from base
+                            where numero_de_cliente <> round(numero_de_cliente)""").fetchone()[0]
+assert no_enteros == 0
+print('Controles OK')
+
+#%% celda 16 [texto]
+## 7. Persistencia en parquet
+
+Se guarda el dataset base y **se relee para confirmar** que quedó igual: filas, columnas, tipos y la tabla de clases.
+
+Los notebooks siguientes leen este archivo, no el crudo. `data/` no se versiona.
+
+#%% celda 17 [código]
+t0 = time.time()
+con.execute(f"copy base to '{BASE_PARQUET.as_posix()}' (format parquet, compression zstd)")
+print(f'Guardado: {BASE_PARQUET} · {BASE_PARQUET.stat().st_size / 1e6:.0f} MB · {time.time() - t0:.0f} s')
+
+releido = f"read_parquet('{BASE_PARQUET.as_posix()}')"
+filas_p = con.execute(f"select count(*) from {releido}").fetchone()[0]
+tipos_p = con.execute(f"describe select * from {releido}").df().set_index('column_name')['column_type']
+tabla_p = con.execute(f"""select foto_mes, clase_ternaria, count(*) as n
+                          from {releido} group by all order by all""").df()
+
+assert filas_p == ESPERADO_FILAS
+assert tipos_p.equals(tipos), 'Los tipos del parquet no coinciden con los de la tabla base'
+assert clases_por_mes(tabla_p) == ESPERADO_CLASES
+print(f'Parquet OK: {filas_p:,} filas · {len(tipos_p)} columnas · clases iguales')
+
+#%% celda 18 [texto]
+## 8. Tabla de calidad por mes
+
+Para cada variable y cada mes, el **% de nulos** y el **% de ceros**, los dos **sobre todas las filas del mes** (como en `z701`): las "dos reglas de oro" de la Clase 08.
+- **Un salto de nulos** suele ser un mal *left join*.
+- **Un salto de ceros** suele ser una imputación por defecto.
+
+Se guarda completa en `exp/01_calidad_por_mes.csv`, como insumo de la etapa 4. Abajo se listan las variables donde algún mes se aparta más de 5 puntos del resto.
+
+#%% celda 19 [código]
+t0 = time.time()
+agregados = ',\n    '.join(
+    f'avg(("{c}" is null)::INT) as "nulos__{c}", avg(coalesce("{c}" = 0, false)::INT) as "ceros__{c}"'
+    for c in variables
+)
+ancho = con.execute(f"select foto_mes,\n    {agregados}\nfrom base group by 1 order by 1").df()
+
+calidad = (ancho.melt(id_vars='foto_mes', var_name='medida_variable', value_name='proporcion')
+                .assign(medida=lambda d: d['medida_variable'].str.split('__').str[0],
+                        variable=lambda d: d['medida_variable'].str.split('__').str[1])
+                .pivot_table(index=['variable', 'medida'], columns='foto_mes', values='proporcion')
+                .mul(100).round(2))
+calidad.to_csv(CALIDAD_CSV)
+print(f'Guardado: {CALIDAD_CSV} · {len(calidad)} filas · {time.time() - t0:.0f} s')
+
+#%% celda 20 [código]
+# Variables donde algún mes se aparta más de 5 puntos de la mediana de los meses
+desvio = calidad.sub(calidad.median(axis=1), axis=0).abs().max(axis=1)
+saltos = calidad[desvio > 5].assign(max_desvio_pp=desvio[desvio > 5]).sort_values('max_desvio_pp', ascending=False)
+saltos
+
+#%% celda 21 [texto]
+**Qué esperar** (verificado al preparar la etapa y en la corrida de prueba del 2026-10-05; ver CLAUDE.md §2.2):
+- `Master_fultimo_cierre` y `Visa_fultimo_cierre`: 69 % en cero en `202106`, 0 % los otros meses;
+- `Visa_mpagado`: ~70 % de ceros en `202105` y `202108`, contra ~86 % el resto;
+- `ctarjeta_visa_debitos_automaticos` y `mttarjeta_visa_debitos_automaticos`: 43 % de ceros en `202103`, contra 35–37 % después (hallazgo de la corrida de prueba);
+- `ccajas_depositos` (100 % en cero en `202105`) **no** aparece: siempre está cerca del 96 %, así que el salto queda debajo del umbral de 5 puntos. Mirarlo en el CSV.
+
+Si aparece algo más, se anota para la etapa 4.
+
+#%% celda 22 [texto]
+## 9. Cierre
+
+- **Tabla de verificación de la ficha:** se cumplen los controles 1 a 8. El 9 (reproducibilidad) se cumple corriendo el notebook entero en un kernel nuevo: *Restart* → *Run All*.
+- **Registro:** anotar en `decisiones.md` el resultado de la verificación y cualquier hallazgo nuevo de la tabla de calidad.
+- **Lo que sigue:** etapa 2, la línea base con LightGBM (necesita su ficha). El próximo notebook lee `data/competencia_01_base.parquet`.
+
+#%% celda 23 [código]
+con.close()

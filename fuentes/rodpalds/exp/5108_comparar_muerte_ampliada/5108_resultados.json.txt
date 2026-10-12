@@ -1,0 +1,37 @@
+{
+  "resumen": [
+    {
+      "modelo": "muerte_3003",
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": 766,
+      "hiper": "4107 p23_4104",
+      "arboles": 580,
+      "meses_train": "202103 202104",
+      "min_data_in_leaf": 20248,
+      "meseta_M": 443.1,
+      "maximo_M": 456.0,
+      "envios_optimos": 13500,
+      "envios_agosto_p25_p50_p75": "13,042 / 13,644 / 13,845",
+      "dif_vs_muerte_3003_M": NaN,
+      "IC90_M": NaN,
+      "pct_remuestreos_gana": NaN
+    },
+    {
+      "modelo": "muerte_ampliada_3006",
+      "dataset": "ds3006_muerte_ampliada.parquet",
+      "variables": 794,
+      "hiper": "4107 p23_4104",
+      "arboles": 580,
+      "meses_train": "202103 202104",
+      "min_data_in_leaf": 20248,
+      "meseta_M": 435.4,
+      "maximo_M": 444.4,
+      "envios_optimos": 14000,
+      "envios_agosto_p25_p50_p75": "13,143 / 13,845 / 14,346",
+      "dif_vs_muerte_3003_M": -7.8,
+      "IC90_M": "[-19.6 ; 3.9]",
+      "pct_remuestreos_gana": "15%"
+    }
+  ],
+  "_minutos": 50.76
+}

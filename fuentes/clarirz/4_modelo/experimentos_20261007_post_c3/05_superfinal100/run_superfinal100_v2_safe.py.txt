@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import superfinal100_v2 as V2
+from stage5_v2_safe import stage5_per_seed_safe
+
+V2.stage5_per_seed = stage5_per_seed_safe
+
+if __name__ == "__main__":
+    V2.main()

@@ -1,0 +1,234 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–30] Importa `optuna`, `polars` y `yaml`, el identificador del experimento desde
+#   `_bootstrap` y, del paquete `common`, las utilidades de la búsqueda, la preparación de datos, la
+#   sincronización con GCS, las rutas de resultados y el entrenamiento de LightGBM.
+#!/usr/bin/env python3
+"""BO Optuna + CV temporal mar–may (``experiment_id`` 04py-00, FE completo)."""
+
+from __future__ import annotations
+
+import os
+from datetime import datetime
+
+import optuna
+import polars as pl
+import yaml
+
+import _bootstrap  # noqa: F401
+from _bootstrap import EXPERIMENT_ID
+
+from common.bo_space import (
+    bo_export_at_last_complete,
+    count_complete_trials,
+    hyperparametertuning_meta,
+    last_complete_trial_number,
+    suggest_from_bo_space,
+)
+from common.data import FOTO_MES_MAR_JUN, FOTO_MES_MAR_MAY, preparar_holdout_temporal
+from common.gcs_upload import pull_resultados_subdir, sync_every_trials, sync_resultados_subdir
+from common.layers import SUBDIR_BO, bo_dir
+from common.lgb_train import (
+    fixed_params_00,
+    merge_tuned,
+    temporal_cv_average_precision_mar_may,
+)
+
+# [Anotación · líneas 32–38] Define la semilla 427417 y el espacio de búsqueda: `num_iterations` entero entre
+#   2000 y 8000, `num_leaves` entero entre 20 y 200 y `min_sum_hessian_in_leaf` real entre 0.001 y 0.01.
+SEMILLA_PRIMIGENIA = 427417
+
+BO_SPACE = {
+    "num_iterations": {"type": "int", "low": 2000, "high": 8000},
+    "num_leaves": {"type": "int", "low": 20, "high": 200},
+    "min_sum_hessian_in_leaf": {"type": "float", "low": 0.001, "high": 0.01},
+}
+
+
+# [Anotación · líneas 41–50] Ubica la carpeta `bo/` del experimento (en modo VM la baja antes desde GCS) y
+#   fija los parámetros de la corrida: cantidad de trials desde `COMPE1_BO_ITER` (150 por defecto),
+#   `undersampling = 1.0`, fold 1 para entrenamiento, fold 2 para prueba y una lista de 31 cortes de 4000 a
+#   19000 en pasos de 500.
+def main() -> None:
+    ht_dir = bo_dir(EXPERIMENT_ID)
+    pull_resultados_subdir(EXPERIMENT_ID, SUBDIR_BO, optional=True)
+    ht_dir.mkdir(parents=True, exist_ok=True)
+
+    n_iter = int(os.environ.get("COMPE1_BO_ITER", "150"))
+    undersampling = 1.0
+    fold_train = 1
+    fold_test = 2
+    cortes = list(range(4000, 19001, 500))
+
+# [Anotación · líneas 52–64] Llama a `preparar_holdout_temporal`, que une las 8 capas parquet para
+#   202103–202106, agrega `clase01` y marca 202103–202105 como fold 1 y 202106 como fold 2. Se queda con las
+#   filas del fold 1 para la búsqueda, carga los hiperparámetros fijos con la semilla 427417 y guarda el
+#   `min_data_in_leaf` fijo (0).
+    prep = preparar_holdout_temporal(
+        EXPERIMENT_ID,
+        foto_mes=FOTO_MES_MAR_JUN,
+        fold_train=fold_train,
+        fold_test=fold_test,
+    )
+    df: pl.DataFrame = prep["data"]
+    campos_buenos = prep["campos_buenos"]
+
+    train_bo = df.filter(pl.col("fold") == fold_train)
+
+    fijos = fixed_params_00(SEMILLA_PRIMIGENIA)
+    mdil_fijo = int(fijos["min_data_in_leaf"])
+
+# [Anotación · líneas 66–72] Crea el estudio Optuna `04py_00_temporal_cv_ap` con almacenamiento SQLite en
+#   `bo/optuna.db`, dirección maximize y `load_if_exists=True`, de modo que una corrida posterior retoma los
+#   trials ya guardados.
+    storage = f"sqlite:///{ht_dir / 'optuna.db'}"
+    study = optuna.create_study(
+        study_name=f"{EXPERIMENT_ID.replace('-', '_')}_temporal_cv_ap",
+        storage=storage,
+        load_if_exists=True,
+        direction="maximize",
+    )
+
+# [Anotación · líneas 74–86] Función objetivo: pide a Optuna un valor para cada hiperparámetro del espacio,
+#   los superpone a los fijos y llama a `temporal_cv_average_precision_mar_may` sobre el fold 1. Esa función
+#   entrena con 202103 y valida en 202104, entrena con 202103–202104 y valida en 202105, toma en cada fold el
+#   máximo average precision entre las iteraciones y devuelve el promedio. Imprime una línea por trial con la
+#   hora, el valor y los hiperparámetros.
+    def objective(trial: optuna.Trial) -> float:
+        hp = suggest_from_bo_space(trial, BO_SPACE)
+        params = merge_tuned(fijos, hp)
+        ap = temporal_cv_average_precision_mar_may(train_bo, campos_buenos, params)
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = (
+            f"[{ts}] trial={trial.number} | PR-AUC={ap:.6f} | "
+            f"num_iterations={hp['num_iterations']} num_leaves={hp['num_leaves']} "
+            f"min_sum_hessian={hp['min_sum_hessian_in_leaf']:.4g} "
+            f"min_data_in_leaf={mdil_fijo}\n"
+        )
+        print(line, end="", flush=True)
+        return ap
+
+# [Anotación · líneas 88–93] Lee cada cuántos trials sincronizar (`COMPE1_GCS_SYNC_EVERY_TRIALS`, 1 por
+#   defecto) y define un callback que sube la carpeta `bo/` a GCS con esa frecuencia; fuera del modo VM la
+#   sincronización no hace nada.
+    every = sync_every_trials()
+
+    def gcs_trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if (trial.number + 1) % every != 0:
+            return
+        sync_resultados_subdir(EXPERIMENT_ID, SUBDIR_BO)
+
+# [Anotación · líneas 95–106] Si `COMPE1_BO_EXPORT_AT_LAST_COMPLETE` está activa no lanza trials nuevos. En
+#   otro caso calcula cuántos faltan para llegar a la cantidad pedida, descontando los ya completos en el
+#   estudio, y los ejecuta con barra de progreso y el callback de sincronización.
+    export_at_last = bo_export_at_last_complete()
+    if export_at_last:
+        remaining = 0
+    else:
+        remaining = max(0, n_iter - count_complete_trials(study))
+    if remaining:
+        study.optimize(
+            objective,
+            n_trials=remaining,
+            show_progress_bar=True,
+            callbacks=[gcs_trial_callback],
+        )
+
+# [Anotación · líneas 108–129] Recorre los trials en estado COMPLETE y arma una fila por trial con sus
+#   hiperparámetros, el `min_data_in_leaf` fijo, el valor del objetivo (`y`) y el número de iteración. Termina
+#   con error si no hay ninguno. Ordena la tabla por `y` de mayor a menor y la escribe en `BO_log.txt` separada
+#   por tabuladores.
+    log_path = ht_dir / "BO_log.txt"
+    rows = []
+    for t in study.trials:
+        if t.state != optuna.trial.TrialState.COMPLETE:
+            continue
+        row = dict(t.params)
+        row.setdefault("min_data_in_leaf", mdil_fijo)
+        row["y"] = t.value
+        row["iter"] = t.number + 1
+        rows.append(row)
+    if not rows:
+        raise RuntimeError("No hay trials COMPLETE en optuna.db; no se puede exportar BO.")
+    n_exported = len(rows)
+    if export_at_last:
+        last_n = last_complete_trial_number(study)
+        print(
+            f"[BO] COMPE1_BO_EXPORT_AT_LAST_COMPLETE: "
+            f"{n_exported} trials COMPLETE (último trial #{last_n}).",
+            flush=True,
+        )
+    tb = pl.DataFrame(rows).sort("y", descending=True)
+    tb.write_csv(log_path, separator="\t")
+
+# [Anotación · líneas 131–137] Toma la primera fila de la tabla ordenada como la de mayor objetivo, extrae sus
+#   hiperparámetros (todas las columnas menos `y` e `iter`) y cuenta las filas del fold 1 y del fold 2.
+    iteraciones_report = n_exported if export_at_last else n_iter
+    best = tb.row(0, named=True)
+    hp_cols = [c for c in tb.columns if c not in ("y", "iter")]
+    mejores = {k: best[k] for k in hp_cols}
+
+    n_train = int(df.filter(pl.col("fold") == fold_train).height)
+    n_test = int(df.filter(pl.col("fold") == fold_test).height)
+
+# [Anotación · líneas 139–181] Arma el diccionario `param`: identificador del experimento, semilla, meses
+#   202103–202106, cortes, estrategia de entrenamiento (`undersampling` 1.0 sin aplicar), descripción del
+#   holdout temporal (entrena 202103–202105, prueba 202106, cantidad de filas), hiperparámetros fijos, metadatos
+#   de la búsqueda (espacio, 2 folds, cantidad de iteraciones, objetivo `temporal_cv_average_precision`, ruta de
+#   `optuna.db`), hiperparámetros de la primera fila con su valor y la lista de variables `campos_buenos`.
+    param = {
+        "experiment_id": EXPERIMENT_ID,
+        "semilla_primigenia": SEMILLA_PRIMIGENIA,
+        "foto_mes": list(FOTO_MES_MAR_JUN),
+        "cortes": cortes,
+        "trainingstrategy": {
+            "undersampling": undersampling,
+            "apply_undersampling": False,
+        },
+        "holdout": {
+            "tipo": "temporal_mar_may_jun",
+            "foto_mes_train": list(FOTO_MES_MAR_MAY),
+            "foto_mes_test": 202106,
+            "fold_train": fold_train,
+            "fold_test": fold_test,
+            "n_train": n_train,
+            "n_test": n_test,
+        },
+        "lgbm": {"param_fijos": fijos},
+        "hypeparametertuning": {
+            **hyperparametertuning_meta(BO_SPACE),
+            "xval_folds": 2,
+            "iteraciones": iteraciones_report,
+            "iteraciones_planificadas": n_iter,
+            "export_at_last_complete": export_at_last,
+            "ultimo_trial_complete": last_complete_trial_number(study),
+            "objetivo": "temporal_cv_average_precision",
+            "optimizer": "optuna",
+            "storage": str(ht_dir / "optuna.db"),
+        },
+        "hyperparametertuning": {
+            "xval_folds": 2,
+            "iteraciones": iteraciones_report,
+            "objetivo": "temporal_cv_average_precision",
+        },
+        "out": {
+            "lgbm": {
+                "mejores_hiperparametros": mejores,
+                "y": float(best["y"]),
+            }
+        },
+        "campos_buenos": campos_buenos,
+    }
+
+# [Anotación · líneas 183–191] Escribe `param` en `bo/PARAM.yml`, sincroniza la carpeta `bo/` con GCS (sólo en
+#   modo VM), imprime el valor máximo del objetivo y define el punto de entrada del script.
+    with (ht_dir / "PARAM.yml").open("w", encoding="utf-8") as f:
+        yaml.safe_dump(param, f, sort_keys=False, allow_unicode=True)
+
+    sync_resultados_subdir(EXPERIMENT_ID, SUBDIR_BO)
+    print(f"BO finalizada. Mejor PR-AUC={best['y']:.6f} → {ht_dir}")
+
+
+if __name__ == "__main__":
+    main()

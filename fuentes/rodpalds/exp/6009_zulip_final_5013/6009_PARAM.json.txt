@@ -1,0 +1,21 @@
+{
+  "experimento": 6009,
+  "nombre": "zulip_final_5013",
+  "descripcion": "Archivos finales de la receta completa del profesor (5013, sin ensamble): 11.000 a 13.500 envios.",
+  "modo": "final",
+  "fuente": "5013_prod_receta_muerte_lag2",
+  "envios": [
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500
+  ],
+  "max_archivos": 20,
+  "clientes_esperados": 164647,
+  "_config": "6009_zulip_final_5013.json",
+  "_fecha_inicio": "2026-10-09 18:26:32",
+  "_script": "10_entrega_zulip.py",
+  "_git_commit": "sin_git"
+}

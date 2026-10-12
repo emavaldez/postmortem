@@ -1,0 +1,11 @@
+{
+  "experimento": 2001,
+  "nombre": "diagnostico_aguinaldo",
+  "descripcion": "Efecto del aguinaldo (jun/jul) en variables de sueldo y en la tasa de bajas.",
+  "dataset": "ds1001_base.parquet",
+  "salto_min": 1.3,
+  "salto_max": 1.7,
+  "_fecha_inicio": "2026-10-05 00:43:01",
+  "_script": "02_diagnostico_aguinaldo.py",
+  "_git_commit": "sin_git"
+}

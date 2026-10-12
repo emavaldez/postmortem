@@ -1,0 +1,34 @@
+
+===== 026 2026-10-09 11:00 | 5 semillas =====
+[A s=676057] MC_cond 231.1 | MC_suma +6.3 | B12 +6.5 | B12_w05 +6.1 | MC+B12 +7.3 (2 min)
+[A s=482687] MC_cond 237.9 | MC_suma +9.8 | B12 +11.3 | B12_w05 +3.6 | MC+B12 +6.3 (3 min)
+[A s=399221] MC_cond 239.0 | MC_suma +8.5 | B12 +9.6 | B12_w05 +12.0 | MC+B12 +8.2 (5 min)
+[A s=121109] MC_cond 235.9 | MC_suma +8.9 | B12 +5.2 | B12_w05 +6.3 | MC+B12 +5.0 (7 min)
+[A s=292131] MC_cond 243.2 | MC_suma +13.9 | B12 +13.2 | B12_w05 +15.8 | MC+B12 +9.2 (8 min)
+[B s=676057] MC_cond 406.7 | MC_suma -2.8 | B12 -6.5 | B12_w05 -6.1 | MC+B12 -3.4 (10 min)
+[B s=482687] MC_cond 404.7 | MC_suma +0.4 | B12 -6.7 | B12_w05 -4.3 | MC+B12 +0.0 (12 min)
+[B s=399221] MC_cond 405.5 | MC_suma +1.6 | B12 -1.4 | B12_w05 -3.2 | MC+B12 +1.8 (13 min)
+[B s=121109] MC_cond 403.7 | MC_suma -1.0 | B12 -4.5 | B12_w05 -7.8 | MC+B12 -2.5 (15 min)
+[B s=292131] MC_cond 408.5 | MC_suma +0.6 | B12 -4.0 | B12_w05 +1.4 | MC+B12 +1.5 (17 min)
+[Bh s=676057] MC_cond 392.7 | MC_suma +6.2 | B12 +5.5 | B12_w05 +6.7 | MC+B12 +5.2 (18 min)
+[Bh s=482687] MC_cond 393.8 | MC_suma +9.3 | B12 +6.5 | B12_w05 +2.1 | MC+B12 +6.5 (20 min)
+[Bh s=399221] MC_cond 393.4 | MC_suma +8.0 | B12 +7.0 | B12_w05 +4.0 | MC+B12 +6.5 (21 min)
+[Bh s=121109] MC_cond 388.0 | MC_suma +12.9 | B12 +3.9 | B12_w05 +4.5 | MC+B12 +8.7 (23 min)
+[Bh s=292131] MC_cond 395.6 | MC_suma +10.7 | B12 +6.2 | B12_w05 +2.1 | MC+B12 +7.0 (24 min)
+
+Niveles (M ARS):
+fold          A      B     Bh
+variante                     
+B12       246.6  401.2  398.5
+B12_w05   246.2  401.8  396.6
+MC+B12    244.6  405.3  399.5
+MC_cond   237.4  405.8  392.7
+MC_suma   246.9  405.6  402.1
+
+Diferencias pareadas vs MC_cond:
+         variante  A_delta  B_delta  Bh_delta  A_ee  B_ee  Bh_ee pares_positivos
+MC_suma - MC_cond     9.49    -0.22      9.43  1.24  0.76   1.15           13/15
+    B12 - MC_cond     9.16    -4.62      5.80  1.48  0.97   0.55           10/15
+B12_w05 - MC_cond     8.75    -3.99      3.88  2.24  1.56   0.87           11/15
+ MC+B12 - MC_cond     7.21    -0.52      6.77  0.74  1.05   0.56           12/15
+[026] terminado

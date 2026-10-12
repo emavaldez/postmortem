@@ -1,0 +1,288 @@
+#%% celda 1 [texto]
+# 3b · Ensemble combinando los sets 1 y 2 + corte y entrega
+
+Igual que el notebook 3, pero junta los modelos de los **dos sets de hiperparámetros**
+(20 semillas con el set 1 + 20 con el set 2 = **40 modelos**) en un solo ensemble.
+
+**Cómo arma el ensemble:** lee la predicción de **cada modelo** desde `exp/modelos/`
+(no las tablas `probabilidades_*.csv`, que ya traen su propio `prob_ensemble` adentro)
+y hace el **promedio simple de los 40 modelos**. Así ningún ensemble parcial entra en el promedio.
+
+Además calcula el ensemble de cada set por separado, solo para compararlos en el gráfico.
+
+**Antes:** tiene que estar corrido el notebook 2 con `PARAM$set_hiperparametros <- 1` y con `<- 2`.
+
+#%% celda 2 [texto]
+### Librerías
+
+#%% celda 3 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+# limpio la memoria
+rm(list=ls(all.names=TRUE))
+gc(full=TRUE, verbose=FALSE)
+
+# cargo las librerias (la primera vez se instalan y tarda varios minutos)
+options(repos= c(CRAN= "https://cloud.r-project.org"))
+options(width= 200)
+
+for (paquete in c("data.table", "R.utils", "fst", "lightgbm", "ggplot2")) {
+  if (!require(paquete, character.only= TRUE)) {
+    install.packages(paquete)
+    library(paquete, character.only= TRUE)
+  }
+}
+
+cat("Nucleos disponibles:", parallel::detectCores(), "\n")
+
+#%% celda 4 [texto]
+### Parámetros
+
+#%% celda 5 [código]
+PARAM <- list()
+
+# ✏️ los sets que se juntan en el ensemble
+PARAM$sets <- c(1, 2)
+
+PARAM$archivo_dataset <- "datos/dataset_preprocesado.fst"
+PARAM$backtest_test   <- c(202106)
+
+# rango del grafico y de la tabla de ganancias
+PARAM$grafico_hasta <- 20000
+PARAM$tabla_cortes  <- seq(8000, 15000, by= 500)
+
+nombre_sets <- paste0("sets", paste(PARAM$sets, collapse= ""))   # ej: "sets12"
+
+#%% celda 6 [texto]
+### Funciones
+
+#%% celda 7 [código]
+# escribe un mensaje con la hora
+avisar <- function(...) {
+  cat(format(Sys.time(), "%H:%M:%S"), " ", ..., "\n", sep= "")
+  flush.console()
+}
+
+# muestra el avance de LightGBM mientras entrena (cada 250 arboles)
+mostrar_avance <- function(env) {
+  if (env$iteration %% 250 == 0 || env$iteration == env$end_iteration) {
+    cat("      ", format(Sys.time(), "%H:%M:%S"),
+      "  arbol ", env$iteration, " de ", env$end_iteration, "\n", sep= "")
+    flush.console()
+  }
+}
+attr(mostrar_avance, "call") <- quote(mostrar_avance())
+attr(mostrar_avance, "name") <- "mostrar_avance"
+
+# lee del dataset preprocesado solo los meses pedidos
+# (el archivo esta ordenado por foto_mes, asi no se carga todo en memoria)
+leer_meses <- function(meses) {
+  foto_mes <- read_fst(PARAM$archivo_dataset, columns= "foto_mes")$foto_mes
+  filas <- which(foto_mes %in% meses)
+  dt <- read_fst(PARAM$archivo_dataset, from= min(filas), to= max(filas),
+    as.data.table= TRUE)
+  dt[foto_mes %in% meses]
+}
+
+# AUC (area bajo la curva ROC), calculado a partir de los rankings
+calcular_auc <- function(clase, prob) {
+  rango <- frank(prob)
+  n1 <- sum(clase == 1)
+  n0 <- sum(clase == 0)
+  (sum(rango[clase == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+# ganancia si le envio estimulo a los primeros N clientes (para cada N de cortes)
+calcular_ganancias <- function(prob, gan, cortes) {
+  acumulada <- cumsum(gan[order(-prob)])
+  acumulada[cortes]
+}
+
+#%% celda 8 [código]
+# junta las predicciones de todos los modelos de los sets pedidos.
+# Arma una columna por modelo (prob_set1_s450862, prob_set2_s450862, ...),
+# el ensemble de cada set por separado (ensemble_set1, ensemble_set2, solo para comparar)
+# y prob_ensemble = promedio simple de TODOS los modelos
+armar_tabla_sets <- function(tipo, sets) {      # tipo: "final" o "backtest"
+  tabla <- NULL
+  for (s in sets) {
+    archivos <- sort(list.files("exp/modelos",
+      pattern= paste0("^", tipo, "_set", s, "_s"), full.names= TRUE))
+    for (archivo in archivos) {
+      pred <- fread(archivo)
+      setorder(pred, numero_de_cliente)
+      semilla <- sub(".*_s([0-9]+)\\.txt$", "\\1", archivo)
+      if (is.null(tabla)) tabla <- pred[, list(numero_de_cliente)]
+      stopifnot(identical(tabla$numero_de_cliente, pred$numero_de_cliente))
+      tabla[, paste0("prob_set", s, "_s", semilla) := pred$prob]
+    }
+  }
+  if (is.null(tabla)) return(NULL)
+
+  # columnas de los modelos (no incluye ningun ensemble)
+  modelos <- grep("^prob_set[0-9]+_s", names(tabla), value= TRUE)
+
+  for (s in sets) {
+    cols_set <- grep(paste0("^prob_set", s, "_s"), modelos, value= TRUE)
+    if (length(cols_set) > 0)
+      tabla[, paste0("ensemble_set", s) := rowMeans(.SD), .SDcols= cols_set]
+  }
+  tabla[, prob_ensemble := rowMeans(.SD), .SDcols= modelos]
+  tabla
+}
+
+#%% celda 9 [texto]
+## Tablas de probabilidades con todos los modelos
+
+#%% celda 10 [código]
+tabla_final <- armar_tabla_sets("final", PARAM$sets)
+tabla_bt    <- armar_tabla_sets("backtest", PARAM$sets)
+
+if (is.null(tabla_final)) stop("No hay modelos finales. Falta correr el notebook 2")
+if (is.null(tabla_bt))    stop("No hay modelos del backtest. Falta correr el notebook 2")
+
+clases <- leer_meses(PARAM$backtest_test)[, list(numero_de_cliente, clase_ternaria)]
+tabla_bt[clases, on= "numero_de_cliente", clase_ternaria := i.clase_ternaria]
+
+# cuantos modelos hay de cada set
+contar <- function(tabla) {
+  sapply(PARAM$sets, function(s) sum(grepl(paste0("^prob_set", s, "_s"), names(tabla))))
+}
+cantidad_final <- sum(grepl("^prob_set[0-9]+_s", names(tabla_final)))
+cantidad_bt    <- sum(grepl("^prob_set[0-9]+_s", names(tabla_bt)))
+
+print(data.table(set= PARAM$sets,
+  modelos_finales_202108= contar(tabla_final),
+  modelos_backtest_202106= contar(tabla_bt)))
+cat("\nModelos en el ensemble final:", cantidad_final, "\n")
+
+fwrite(tabla_final, paste0("exp/probabilidades_202108_", nombre_sets, ".csv"))
+fwrite(tabla_bt, paste0("exp/probabilidades_202106_backtest_", nombre_sets, ".csv"))
+
+#%% celda 11 [texto]
+## Ganancia vs. cantidad de envíos (backtest en 202106)
+
+Tres curvas: el ensemble de cada set por separado y el de **todos juntos** (el que se usa para el bot).
+
+#%% celda 12 [código]
+columnas_curva <- c(paste0("ensemble_set", PARAM$sets), "prob_ensemble")
+columnas_curva <- intersect(columnas_curva, names(tabla_bt))
+gan <- ifelse(tabla_bt$clase_ternaria == "BAJA+2", 1072500, -27500)
+
+curvas <- rbindlist(lapply(columnas_curva, function(col) {
+  orden <- order(-tabla_bt[[col]])
+  data.table(
+    ensemble= ifelse(col == "prob_ensemble", "todos juntos",
+                     sub("ensemble_set", "solo set ", col)),
+    envios= seq_along(orden),
+    ganancia= cumsum(gan[orden]))
+}))
+
+mejores <- curvas[, .SD[which.max(ganancia)], by= ensemble]
+print(mejores[, list(ensemble, envios, ganancia_millones= round(ganancia / 1e6, 1))])
+mejor <- mejores[ensemble == "todos juntos"]
+
+grafico <- ggplot(curvas[envios <= PARAM$grafico_hasta],
+                  aes(x= envios, y= ganancia / 1e6, color= ensemble)) +
+  geom_line(aes(linewidth= ensemble == "todos juntos")) +
+  scale_linewidth_manual(values= c(`FALSE`= 0.5, `TRUE`= 1.1), guide= "none") +
+  geom_vline(xintercept= mejor$envios, linetype= "dashed") +
+  annotate("text", x= mejor$envios, y= mejor$ganancia / 1e6,
+    label= paste0("  maximo (todos juntos): ", mejor$envios, " envios"),
+    hjust= 0, vjust= -0.5) +
+  scale_x_continuous(breaks= seq(0, PARAM$grafico_hasta, by= 2000)) +
+  scale_y_continuous(expand= expansion(mult= c(0.02, 0.12))) +
+  labs(x= "Cantidad de envios", y= "Ganancia (millones)", color= "Ensemble",
+    title= paste0("Ganancia en 202106 (backtest, ", cantidad_bt, " modelos en total)")) +
+  theme_minimal(base_size= 16) + theme(legend.position= "top")
+
+options(repr.plot.width= 16, repr.plot.height= 8)
+print(grafico)
+ggsave(paste0("exp/ganancia_vs_envios_", nombre_sets, ".png"), grafico, width= 12, height= 6)
+
+# tabla de ganancias en cortes redondos, una columna por ensemble
+dcast(curvas[envios %in% PARAM$tabla_cortes],
+  envios ~ ensemble, value.var= "ganancia", fun.aggregate= function(x) round(x / 1e6, 1))
+
+#%% celda 13 [texto]
+## Elegí el corte  ✏️
+
+Escribie el corte en la primera línea de la celda (`CORTES <- c(11000, 11500, 12000)`).
+
+#%% celda 14 [código]
+CORTES <- c(11750)   # Escribir aca el corte. Ejemplo: CORTES <- c(11000)
+
+if (all(is.na(CORTES)) && interactive()) {
+  respuesta <- readline("Cuantos envios? (si son varios, separalos con espacios): ")
+  CORTES <- suppressWarnings(as.integer(strsplit(trimws(respuesta), "[ ,;]+")[[1]]))
+}
+
+if (length(CORTES) == 0 || any(is.na(CORTES)))
+  stop("No hay corte. Escribilo en la primera linea de esta celda, por ejemplo",
+    " CORTES <- c(11000), y volve a correrla")
+if (any(CORTES < 1 | CORTES > nrow(tabla_final)))
+  stop("Los cortes tienen que estar entre 1 y ", nrow(tabla_final))
+
+cat("Cortes elegidos:", CORTES, "\n")
+
+#%% celda 15 [texto]
+## Archivos para el bot
+
+Con el ensemble de **todos los modelos juntos** (`prob_ensemble`). Quedan en `exp/entregas/`, junto con un resumen.
+
+#%% celda 16 [código]
+dir.create("exp/entregas", showWarnings= FALSE, recursive= TRUE)
+
+marca <- format(Sys.time(), "%m%d%H%M")   # mes, dia, hora y minuto: el nombre nunca se repite
+setorder(tabla_final, -prob_ensemble)
+
+archivos_bot <- c()
+for (corte in CORTES) {
+  # sprintf("%.0f") escribe los numeros como enteros, nunca como 4.8e+07
+  ids <- sprintf("%.0f", tabla_final[1:corte, numero_de_cliente])
+  stopifnot(!anyDuplicated(ids), !any(grepl("e", ids)))
+
+  archivo <- paste0("exp/entregas/v3_", nombre_sets, "_", cantidad_final, "mod_c",
+    corte, "_", marca, ".csv")
+  writeLines(ids, archivo)
+  archivos_bot <- c(archivos_bot, archivo)
+  cat("Generado:", archivo, " (", length(ids), "clientes )\n")
+}
+
+nombre_submit <- paste0("v3", nombre_sets, "c", paste(CORTES, collapse= "c"), "t", marca)
+
+# ---- resumen ----
+archivo_resumen <- paste0("exp/entregas/resumen_", marca, ".txt")
+escribir <- function(...) cat(..., "\n", file= archivo_resumen, append= TRUE, sep= "")
+
+escribir("RESUMEN DE LA ENTREGA   ", format(Sys.time(), "%Y-%m-%d %H:%M"))
+escribir("")
+escribir("Ensemble: promedio simple de ", cantidad_final, " LightGBM")
+hiper <- fread("exp/mejores_hiperparametros.txt")
+for (s in PARAM$sets) {
+  h <- hiper[set == s]
+  semillas <- sub(paste0("prob_set", s, "_s"), "",
+    grep(paste0("^prob_set", s, "_s"), names(tabla_final), value= TRUE))
+  escribir("Set ", s, ": ", length(semillas), " modelos.  num_iterations = ", h$num_iterations,
+    ", num_leaves = ", h$num_leaves,
+    ", min_sum_hessian_in_leaf = ", signif(h$min_sum_hessian_in_leaf, 4))
+  escribir("   semillas: ", paste(semillas, collapse= ", "))
+}
+escribir("Fijos: max_bin 31, min_data_in_leaf 0, feature_fraction 0.5,",
+  " feature_fraction_bynode 0.2, learning_rate 0.005")
+escribir("")
+escribir("Ganancia en el backtest 202106 (todos juntos, ", cantidad_bt, " modelos):")
+curva_todos <- curvas[ensemble == "todos juntos"]
+for (corte in CORTES)
+  escribir("   ", corte, " envios: ",
+    round(curva_todos[envios == corte, ganancia] / 1e6, 1), " millones")
+for (k in seq_len(nrow(mejores)))
+  escribir("   maximo ", mejores$ensemble[k], ": ", round(mejores$ganancia[k] / 1e6, 1),
+    " millones con ", mejores$envios[k], " envios")
+escribir("")
+escribir("Mensaje para el bot:  submit    ", nombre_submit)
+escribir("Archivos:")
+escribir(paste0("   ", basename(archivos_bot), "   ->  ganancia del bot: ", collapse= "\n"))
+
+cat("\n")
+cat(readLines(archivo_resumen), sep= "\n")

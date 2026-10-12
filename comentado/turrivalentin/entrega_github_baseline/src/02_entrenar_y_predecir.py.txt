@@ -1,0 +1,61 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–13] Docstring (10 LightGBM, uno por juego de hiperparámetros; el modelo i usa la
+#   semilla i; cada modelo se guarda al terminar) e importaciones: os, time, numpy, pandas, LGBMClassifier y
+#   comun.
+"""Paso 02: entrena 10 LightGBM con 202103-202106 y predice 202108 (~80 min).
+
+Un modelo por cada uno de los 10 mejores juegos de hiperparámetros de la bayesiana; el modelo i
+usa la semilla i. Cada modelo se guarda apenas termina, así una corrida cortada retoma donde quedó.
+"""
+import os
+from time import time
+
+import numpy as np
+import pandas as pd
+from lightgbm import LGBMClassifier
+
+import comun as cm
+
+# [Anotación · líneas 15–19] Lee trabajo/competencia_01.parquet y, para cada variable de variables_en_na, pone
+#   NaN en los meses indicados: ccajas_depositos en 202105.
+df = pd.read_parquet(cm.DATASET)
+# ccajas_depositos está toda en cero en 202105 (dato roto): se pasa a NA antes de armar los lags,
+# así tampoco contamina el lag de 202106 ni el lag2 de 202107.
+for var, meses in cm.ENTREGA['variables_en_na'].items():
+    df.loc[df['foto_mes'].isin(meses), var] = np.nan
+# [Anotación · líneas 20–26] Marca las filas de entrenamiento (foto_mes en 202103-202106) y las de predicción
+#   (202108), arma la matriz de 760 columnas para la unión de ambas y la separa en X_train y X_pred según el
+#   mes. Según el comentario, los lags de 202108 toman valores de 202107 y 202106.
+es_train = df['foto_mes'].isin(cm.MESES_TRAIN).to_numpy()
+es_pred = (df['foto_mes'] == cm.MES_PRED).to_numpy()
+# Los lags de 202108 usan 202107 y 202106: esos meses no tienen target, pero sus variables sí se conocen.
+X = cm.matriz(df, es_train | es_pred)
+mes = df.loc[es_train | es_pred, 'foto_mes'].to_numpy()
+X_train, X_pred = X[mes != cm.MES_PRED], X[mes == cm.MES_PRED]
+del X
+# [Anotación · líneas 27–30] Construye el vector objetivo: 1 si clase_ternaria está en lgbm_target_positivos
+#   (BAJA+1, BAJA+2) y 0 en otro caso, sobre todas las filas de entrenamiento. Imprime la cantidad de filas y
+#   columnas de X_train.
+# Sin undersampling. BAJA+1 como positivo duplica los casos de fuga para aprender; la ganancia
+# se mide igual solo con BAJA+2.
+y = np.isin(df.loc[es_train, 'clase_ternaria'].to_numpy(), cm.ENTREGA['lgbm_target_positivos']).astype(int)
+print(f'train {X_train.shape[0]:,} filas x {X_train.shape[1]} columnas', flush=True)
+
+# [Anotación · líneas 32–42] Si existe trabajo/probabilidades_202108.npz carga su contenido. Recorre en
+#   paralelo los 10 juegos y las 10 semillas: saltea los modelos cuya clave m<i> ya está guardada; para el resto
+#   crea un LGBMClassifier con los parámetros fijos, el juego i y random_state igual a la semilla i, lo entrena,
+#   guarda la probabilidad de la clase positiva sobre X_pred, reescribe el archivo npz e imprime los segundos
+#   que tardó.
+probas = dict(np.load(cm.PROBAS)) if os.path.exists(cm.PROBAS) else {}
+probas['numero_de_cliente'] = df.loc[es_pred, 'numero_de_cliente'].to_numpy()
+for i, (juego, s) in enumerate(zip(cm.JUEGOS, cm.SEMILLAS)):
+    if f'm{i}' in probas:
+        continue
+    t0 = time()
+    m = LGBMClassifier(**cm.LGBM_FIJOS, **juego, random_state=s)
+    m.fit(X_train, y)
+    probas[f'm{i}'] = m.predict_proba(X_pred)[:, 1]
+    np.savez(cm.PROBAS, **probas)
+    print(f'modelo {i} {juego} semilla {s}: {time() - t0:.0f}s', flush=True)

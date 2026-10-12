@@ -1,0 +1,83 @@
+{
+  "experimento": 4106,
+  "nombre": "bo_receta_muerte",
+  "descripcion": "Bayesiana liviana (como pide el profesor) sobre el dataset ganador de 5105: ds3003 = receta (lags y deltas 1 y 2 sobre crudos, luego rank por mes con cero fijo) + 6 variables del proceso de muerte, CON lag2/delta2. 5 hiperparametros, 40 pruebas (12 al azar), 1 semilla por prueba. Confirmacion: top 5 + referencias (z601, p117 de 4102, p35 y p23 de 4104) con 20 semillas en la mitad B; reemplaza a la mejor referencia solo si gana en 14 de 20.",
+  "dataset": "ds3003_rank_extra.parquet",
+  "variables": null,
+  "usar_lag2": true,
+  "mitades_desde": "4102_bo_fuera_de_tiempo/4102_mitades_junio.csv",
+  "semilla_sampler": 655531,
+  "n_trials": 40,
+  "n_startup_trials": 12,
+  "espacio": {
+    "learning_rate": [
+      0.01,
+      0.2,
+      "log"
+    ],
+    "num_leaves": [
+      8,
+      256,
+      "log"
+    ],
+    "min_data_in_leaf": [
+      100,
+      20000,
+      "log"
+    ],
+    "feature_fraction": [
+      0.05,
+      1.0,
+      "lineal"
+    ],
+    "bagging_fraction": [
+      0.05,
+      1.0,
+      "lineal"
+    ]
+  },
+  "referencias_extra": [
+    {
+      "nombre": "p117_4102",
+      "params": {
+        "learning_rate": 0.0841955833978562,
+        "num_leaves": 81,
+        "min_data_in_leaf": 3994,
+        "feature_fraction": 0.20103345480390813,
+        "bagging_fraction": 0.23230822267251724,
+        "lambda_l1": 0.0013403511313236994,
+        "lambda_l2": 0.005891768464365107
+      },
+      "arboles": 181
+    },
+    {
+      "nombre": "p35_4104",
+      "params": {
+        "learning_rate": 0.06300497368040801,
+        "num_leaves": 14,
+        "min_data_in_leaf": 5659,
+        "feature_fraction": 0.20136660177949867,
+        "bagging_fraction": 0.2147798483846397,
+        "lambda_l1": 0.001,
+        "lambda_l2": 0.001
+      },
+      "arboles": 238
+    },
+    {
+      "nombre": "p23_4104",
+      "params": {
+        "learning_rate": 0.0678,
+        "num_leaves": 41,
+        "min_data_in_leaf": 10124,
+        "feature_fraction": 0.1798,
+        "bagging_fraction": 0.3124,
+        "lambda_l1": 0.001,
+        "lambda_l2": 0.001
+      },
+      "arboles": 580
+    }
+  ],
+  "top_confirmar": 5,
+  "semillas_confirmacion": 20,
+  "regla_minimo_semillas_ganadas": 14
+}

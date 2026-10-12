@@ -1,0 +1,129 @@
+"""Prediccion de un mes sin respuestas (agosto) y archivo de submit.
+
+Formato pedido por la plataforma:
+- archivo .csv, con un nombre distinto en cada submit (nunca repetido);
+- solo los numero_de_cliente a los que se envia estimulo, uno por linea, entre 8000 y 15000;
+- sin encabezado;
+- ids como enteros (nunca en notacion cientifica, ej. 48000000 y no 4.8e+07).
+
+Los archivos quedan en submits/ y cada uno se anota en submits/registro.md.
+"""
+import datetime
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+from . import config
+from .datos import separar
+from .ensamble import predecir_promedio_semillas
+
+MIN_REGISTROS = 8000
+MAX_REGISTROS = 15000
+
+
+def armar_prediccion(data, meses_train, mes_prediccion, columnas_excluidas=(), clase_objetivo='baja2'):
+    """Train con meses_train (con respuestas) y las filas de mes_prediccion (sin respuestas).
+
+    clase_objetivo: 'baja2' (modelo A) o 'baja1y2' (modelo B). 'umbral' es el corte de decision
+    (0.025 en el A; 0.025 / s en el B, con s = BAJA+2 / positivos del train).
+    """
+    if any(m >= mes_prediccion for m in meses_train):
+        raise ValueError(f'Los meses de train {list(meses_train)} tienen que ser anteriores a {mes_prediccion}')
+    for mes in meses_train:
+        if data.loc[data['foto_mes'] == mes, 'clase_ternaria'].isna().any():
+            raise ValueError(f'El mes {mes} no tiene la clase completa (BAJA+2 desconocida): no sirve para train')
+    datos_mes = data[data['foto_mes'] == mes_prediccion]
+    if datos_mes.empty:
+        raise ValueError(f'No hay filas del mes {mes_prediccion}')
+    X_train, y_baja2, clase_train = separar(data, meses_train, columnas_excluidas)
+    if clase_objetivo == 'baja2':
+        y_train = y_baja2
+    else:
+        y_train = clase_train.isin(config.CLASES_OBJETIVO[clase_objetivo]).astype('int64')
+    X_pred, _, _ = separar(data, [mes_prediccion], columnas_excluidas)
+    return {
+        'meses_train': list(meses_train),
+        'mes_prediccion': mes_prediccion,
+        'X_train': X_train,
+        'y_train': y_train,
+        'umbral': config.UMBRAL / (y_baja2.sum() / y_train.sum()),
+        'train_lgb': lgb.Dataset(X_train, label=y_train),
+        'X_pred': X_pred,
+        'ids': datos_mes['numero_de_cliente'].to_numpy(dtype='int64'),
+    }
+
+
+def predecir(params, num_boost_round, prediccion, semillas, undersampling=None, archivo=None):
+    """Ensamble de semillas entrenado con los meses de train; probabilidades del mes a predecir."""
+    return predecir_promedio_semillas(
+        params, num_boost_round, prediccion['train_lgb'], prediccion['X_pred'], semillas,
+        archivo=archivo, y_train=prediccion['y_train'], undersampling=undersampling,
+    )
+
+
+def clientes_a_contactar(ids, y_pred, corte='umbral', umbral=None):
+    """ids a estimular. corte = 'umbral' (p >= umbral, por defecto config.UMBRAL) o un entero N
+    (los N de mayor probabilidad)."""
+    umbral = config.UMBRAL if umbral is None else umbral
+    ids, y_pred = np.asarray(ids), np.asarray(y_pred)
+    if corte == 'umbral':
+        elegidos = ids[y_pred >= umbral]
+    elif isinstance(corte, (int, np.integer)) and corte > 0:
+        elegidos = ids[np.argsort(y_pred)[::-1][:corte]]
+    else:
+        raise ValueError(f"corte tiene que ser 'umbral' o una cantidad de clientes, no {corte!r}")
+    return np.sort(elegidos.astype('int64'))
+
+
+def guardar_submit(ids, nombre, carpeta=None):
+    """Valida el formato y guarda submits/<nombre>_<fecha-hora>.csv. Devuelve la ruta.
+
+    Nunca pisa un archivo: la fecha y hora en el nombre lo hace unico.
+    """
+    carpeta = carpeta or config.SUBMITS_DIR
+    carpeta.mkdir(parents=True, exist_ok=True)
+    ids = np.asarray(ids)
+
+    if not np.issubdtype(ids.dtype, np.integer):
+        raise ValueError(f'Los ids tienen que ser enteros, no {ids.dtype}')
+    if len(np.unique(ids)) != len(ids):
+        raise ValueError('Hay numero_de_cliente repetidos')
+    if not MIN_REGISTROS <= len(ids) <= MAX_REGISTROS:
+        raise ValueError(f'El submit tiene {len(ids)} clientes; la plataforma pide entre '
+                         f'{MIN_REGISTROS} y {MAX_REGISTROS}. Cambiar el corte.')
+
+    sello = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    archivo = carpeta / f'{nombre}_{sello}.csv'
+    if archivo.exists():
+        raise FileExistsError(archivo)
+    archivo.write_text(''.join(f'{int(i)}\n' for i in ids), encoding='utf-8')
+
+    # control: se relee como texto y se verifica linea por linea
+    lineas = archivo.read_text(encoding='utf-8').splitlines()
+    assert len(lineas) == len(ids) and all(l.isdigit() for l in lineas), 'El archivo no quedo con ids enteros'
+    return archivo
+
+
+def anotar_en_registro(archivo, experimento, trial, corte, ids, y_pred, meses_train, carpeta=None):
+    """Agrega una fila a submits/registro.md para saber despues que se mando en cada archivo."""
+    carpeta = carpeta or config.SUBMITS_DIR
+    registro = carpeta / 'registro.md'
+    if not registro.exists():
+        registro.write_text(
+            '# Submits generados\n\n'
+            '| Archivo | Experimento | Trial | Train | Corte | Clientes | p minima enviada |\n'
+            '|---|---|---|---|---|---|---|\n', encoding='utf-8')
+    p_min = float(np.sort(np.asarray(y_pred))[::-1][len(ids) - 1])
+    with registro.open('a', encoding='utf-8') as f:
+        f.write(f"| `{archivo.name}` | {experimento} | {trial} | {', '.join(map(str, meses_train))} "
+                f"| {corte} | {len(ids)} | {p_min:.4f} |\n")
+
+
+def resumen_cortes(y_pred, cortes=(8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000), umbral=None):
+    """Cuantos clientes manda p >= umbral (por defecto 0.025) y que probabilidad minima tiene cada cantidad fija."""
+    umbral = config.UMBRAL if umbral is None else umbral
+    orden = np.sort(np.asarray(y_pred))[::-1]
+    filas = [{'corte': f'p >= {umbral:.4g}', 'clientes': int((orden >= umbral).sum()), 'p_minima': umbral}]
+    filas += [{'corte': f'top {n}', 'clientes': n, 'p_minima': float(orden[n - 1])} for n in cortes if n <= len(orden)]
+    return pd.DataFrame(filas)

@@ -1,0 +1,37 @@
+{
+  "pruebas_completas": 100,
+  "mejor_cv_M": 565.6,
+  "ranking_test": [
+    {
+      "prueba": 73,
+      "ganancia_test_M": 396.4,
+      "desvio_M": 5.6,
+      "corte_optimo": 13000
+    },
+    {
+      "prueba": 97,
+      "ganancia_test_M": 389.3,
+      "desvio_M": 10.7,
+      "corte_optimo": 13500
+    },
+    {
+      "prueba": 52,
+      "ganancia_test_M": 387.8,
+      "desvio_M": 2.5,
+      "corte_optimo": 13500
+    },
+    {
+      "prueba": 84,
+      "ganancia_test_M": 380.4,
+      "desvio_M": 8.8,
+      "corte_optimo": 14000
+    },
+    {
+      "prueba": 47,
+      "ganancia_test_M": 380.0,
+      "desvio_M": 6.4,
+      "corte_optimo": 15500
+    }
+  ],
+  "_minutos": 214.55
+}

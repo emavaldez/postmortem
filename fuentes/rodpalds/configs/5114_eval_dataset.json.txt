@@ -1,0 +1,7 @@
+{
+  "experimento": 5114,
+  "nombre": "eval_dataset",
+  "sobrescribir": true,
+  "descripcion": "Solo cambia el dataset: prueba 23 sobre ds3003 (5015) contra prueba 23 sobre ds3007 (FE del profesor: 1.1, 1.3, 1.4). Train 202103+202104, junio completo, 20 semillas pareadas. R8 fijada de antemano: se adopta ds3007 si no es mas de 3 M peor.",
+  "n_semillas": 20
+}

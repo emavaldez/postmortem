@@ -1,0 +1,18 @@
+{
+  "experimento": 3002,
+  "nombre": "fe_lag2_rank_total",
+  "descripcion": "Lags y deltas 1 y 2 sobre valores crudos; despues todas las columnas rankeadas dentro de cada mes con cero fijo (positivos 0..1, negativos -1..0, NA se mantiene).",
+  "dataset_entrada": "ds1001_base.parquet",
+  "dataset_salida": "ds3002_rank_total.parquet",
+  "lags": [
+    1,
+    2
+  ],
+  "deltas": [
+    1,
+    2
+  ],
+  "_fecha_inicio": "2026-10-09 01:21:57",
+  "_script": "03b_fe_rank_total.py",
+  "_git_commit": "sin_git"
+}

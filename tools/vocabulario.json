@@ -1,0 +1,73 @@
+{
+ "modelo": {
+  "lightgbm": "LightGBM",
+  "xgboost": "XGBoost",
+  "catboost": "CatBoost",
+  "random_forest": "Random Forest",
+  "arbol_decision": "Árbol de decisión (rpart u otro)",
+  "regresion_logistica": "Regresión logística",
+  "red_neuronal": "Red neuronal",
+  "otro_modelo": "Otro modelo"
+ },
+ "clase": {
+  "binaria_baja2": "Clase binaria: positivo = BAJA+2",
+  "binaria_baja1_baja2": "Clase binaria: positivo = BAJA+1 o BAJA+2",
+  "multiclase": "Tres clases (CONTINUA, BAJA+1, BAJA+2)",
+  "pesos_por_clase": "Pesos distintos por clase o por fila al entrenar",
+  "clase_artificial": "Clase artificial o pseudo-etiquetas para meses sin clase"
+ },
+ "datos": {
+  "submuestreo_continua": "Submuestreo de la clase CONTINUA",
+  "variables_rotas_a_na": "Variables rotas en algún mes pasadas a NA o corregidas",
+  "excluye_variables": "Excluye variables a mano (por ejemplo préstamos personales)"
+ },
+ "drifting": {
+  "rank_por_mes": "Rank o percentil de variables dentro de cada mes",
+  "rank_cero_fijo": "Rank con cero fijo",
+  "deflacion": "Deflación por IPC, dólar o UVA",
+  "estandarizacion_por_mes": "Estandarización o normalización por mes"
+ },
+ "variables": {
+  "intra_mes": "Variables nuevas dentro del mes (sumas, cocientes, combinaciones)",
+  "lags": "Lags",
+  "deltas": "Deltas (diferencia con meses anteriores)",
+  "tendencias": "Tendencias (pendiente en una ventana)",
+  "promedios_ventana": "Promedios móviles o de ventana",
+  "min_max_ventana": "Mínimos y máximos de ventana",
+  "ratios_historia": "Cocientes contra valores anteriores o contra la ventana",
+  "canaritos": "Canaritos (variables al azar para medir ruido)",
+  "seleccion_por_importancia": "Selección de variables por importancia"
+ },
+ "hiperparametros": {
+  "optimizacion_bayesiana": "Optimización bayesiana (mlrMBO, mlr3mbo, bbotk, skopt u otra)",
+  "optuna": "Optuna",
+  "grilla_o_azar": "Búsqueda en grilla o al azar",
+  "fijos": "Hiperparámetros fijos escritos en el código"
+ },
+ "validacion": {
+  "mes_futuro": "Validación en un mes posterior al entrenamiento",
+  "particion_aleatoria": "Partición aleatoria de entrenamiento y validación",
+  "validacion_cruzada": "Validación cruzada",
+  "varios_meses_de_prueba": "Prueba en más de un mes (backtesting)",
+  "ganancia_como_metrica": "Usa la ganancia de la competencia como métrica"
+ },
+ "ensamble": {
+  "semillerio": "Promedio de varias semillas del mismo modelo",
+  "modelos_distintos": "Combina modelos o configuraciones distintas",
+  "stacking": "Stacking (un modelo sobre las salidas de otros)"
+ },
+ "corte": {
+  "cantidad_fija": "Envía una cantidad fija de clientes",
+  "umbral_probabilidad": "Corta por umbral de probabilidad",
+  "elegido_en_validacion": "El corte sale de una curva de ganancia en meses con clase",
+  "varios_cortes": "Genera archivos con varios cortes"
+ },
+ "final": {
+  "reentrena_con_todo": "El modelo final se reentrena sumando los meses usados para validar"
+ },
+ "proceso": {
+  "bitacora": "Incluye bitácora o registro de experimentos",
+  "uso_de_ia_declarado": "El repositorio declara el uso de asistentes de IA",
+  "automatizacion_envios": "Incluye código para enviar al bot o a la plataforma"
+ }
+}

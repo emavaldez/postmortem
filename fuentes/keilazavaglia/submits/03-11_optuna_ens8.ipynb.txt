@@ -1,0 +1,112 @@
+#%% celda 1 [texto]
+# Ensamble Optuna (receta del profesor) - submit
+
+Los mejores trials de z005 (ordenados por el promedio de 5 semillas), entrenados con 202103-202106,
+predicen 202108; se promedian las probabilidades por cliente y se guarda el top N para varios cortes.
+
+- Opción A: `SEMILLAS = [501419]` (8 modelos, ~15 min).
+- Opción B: 3 semillas (24 modelos) para el archivo final.
+
+**Submits 3 a 11** (un corte por submit: 10.000 a 14.000). Este notebook guardó 3 cortes y las probabilidades en `optuna_ens_probs_8modelos.parquet`; los 9 archivos numerados (`3_optuna_ens8_10000.csv` … `11_optuna_ens8_12000.csv`) se generaron desde ese parquet.
+
+#%% celda 2 [código]
+# --- 1. Librerías y parámetros ---
+import time
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+MESES_FINAL = [202103, 202104, 202105, 202106]
+MES_PRED    = 202108
+TOP_TRIALS  = 8
+SEMILLAS    = [501419]                 # opción A; para la B: [501419, 623353, 786349]
+CORTES      = [11_500, 12_000, 12_500]
+
+params_fijos = {
+    "objective": "binary", "learning_rate": 0.005, "min_data_in_leaf": 0,
+    "feature_fraction": 0.5, "feature_fraction_bynode": 0.2, "max_bin": 31, "verbose": -1,
+}
+
+# Los mejores trials de z005 (ranking por promedio de 5 semillas)
+ranking = pd.read_csv("../0_exploracion/z005_top10_5semillas.csv", sep=";", decimal=",",
+                      encoding="utf-8-sig", index_col="trial").head(TOP_TRIALS)
+ranking[["params_num_leaves", "params_min_sum_hessian_in_leaf", "user_attrs_best_iter", "ganancia_max_M_mean"]]
+
+#%% celda 3 [código]
+# --- 2. Cargar datos, target y lags (igual que z003) ---
+df = pd.read_parquet("../competencia_01.parquet")
+df["clase_binaria"] = (df["clase_ternaria"] == "BAJA+2").astype(int)
+
+no_usar = ["foto_mes", "clase_ternaria", "clase_binaria"]
+originales = [c for c in df.columns if c not in no_usar]
+cols = [c for c in originales if c != "numero_de_cliente"]
+
+df = df.sort_values(["numero_de_cliente", "foto_mes"]).reset_index(drop=True)
+grupo = df.groupby("numero_de_cliente")[cols]
+nuevas = []
+for k in [1, 2]:
+    lag = grupo.shift(k).astype("float32")
+    delta = (df[cols] - lag).astype("float32")
+    lag.columns   = [f"{c}_lag{k}" for c in cols]
+    delta.columns = [f"{c}_delta{k}" for c in cols]
+    nuevas += [lag, delta]
+df = pd.concat([df] + nuevas, axis=1)
+del nuevas, lag, delta, grupo
+
+variables = [c for c in df.columns if c not in no_usar]
+final  = df[df["foto_mes"].isin(MESES_FINAL)]
+futuro = df[df["foto_mes"] == MES_PRED][["numero_de_cliente"]].copy()
+X_futuro = df.loc[futuro.index, variables]
+datos_final = lgb.Dataset(final[variables], label=final["clase_binaria"], free_raw_data=False)
+print("Variables:", len(variables), "| filas de entrenamiento:", len(final))
+
+#%% celda 4 [código]
+# --- 3. Entrenar cada trial con cada semilla y predecir 202108 ---
+columnas_prob = []
+for trial, r in ranking.iterrows():
+    p = {**params_fijos, "num_leaves": int(r["params_num_leaves"]),
+         "min_sum_hessian_in_leaf": float(r["params_min_sum_hessian_in_leaf"])}
+    for semilla in SEMILLAS:
+        inicio = time.time()
+        modelo = lgb.train({**p, "seed": semilla}, datos_final, num_boost_round=int(r["user_attrs_best_iter"]))
+        col = f"prob_t{trial}_s{semilla}"
+        futuro[col] = modelo.predict(X_futuro)
+        columnas_prob.append(col)
+        print(f"Trial {trial}, semilla {semilla}: {(time.time() - inicio) / 60:.1f} min")
+
+# Ensamble: promedio de probabilidades por cliente
+futuro["prob_ensamble"] = futuro[columnas_prob].mean(axis=1)
+futuro.to_parquet(f"optuna_ens_probs_{len(columnas_prob)}modelos.parquet")   # por si hace falta otro corte
+
+#%% celda 5 [código]
+# --- 4. Guardar un CSV por corte ---
+ordenados = futuro.sort_values("prob_ensamble", ascending=False)
+for n in CORTES:
+    archivo = f"optuna_ens{len(columnas_prob)}_{n}.csv"
+    ids = ordenados.head(n)["numero_de_cliente"].astype("int64")   # int64: sin notación científica
+    ids.to_csv(archivo, index=False, header=False)                  # sin encabezado, una columna
+    with open(archivo) as f:
+        contenido = f.read()
+    print(archivo, "| filas:", len(contenido.splitlines()), "| ¿e+?", "e+" in contenido)
+
+#%% celda 6 [código]
+# --- 5. Anotar en resultados_experimentos.csv ---
+ruta_res = "../0_exploracion/resultados_experimentos.csv"
+res = pd.read_csv(ruta_res, sep=";", decimal=",", encoding="utf-8-sig")
+
+for n in CORTES:
+    nueva = {
+        "fecha": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "descripcion": f"Ensamble Optuna z005: {TOP_TRIALS} trials x {len(SEMILLAS)} semillas, lags 1 y 2, top {n} (submit)",
+        "meses_train": str(MESES_FINAL),
+        "mes_valid": MES_PRED,
+        "semilla": str(SEMILLAS),
+        "params": str(params_fijos) + " | trials " + str(list(ranking.index)),
+        "n_enviados": n,
+        "ganancia_publica_M": None,     # completar con la respuesta del bot
+    }
+    res = pd.concat([res, pd.DataFrame([nueva])], ignore_index=True)
+
+res["n_enviados"] = res["n_enviados"].astype("Int64")
+res.to_csv(ruta_res, sep=";", decimal=",", index=False, encoding="utf-8-sig")
+res.tail(3)

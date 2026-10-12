@@ -1,0 +1,9 @@
+# Python 3.12. Versiones exactas: reemplazar por la salida de
+#   py -3.12 -m pip freeze | findstr /i "lightgbm optuna pandas numpy pyarrow plotly scipy"
+lightgbm==4.7.0
+numpy==2.5.2
+optuna==5.0.0
+pandas==3.0.5
+plotly==7.1.0
+pyarrow==24.0.0
+scipy==1.18.1

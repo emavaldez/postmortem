@@ -1,0 +1,13 @@
+{
+  "archivos": [
+    "Z6003_5008_e9000_semillerio.csv",
+    "Z6003_5008_e9500_semillerio.csv",
+    "Z6003_5008_e10000_semillerio.csv",
+    "Z6003_5008_e11000_semillerio.csv",
+    "Z6003_5008_e12000_semillerio.csv",
+    "Z6003_5008_e13000_semillerio.csv",
+    "Z6003_5008_e14000_semillerio.csv"
+  ],
+  "cuerpo": "submit 6003zulipfinal5008cortes",
+  "_minutos": 0.0
+}

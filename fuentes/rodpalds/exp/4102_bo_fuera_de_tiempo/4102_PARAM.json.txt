@@ -1,0 +1,83 @@
+{
+  "experimento": 4102,
+  "nombre": "bo_fuera_de_tiempo",
+  "descripcion": "Optuna entrenando con 202104 completo y midiendo en la mitad A de 202106 (meseta 12-17 mil envios equivalentes). Confirmacion en la mitad B con 10 semillas contra z601. Variables p95, crudo + binaria2.",
+  "reanudar": false,
+  "dataset": "ds3001_crudo.parquet",
+  "variables": "4003_canaritos/4003_variables_p95.txt",
+  "mes_train": 202104,
+  "mes_test": 202106,
+  "clase": "clase_binaria2",
+  "semilla_mitades": 571369,
+  "n_trials": 150,
+  "n_startup_trials": 25,
+  "max_boost_round": 3000,
+  "espacio": {
+    "learning_rate": [
+      0.005,
+      0.1,
+      "log"
+    ],
+    "num_leaves": [
+      8,
+      128,
+      "log"
+    ],
+    "min_data_in_leaf": [
+      50,
+      5000,
+      "log"
+    ],
+    "feature_fraction": [
+      0.1,
+      1.0,
+      "lineal"
+    ],
+    "bagging_fraction": [
+      0.2,
+      1.0,
+      "lineal"
+    ],
+    "lambda_l1": [
+      0.001,
+      10.0,
+      "log"
+    ],
+    "lambda_l2": [
+      0.001,
+      100.0,
+      "log"
+    ]
+  },
+  "lgbm_fijos": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "metric": "None",
+    "max_bin": 31,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "first_metric_only": true,
+    "deterministic": true,
+    "force_row_wise": true,
+    "verbose": -1
+  },
+  "top_confirmar": 5,
+  "semillas_confirmacion": 10,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "regla_minimo_semillas_ganadas": 7,
+  "meseta_mes_completo": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "_fecha_inicio": "2026-10-06 00:50:37",
+  "_script": "08_bo_fuera_de_tiempo.py",
+  "_git_commit": "sin_git"
+}

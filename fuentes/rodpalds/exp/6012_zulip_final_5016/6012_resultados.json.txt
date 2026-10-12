@@ -1,0 +1,12 @@
+{
+  "archivos": [
+    "Z6012_5016_e11000_semillerio.csv",
+    "Z6012_5016_e11500_semillerio.csv",
+    "Z6012_5016_e12000_semillerio.csv",
+    "Z6012_5016_e12500_semillerio.csv",
+    "Z6012_5016_e13000_semillerio.csv",
+    "Z6012_5016_e13500_semillerio.csv"
+  ],
+  "cuerpo": "submit 6012zulipfinal5016",
+  "_minutos": 0.0
+}

@@ -1,0 +1,33 @@
+{
+  "resumen": [
+    {
+      "modelo": "rank_extra_bo4105",
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": 461,
+      "hiper": "4105 p23_4104",
+      "arboles": 580,
+      "meseta_M": 438.7,
+      "maximo_M": 453.8,
+      "envios_optimos": 13500,
+      "envios_agosto_p25_p50_p75": "12,942 / 13,243 / 13,544",
+      "dif_vs_rank_bo4105_M": 5.4,
+      "IC90_M": "[-3.6 ; 14.9]",
+      "pct_remuestreos_gana": "84%"
+    },
+    {
+      "modelo": "rank_bo4105",
+      "dataset": "ds3002_rank_total.parquet",
+      "variables": 456,
+      "hiper": "4105 p23_4104",
+      "arboles": 580,
+      "meseta_M": 433.3,
+      "maximo_M": 445.5,
+      "envios_optimos": 13000,
+      "envios_agosto_p25_p50_p75": "11,236 / 12,541 / 13,042",
+      "dif_vs_rank_bo4105_M": NaN,
+      "IC90_M": NaN,
+      "pct_remuestreos_gana": NaN
+    }
+  ],
+  "_minutos": 13.93
+}

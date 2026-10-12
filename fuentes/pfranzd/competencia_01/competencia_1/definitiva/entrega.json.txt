@@ -1,0 +1,74 @@
+{
+  "tipo": "ensamble",
+  "run": "work/competencia_1/ensambles/20261011-091551_ens04_e032_e033_e034",
+  "experimento": "ens04_e032_e033_e034",
+  "metodo": "rank",
+  "pesos": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "commit_del_run": "39cd97f228f61e1b70f00ae2a0917c86a3c44653",
+  "commit_actual": "27084eb76ef3357a54928f94e6879356eb38fdf9",
+  "promovido": "2026-10-11T12:13:50-03:00",
+  "envios": 10500,
+  "modelo": "ensamble",
+  "csv_original": "20261011-091551_ens04_e032_e033_e034_e10500.csv",
+  "sha256_esperado": "385da7093ab1e93b894016de3cb537460dc48ee0cc2befdce943ddbae850d5df",
+  "versiones": {
+    "python": "3.11.0",
+    "lightgbm": "4.7.0",
+    "optuna": "4.9.0",
+    "polars": "1.43.2",
+    "duckdb": "1.5.5",
+    "numpy": "2.4.6"
+  },
+  "resultado_publico": 110.165,
+  "modelos_incluidos": 72,
+  "config_experimento": null,
+  "completo_automatico": true,
+  "componentes": [
+    {
+      "carpeta": "competencia_1/definitiva/componentes/0_e032_expansiva_auc_topk",
+      "run": "work/competencia_1/runs/20261009-232755_e032_expansiva_auc_topk",
+      "experimento": "e032_expansiva_auc_topk",
+      "peso": 1.0,
+      "envios_verificacion": 10500,
+      "sha256_csv": "5d2713bd87934be94c6c54ca9ec59ba013104090faeb5fe982228516fc9180d1",
+      "sha256_probas": "35d6e02dbc5bbcfbf5a00fecdde9e3d2d7106ed9da466c8b35860a1abb6a1e0d",
+      "modelos": 24,
+      "config_experimento": "competencia_1/configs/exp/e032_expansiva_auc_topk.yaml",
+      "completo_automatico": true
+    },
+    {
+      "carpeta": "competencia_1/definitiva/componentes/1_e033_montos_rank_cero_fijo",
+      "run": "work/competencia_1/runs/20261011-023622_e033_montos_rank_cero_fijo",
+      "experimento": "e033_montos_rank_cero_fijo",
+      "peso": 1.0,
+      "envios_verificacion": 10000,
+      "sha256_csv": "5a2267e8b4f846e84744949847a5106683054b94b4fdd6c9a2763fdb7c2be994",
+      "sha256_probas": "4f85bcb28aa43363308e96b014a02f2dd861cf9f9e5750b19cddaa8ff918879b",
+      "modelos": 24,
+      "config_experimento": "competencia_1/configs/exp/e033_montos_rank_cero_fijo.yaml",
+      "completo_automatico": true
+    },
+    {
+      "carpeta": "competencia_1/definitiva/componentes/2_e034_comportamiento",
+      "run": "work/competencia_1/runs/20261011-041115_e034_comportamiento",
+      "experimento": "e034_comportamiento",
+      "peso": 1.0,
+      "envios_verificacion": 10000,
+      "sha256_csv": "0a957ababbff26f9a858066ff0d371d36378aef20dfe4e5217dde98043c10e41",
+      "sha256_probas": "d814de96315bf1519fd78ff69b790ce8705264c9fd44041ac535922e56d70eda",
+      "modelos": 24,
+      "config_experimento": "competencia_1/configs/exp/e034_comportamiento.yaml",
+      "completo_automatico": true
+    }
+  ],
+  "cadena_config": [
+    "competencia_1/configs/base.yaml",
+    "competencia_1/configs/exp/e032_expansiva_auc_topk.yaml",
+    "competencia_1/configs/exp/e033_montos_rank_cero_fijo.yaml",
+    "competencia_1/configs/exp/e034_comportamiento.yaml"
+  ]
+}

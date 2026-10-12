@@ -1,0 +1,40 @@
+
+===== 013 2026-10-07 18:12 | semillas [676057, 482687, 399221, 121109, 292131] =====
+[A s=676057] MC_MIX6 236.8 | rank 236.9 | solo M1 235.3 | M1_top1 231.1 (5 min)
+[A s=482687] MC_MIX6 247.9 | rank 246.9 | solo M1 242.1 | M1_top1 237.9 (11 min)
+[A s=399221] MC_MIX6 243.4 | rank 243.4 | solo M1 240.9 | M1_top1 239.0 (16 min)
+[A s=121109] MC_MIX6 241.0 | rank 241.2 | solo M1 235.7 | M1_top1 235.9 (21 min)
+[A s=292131] MC_MIX6 246.9 | rank 246.9 | solo M1 244.3 | M1_top1 243.2 (27 min)
+[B s=676057] MC_MIX6 404.8 | rank 405.2 | solo M1 405.4 | M1_top1 406.7 (33 min)
+[B s=482687] MC_MIX6 400.3 | rank 401.2 | solo M1 402.2 | M1_top1 404.7 (39 min)
+[B s=399221] MC_MIX6 404.1 | rank 404.5 | solo M1 404.8 | M1_top1 405.5 (45 min)
+[B s=121109] MC_MIX6 400.4 | rank 401.4 | solo M1 400.9 | M1_top1 403.7 (51 min)
+[B s=292131] MC_MIX6 407.6 | rank 408.6 | solo M1 409.8 | M1_top1 408.5 (57 min)
+[Bh s=676057] MC_MIX6 394.9 | rank 398.5 | solo M1 397.2 | M1_top1 392.7 (62 min)
+[Bh s=482687] MC_MIX6 397.2 | rank 400.9 | solo M1 397.0 | M1_top1 393.8 (68 min)
+[Bh s=399221] MC_MIX6 391.5 | rank 393.4 | solo M1 395.9 | M1_top1 393.4 (73 min)
+[Bh s=121109] MC_MIX6 391.6 | rank 393.4 | solo M1 392.6 | M1_top1 388.0 (78 min)
+[Bh s=292131] MC_MIX6 399.7 | rank 403.1 | solo M1 395.6 | M1_top1 395.6 (83 min)
+
+Niveles (M ARS):
+fold               A      B     Bh
+modelo                            
+M0_top1        240.9  391.3  379.7
+M0_top2        243.0  391.0  382.1
+M0_top3        243.5  393.0  383.9
+M1_top1        237.4  405.8  392.7
+M1_top2        240.0  400.1  393.4
+M1_top3        239.9  402.7  394.6
+MC_M1_rank     239.7  404.6  395.6
+MC_MIX6        243.2  403.4  395.0
+MC_MIX6_rank   243.1  404.2  397.9
+BIN_MIX6       234.2  397.5  386.2
+BIN_MIX6_rank  234.3  398.7  388.5
+
+Diferencias pareadas:
+                 comparacion  A_delta  A_ee  B_delta  B_ee  Bh_delta  Bh_ee pares_positivos
+          MC_MIX6 - BIN_MIX6     9.02  0.93     5.89  0.95      8.75   0.79           15/15
+MC_MIX6_rank - BIN_MIX6_rank     8.77  1.00     5.53  0.84      9.32   1.06           15/15
+      MC_MIX6_rank - MC_MIX6    -0.14  0.21     0.77  0.15      2.89   0.42           12/15
+   MC_M1_rank - MC_MIX6_rank    -3.41  0.74     0.41  0.28     -2.23   1.68            5/15
+[013] terminado

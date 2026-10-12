@@ -1,0 +1,7 @@
+{
+  "R8": "R8: p23_ds3007 432.7 M vs p23_ds3003 436.5 M (dif -3.7 M) -> QUEDARSE CON 5015 (ds3003)",
+  "dif_media_M": -3.74,
+  "semillas_gana": 4,
+  "adoptar": false,
+  "_minutos": 46.25
+}

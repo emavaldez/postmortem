@@ -1,0 +1,28 @@
+{
+  "experimento": 2002,
+  "nombre": "diagnostico_ceros_na",
+  "descripcion": "Tasa de BAJA+2 segun la variable sea NA, cero, negativa o positiva (meses con clase completa) y orden en que los BAJA+2 apagan sus productos.",
+  "dataset": "ds1001_base.parquet",
+  "meses": [
+    202103,
+    202104,
+    202105,
+    202106
+  ],
+  "min_clientes_grupo": 500,
+  "productos_clave": [
+    "ctarjeta_visa_transacciones",
+    "ctarjeta_master_transacciones",
+    "mtarjeta_visa_consumo",
+    "mpayroll",
+    "mcuentas_saldo",
+    "chomebanking_transacciones",
+    "cmobile_app_trx",
+    "mprestamos_personales",
+    "ctrx_quarter",
+    "cproductos"
+  ],
+  "_fecha_inicio": "2026-10-09 01:21:54",
+  "_script": "02b_diagnostico_ceros_na.py",
+  "_git_commit": "sin_git"
+}

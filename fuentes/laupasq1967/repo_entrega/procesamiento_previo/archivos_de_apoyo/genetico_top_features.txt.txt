@@ -1,0 +1,2 @@
+signature   op  var1    var2    fitness
+ctrx_quarter + cpayroll_trx_min3    +   ctrx_quarter    cpayroll_trx_min3   0.875170049465404

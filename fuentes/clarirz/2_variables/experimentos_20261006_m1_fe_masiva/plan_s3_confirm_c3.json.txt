@@ -1,0 +1,47 @@
+{
+  "version": "c1m1femasiva03_s3_confirm_c3_v1",
+  "run_c1": "c1m1femasiva03",
+  "stage": "S3_CONFIRM_C3",
+  "parent_stage": "S2",
+  "reference": "M1_RAW",
+  "candidate": "C3_HIST_MAS_TARJETAS",
+  "target_train": "baja2_vs_rest",
+  "dataset_sha256": "59231e670a1342ad6f689ad7edc7ece047fc9f7115c6d7845e6c72fa3bbd95bb",
+  "public_exposure": "PUBLIC_INFORMED",
+  "fold": {
+    "name": "junio",
+    "train": [202103, 202104],
+    "eval": 202106
+  },
+  "seeds": [17,101,202,303,404,505,606,707,808,909,1001,1102,1203,1304,1405,1506,1607,1708,1809,1910],
+  "rounds": 300,
+  "cuts": [10500,11000,11500],
+  "fixed_cut": 11000,
+  "reference_features": {
+    "raw": 152,
+    "derived": []
+  },
+  "candidate_features": {
+    "components": ["S2_HIST_CORE","S2_TARJETAS_RATIOS"],
+    "source_plan": "plan_s2_familias.json",
+    "reuse_fe_bank": true
+  },
+  "decision": {
+    "promote_if_all": [
+      "delta_banda_medio > 0",
+      "delta_11000_medio > 0",
+      "delta_banda_mediana > 0",
+      "positive_seed_fraction >= 0.60"
+    ],
+    "interpretation": "Filtro operativo de robustez algorítmica; las seeds no son meses independientes ni un test formal."
+  },
+  "no_tuning": true,
+  "no_august": true,
+  "no_submits": true,
+  "notes": [
+    "Se retrenan ambos brazos bajo el mismo runner y mismas 20 seeds; no se seleccionan seeds por resultado.",
+    "Se reutiliza el banco FE de S1; no se regeneran las 3364 FE.",
+    "Junio es el fold primario porque el train marzo-abril permite aprender historia.",
+    "Mayo no se usa para confirmar C3 porque marzo no enseña las features históricas."
+  ]
+}

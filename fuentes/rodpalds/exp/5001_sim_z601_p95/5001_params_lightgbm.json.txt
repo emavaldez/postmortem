@@ -1,0 +1,19 @@
+{
+  "origen": "z601",
+  "arboles": 250,
+  "params": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "max_bin": 31,
+    "num_leaves": 16,
+    "learning_rate": 0.019868,
+    "min_data_in_leaf": 816,
+    "feature_fraction": 0.277155,
+    "bagging_fraction": 0.63413,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "deterministic": true,
+    "force_row_wise": true,
+    "verbose": -1
+  }
+}

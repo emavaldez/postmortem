@@ -1,0 +1,1075 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–32] Docstring con los dos modos del script (`experimento` y `entrega`) y un ejemplo de
+#   invocación de cada uno. Importa argparse, json, platform, shutil, subprocess, sys, time, datetime, Path,
+#   lightgbm, numpy, optuna, pandas y yaml.
+# -*- coding: utf-8 -*-
+"""Modelado de la competencia 01: optimiza, mide, y genera las entregas.
+
+    python modelar_competencia_01.py --modo experimento
+    python modelar_competencia_01.py --modo entrega --desde experimentos/2026...
+
+DOS MODOS
+
+  experimento : (datos + rangos de hiperparametros) -> Optuna -> reentrena con los
+                ganadores -> mide contra el mes de test. Escribe una carpeta en
+                experimentos/ y apendea una linea a experimentos/experimentos.csv.
+  entrega     : toma de una carpeta de experimentos/ los hiperparametros Y el corte
+                optimo que midio, entrena, scorea el mes de aplicacion y escribe los
+                .csv del submit en entregas/.
+
+"""
+
+import argparse
+import json
+import platform
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import lightgbm as lgb
+import numpy as np
+import optuna
+import pandas as pd
+import yaml
+
+# [Anotación · líneas 34–68] Constantes del problema: ganancia por acierto 1.072.500 y costo por estímulo
+#   27.500; clases positivas del entrenamiento `BAJA+1` y `BAJA+2`; columnas que nunca son variables del modelo
+#   (`numero_de_cliente`, `foto_mes`, `clase_ternaria`, `clase_binaria`, `t`); mes de aplicación 202108; rango
+#   de registros aceptado para un archivo (8.000 a 15.000); semilla base 100019; y las carpetas `experimentos/`
+#   y `entregas/` con el archivo `experimentos/experimentos.csv`.
+# ------------------------------------------------------------------- constantes
+
+# El caso de negocio. El 0.025 de la catedra es exactamente
+# COSTO / (GANANCIA + COSTO) = 27.500 / 1.100.000: la probabilidad de equilibrio, o sea
+# a partir de que probabilidad estimular deja de ser plata perdida.
+GANANCIA_ACIERTO = 1_072_500
+COSTO_ESTIMULO = 27_500
+
+# El target de entrenamiento: BAJA+1 y BAJA+2 juntos contra CONTINUA. z601 lo midio mejor
+# que BAJA+2 contra el resto, y en pruebas posteriores la curva es plana entre dar peso 0.5
+# y 1.0 a los BAJA+1. OJO con la asimetria: la ganancia se cobra SOLO por BAJA+2. El target
+# de entrenamiento y la metrica de negocio son distintos a proposito.
+CLASES_POSITIVAS = ['BAJA+1', 'BAJA+2']
+
+# Nunca son features: la llave, el tiempo y cualquier cosa derivada del target.
+# 'foto_mes' se saca ademas por una razon propia: con varios meses apilados el modelo
+# partiria por ella, y el mes de aplicacion es un valor que ningun arbol vio, asi que
+# todas sus filas caerian para el mismo lado del corte.
+# 't' y 'clase_binaria' no estan en el parquet actual (fe_competencia_01.py hace
+# 'exclude (t)'); quedan como guarda porque 't' es foto_mes disfrazada.
+COLS_PROHIBIDAS = {'numero_de_cliente', 'foto_mes', 'clase_ternaria', 'clase_binaria', 't'}
+
+# El bot rechaza los archivos fuera de este rango.
+# El mes a predecir. Es un hecho de la competencia, no un parametro del experimento:
+# si viviera en el yaml, alguien lo cambiaria por accidente y la entrega saldria
+# sobre un mes equivocado sin que nada se queje.
+MES_APLICACION = 202108
+
+MIN_REGISTROS, MAX_REGISTROS = 8_000, 15_000
+
+SEMILLA_BASE = 100019
+
+DIR_EXPERIMENTOS = Path('experimentos')
+DIR_ENTREGAS = Path('entregas')
+CSV_LOG = DIR_EXPERIMENTOS / 'experimentos.csv'
+
+# [Anotación · líneas 70–105] Define qué claves del YAML son opciones del script (`CLAVES_NO_LGB`) y qué 13
+#   parámetros de LightGBM se aceptan (`PARAMS_LGB`), cada uno con su tipo y si se busca en escala logarítmica
+#   (`min_sum_hessian_in_leaf`, `learning_rate`, `lambda_l1` y `lambda_l2`). `PARAMS_FIJOS_SIEMPRE` fija para
+#   todos los modelos: objective binary, metric auc, verbose -1, deterministic True, force_row_wise True y
+#   num_threads 16.
+# Las claves del yaml que NO son parametros de LightGBM. Todo lo demas se interpreta como
+# tal: escalar = fijo, lista [min, max] = rango que busca Optuna.
+CLAVES_NO_LGB = {'nombre', 'pregunta', 'dataset', 'meses_train', 'estrategia_meses',
+                 'mes_test', 'semillas', 'trials', 'folds', 'test_size', 'top_n',
+                 'mes_aplicacion', 'permitir_gap_corto', 'meses_train_entrega',
+                 'permitir_test_en_train', 'excluir_positivos_del_train',
+                 'optuna_timeout_horas'}
+
+# Whitelist de parametros de LightGBM aceptados. Sirve para atrapar typos: sin esto, una
+# clave mal escrita en el yaml se pasaria a LightGBM, que solo avisa con un warning y
+# sigue — el parametro quedaria en su default y nadie se enteraria.
+# (tipo, escala logaritmica). min_sum_hessian_in_leaf va en log porque su rango abarca 5
+# ordenes de magnitud: en lineal, Optuna gastaria casi todos los trials entre 1 y 10 y
+# practicamente nunca probaria 0.001.
+PARAMS_LGB = {
+    'max_bin': ('int', False),
+    'num_leaves': ('int', False),
+    'num_iterations': ('int', False),
+    'min_data_in_leaf': ('int', False),
+    'min_sum_hessian_in_leaf': ('float', True),
+    'feature_fraction': ('float', False),
+    'feature_fraction_bynode': ('float', False),
+    'bagging_fraction': ('float', False),
+    'bagging_freq': ('int', False),
+    'learning_rate': ('float', True),
+    'lambda_l1': ('float', True),
+    'lambda_l2': ('float', True),
+    'min_gain_to_split': ('float', False),
+}
+
+# Los que el script fija siempre; no se configuran.
+# num_threads fijo y no 0: con 0 LightGBM usa todos los nucleos de la maquina, y con
+# otra cantidad de hilos los arboles pueden no salir identicos. La entrega se genero
+# con 16 (lo que daba 0 en esa maquina), asi que replicarla exacta pide 16.
+PARAMS_FIJOS_SIEMPRE = {'objective': 'binary', 'metric': 'auc', 'verbose': -1,
+                        'deterministic': True, 'force_row_wise': True, 'num_threads': 16}
+
+
+# [Anotación · líneas 108–145] Tres funciones de ganancia. `ganancia_curva` ordena los clientes por puntaje
+#   descendente (orden estable) y devuelve la ganancia acumulada: +1.072.500 por cada BAJA+2 y −27.500 por cada
+#   cliente que no lo es. `mejor_corte` devuelve la posición del máximo de esa curva y su ganancia.
+#   `curva_en_grilla` muestrea la curva cada 250 clientes.
+# ---------------------------------------------------------------------- ganancia
+
+def ganancia_curva(proba, es_baja2):
+    """Ganancia acumulada ordenando los clientes por `proba` descendente.
+
+    `proba` puede ser una probabilidad o un ranking promediado: solo importa el orden.
+    Devuelve un array donde la posicion i es la ganancia de estimular a los i+1 clientes
+    de mayor score.
+
+    Se cobra SOLO por BAJA+2: cada uno estimulado suma GANANCIA_ACIERTO, y cada estimulo
+    que no era BAJA+2 cuesta COSTO_ESTIMULO. Un BAJA+1 paga lo mismo que un CONTINUA, que
+    es cero.
+
+    No asume que recibe el mes completo: trabaja con las filas que le pasen, que es lo que
+    va a necesitar la simulacion publico/privado.
+
+    `kind='stable'` para que los empates se desempaten por orden original y la salida sea
+    reproducible. Importa porque el ensemble promedia RANKINGS, y los promedios de rangos
+    colisionan mas seguido que las probabilidades crudas.
+    """
+    ganancia = (np.where(es_baja2 == 1, GANANCIA_ACIERTO, 0)
+                - np.where(es_baja2 == 0, COSTO_ESTIMULO, 0))
+    orden = np.argsort(proba, kind='stable')[::-1]
+    return np.cumsum(ganancia[orden])
+
+
+def mejor_corte(proba, es_baja2):
+    """(corte, ganancia) en el maximo de la curva acumulada."""
+    acum = ganancia_curva(proba, es_baja2)
+    corte = int(np.argmax(acum)) + 1
+    return corte, float(acum[corte - 1])
+
+
+def curva_en_grilla(proba, es_baja2, paso=250):
+    """La curva muestreada cada `paso` clientes, para graficar y para comparar corridas."""
+    acum = ganancia_curva(proba, es_baja2)
+    cortes = range(paso, len(acum) + 1, paso)
+    return pd.DataFrame([{'corte': c, 'ganancia': float(acum[c - 1])} for c in cortes])
+
+
+# [Anotación · líneas 148–179] `objetivo_optuna`: arma los parámetros de un trial (fijos del config,
+#   `PARAMS_FIJOS_SIEMPRE`, seed 100019 y un valor sugerido por Optuna para cada parámetro con rango), separa
+#   `num_iterations` para usarlo como cantidad de rondas, entrena un LightGBM por fold y calcula el AUC en la
+#   parte de validación. Tras cada fold informa a Optuna el promedio acumulado y corta el trial si el pruner lo
+#   indica. Devuelve el AUC promedio.
+# ------------------------------------------------------------------ optimizacion
+
+def objetivo_optuna(trial, X, y, folds, fijos, buscados):
+    """Lo que Optuna maximiza: el AUC promedio entre folds.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    params = dict(fijos)
+    params.update(PARAMS_FIJOS_SIEMPRE)
+    params['seed'] = SEMILLA_BASE
+
+    for nombre, (lo, hi) in buscados.items():
+        tipo, log = PARAMS_LGB[nombre]
+        params[nombre] = (trial.suggest_int(nombre, int(lo), int(hi), log=log)
+                          if tipo == 'int' else
+                          trial.suggest_float(nombre, float(lo), float(hi), log=log))
+
+    # num_iterations va aparte, como num_boost_round. Se guarda ya, antes de cualquier
+    # poda posible, para que el mejor trial siempre lo tenga.
+    n_iter = int(params.pop('num_iterations'))
+    trial.set_user_attr('num_iterations', n_iter)
+
+    aucs = []
+    for paso, (idx_tr, idx_va) in enumerate(folds, 1):
+        modelo = lgb.train(params, lgb.Dataset(X.iloc[idx_tr], label=y.iloc[idx_tr]),
+                           num_boost_round=n_iter)
+        aucs.append(roc_auc_score(y.iloc[idx_va], modelo.predict(X.iloc[idx_va])))
+        trial.report(float(np.mean(aucs)), step=paso)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+
+    return float(np.mean(aucs))
+
+
+# [Anotación · líneas 182–220] `graficar_optuna`: genera y guarda en la carpeta del experimento tres gráficos
+#   del estudio (`optuna_slice.png`, `optuna_history.png`, `optuna_importances.png`) con matplotlib en modo sin
+#   pantalla. Si un gráfico da error, imprime un aviso y continúa.
+def graficar_optuna(study, carpeta):
+    """Tres graficos para decidir como ajustar los rangos del config.
+
+    slice        : cada hiperparametro contra el AUC. Si los mejores trials se apilan
+                   contra un borde del rango, el rango esta mal puesto y conviene
+                   extenderlo hacia ese lado.
+    history      : el mejor AUC acumulado contra el numero de trial. Si la curva esta
+                   plana desde hace muchos trials, mas trials no van a aportar; si
+                   todavia sube, conviene seguir.
+    importances  : cuanto mueve el resultado cada hiperparametro. Los que no mueven nada
+                   se pueden fijar y liberar presupuesto de busqueda para los que si.
+    """
+    import warnings
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from optuna.visualization import matplotlib as ovm
+
+    graficos = {'optuna_slice': ovm.plot_slice,
+                'optuna_history': ovm.plot_optimization_history,
+                'optuna_importances': ovm.plot_param_importances}
+
+    for nombre, fn in graficos.items():
+        try:
+            with warnings.catch_warnings():
+                # Los graficos de optuna estan marcados como experimentales desde la v2.2
+                warnings.simplefilter('ignore')
+                ax = fn(study)
+            # plot_slice devuelve un array de Axes (uno por hiperparametro); el resto, uno
+            fig = (ax.flatten()[0] if isinstance(ax, np.ndarray) else ax).figure
+            fig.set_size_inches(max(9, 4 * (len(ax) if isinstance(ax, np.ndarray) else 1)),
+                                4.5)
+            fig.tight_layout()
+            fig.savefig(carpeta / f'{nombre}.png', dpi=120)
+            plt.close(fig)
+        except Exception as e:
+            # Un grafico que falla no tiene por que tirar abajo la corrida
+            print(f'  (no pude generar {nombre}: {type(e).__name__}: {str(e)[:70]})')
+    plt.close('all')
+
+
+# [Anotación · líneas 223–251] `optimizar`, primera parte: toma las filas de los meses de entrenamiento del
+#   config y arma la clase binaria. Con más de un mes parte los datos con `StratifiedGroupKFold` (cantidad de
+#   folds del config, shuffle, random_state 100019) usando `numero_de_cliente` como grupo; con un solo mes usa
+#   `StratifiedShuffleSplit` con el `test_size` del config.
+def optimizar(data, features, cfg, fijos, buscados, db_path, carpeta):
+    """Corre Optuna y devuelve una LISTA con los top-N trials."""
+    from sklearn.model_selection import StratifiedGroupKFold, StratifiedShuffleSplit
+
+    train = data[data['foto_mes'].isin(cfg['meses_train'])]
+    X, y = train[features], construir_target(train)
+
+    # Con VARIOS meses hay que partir por CLIENTE, no por fila. Si no, el mismo cliente
+    # cae en train (con su fila de un mes) y en validacion (con la del otro), con
+    # features casi iguales y label correlacionado. Medido sobre 202103+202104: el 81.6%
+    # de los clientes de validacion estaban tambien en train.
+    #
+    # No es cosmetico. Esa fuga premia memorizar, y empuja la busqueda a modelos mucho
+    # mas grandes: con un mes Optuna prefiere 8-49 hojas, con dos meses y fuga pedia
+    # 170-192. Un factor de 10 a 20 de capacidad, elegido por el artefacto.
+    if len(cfg['meses_train']) > 1:
+        sgk = StratifiedGroupKFold(n_splits=cfg['folds'], shuffle=True,
+                                   random_state=SEMILLA_BASE)
+        folds = list(sgk.split(X, y, groups=train['numero_de_cliente']))
+        print(f'CV: StratifiedGroupKFold por cliente ({cfg["folds"]} folds), '
+              f'{len(cfg["meses_train"])} meses apilados')
+    else:
+        # Con un solo mes cada cliente aparece una vez, asi que partir filas ya parte
+        # clientes y el ShuffleSplit permite elegir el test_size.
+        sss = StratifiedShuffleSplit(n_splits=cfg['folds'], test_size=cfg['test_size'],
+                                     random_state=SEMILLA_BASE)
+        folds = list(sss.split(X, y))
+        print(f'CV: StratifiedShuffleSplit ({cfg["folds"]} folds, '
+              f'test_size={cfg["test_size"]})')
+
+# [Anotación · líneas 253–280] Crea o reabre el estudio de Optuna `competencia_01` guardado en SQLite
+#   (`optuna.db`), con dirección maximizar, `TPESampler(seed=100019)` y `MedianPruner(n_startup_trials=10,
+#   n_warmup_steps=1)`. Cuenta los trials completos y podados ya hechos, corre los que faltan hasta `trials` con
+#   un límite de tiempo de `optuna_timeout_horas`, informa cuántos se podaron y genera los gráficos.
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction='maximize', study_name='competencia_01',
+        storage=f'sqlite:///{db_path}', load_if_exists=True,
+        sampler=optuna.samplers.TPESampler(seed=SEMILLA_BASE),
+        # n_startup_trials=10: no poda nada hasta tener 10 trials con que comparar.
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=1))
+
+    # Los podados cuentan como hechos: si no, al reanudar se volverian a correr.
+    terminados = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+    hechos = len([t for t in study.trials if t.state in terminados])
+    faltan = max(0, cfg['trials'] - hechos)
+    print(f'Optuna: {hechos} trials hechos, corro {faltan} mas ({cfg["folds"]} folds)')
+    if faltan:
+        # Con un tope de horas, Optuna deja de lanzar trials nuevos al vencer (el que
+        # esta corriendo termina). Sirve para que una corrida nocturna llegue a la
+        # manana con resultado aunque los trials salgan mas lentos de lo estimado.
+        horas = cfg.get('optuna_timeout_horas')
+        study.optimize(lambda t: objetivo_optuna(t, X, y, folds, fijos, buscados),
+                       n_trials=faltan, show_progress_bar=True,
+                       timeout=float(horas) * 3600 if horas else None)
+
+    podados = len([t for t in study.trials
+                   if t.state == optuna.trial.TrialState.PRUNED])
+    if podados:
+        print(f'  ({podados} trials podados antes de terminar los folds)')
+
+    graficar_optuna(study, carpeta)
+
+# [Anotación · líneas 282–307] Ordena los trials completos por AUC descendente, termina con error si no hay
+#   ninguno, y arma la lista de los `top_n` primeros: número de trial, AUC de la validación cruzada,
+#   `num_iterations` y parámetros (los fijos más los del trial). Imprime la lista y la devuelve.
+    # Solo los COMPLETE: un trial podado no tiene el AUC de todos los folds, asi que su
+    # valor no es comparable con el de uno que los corrio todos.
+    completos = sorted([t for t in study.trials
+                        if t.state == optuna.trial.TrialState.COMPLETE],
+                       key=lambda t: t.value, reverse=True)
+    if not completos:
+        sys.exit('ERROR: ningun trial termino. Si todos quedaron podados, subi '
+                 'n_startup_trials o corre mas trials.')
+
+    top_n = int(cfg.get('top_n', 1))
+    elegidos = []
+    for t in completos[:top_n]:
+        params = dict(fijos)
+        params.update(t.params)
+        params.pop('num_iterations', None)
+        elegidos.append({'trial': t.number, 'auc_cv': float(t.value),
+                         'num_iterations': int(t.user_attrs['num_iterations']),
+                         'params': params})
+
+    print(f'\nTop {len(elegidos)} de {len(completos)} trials completos:')
+    for i, e in enumerate(elegidos, 1):
+        extra = ' '.join(f'{k}={v}' for k, v in sorted(e['params'].items())
+                         if k in buscados)
+        print(f'  {i}. trial {e["trial"]:3d}  AUC {e["auc_cv"]:.5f}  '
+              f'{e["num_iterations"]:4d} arboles  {extra}')
+    return elegidos
+
+
+# [Anotación · líneas 310–330] Utilidades: `git_commit` devuelve el hash corto del commit actual (o
+#   `sin_git`); `versiones` devuelve las versiones de python, lightgbm, optuna, pandas, numpy y scikit-learn;
+#   `semillas_del_curso` genera 50 enteros distintos menores que 1.000.000 con `RandomState(100019)` y devuelve
+#   los primeros `cantidad`.
+# ------------------------------------------------------------------- utilidades
+
+def git_commit():
+    """Si el codigo cambio entre dos corridas, no son comparables. Es lo que uno olvida."""
+    try:
+        return subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'],
+                                       stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return 'sin_git'
+
+
+def versiones():
+    import sklearn
+    return {'python': platform.python_version(), 'lightgbm': lgb.__version__,
+            'optuna': optuna.__version__, 'pandas': pd.__version__,
+            'numpy': np.__version__, 'scikit-learn': sklearn.__version__}
+
+
+def semillas_del_curso(cantidad):
+    return np.random.RandomState(SEMILLA_BASE).choice(
+        1000000, size=50, replace=False).tolist()[:cantidad]
+
+
+# [Anotación · líneas 333–373] `cargar_config`, primera parte: lee el YAML y termina con error si faltan
+#   claves obligatorias (`nombre`, `dataset`, `meses_train`, `mes_test`, `semillas`, `trials`, `folds`,
+#   `test_size`), si `estrategia_meses` no es `por_mes` ni `apilado` o si `top_n` es menor que 1. Si `mes_test`
+#   está dentro de `meses_train`, termina con error salvo que el config traiga `permitir_test_en_train`, en cuyo
+#   caso imprime un aviso.
+# ------------------------------------------------------------------------ config
+
+CLAVES_OBLIGATORIAS = ['nombre', 'dataset', 'meses_train', 'mes_test', 'semillas',
+                       'trials', 'folds', 'test_size']
+
+
+def cargar_config(ruta):
+    """Lee el yaml, lo valida, y separa los parametros de LightGBM en fijos y buscados."""
+    ruta = Path(ruta)
+    if not ruta.exists():
+        sys.exit(f'ERROR: no encuentro {ruta}')
+    with open(ruta, encoding='utf-8') as fh:
+        cfg = yaml.safe_load(fh)
+
+    faltan = [k for k in CLAVES_OBLIGATORIAS if k not in cfg]
+    if faltan:
+        sys.exit(f'ERROR: al config le faltan claves: {faltan}')
+    if cfg.get('estrategia_meses', 'por_mes') not in ('por_mes', 'apilado'):
+        sys.exit(f"ERROR: estrategia_meses '{cfg['estrategia_meses']}' no es por_mes "
+                 'ni apilado')
+    if int(cfg.get('top_n', 1)) < 1:
+        sys.exit('ERROR: top_n tiene que ser >= 1')
+    if cfg['mes_test'] in cfg['meses_train']:
+        if not cfg.get('permitir_test_en_train'):
+            sys.exit(
+                f"ERROR: mes_test {cfg['mes_test']} esta en meses_train. El test "
+                'tiene que ser un mes que el modelo no vio.\n'
+                '  Si lo queres igual (por ejemplo para sacar hiperparametros de '
+                'TODOS los\n  meses etiquetados, sabiendo que no sobra ninguno para testear), agrega\n'
+                '  al config:\n    permitir_test_en_train: true')
+        print('=' * 78)
+        print(f"AVISO FUERTE: mes_test {cfg['mes_test']} ESTA en meses_train.")
+        print('  ganancia_ensemble y corte_optimo de esta corrida se miden sobre '
+              'datos que')
+        print('  el modelo ya vio: NO son mediciones validas y no se comparan con '
+              'las de los')
+        print('  demas experimentos. Lo unico utilizable es hiperparametros.json, '
+              'que sale')
+        print('  de la CV por cliente dentro de meses_train.')
+        print('  El corte de la entrega hay que pasarlo a mano con --corte.')
+        print('=' * 78)
+
+# [Anotación · líneas 375–392] Calcula el gap como `mes_test` menos el último mes de entrenamiento y termina
+#   con error si es menor que 2, salvo que el config traiga `permitir_gap_corto: true`.
+    # El gap entre el ultimo mes de train y el de test tiene que ser de 2 meses.
+    # clase_ternaria mira dos meses adelante, asi que con gap 1 los positivos del train
+    # SON los mismos clientes que hay que acertar en el test: medido, el 43-54% de los
+    # positivos se repite. El modelo los memoriza y se lleva el credito, y la ganancia
+    # sale inflada. Con gap 2 el solapamiento es exactamente cero: un BAJA+2 del mes de
+    # train ya no existe en el mes de test.
+    # Ademas gap 2 es la estructura real de la entrega (train 202106 -> score 202108).
+    gap = cfg['mes_test'] - max(cfg['meses_train'])
+    if gap < 2 and not cfg.get('permitir_gap_corto'):
+        sys.exit(
+            f"ERROR: el gap entre el ultimo mes de train ({max(cfg['meses_train'])}) y "
+            f"el mes de test ({cfg['mes_test']}) es de {gap} mes.\n"
+            '  Con gap 1 el 43-54% de los positivos del train son los MISMOS clientes '
+            'que\n  hay que acertar en el test, asi que la ganancia sale inflada.\n'
+            '  Pone mes_test = ultimo mes de train + 2.\n'
+            '  Si lo queres igual (por ejemplo para comparar dos variantes que comparten '
+            'el\n  mismo gap, donde la inflacion afecta a las dos), agrega al config:\n'
+            '    permitir_gap_corto: true')
+
+# [Anotación · líneas 394–420] Recorre las demás claves del config: un escalar queda como parámetro fijo de
+#   LightGBM y una lista de dos elementos como rango `[mínimo, máximo]` para Optuna. Termina con error ante
+#   claves que no están en `PARAMS_LGB`, listas que no tienen 2 elementos o `num_iterations` ausente o fijo.
+#   Devuelve el config, los fijos y los buscados.
+    # Un escalar es un valor fijo; una lista [min, max] es un rango para Optuna.
+    fijos, buscados, desconocidas = {}, {}, []
+    for clave, valor in cfg.items():
+        if clave in CLAVES_NO_LGB:
+            continue
+        if clave not in PARAMS_LGB:
+            desconocidas.append(clave)
+        elif isinstance(valor, (list, tuple)):
+            if len(valor) != 2:
+                sys.exit(f"ERROR: '{clave}' es una lista de {len(valor)} elementos; "
+                         'un rango para Optuna tiene que ser [minimo, maximo]')
+            buscados[clave] = valor
+        else:
+            fijos[clave] = valor
+
+    if desconocidas:
+        sys.exit(f'ERROR: claves del config que no son parametros de LightGBM conocidos '
+                 f'ni opciones del script: {desconocidas}\n'
+                 'Si es un typo, corregilo. Si es un parametro de LightGBM que falta, '
+                 'agregalo a PARAMS_LGB en este script.')
+    if 'num_iterations' not in buscados and 'num_iterations' not in fijos:
+        sys.exit('ERROR: falta num_iterations en el config (fijo o como rango)')
+    if 'num_iterations' in fijos:
+        sys.exit('ERROR: num_iterations tiene que ser un rango [min, max]. No hay early '
+                 'stopping, asi que lo elige Optuna.')
+
+    return cfg, fijos, buscados
+
+
+# [Anotación · líneas 423–458] `meses_para_entrega`: devuelve `meses_train_entrega` si el config lo declara.
+#   Si no, desplaza cada mes de `meses_train` tantas posiciones (en la lista ordenada de meses del dataset) como
+#   separan a `mes_test` de 202108, y termina con error si algún mes cae fuera del dataset.
+# -------------------------------------------------------------------------- datos
+
+def meses_para_entrega(cfg, meses_disponibles):
+    """Los meses con que entrenar la entrega: la MISMA receta, corrida hasta 202108.
+
+    Un experimento mide una receta dos meses para atras: por ejemplo "2 meses apilados
+    con gap 2" se mide como train 202103+202104 -> test 202106. Para aplicarla hay que
+    desplazarla: train 202105+202106 -> score 202108, que conserva el gap.
+
+    Si se entregara con los mismos meses del experimento, el gap seria de 4 meses. Y
+    medimos que UN mes de distancia cuesta 45M, asi que seria desastroso.
+
+    Se puede declarar a mano en el config con `meses_train_entrega`. Si no esta, se
+    deriva desplazando por la misma cantidad de meses que separa mes_test de
+    MES_APLICACION. El desplazamiento se hace por POSICION en la lista de meses del
+    dataset y no restando los enteros, porque 202112 + 1 no es 202113.
+    """
+    if cfg.get('meses_train_entrega'):
+        return list(cfg['meses_train_entrega'])
+
+    orden = {m: i for i, m in enumerate(sorted(meses_disponibles))}
+    if MES_APLICACION not in orden or cfg['mes_test'] not in orden:
+        sys.exit('ERROR: no puedo derivar los meses de entrega; declaralos en el config '
+                 'con meses_train_entrega')
+    desplazamiento = orden[MES_APLICACION] - orden[cfg['mes_test']]
+    inverso = {i: m for m, i in orden.items()}
+
+    derivados = []
+    for m in cfg['meses_train']:
+        destino = orden[m] + desplazamiento
+        if destino not in inverso:
+            sys.exit(f'ERROR: al desplazar la receta, el mes {m} caeria fuera del '
+                     'dataset. Declara meses_train_entrega a mano en el config.')
+        # int() y no el numpy int que trae el parquet: si no, ensucia el yaml y el json
+        derivados.append(int(inverso[destino]))
+    return sorted(derivados)
+
+
+# [Anotación · líneas 461–473] `cargar_datos`: lee del parquet sólo las filas de los meses pedidos (filtro en
+#   la lectura), termina con error si el archivo no existe o no hay filas, y devuelve la tabla ordenada por
+#   `foto_mes` y `numero_de_cliente`.
+def cargar_datos(cfg, meses):
+    """Lee solo los meses que hacen falta. Filtrar en la lectura evita traer 983k filas."""
+    ruta = Path(cfg['dataset'])
+    if not ruta.exists():
+        sys.exit(f'ERROR: no encuentro {ruta}.\n'
+                 'Generalo con: python fe_competencia_01.py')
+    data = pd.read_parquet(ruta, filters=[('foto_mes', 'in', list(meses))])
+    if data.empty:
+        sys.exit(f'ERROR: no hay filas para los meses {list(meses)}')
+    # El FE no garantiza el orden de las filas (duckdb arma la tabla en paralelo), y
+    # LightGBM si depende de el: arma los cortes de los histogramas con una muestra de
+    # filas. Sin ordenar, dos parquets con el mismo contenido dan modelos distintos.
+    return data.sort_values(['foto_mes', 'numero_de_cliente']).reset_index(drop=True)
+
+
+# [Anotación · líneas 476–491] `resolver_features` devuelve todas las columnas del dataset que no están en
+#   `COLS_PROHIBIDAS`. `construir_target` devuelve 1 si `clase_ternaria` es `BAJA+1` o `BAJA+2` y 0 en otro
+#   caso.
+def resolver_features(data):
+    """Todas las columnas del dataset menos las prohibidas.
+
+    Medido el 2026-10-08: filtrar features con canaritos PIERDE (261 features 410.7M,
+    69 features 393.1M, 17 features 297.4M, en train 202104 -> test 202106). Por eso no
+    hay opcion para filtrar: se usan todas.
+    """
+    features = [c for c in data.columns if c not in COLS_PROHIBIDAS]
+    colados = COLS_PROHIBIDAS & set(features)
+    assert not colados, f'se colo el target o la llave en las features: {colados}'
+    return features
+
+
+def construir_target(data):
+    """1 si el cliente es BAJA+1 o BAJA+2, 0 si no."""
+    return data['clase_ternaria'].isin(CLASES_POSITIVAS).astype(int)
+
+
+# [Anotación · líneas 494–534] `entrenar_ensemble`: separa las filas del mes objetivo y arma los grupos de
+#   entrenamiento (un solo grupo con todos los meses si la estrategia es `apilado`; un grupo por mes si es
+#   `por_mes`). Para cada grupo, cada configuración de hiperparámetros y cada semilla entrena un LightGBM con
+#   `num_iterations` rondas, predice el mes objetivo y convierte las probabilidades en ranking percentil
+#   (`rank(pct=True)`). Devuelve el promedio de todos los rankings, las filas del mes objetivo y el detalle por
+#   modelo.
+# -------------------------------------------------------------- entrenar y scorear
+
+def entrenar_ensemble(data, features, cfg, configs, mes_objetivo, semillas):
+    """Un modelo por (config x grupo de meses x semilla). Devuelve (ranking, filas, detalle).
+    """
+    objetivo = data[data['foto_mes'] == mes_objetivo]
+    if objetivo.empty:
+        sys.exit(f'ERROR: no hay filas de {mes_objetivo} en el dataset')
+
+    # 'por_mes' = un modelo por cada mes: los miembros ven datos distintos, lo que los
+    # decorrelaciona, y un ensemble rinde mas cuanto menos correlacionados estan.
+    # 'apilado' = un solo dataset con todos los meses: mas filas y mas positivos, pero
+    # promedia regimenes distintos dentro de la funcion de perdida.
+    if cfg.get('estrategia_meses', 'por_mes') == 'apilado':
+        grupos = [list(cfg['meses_train'])]
+    else:
+        grupos = [[m] for m in cfg['meses_train']]
+
+    detalle = []
+    total = len(configs) * len(grupos) * len(semillas)
+    hecho = 0
+
+    for grupo in grupos:
+        train = data[data['foto_mes'].isin(grupo)]
+        ds = lgb.Dataset(train[features], label=construir_target(train))
+        for cfg_i, config in enumerate(configs, 1):
+            for semilla in semillas:
+                p = dict(config['params'])
+                p.update(PARAMS_FIJOS_SIEMPRE)
+                p['seed'] = int(semilla)
+                modelo = lgb.train(p, ds, num_boost_round=config['num_iterations'])
+                proba = modelo.predict(objetivo[features])
+                detalle.append({'meses_train': grupo, 'config': cfg_i,
+                                'trial': config['trial'], 'semilla': int(semilla),
+                                'ranking': pd.Series(proba).rank(pct=True).to_numpy()})
+                hecho += 1
+                print(f'  modelo {hecho}/{total} (meses {grupo}, config {cfg_i} '
+                      f'[trial {config["trial"]}], semilla {semilla})', flush=True)
+
+    ranking = np.mean([d['ranking'] for d in detalle], axis=0)
+    return ranking, objetivo, detalle
+
+
+# [Anotación · líneas 537–563] `escribir_csv_entrega`: escribe los `numero_de_cliente` como enteros, uno por
+#   línea, sin encabezado ni índice. Después relee el archivo y termina con error si la cantidad de líneas está
+#   fuera de 8.000–15.000, si alguna línea no es sólo dígitos, si hay ids repetidos o si algún id no pertenece
+#   al mes de aplicación. Devuelve la cantidad de líneas.
+# ----------------------------------------------------------------------- salidas
+
+def escribir_csv_entrega(ids, ruta, ids_validos):
+    """Escribe un .csv y lo valida releyendolo del disco."""
+    import re
+    serie = pd.Series(ids, name='numero_de_cliente')
+    if serie.isna().any():
+        sys.exit(f'ERROR: hay numero_de_cliente nulos para {ruta.name}')
+    serie.astype('int64').to_csv(ruta, header=False, index=False)
+
+    with open(ruta, encoding='utf-8') as fh:
+        lineas = [l.strip() for l in fh if l.strip()]
+    problemas = []
+    if not MIN_REGISTROS <= len(lineas) <= MAX_REGISTROS:
+        problemas.append(f'{len(lineas)} registros, fuera de '
+                         f'[{MIN_REGISTROS}, {MAX_REGISTROS}]')
+    malas = [l for l in lineas if not re.fullmatch(r'\d+', l)]
+    if malas:
+        problemas.append(f'{len(malas)} ids que no son solo digitos, ej {malas[:3]}')
+    if len(set(lineas)) != len(lineas):
+        problemas.append(f'{len(lineas) - len(set(lineas))} ids repetidos')
+    ajenos = set(map(int, lineas)) - ids_validos
+    if ajenos:
+        problemas.append(f'{len(ajenos)} ids que no estan en el mes de aplicacion')
+    if problemas:
+        sys.exit(f'ERROR en {ruta}:\n  ' + '\n  '.join(problemas))
+    return len(lineas)
+
+
+# [Anotación · líneas 566–585] `regenerar_log`: recorre las subcarpetas de `experimentos/`, lee cada
+#   `resultado.json` y reescribe `experimentos/experimentos.csv` con una fila por corrida, ordenadas por
+#   `timestamp`; los valores que son listas o diccionarios se guardan como texto JSON.
+def regenerar_log():
+    """Rearma el csv de experimentos entero, una linea por resultado.json.
+
+    Antes se apendeaba una linea por corrida, con el header escrito solo la primera
+    vez. Cuando resultado.json gano campos nuevos, las filas nuevas quedaron mas
+    largas que el header y pandas dejo de poder leer el archivo. Regenerandolo desde
+    los json, que son la fuente de verdad, las columnas son siempre la union de
+    todas y una corrida borrada desaparece del csv la proxima vez.
+    """
+    filas = []
+    for d in sorted(DIR_EXPERIMENTOS.iterdir()):
+        ruta = d / 'resultado.json'
+        if not ruta.is_file():
+            continue
+        with open(ruta, encoding='utf-8') as fh:
+            r = json.load(fh)
+        filas.append({k: (json.dumps(v) if isinstance(v, (dict, list)) else v)
+                      for k, v in r.items()})
+    pd.DataFrame(filas).sort_values('timestamp').to_csv(CSV_LOG, index=False)
+    print(f'{CSV_LOG} regenerado: {len(filas)} corridas')
+
+
+# [Anotación · líneas 588–606] `graficar_curva`: dibuja la ganancia acumulada (en millones) contra el corte,
+#   marca con una línea vertical y una etiqueta el punto de máxima ganancia y guarda la figura en PNG.
+def graficar_curva(curva, ruta, titulo):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(curva['corte'], curva['ganancia'] / 1e6, lw=1.2)
+    mejor = curva.loc[curva['ganancia'].idxmax()]
+    ax.axvline(mejor['corte'], ls='--', c='crimson', lw=1)
+    ax.annotate(f"optimo {int(mejor['corte']):,}\n{mejor['ganancia'] / 1e6:.1f}M",
+                xy=(mejor['corte'], mejor['ganancia'] / 1e6),
+                xytext=(8, -26), textcoords='offset points', color='crimson', fontsize=9)
+    ax.set_xlabel('corte (cantidad de clientes estimulados)')
+    ax.set_ylabel('ganancia acumulada (millones)')
+    ax.set_title(titulo)
+    ax.grid(alpha=.3)
+    fig.tight_layout()
+    fig.savefig(ruta, dpi=120)
+    plt.close(fig)
+
+
+# [Anotación · líneas 609–625] `carpetas_con_nombre`: devuelve, ordenadas, las carpetas de `experimentos/`
+#   cuyo nombre tiene la forma `AAAAMMDD_HHMM_<nombre>` y cuya tercera parte coincide con el nombre pedido.
+# -------------------------------------------------------------------------- modos
+
+def carpetas_con_nombre(nombre):
+    """Las carpetas de experimentos/ cuyo `nombre` coincide, mas nuevas al final.
+
+    El formato es YYYYMMDD_HHMM_nombre, asi que se parte en 3 y se compara la tercera
+    parte. No alcanza con endswith('_' + nombre): con nombre='base', la carpeta
+    '..._mi_base' daria un falso positivo.
+    """
+    if not DIR_EXPERIMENTOS.exists():
+        return []
+    halladas = []
+    for d in DIR_EXPERIMENTOS.iterdir():
+        partes = d.name.split('_', 2)
+        if d.is_dir() and len(partes) == 3 and partes[2] == nombre:
+            halladas.append(d)
+    return sorted(halladas)
+
+
+# [Anotación · líneas 628–656] `modo_experimento`, inicio: si ya existe una corrida con el mismo `nombre`
+#   termina con error, salvo con `--reanudar`, que reutiliza la carpeta más reciente. En una corrida nueva crea
+#   `experimentos/<AAAAMMDD_HHMM>_<nombre>`. Copia el config a esa carpeta y carga del parquet los meses de
+#   entrenamiento y el mes de test.
+def modo_experimento(cfg, fijos, buscados, ruta_config, args):
+    nombre = cfg['nombre']
+    previas = carpetas_con_nombre(nombre)
+
+    if previas and not args.reanudar:
+        sys.exit(
+            f"ERROR: ya hay {len(previas)} corrida(s) con el nombre '{nombre}':\n"
+            + '\n'.join(f'  {d}' for d in previas) + '\n\n'
+            'Lo mas probable es que te hayas olvidado de cambiar `nombre` en el config.\n'
+            'Si es otro experimento, cambiale el nombre (y la pregunta).\n'
+            'Si querias CONTINUAR el anterior, corre con --reanudar: reusa la carpeta y\n'
+            'su optuna.db, asi los trials ya hechos no se vuelven a correr.')
+
+    if args.reanudar:
+        if not previas:
+            sys.exit(f"ERROR: --reanudar pero no hay ninguna corrida con el nombre "
+                     f"'{nombre}' para continuar")
+        carpeta = previas[-1]
+        print(f'Reanudando {carpeta}')
+    else:
+        sello = datetime.now().strftime('%Y%m%d_%H%M')
+        carpeta = DIR_EXPERIMENTOS / f'{sello}_{nombre}'
+        carpeta.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy(ruta_config, carpeta / 'config.yaml')
+    arranque = time.time()
+
+    meses = sorted(set(cfg['meses_train']) | {cfg['mes_test']})
+    data = cargar_datos(cfg, meses)
+
+# [Anotación · líneas 658–686] Si el config trae `excluir_positivos_del_train`, quita del mes de test a los
+#   clientes que son `BAJA+1` o `BAJA+2` en alguno de los meses de entrenamiento e imprime cuántos quita y
+#   cuántos de ellos eran `BAJA+2` en el test. Después resuelve la lista de variables, genera las semillas e
+#   imprime el encabezado de la corrida.
+    # Con gap 2 (y en la entrega) TODOS los positivos del train ya se fueron del mes
+    # de test: un BAJA+1 de 202104 no esta en 202105, y un BAJA+2 de 202104 no esta
+    # en 202106. Con gap 1 no: los BAJA+2 del train siguen presentes en el test, como
+    # BAJA+1. El modelo los memorizo y los pone arriba de la lista, pero NO pagan,
+    # asi que son costo puro y la ganancia sale pesimista.
+    #
+    # Sacarlos del test no es limpiar a favor: es lo que hace que una medicion con
+    # gap 1 tenga la misma estructura que la entrega. Medido en 202105 -> 202106 son
+    # 867 clientes, y ninguno de los 1,098 que pagan esta entre ellos.
+    if cfg.get('excluir_positivos_del_train'):
+        pos = set(data.loc[data['foto_mes'].isin(cfg['meses_train'])
+                           & data['clase_ternaria'].isin(CLASES_POSITIVAS),
+                           'numero_de_cliente'])
+        en_test = data['foto_mes'] == cfg['mes_test']
+        fuera = en_test & data['numero_de_cliente'].isin(pos)
+        paga = data['clase_ternaria'] == 'BAJA+2'
+        print(f'Excluidos del test {fuera.sum():,} de {en_test.sum():,} clientes por '
+              f'haber sido positivos en el train ({(fuera & paga).sum()} de ellos '
+              f'pagaban).')
+        data = data[~fuera]
+
+    features = resolver_features(data)
+    semillas = semillas_del_curso(cfg['semillas'])
+
+    print(f"\n=== {cfg['nombre']}")
+    print(f"{cfg.get('pregunta', '(sin pregunta)')}")
+    print(f"train {cfg['meses_train']} ({cfg.get('estrategia_meses', 'por_mes')}) "
+          f"-> test {cfg['mes_test']} | {len(features)} features | "
+          f'{len(semillas)} semillas\n')
+
+# [Anotación · líneas 688–706] Corre la optimización y guarda las configuraciones elegidas en
+#   `hiperparametros.json`. Entrena el ensamble con esas configuraciones y predice el mes de test. Con la marca
+#   de `BAJA+2` calcula el corte y la ganancia máxima del ranking promedio y de cada modelo por separado, y
+#   guarda la curva de ganancia en `curva_ganancia.csv` y `curva_ganancia.png`.
+    configs = optimizar(data, features, cfg, fijos, buscados,
+                        carpeta / 'optuna.db', carpeta)
+    with open(carpeta / 'hiperparametros.json', 'w', encoding='utf-8') as fh:
+        json.dump({'configs': configs}, fh, indent=2)
+
+    print(f'\nReentrenando sobre el mes completo y midiendo en {cfg["mes_test"]}:')
+    ranking, test, detalle = entrenar_ensemble(
+        data, features, cfg, configs, cfg['mes_test'], semillas)
+    es_baja2 = (test['clase_ternaria'] == 'BAJA+2').to_numpy()
+
+    # El ensemble es lo que se entrega; el detalle por modelo es la barra de error.
+    corte_ens, gan_ens = mejor_corte(ranking, es_baja2)
+    por_modelo = [mejor_corte(d['ranking'], es_baja2) for d in detalle]
+    gan_modelo = [g for _, g in por_modelo]
+
+    curva = curva_en_grilla(ranking, es_baja2)
+    curva.to_csv(carpeta / 'curva_ganancia.csv', index=False)
+    graficar_curva(curva, carpeta / 'curva_ganancia.png',
+                   f"{cfg['nombre']}: train {cfg['meses_train']} -> test {cfg['mes_test']}")
+
+# [Anotación · líneas 708–742] Escribe `resultado.json` con nombre, pregunta, fecha, commit, meses, cantidad
+#   de variables, configuraciones, AUC de la validación cruzada, gap, ganancia del ensamble, corte de máxima
+#   ganancia, media y desvío de la ganancia por modelo, cantidad de modelos, segundos y versiones. Regenera
+#   `experimentos.csv`, imprime el resumen y avisa si el corte queda fuera de 8.000–15.000.
+    resultado = {
+        'nombre': cfg['nombre'], 'pregunta': cfg.get('pregunta'),
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
+        'carpeta': str(carpeta), 'git_commit': git_commit(),
+        'meses_train': cfg['meses_train'],
+        'estrategia_meses': cfg.get('estrategia_meses', 'por_mes'),
+        'mes_test': cfg['mes_test'], 'n_features': len(features),
+        'top_n': len(configs), 'configs': configs,
+        'auc_cv': configs[0]['auc_cv'],
+        'medicion_valida': cfg['mes_test'] not in cfg['meses_train'],
+        'gap': cfg['mes_test'] - max(cfg['meses_train']),
+        'excluir_positivos_del_train': bool(cfg.get('excluir_positivos_del_train')),
+        'ganancia_ensemble': gan_ens, 'corte_optimo': corte_ens,
+        'ganancia_media_modelo': float(np.mean(gan_modelo)),
+        'sd_modelo': float(np.std(gan_modelo, ddof=1)) if len(gan_modelo) > 1 else None,
+        'n_modelos': len(detalle), 'segundos': round(time.time() - arranque),
+        'versiones': versiones(),
+    }
+    with open(carpeta / 'resultado.json', 'w', encoding='utf-8') as fh:
+        json.dump(resultado, fh, indent=2, ensure_ascii=False)
+
+    regenerar_log()
+
+    sd = np.std(gan_modelo, ddof=1) if len(gan_modelo) > 1 else 0
+    print(f'\n--- {cfg["nombre"]}')
+    print(f'  AUC CV (mejor)      {configs[0]["auc_cv"]:.5f}')
+    print(f'  modelos             {len(detalle)} '
+          f'({len(configs)} configs x {len(semillas)} semillas x meses)')
+    print(f'  ganancia ENSEMBLE   {gan_ens / 1e6:,.1f}M  en el corte {corte_ens:,}')
+    print(f'  por modelo          {np.mean(gan_modelo) / 1e6:,.1f}M +- {sd / 1e6:,.1f}M')
+    print(f'  carpeta             {carpeta}')
+    if not MIN_REGISTROS <= corte_ens <= MAX_REGISTROS:
+        print(f'\n  AVISO: el corte optimo ({corte_ens:,}) esta FUERA del rango que acepta '
+              f'el bot [{MIN_REGISTROS:,}, {MAX_REGISTROS:,}].\n'
+              '  La entrega lo va a recortar al limite mas cercano.')
+
+
+# [Anotación · líneas 745–772] `modo_entrega`, inicio: exige `--desde` y verifica que la carpeta tenga
+#   `resultado.json`, `hiperparametros.json` y `config.yaml`. Carga ese config, reemplaza la ruta del dataset si
+#   se pasa `--dataset`, avisa si el config trae `mes_aplicacion` (se ignora) y lee las configuraciones de
+#   hiperparámetros y el resultado del experimento.
+def modo_entrega(args):
+    """Entrega lo que midio UN experimento. Todo sale de su carpeta, nada del yaml actual.
+    """
+    if not args.desde:
+        sys.exit('ERROR: --modo entrega necesita --desde <carpeta de experimentos/>')
+    origen = Path(args.desde)
+    ruta_res = origen / 'resultado.json'
+    ruta_hp = origen / 'hiperparametros.json'
+    ruta_config = origen / 'config.yaml'
+    for r in (ruta_res, ruta_hp, ruta_config):
+        if not r.exists():
+            sys.exit(f'ERROR: no encuentro {r}')
+
+    cfg, _, _ = cargar_config(ruta_config)
+    if args.dataset:
+        print(f"Dataset: {args.dataset} (el config del experimento decia "
+              f"{cfg['dataset']})")
+        cfg['dataset'] = args.dataset
+    if 'mes_aplicacion' in cfg:
+        print(f"AVISO: el config trae mes_aplicacion="
+              f"{cfg['mes_aplicacion']}, se IGNORA; el script usa la "
+              f"constante MES_APLICACION={MES_APLICACION}.")
+
+    with open(ruta_hp, encoding='utf-8') as fh:
+        hp = json.load(fh)
+    with open(ruta_res, encoding='utf-8') as fh:
+        res = json.load(fh)
+    configs = hp['configs']
+
+# [Anotación · líneas 774–798] Toma el corte de `corte_optimo` de `resultado.json`. Con `--corte` usa los
+#   valores pasados (termina con error si alguno está fuera de 8.000–15.000); sin `--corte` lleva el corte
+#   medido al límite más cercano de ese rango si queda fuera. Arma el nombre base de la entrega: `DU` + fecha y
+#   hora + `nombre` del config.
+    # El corte sale del experimento, no del config: es el optimo que midio la curva de
+    # ganancia acumulada en el mes de test. Recortado al rango que acepta el bot.
+    corte = int(res['corte_optimo'])
+    nota_corte = ''
+    if args.corte:
+        fuera = [c for c in args.corte
+                 if not MIN_REGISTROS <= c <= MAX_REGISTROS]
+        if fuera:
+            sys.exit(f'ERROR: los cortes {fuera} estan fuera del rango que acepta '
+                     f'el bot [{MIN_REGISTROS:,}, {MAX_REGISTROS:,}]')
+        cortes = sorted(set(args.corte))
+        nota_corte = ', forzado por --corte'
+        print(f'Cortes forzados por --corte: '
+              f'{", ".join(f"{c:,}" for c in cortes)} '
+              f'(el experimento habia medido {corte:,}).')
+    else:
+        ajustado = min(max(corte, MIN_REGISTROS), MAX_REGISTROS)
+        if ajustado != corte:
+            print(f'AVISO: el corte optimo medido es {corte:,}, fuera del rango del '
+                  f'bot. Se usa {ajustado:,}.')
+        cortes = [ajustado]
+
+    sello = datetime.now().strftime('%Y%m%d%H%M')
+    base = ''.join(ch for ch in f"DU{sello}{cfg['nombre']}"
+                   if ch.isalnum() or ch in '_-')
+
+# [Anotación · líneas 800–826] Lee los meses presentes en el parquet, obtiene los meses de entrenamiento de la
+#   entrega con `meses_para_entrega` y avisa si el gap respecto de 202108 difiere del gap del experimento cuando
+#   los meses no están declarados a mano. Carga esos meses más 202108, resuelve variables y semillas, y entrena
+#   el ensamble con los meses de la entrega para puntuar 202108. Guarda los ids del mes de aplicación.
+    # Todos los meses del dataset, para poder derivar el desplazamiento por posicion
+    todos = pd.read_parquet(cfg['dataset'], columns=['foto_mes'])['foto_mes'].unique()
+    meses_entrega = meses_para_entrega(cfg, todos)
+    gap_entrega = sorted(todos).index(MES_APLICACION) - \
+                  sorted(todos).index(max(meses_entrega))
+    if gap_entrega != cfg['mes_test'] - max(cfg['meses_train']) and \
+            not cfg.get('meses_train_entrega'):
+        print(f'AVISO: el gap de la entrega ({gap_entrega}) no coincide con el del '
+              f'experimento. Revisa meses_train_entrega.')
+
+    meses = sorted(set(meses_entrega) | {MES_APLICACION})
+    data = cargar_datos(cfg, meses)
+    features = resolver_features(data)
+    semillas = semillas_del_curso(cfg['semillas'])
+
+    lista_cortes = ", ".join(f"{c:,}" for c in cortes)
+    print(f"\n=== entrega {base}")
+    print(f"train {meses_entrega} ({cfg.get('estrategia_meses', 'por_mes')}) "
+          f"-> score {MES_APLICACION} (gap {gap_entrega}) | {len(features)} features | "
+          f'{len(semillas)} semillas | {"cortes" if len(cortes) > 1 else "corte"} {lista_cortes}\n')
+
+    cfg_entrega = dict(cfg)
+    cfg_entrega['meses_train'] = meses_entrega
+    _, aplicacion, detalle = entrenar_ensemble(
+        data, features, cfg_entrega, configs, MES_APLICACION, semillas)
+    ids_todos = aplicacion['numero_de_cliente'].to_numpy()
+    validos = set(aplicacion['numero_de_cliente'].astype('int64'))
+
+# [Anotación · líneas 828–839] Define cuántos modelos promedia cada archivo: todos si `--archivos` es 1; si
+#   no, el mayor entre 4 y la mitad de los modelos. Con más de un archivo termina con error si ese número
+#   alcanza al total de modelos entrenados.
+    n_archivos = args.archivos
+    # Un solo archivo es la entrega final (la catedra pide que el ultimo submit lleve
+    # uno solo): promedia TODOS los modelos, no un subconjunto al azar.
+    por_archivo = len(detalle) if n_archivos == 1 else max(4, len(detalle) // 2)
+
+    if n_archivos > 1 and por_archivo >= len(detalle):
+        sys.exit(
+            f'ERROR: {len(detalle)} modelos entrenados no alcanzan para armar '
+            f'{n_archivos} archivos con diversidad real.\n'
+            f'  Cada archivo promedia {por_archivo} modelos, que es todo el conjunto.\n'
+            f'  Subi semillas en el config a 16 o mas (con estrategia por_mes, los\n'
+            f'  modelos son semillas x meses, asi que varios meses tambien suman).')
+
+# [Anotación · líneas 841–865] Para cada corte crea la carpeta `entregas/<nombre>` y copia el config. Para
+#   cada archivo promedia los rankings de sus modelos (todos, o un subconjunto elegido al azar con un generador
+#   sembrado con 100019), ordena los clientes de mayor a menor y escribe los primeros `corte_usado` ids en
+#   `<nombre>_m<NN>.csv` con `escribir_csv_entrega`.
+    resumen = []
+    for corte_usado in cortes:
+        # Re-sembrado A PROPOSITO en cada corte: asi el archivo m07 del corte 9000
+        # promedia los MISMOS modelos que el m07 del corte 13000, y las dos listas
+        # quedan anidadas. Sin esto, cada corte tendria su propio ranking y las
+        # diferencias entre cortes volverian a cargar el ruido entero del publico.
+        rng = np.random.default_rng(SEMILLA_BASE)
+        nombre = f'{base}_c{corte_usado}' if len(cortes) > 1 else base
+        carpeta = DIR_ENTREGAS / nombre
+        carpeta.mkdir(parents=True, exist_ok=True)
+        shutil.copy(ruta_config, carpeta / 'config.yaml')
+
+        print(f'\nEscribiendo {n_archivos} archivos de {corte_usado:,} registros en {carpeta}:')
+        generados, miembros_por_archivo = [], []
+        for i in range(1, n_archivos + 1):
+            idx = (np.arange(len(detalle)) if n_archivos == 1 else
+                   rng.choice(len(detalle), size=min(por_archivo, len(detalle)),
+                              replace=False))
+            sub = np.mean([detalle[j]['ranking'] for j in idx], axis=0)
+            ids = ids_todos[np.argsort(sub, kind='stable')[::-1]][:corte_usado]
+            ruta = carpeta / f'{nombre}_m{i:02d}.csv'
+            n = escribir_csv_entrega(ids, ruta, validos)
+            generados.append(ruta.name)
+            miembros_por_archivo.append([int(detalle[j]['semilla']) for j in idx])
+            print(f'  OK {ruta.name} ({n:,} registros, {len(idx)} modelos promediados)')
+
+# [Anotación · líneas 867–887] En la carpeta de cada corte escribe `submit.txt` (texto `submit` + nombre),
+#   `viene_de.txt` (carpeta de origen, AUC, trials usados, ganancia medida, corte medido y usado, meses medidos
+#   y meses de la entrega, commit), `resultado_bot.txt` (plantilla para pegar la respuesta del bot) y
+#   `detalle_archivos.json` (corte, modelos por archivo y semillas de cada archivo).
+        cuerpo = f'submit    {nombre}'
+        (carpeta / 'submit.txt').write_text(cuerpo + '\n', encoding='utf-8')
+        (carpeta / 'viene_de.txt').write_text(
+            f'hiperparametros y corte de: {origen}\n'
+            f'auc_cv del mejor config: {configs[0]["auc_cv"]}\n'
+            f'configs usados: {len(configs)}, trials {[c["trial"] for c in configs]}\n'
+            f'ganancia_ensemble en {res["mes_test"]}: {res["ganancia_ensemble"]:,.0f}\n'
+            f'corte optimo medido: {corte:,} (usado: {corte_usado:,}{nota_corte})\n'
+            f'receta medida con: {cfg["meses_train"]} -> {cfg["mes_test"]}\n'
+            f'entregada con:     {meses_entrega} -> {MES_APLICACION}\n'
+            f'commit: {git_commit()}\n', encoding='utf-8')
+        (carpeta / 'resultado_bot.txt').write_text(
+            '# Pega aca la respuesta del bot cuando mandes el submit.\n'
+            '# Sin esto, en dos semanas no vas a poder reconstruir que dio cada entrega.\n',
+            encoding='utf-8')
+        with open(carpeta / 'detalle_archivos.json', 'w', encoding='utf-8') as fh:
+            json.dump({'corte': corte_usado, 'modelos_por_archivo': por_archivo,
+                       'semillas_de_cada_archivo': dict(zip(generados,
+                                                            miembros_por_archivo))},
+                      fh, indent=2)
+        resumen.append((corte_usado, cuerpo, carpeta, len(generados)))
+
+# [Anotación · líneas 889–902] Imprime, para cada corte, el texto del mensaje, la cantidad de archivos y su
+#   carpeta, con la indicación de enviarlos por mensaje privado a `@competencia-uno`.
+    print('\n' + '=' * 78)
+    print('PARA MANDAR: un mensaje privado a @competencia-uno POR CADA corte,')
+    print('cada uno con su cuerpo exacto y sus archivos adjuntos.')
+    print('=' * 78)
+    for corte_usado, cuerpo, carpeta, n_gen in resumen:
+        print(f'\n  corte {corte_usado:,}')
+        print(f'      cuerpo : {cuerpo}')
+        print(f'      {n_gen} archivos de: {carpeta}')
+        print(f'      respuesta del bot -> {carpeta / "resultado_bot.txt"}')
+    if len(resumen) > 1:
+        print('\nSON SUBMITS SEPARADOS: el bot informa media y desvio de los archivos de')
+        print('UN mensaje, asi que mandarlos juntos da un solo numero y se pierde el')
+        print('barrido. Uno por mensaje = un numero por corte.')
+    print('\nOJO: el ultimo submit antes del deadline es el final, automaticamente.')
+
+
+# [Anotación · líneas 905–950] `main`: define los argumentos `--modo` (obligatorio: `experimento` o
+#   `entrega`), `--config` (por defecto `config.yaml`), `--desde`, `--reanudar`, `--dataset`, `--corte` (uno o
+#   varios enteros) y `--archivos` (por defecto 20). Con `--modo entrega` llama a `modo_entrega`; en otro caso
+#   carga el config y llama a `modo_experimento`.
+# --------------------------------------------------------------------------- main
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--modo', required=True, choices=['experimento', 'entrega'])
+    parser.add_argument('--config', default='config.yaml',
+                        help='solo para --modo experimento (default: ./config.yaml; pasale el de una carpeta de experimentos/ para repetir una corrida). La entrega ignora este flag: usa el config del experimento que indica --desde')
+    parser.add_argument('--desde', help='carpeta de experimentos/ de donde tomar los '
+                                        'hiperparametros y el corte (solo para --modo '
+                                        'entrega)')
+    parser.add_argument('--reanudar', action='store_true',
+                        help='continua la ultima corrida que tenga el mismo `nombre` del '
+                             'config, en lugar de abortar. Reusa su optuna.db, asi los '
+                             'trials ya hechos no se repiten: sirve cuando se corto una '
+                             'corrida larga o para sumarle trials subiendo `trials`')
+    parser.add_argument('--dataset',
+                        help='parquet con features, pisando la ruta del config del '
+                             'experimento (solo --modo entrega)')
+    parser.add_argument('--corte', type=int, nargs='+', metavar='N',
+                        help='uno o varios cortes, pisando el optimo que midio el '
+                             'experimento (solo --modo entrega). Con varios, entrena '
+                             'UNA vez y escribe una carpeta por corte. Sirve para dos '
+                             'cosas: barrer cortes del MISMO modelo, donde las listas '
+                             'son subconjuntos anidados y el ruido del publico se '
+                             'cancela en las diferencias; y entregar un experimento '
+                             'cuyo mes_test cae dentro del train, donde el corte '
+                             'medido no vale nada')
+    parser.add_argument('--archivos', type=int, default=20,
+                        help='cuantos .csv lleva el submit (default: 20). Es una '
+                             'decision tactica del momento, no un parametro del '
+                             'experimento, asi que vive aca y no en el yaml')
+    args = parser.parse_args()
+
+    pd.set_option('display.width', 200)
+
+    if args.modo == 'entrega':
+        # La entrega no mira el config del root: lee el del experimento que entrega.
+        modo_entrega(args)
+    else:
+        cfg, fijos, buscados = cargar_config(args.config)
+        modo_experimento(cfg, fijos, buscados, args.config, args)
+
+
+if __name__ == '__main__':
+    main()

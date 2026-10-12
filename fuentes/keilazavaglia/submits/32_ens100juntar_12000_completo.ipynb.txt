@@ -1,0 +1,141 @@
+#%% celda 1 [texto]
+# Submit 32 (entrega final) — código completo de principio a fin
+
+**Resultado:** `32_ens100juntar_12000.csv` = los 12.000 clientes de 202108 con mayor probabilidad promedio de 100 modelos LightGBM.
+Público: 102,11 (idéntico al submit 28, del que es copia).
+
+**Receta**
+1. Datos: `competencia_01.parquet` (clase_ternaria recalculada; `ccajas_depositos` = NA en 202105).
+2. Variables: las 153 originales (incluye `numero_de_cliente`) + lags y deltas de orden 1 y 2 = **761 variables**.
+3. Target "juntar": 1 si el cliente es BAJA+1 o BAJA+2, 0 si es CONTINUA.
+4. Train: 202103, 202104, 202105 y 202106 completos (sin undersampling).
+5. Modelos: los 10 mejores trials de la optimización bayesiana z005 (`0_exploracion/z005_optuna.ipynb`, revalidados con 5 semillas
+   en `z005b_revalidar_extra.ipynb` → `z005_top10_final.csv`)
+   × 10 semillas = **100 modelos**. Hiperparámetros fijos del profesor: learning_rate 0,005, min_data_in_leaf 0, max_bin 31,
+   feature_fraction 0,5, feature_fraction_bynode 0,2.
+6. Ensamble: promedio simple de las 100 probabilidades por cliente → top 12.000.
+
+**Historia:** los 100 modelos se entrenaron en dos tandas: semillas del submit 15 (`14-15_ens50_juntar.ipynb`) y semillas
+del submit 16 (`16-17_distribucion_semillas.ipynb`). Este notebook las junta en un solo código y reproduce el archivo exacto.
+
+**Tiempo:** ~4 h (2,2 min por modelo). Cada predicción se guarda en `probs_32/`: si se corta, volver a correr y retoma.
+
+#%% celda 2 [código]
+# --- 1. Librerías y parámetros ---
+import os
+import time
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+MESES_FINAL = [202103, 202104, 202105, 202106]   # meses de entrenamiento
+MES_PRED    = 202108                             # mes a predecir
+N_ENVIO     = 12_000                             # cantidad de clientes a estimular
+ARCHIVO     = "32_ens100juntar_12000.csv"
+CARPETA     = "probs_32"                         # una predicción por modelo (para retomar si se corta)
+os.makedirs(CARPETA, exist_ok=True)
+
+# Dos grupos de 5 semillas (el 15 y el 16). Cada grupo usa su propio Dataset (ver celda 3).
+GRUPOS_SEMILLAS = {
+    "submit15": [501419, 623353, 786349, 834569, 946331],
+    "submit16": [270131, 417293, 583117, 692347, 851071],
+}
+
+# Hiperparámetros fijos (recomendación del profesor)
+params_fijos = {
+    "objective": "binary", "learning_rate": 0.005, "min_data_in_leaf": 0,
+    "feature_fraction": 0.5, "feature_fraction_bynode": 0.2, "max_bin": 31, "verbose": -1,
+}
+
+# Los 10 mejores trials de z005: trial -> (num_leaves, min_sum_hessian_in_leaf, cantidad de árboles)
+# (copiados de 0_exploracion/z005_top10_final.csv, con todos los decimales)
+TRIALS = {
+    34: (137, 9.755574121446362, 538),
+    36: (61, 7.745373665319586, 727),
+    27: (241, 5.632060378965947, 578),
+    29: (193, 5.9684882171070806, 567),
+    37: (240, 0.0030389429440898, 888),
+    31: (203, 1.4449699818050468, 532),
+    20: (159, 0.0215427682411664, 843),
+    9:  (65, 1.2505922499454127, 684),
+    28: (237, 0.0956720722437809, 826),
+    39: (118, 1.942966740643147, 664),
+}
+
+#%% celda 3 [código]
+# --- 2. Datos, lags/deltas de orden 1 y 2, y target juntar ---
+df = pd.read_parquet("../competencia_01.parquet")
+
+no_usar = ["foto_mes", "clase_ternaria"]
+cols = [c for c in df.columns if c not in no_usar and c != "numero_de_cliente"]   # a estas se les calculan lags
+
+# Ordeno por cliente y mes para que shift(k) traiga el valor de k meses antes del MISMO cliente
+df = df.sort_values(["numero_de_cliente", "foto_mes"]).reset_index(drop=True)
+grupo = df.groupby("numero_de_cliente")[cols]
+nuevas = []
+for k in [1, 2]:
+    lag = grupo.shift(k).astype("float32")              # valor de hace k meses
+    delta = (df[cols] - lag).astype("float32")          # cuánto cambió desde entonces
+    lag.columns   = [f"{c}_lag{k}" for c in cols]
+    delta.columns = [f"{c}_delta{k}" for c in cols]
+    nuevas += [lag, delta]
+df = pd.concat([df] + nuevas, axis=1)
+del nuevas, lag, delta, grupo
+
+variables = [c for c in df.columns if c not in no_usar]   # 761, incluye numero_de_cliente
+final  = df[df["foto_mes"].isin(MESES_FINAL)]
+y_final = final["clase_ternaria"].isin(["BAJA+1", "BAJA+2"]).astype(int)   # target juntar
+futuro = df[df["foto_mes"] == MES_PRED][["numero_de_cliente"]].copy()
+X_futuro = df.loc[futuro.index, variables]
+print("Variables:", len(variables), "| filas train:", len(final), "| positivos:", y_final.sum())
+
+#%% celda 4 [código]
+# --- 3. Funciones ---
+def armar_dataset(semilla_grupo):
+    # LightGBM arma los "bines" de cada variable (max_bin = 31) con una muestra de 200.000 filas elegida con la semilla.
+    # En los submits 15 y 16 el Dataset se armó UNA vez por grupo, en el primer modelo (trial 34 con la primera semilla
+    # del grupo), y se reusó para los otros 49. Para reproducir exacto, lo armamos igual: con la primera semilla del grupo.
+    datos = lgb.Dataset(final[variables], label=y_final, free_raw_data=False,
+                        params={**params_fijos, "seed": semilla_grupo})
+    return datos.construct()
+
+def entrenar_y_predecir(datos, trial, semilla):
+    hojas, hessian, arboles = TRIALS[trial]
+    p = {**params_fijos, "num_leaves": hojas, "min_sum_hessian_in_leaf": hessian, "seed": semilla}
+    modelo = lgb.train(p, datos, num_boost_round=arboles)
+    return modelo.predict(X_futuro)                  # probabilidad de baja de cada cliente de 202108
+
+#%% celda 5 [código]
+# --- 4. Entrenar los 100 modelos (retoma si se cortó) ---
+inicio_total = time.time()
+for nombre, semillas in GRUPOS_SEMILLAS.items():
+    datos = armar_dataset(semillas[0])
+    for trial in TRIALS:
+        for semilla in semillas:
+            archivo = f"{CARPETA}/t{trial}_s{semilla}.npy"
+            if os.path.exists(archivo):              # ya estaba hecho: lo salteamos
+                continue
+            inicio = time.time()
+            np.save(archivo, entrenar_y_predecir(datos, trial, semilla))
+            print(f"{nombre} | trial {trial}, semilla {semilla}: {(time.time() - inicio) / 60:.1f} min", flush=True)
+    del datos
+print(f"Total: {(time.time() - inicio_total) / 60:.0f} min")
+
+#%% celda 6 [código]
+# --- 5. Ensamble (promedio de las 100 probabilidades) y archivo para la entrega ---
+todas = [s for semillas in GRUPOS_SEMILLAS.values() for s in semillas]
+probs = [np.load(f"{CARPETA}/t{t}_s{s}.npy") for t in TRIALS for s in todas]
+futuro["prob_ensamble"] = np.mean(probs, axis=0)
+print("Modelos en el ensamble:", len(probs))
+
+top = futuro.sort_values("prob_ensamble", ascending=False).head(N_ENVIO)["numero_de_cliente"].astype("int64")
+top.to_csv(ARCHIVO, index=False, header=False)     # una columna, sin encabezado (formato del bot)
+with open(ARCHIVO) as f:
+    contenido = f.read()
+print(ARCHIVO, "| filas:", len(contenido.splitlines()), "| únicos:", top.nunique(), "| ¿e+?", "e+" in contenido)
+
+#%% celda 7 [código]
+# --- 6. Verificación: ¿es el mismo archivo que se entregó? (el 32 es copia exacta del 28) ---
+entregado = pd.read_csv("28_ens100juntar_12000.csv", header=None)[0]
+print("¿Mismos 12.000 clientes que la entrega?", set(entregado) == set(top))
+print("¿Archivo idéntico, en el mismo orden?", entregado.tolist() == top.tolist())

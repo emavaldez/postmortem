@@ -1,0 +1,62 @@
+{
+ "mejores_hiperparametros": {
+  "num_iterations": 1856,
+  "num_leaves": 556,
+  "min_sum_hessian_in_leaf": 0.03686919557819343
+ },
+ "auc_validacion_06": 0.9203619830592986,
+ "trial_ganador": 9,
+ "params_fijos": {
+  "boosting": "gbdt",
+  "objective": "binary",
+  "metric": "auc",
+  "first_metric_only": false,
+  "boost_from_average": true,
+  "force_row_wise": true,
+  "deterministic": true,
+  "verbosity": -1,
+  "max_depth": -1,
+  "min_gain_to_split": 0.0,
+  "lambda_l1": 0.0,
+  "lambda_l2": 0.0,
+  "max_bin": 31,
+  "bagging_fraction": 1.0,
+  "pos_bagging_fraction": 1.0,
+  "neg_bagging_fraction": 1.0,
+  "is_unbalance": false,
+  "scale_pos_weight": 1.0,
+  "drop_rate": 0.1,
+  "max_drop": 50,
+  "skip_drop": 0.5,
+  "extra_trees": false,
+  "min_data_in_leaf": 0,
+  "feature_fraction": 0.5,
+  "feature_fraction_bynode": 0.2,
+  "learning_rate": 0.005,
+  "feature_pre_filter": false
+ },
+ "semilla_bayesiana": 878443,
+ "entrenamiento": [
+  202103,
+  202104
+ ],
+ "validacion": 202106,
+ "columnas_excluidas": [
+  "cprestamos_personales",
+  "cprestamos_personales_lag1",
+  "cprestamos_personales_delta1",
+  "cprestamos_personales_lag2",
+  "cprestamos_personales_delta2",
+  "cprestamos_personales_tend3",
+  "cprestamos_personales_avg3",
+  "cprestamos_personales_zero",
+  "mprestamos_personales",
+  "mprestamos_personales_lag1",
+  "mprestamos_personales_delta1",
+  "mprestamos_personales_lag2",
+  "mprestamos_personales_delta2",
+  "mprestamos_personales_tend3",
+  "mprestamos_personales_avg3",
+  "mprestamos_personales_zero"
+ ]
+}

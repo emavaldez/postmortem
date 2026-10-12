@@ -1,0 +1,1729 @@
+#%% celda 1 [texto]
+# Pipeline de Predicción de Churn Bancario (Agosto 2021) — v5
+
+Parte de la v4 (NA de `ccajas_depositos` en 202105, sin undersampling, backtest con gap 2) y agrega:
+
+| # | Cambio v5 | Por qué | Dónde |
+|---|---|---|---|
+| 1 | **Límites de tarjeta sin deflactar** (`NO_DEFLACTAR`): se conserva la versión nominal además de la `_real` | En nominal son estables (PSI ≤ 0.008); el drift (PSI 0.15–0.31) lo creaba la deflactación, porque los límites no siguen al IPC. Antes se descartaban por un drift artificial | Etapa 3 |
+| 2 | **Se sacan los rank por mes** de la v4 | Los límites tienen ~145 valores distintos: el rank queda escalonado y da PSI 0.24–0.25 (artefacto) | Etapa 3 |
+| 3 | **`delta1_` para todas las variables numéricas** (antes sólo 15 tenían lags) | `lag1_ctrx_quarter` ya está entre las 12 más importantes; LightGBM aprovecha muchas columnas | Etapa 3 |
+| 4 | **Etapa 6a — variantes con parámetros fijos:** mismo LightGBM, 10 semillas, distintos conjuntos de columnas (completo / sin límites nominales / sin `mcomisiones_mantenimiento` / sin los deltas nuevos). Elige el mejor antes de Optuna | Decide con datos qué cambios suman. `mcomisiones_mantenimiento` cambia en 202107–08 (PSI 0.24–0.35 vs. el resto) y está en el top 20 | Etapa 6a |
+| 5 | RF desactivado (`"activo": False`); LightGBM con 4 h de Optuna y warm start de los estudios v3 **y** v4 | El RF hizo 2 trials en 2 h y quedó 40 BAJA+2 abajo | Etapa 6 |
+| 6 | **Semillero de 30 modelos** | Barato con LightGBM (~0.5 min/modelo) | Etapas 7 y 9 |
+| 7 | DataFrames en `float32` | Con ~140 columnas nuevas, la memoria se duplicaría | Extracción de roles |
+
+**Roles de cada mes:** Histórico 202107 (sólo lags) · Train 202103–05 · Validación 202106 ·
+Final 202103–06 · Aplicación 202108. La ganancia siempre se mide **sólo sobre BAJA+2**.
+
+
+**v7 (8/10/2026):** copia de la v5. Único cambio: la Etapa 6a compara `sin_limites_nominales` (ganadora v5) contra variantes que además sacan `ccajas_depositos`, `Visa_mpagado` y/o `mcomisiones_mantenimiento` (hallazgos de z701). Decidir por ganancia en 202106 + backtest. **Esta copia no trae los arreglos de memoria de la v6.**
+
+
+**v9 (8/10/2026):** copia de la v7. Cambios: (1) **features de historia** (media, desvío, mínimo, máximo, desvío relativo, desvío del mes contra la media y racha de caídas sobre los últimos 3 meses) para las ~25 variables más importantes; (2) **pesos por mes** en el entrenamiento (`decay ** meses_de_antigüedad`); (3) la Etapa 6a compara base × historia × decay y elige por ganancia en 202106; (4) estudio Optuna `v9`. Se parte de la v7 (la v8 quedó descartada: las fechas aportan señal).
+
+#%% celda 2 [código]
+# Si falta alguna librería, descomentá:
+# %pip install duckdb optuna lightgbm --quiet
+
+import os
+import json
+import time
+import datetime
+
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count()))  # silencia el warning de joblib en Windows
+
+import duckdb
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+#%% celda 3 [texto]
+## Configuración general
+
+`MODO_PRUEBA = True` corre todo con una muestra de clientes y pocos trials (unos minutos), para
+chequear que el notebook ande de punta a punta antes de lanzar la corrida larga.
+
+#%% celda 4 [código]
+BASE_PATH = r"C:\Users\micaela.r.rodriguez\Documents\Mica\Personal\Data Mining\EyF"
+DATASET_PATH = os.path.join(BASE_PATH, "competencia_01.csv")
+MODELOS_PATH = os.path.join(BASE_PATH, "modelos")
+SALIDAS_PATH = BASE_PATH
+os.makedirs(MODELOS_PATH, exist_ok=True)
+
+MODO_PRUEBA = False
+FRACCION_MUESTRA = 0.05 if MODO_PRUEBA else 1.0   # fracción de CLIENTES (no de filas) que se cargan
+
+MESES_HIST = [202107]                    # sólo para lags/deltas, no entrenan
+MESES_TRAIN = [202103, 202104, 202105]   # se concatenan para el entrenamiento
+MES_VALID = 202106                       # Optuna, elección de modelo y cantidad de envíos
+MES_APLICACION = 202108                  # mes del desafío (SIN CLASE)
+MESES_FINAL = MESES_TRAIN + [MES_VALID]  # reentrenamiento final (Etapa 9)
+
+ID_COL = "numero_de_cliente"
+MES_COL = "foto_mes"
+TARGET_COL = "clase_ternaria"
+ROL_COL = "rol"
+
+COLS_NO_FEATURE = {ID_COL, MES_COL, TARGET_COL, ROL_COL}
+
+# Montos que NO se deflactan (además de la versión _real se conserva la nominal con su
+# nombre original): los límites de tarjeta se mantienen fijos en pesos nominales, así que
+# al dividirlos por el IPC "caen" artificialmente mes a mes y el PSI los descarta.
+NO_DEFLACTAR = [
+    "Visa_mlimitecompra", "Master_mlimitecompra",
+    "Visa_mfinanciacion_limite", "Master_mfinanciacion_limite",
+]
+
+# delta1_ (valor actual - mes anterior) para TODAS las variables numéricas, además de
+# los lag1/lag2/delta1/delta2 completos de VARS_LAG.
+DELTAS_EXTRA = True
+
+# Variables con un error de carga en meses puntuales: se ponen en NULL (NA) SÓLO en
+# esos meses, apenas se carga el csv (antes de imputar, deflactar, calcular lags o PSI).
+# Así el modelo no aprende de un valor que no es real (LightGBM lo trata como faltante).
+VARIABLES_ROTAS = {
+    "ccajas_depositos": [202105],   # 100% ceros en 202105 (en el resto de los meses ~3–4% > 0)
+    # Otros candidatos que marcó el scan de la Etapa 2 — descomentá si querés tratarlos igual:
+    # "cprestamos_hipotecarios": [202103],   # promedio 0.014 vs ~0.05 en los demás meses
+}
+
+# Constantes del negocio (idénticas en z201/z301/z401/exp_401/z701)
+ganancia_acierto = 1_072_500
+costo_estimulo = 27_500
+
+
+def periodo(mes: int) -> int:
+    """foto_mes (AAAAMM) -> número de mes correlativo (año*12 + mes). Permite
+    restar meses sin romperse al cruzar de año (202201 - 202112 = 1, no 89)."""
+    return (mes // 100) * 12 + mes % 100
+
+
+PRIMER_MES = min(MESES_HIST + MESES_TRAIN + [MES_VALID, MES_APLICACION])
+
+#%% celda 5 [texto]
+## Etapa 2 — reglas de imputación
+
+El 99% de los nulos de este dataset están en las 22 columnas `Master_*` y 22 `Visa_*`, en bloques
+parejos → no son azarosos, son clientes que no tienen esa tarjeta.
+
+#%% celda 6 [código]
+COLS_CERO = [
+    f"{marca}_{sufijo}"
+    for marca in ("Master", "Visa")
+    for sufijo in (
+        "mfinanciacion_limite", "msaldototal", "msaldopesos", "msaldodolares",
+        "mconsumospesos", "mconsumosdolares", "mconsumototal",
+        "mlimitecompra", "madelantopesos", "madelantodolares",
+        "mpagado", "mpagospesos", "mpagosdolares", "mpagominimo",
+        "cconsumos", "cadelantosefectivo",
+    )
+]
+# Status/delinquency: rango real >= 0 -> centinela -1. fechaalta: rango real >= 1 -> -1 también sirve.
+COLS_EXTREMO_NEG1 = [f"{marca}_{sufijo}" for marca in ("Master", "Visa")
+                     for sufijo in ("status", "delinquency", "fechaalta")]
+# Fvencimiento/Finiciomora/fultimo_cierre pueden ser negativos o ~0 legítimamente -> centinela alto.
+CENTINELA_ALTO = 999_999
+COLS_EXTREMO_ALTO = [f"{marca}_{sufijo}" for marca in ("Master", "Visa")
+                     for sufijo in ("Fvencimiento", "Finiciomora", "fultimo_cierre")]
+
+#%% celda 7 [texto]
+## Etapa 3 — deflactación por inflación y variables para lags
+
+Variación mensual del IPC (INDEC, Argentina 2021), igual que `exp_402_feature_engineering_3`.
+
+Con 202103 en train, ese mes queda con `lag1_*` y `lag2_*` vacíos (no hay 202102/202101), y
+202104 con `lag2_*` vacío. No es un problema: LightGBM usa los NaN de forma nativa y el RF los
+imputa marcando con un indicador que el valor fue imputado (ver Etapa 6).
+
+#%% celda 8 [código]
+IPC_MENSUAL = {
+    202103: 4.8, 202104: 4.1, 202105: 3.3,
+    202106: 3.2, 202107: 3.0, 202108: 2.5,
+}
+
+VARS_LAG = [
+    "mcuentas_saldo_real", "mrentabilidad_real", "mactivos_margen_real",
+    "mpasivos_margen_real", "mpayroll_real", "mprestamos_personales_real",
+    "ctrx_quarter", "ctarjeta_visa_transacciones", "ctarjeta_master_transacciones",
+    "chomebanking_transacciones", "cmobile_app_trx",
+    "mtransferencias_emitidas_real", "mextraccion_autoservicio_real",
+    "cprestamos_personales", "cproductos",
+]
+
+#%% celda 9 [texto]
+## Funciones auxiliares SQL
+
+#%% celda 10 [código]
+def _col(nombre: str) -> str:
+    """Identificador entre comillas dobles (preserva mayúsculas, evita palabras reservadas)."""
+    return f'"{nombre}"'
+
+
+def _columnas(con, tabla: str) -> list:
+    """Nombres de columna de una tabla de la conexión (sin traer datos)."""
+    return con.execute(f"SELECT * FROM {tabla} LIMIT 0").df().columns.tolist()
+
+
+def _periodo_sql(expr: str) -> str:
+    """Versión SQL de periodo(): año*12 + mes (división entera con //)."""
+    return f"(({expr} // 100) * 12 + ({expr} % 100))"
+
+
+def crear_macros_sql(con: duckdb.DuckDBPyConnection) -> None:
+    """Mismas macros que exp_402/z402: suma y ratio tratando NULL/0 sin romperse."""
+    con.execute("CREATE OR REPLACE MACRO suma_sin_null(a, b) AS COALESCE(a, 0) + COALESCE(b, 0)")
+    con.execute(
+        "CREATE OR REPLACE MACRO ratio_sin_null(a, b) AS "
+        "CASE WHEN COALESCE(b, 0) = 0 THEN 0 ELSE a / b END"
+    )
+
+#%% celda 11 [texto]
+## Etapa 1 — Estructura de Datasets (prevención de Data Leakage)
+
+#%% celda 12 [código]
+def construir_etapa1_sql(con: duckdb.DuckDBPyConnection, ruta: str = DATASET_PATH,
+                          fraccion: float = FRACCION_MUESTRA) -> None:
+    """
+    Carga el csv con read_csv_auto (igual que z101_target_sql) y agrega 'rol'.
+    Si fraccion < 1 (MODO_PRUEBA) se queda con una muestra de CLIENTES vía hash
+    del id: así cada cliente seleccionado conserva todos sus meses y los lags
+    siguen teniendo sentido.
+    """
+    t0 = time.time()
+    filtro = ""
+    if fraccion < 1:
+        filtro = f"WHERE hash({_col(ID_COL)}) % 10000 < {int(fraccion * 10000)}"
+    con.execute(f"CREATE OR REPLACE TABLE raw AS SELECT * FROM read_csv_auto('{ruta}') {filtro}")
+    print(f"CSV cargado en DuckDB ({ruta}) en {time.time() - t0:.1f} s"
+          + (f" — MUESTRA de {fraccion:.0%} de clientes" if fraccion < 1 else ""))
+
+    faltantes = {MES_COL, TARGET_COL, ID_COL} - set(_columnas(con, "raw"))
+    if faltantes:
+        raise ValueError(f"Faltan columnas esperadas en el dataset: {faltantes}")
+
+    meses_hist_sql = ",".join(map(str, MESES_HIST))
+    meses_train_sql = ",".join(map(str, MESES_TRAIN))
+
+    # Variables rotas -> NULL sólo en sus meses (SELECT * REPLACE de DuckDB)
+    rotas = {c: m for c, m in VARIABLES_ROTAS.items() if c in _columnas(con, "raw")}
+    for c in set(VARIABLES_ROTAS) - set(rotas):
+        print(f"(Aviso: '{c}' está en VARIABLES_ROTAS pero no existe en el csv)")
+    replace_clause = ""
+    if rotas:
+        reemplazos = ", ".join(
+            f"CASE WHEN {_col(MES_COL)} IN ({','.join(map(str, meses))}) THEN NULL ELSE {_col(c)} END AS {_col(c)}"
+            for c, meses in rotas.items()
+        )
+        replace_clause = f"REPLACE ({reemplazos})"
+
+    con.execute(f"""
+        CREATE OR REPLACE TABLE etapa1 AS
+        SELECT * {replace_clause},
+            CASE
+                WHEN {_col(MES_COL)} IN ({meses_hist_sql}) THEN 'historico'
+                WHEN {_col(MES_COL)} IN ({meses_train_sql}) THEN 'train'
+                WHEN {_col(MES_COL)} = {MES_VALID} THEN 'validacion'
+                WHEN {_col(MES_COL)} = {MES_APLICACION} THEN 'aplicacion'
+            END AS {_col(ROL_COL)}
+        FROM raw
+    """)
+    for c, meses in rotas.items():
+        n_na = con.execute(f"""
+            SELECT COUNT(*) FROM etapa1 WHERE {_col(c)} IS NULL
+            AND {_col(MES_COL)} IN ({','.join(map(str, meses))})
+        """).fetchone()[0]
+        print(f"Variable rota: '{c}' -> NA en {meses} ({n_na:,} filas)")
+
+
+def validar_estructura_sql(con: duckdb.DuckDBPyConnection) -> None:
+    """Chequeos de sanidad: filas por rol, aplicación toda 'SIN CLASE', train/validación sin target nulo."""
+    conteos = con.execute(f"""
+        SELECT {_col(ROL_COL)}, COUNT(*) AS n, MIN({_col(MES_COL)}) AS mn, MAX({_col(MES_COL)}) AS mx
+        FROM etapa1 GROUP BY {_col(ROL_COL)} ORDER BY mn
+    """).fetchall()
+    print("Filas por rol:")
+    for rol, n, mn, mx in conteos:
+        print(f"  {str(rol):12s}: {n:>8,} filas | meses {mn}-{mx}")
+
+    sin_rol = con.execute(f"SELECT COUNT(*) FROM etapa1 WHERE {_col(ROL_COL)} IS NULL").fetchone()[0]
+    assert sin_rol == 0, f"Hay {sin_rol} filas de meses que no están en la configuración."
+
+    mal_aplic = con.execute(f"""
+        SELECT COUNT(*) FROM etapa1
+        WHERE {_col(ROL_COL)} = 'aplicacion' AND COALESCE({_col(TARGET_COL)}, '') != 'SIN CLASE'
+    """).fetchone()[0]
+    assert mal_aplic == 0, "El mes de aplicación debería venir íntegramente como 'SIN CLASE'."
+
+    for rol in ("train", "validacion"):
+        n_nan = con.execute(f"""
+            SELECT COUNT(*) FROM etapa1
+            WHERE {_col(ROL_COL)} = '{rol}' AND {_col(TARGET_COL)} IS NULL
+        """).fetchone()[0]
+        assert n_nan == 0, f"El rol '{rol}' tiene {n_nan} filas con target sin madurar."
+
+    for rol in ("train", "validacion"):
+        dist = con.execute(f"""
+            SELECT {_col(MES_COL)}, {_col(TARGET_COL)}, COUNT(*) AS n FROM etapa1
+            WHERE {_col(ROL_COL)} = '{rol}' GROUP BY ALL ORDER BY 1, 3 DESC
+        """).df()
+        print(f"\n{rol} - distribución de {TARGET_COL} por mes:")
+        print(dist.pivot(index=MES_COL, columns=TARGET_COL, values="n").to_string())
+
+    print("\nOK: estructura de datasets validada.")
+
+#%% celda 13 [código]
+# Base DuckDB EN DISCO (no en RAM): las tablas intermedias ocupan varios GB y una base en
+# memoria se queda sin lugar (OutOfMemoryException). En disco, DuckDB baja a disco lo que no entra.
+DUCKDB_PATH = os.path.join(BASE_PATH, "duckdb_tmp", "churn_v5.duckdb")
+os.makedirs(os.path.dirname(DUCKDB_PATH), exist_ok=True)
+try:   # arrancar siempre de cero
+    con.close()   # si la celda se re-ejecuta en el mismo kernel
+except NameError:
+    pass
+for _f in (DUCKDB_PATH, DUCKDB_PATH + ".wal"):
+    if os.path.exists(_f):
+        try:
+            os.remove(_f)
+        except PermissionError:
+            raise RuntimeError(f"{_f} está en uso por otro kernel: cerralo (Kernel -> Shut Down) y reintentá.")
+
+try:   # límite de memoria de DuckDB: ~40% de la RAM (el resto queda para pandas/LightGBM)
+    import psutil
+    DUCKDB_MEMORIA_GB = max(2, int(psutil.virtual_memory().total / 1e9 * 0.4))
+except ImportError:
+    DUCKDB_MEMORIA_GB = 4
+
+con = duckdb.connect(DUCKDB_PATH)
+con.execute(f"SET memory_limit = '{DUCKDB_MEMORIA_GB}GB'")
+con.execute(f"SET temp_directory = '{os.path.dirname(DUCKDB_PATH)}'")
+con.execute("SET preserve_insertion_order = false")
+print(f"DuckDB en disco ({DUCKDB_PATH}), límite de memoria {DUCKDB_MEMORIA_GB} GB")
+crear_macros_sql(con)
+construir_etapa1_sql(con)
+validar_estructura_sql(con)
+
+#%% celda 14 [texto]
+## Etapa 2 — Data Quality
+
+Primero un **scan de variables rotas por mes** sobre el csv original: así se detectaron
+`ccajas_depositos` en 202105 (100% ceros) y otros candidatos. Después, la auditoría de nulos,
+outliers e imputación de la v3. Las columnas de `VARIABLES_ROTAS` no se imputan: quedan NA.
+
+#%% celda 15 [código]
+def scan_variables_rotas_sql(con: duckdb.DuckDBPyConnection, tabla: str = "raw",
+                             factor: float = 3.0, salto: float = 0.30) -> pd.DataFrame:
+    """
+    Diagnóstico de "catástrofes" de carga: para cada variable numérica y cada mes
+    compara contra la mediana de los demás meses y marca:
+      - promedio que se multiplica/divide por más de 'factor' (o cae a 0 exacto),
+      - salto de 'salto' (30 pp) o más en el % de ceros o en el % de nulos.
+    Corre sobre 'raw' (el csv original, antes de VARIABLES_ROTAS). Es un reporte:
+    no modifica nada; lo que quieras tratar lo agregás a VARIABLES_ROTAS.
+    """
+    tipos = con.execute(f"DESCRIBE {tabla}").df()
+    numericas = [c for c, t in zip(tipos["column_name"], tipos["column_type"])
+                 if c not in COLS_NO_FEATURE and any(k in t.upper() for k in ("INT", "DOUBLE", "FLOAT", "DECIMAL"))]
+    exprs = []
+    for i, c in enumerate(numericas):
+        exprs += [f"AVG({_col(c)}) AS m{i}",
+                  f"AVG(CASE WHEN {_col(c)} = 0 THEN 1.0 ELSE 0.0 END) AS z{i}",
+                  f"AVG(CASE WHEN {_col(c)} IS NULL THEN 1.0 ELSE 0.0 END) AS n{i}"]
+    stats = con.execute(f"""
+        SELECT {_col(MES_COL)}, {", ".join(exprs)} FROM {tabla} GROUP BY 1 ORDER BY 1
+    """).df().set_index(MES_COL)
+
+    filas = []
+    for i, c in enumerate(numericas):
+        m, z, n = stats[f"m{i}"], stats[f"z{i}"], stats[f"n{i}"]
+        for mes in stats.index:
+            otros = stats.index != mes
+            med_m, med_z, med_n = m[otros].median(), z[otros].median(), n[otros].median()
+            ratio = m[mes] / med_m if med_m not in (0,) and pd.notna(med_m) and pd.notna(m[mes]) else np.nan
+            motivos = []
+            if pd.notna(ratio) and ratio != 0 and (abs(ratio) > factor or abs(ratio) < 1 / factor):
+                motivos.append(f"promedio x{ratio:.2f}")
+            if m[mes] == 0 and med_m != 0:
+                motivos.append("promedio = 0")
+            if z[mes] - med_z >= salto:
+                motivos.append(f"ceros {med_z:.0%} -> {z[mes]:.0%}")
+            if n[mes] - med_n >= salto:
+                motivos.append(f"nulos {med_n:.0%} -> {n[mes]:.0%}")
+            if motivos:
+                filas.append({"variable": c, "mes": mes, "promedio_mes": m[mes],
+                              "mediana_otros_meses": med_m, "motivo": "; ".join(motivos),
+                              "ya_en_VARIABLES_ROTAS": mes in VARIABLES_ROTAS.get(c, [])})
+    reporte = pd.DataFrame(filas)
+    print(f"Scan de variables rotas sobre '{tabla}' ({len(numericas)} variables numéricas):")
+    print(reporte.round(4).to_string(index=False) if len(reporte) else "  sin anomalías")
+    print("\nOJO: *_fultimo_cierre / *_Fvencimiento dependen del día de corte de cada mes "
+          "(no son errores; el PSI ya las saca si driftean).")
+    return reporte
+
+
+def auditoria_calidad_sql(con: duckdb.DuckDBPyConnection, columnas: list) -> tuple:
+    """% de nulos en train vs. aplicación (diagnóstico de z701) y columnas con nulos sin regla (van a mediana)."""
+    def pct_nulos(rol: str) -> pd.Series:
+        expr = ", ".join(
+            f"AVG(CASE WHEN {_col(c)} IS NULL THEN 1.0 ELSE 0.0 END) * 100 AS {_col(c)}"
+            for c in columnas
+        )
+        return con.execute(f"SELECT {expr} FROM etapa1 WHERE {_col(ROL_COL)} = '{rol}'").df().iloc[0]
+
+    resumen = pd.DataFrame({
+        "null_%_train": pct_nulos("train"),
+        "null_%_aplicacion": pct_nulos("aplicacion"),
+    })
+    resumen["gap_null_%"] = (resumen["null_%_train"] - resumen["null_%_aplicacion"]).abs()
+    resumen = resumen.sort_values("null_%_train", ascending=False)
+
+    con_nulos = resumen[(resumen["null_%_train"] > 0) | (resumen["null_%_aplicacion"] > 0)]
+    print(f"Columnas con algún nulo (train o aplicación): {len(con_nulos)}")
+    print(con_nulos.round(2).head(20))
+
+    sin_clasificar = [c for c in con_nulos.index
+                      if c not in COLS_CERO + COLS_EXTREMO_NEG1 + COLS_EXTREMO_ALTO]
+    if sin_clasificar:
+        print(f"\nColumnas con nulos NO cubiertas por las reglas -> mediana de train: {sin_clasificar}")
+    return resumen, sin_clasificar
+
+
+def detectar_outliers_sql(con: duckdb.DuckDBPyConnection, columnas: list,
+                           factor_iqr: float = 3.0) -> pd.DataFrame:
+    """Diagnóstico de outliers por IQR, sólo sobre train. Es un reporte: no recorta nada."""
+    filas = []
+    for c in columnas:
+        q1, q3 = con.execute(f"""
+            SELECT quantile_cont({_col(c)}, 0.25), quantile_cont({_col(c)}, 0.75)
+            FROM etapa1 WHERE {_col(ROL_COL)} = 'train'
+        """).fetchone()
+        if q1 is None or q3 is None or q3 == q1:
+            continue
+        iqr = q3 - q1
+        lim_inf, lim_sup = q1 - factor_iqr * iqr, q3 + factor_iqr * iqr
+        n_out, n = con.execute(f"""
+            SELECT SUM(CASE WHEN {_col(c)} < {lim_inf} OR {_col(c)} > {lim_sup} THEN 1 ELSE 0 END), COUNT(*)
+            FROM etapa1 WHERE {_col(ROL_COL)} = 'train'
+        """).fetchone()
+        if n_out:
+            filas.append({"columna": c, "n_outliers_train": n_out, "%_outliers_train": 100 * n_out / n,
+                          "lim_inf": lim_inf, "lim_sup": lim_sup})
+    reporte = pd.DataFrame(filas).sort_values("%_outliers_train", ascending=False)
+    print(f"\nVariables con outliers (IQR x{factor_iqr}) en train: {len(reporte)}")
+    print(reporte.head(15).round(2).to_string(index=False))
+    return reporte
+
+
+def calcular_medianas_train_sql(con: duckdb.DuckDBPyConnection, columnas: list) -> dict:
+    """Mediana calculada ÚNICAMENTE sobre train (fit) para aplicarla igual a todos los roles."""
+    if not columnas:
+        return {}
+    expr = ", ".join(f"median({_col(c)}) AS {_col(c)}" for c in columnas)
+    fila = con.execute(f"SELECT {expr} FROM etapa1 WHERE {_col(ROL_COL)} = 'train'").fetchone()
+    medianas = {c: (v if v is not None else 0) for c, v in zip(columnas, fila)}
+    print(f"Medianas de train: {medianas}")
+    return medianas
+
+
+def construir_etapa2_sql(con: duckdb.DuckDBPyConnection, medianas: dict) -> None:
+    """Aplica ceros, centinelas y medianas; agrega flags de tenencia de tarjeta."""
+    columnas_etapa1 = _columnas(con, "etapa1")
+    cols_cero = [c for c in COLS_CERO if c in columnas_etapa1]
+    cols_neg1 = [c for c in COLS_EXTREMO_NEG1 if c in columnas_etapa1]
+    cols_alto = [c for c in COLS_EXTREMO_ALTO if c in columnas_etapa1]
+    cols_mediana = list(medianas.keys())
+
+    exclude_clause = ", ".join(_col(c) for c in cols_cero + cols_neg1 + cols_alto + cols_mediana)
+    partes = []
+    partes += [f"COALESCE({_col(c)}, 0) AS {_col(c)}" for c in cols_cero]
+    partes += [f"COALESCE({_col(c)}, -1) AS {_col(c)}" for c in cols_neg1]
+    partes += [f"COALESCE({_col(c)}, {CENTINELA_ALTO}) AS {_col(c)}" for c in cols_alto]
+    partes += [f"COALESCE({_col(c)}, {medianas[c]}) AS {_col(c)}" for c in cols_mediana]
+    partes += [
+        "CASE WHEN ctarjeta_visa > 0 THEN 1 ELSE 0 END AS tiene_visa",
+        "CASE WHEN ctarjeta_master > 0 THEN 1 ELSE 0 END AS tiene_master",
+    ]
+    con.execute(f"""
+        CREATE OR REPLACE TABLE etapa2 AS
+        SELECT * EXCLUDE ({exclude_clause}), {", ".join(partes)}
+        FROM etapa1
+    """)
+    print(f"Etapa 2: imputadas {len(cols_cero)} (cero) + {len(cols_neg1)} (-1) + "
+          f"{len(cols_alto)} ({CENTINELA_ALTO}) + {len(cols_mediana)} (mediana train). "
+          f"Agregadas tiene_visa, tiene_master.")
+
+#%% celda 16 [código]
+reporte_rotas = scan_variables_rotas_sql(con)
+con.execute("DROP TABLE raw")   # ya no se usa: liberar espacio
+
+#%% celda 17 [código]
+columnas_candidatas = [c for c in _columnas(con, "etapa1") if c not in COLS_NO_FEATURE]
+_, sin_clasificar = auditoria_calidad_sql(con, columnas_candidatas)
+# Las variables rotas quedan en NA a propósito: NO se imputan por mediana.
+sin_clasificar = [c for c in sin_clasificar if c not in VARIABLES_ROTAS]
+reporte_outliers = detectar_outliers_sql(con, columnas_candidatas)
+medianas = calcular_medianas_train_sql(con, sin_clasificar)
+construir_etapa2_sql(con, medianas)
+con.execute("DROP TABLE etapa1")   # ya no se usa: liberar espacio
+
+#%% celda 18 [texto]
+## Etapa 3 — Feature Engineering
+
+Deflactación (salvo la versión nominal de los límites de tarjeta, `NO_DEFLACTAR`), lags
+completos para `VARS_LAG` + `delta1_` para todas las demás numéricas (`DELTAS_EXTRA`),
+y ratios. Los rank por mes de la v4 quedan desactivados.
+
+#%% celda 19 [código]
+def _columnas_monetarias(columnas: list) -> list:
+    """Montos ('m*', 'Master_m*', 'Visa_m*') salvo los denominados en dólares (no se deflactan por IPC en pesos)."""
+    return [
+        c for c in columnas
+        if c not in COLS_NO_FEATURE
+        and "dolares" not in c.lower()
+        and (c.startswith("Master_m") or c.startswith("Visa_m")
+             or (c.startswith("m") and not c.startswith(("Master", "Visa"))))
+    ]
+
+
+def _indice_ipc_filas() -> list:
+    """Índice acumulado mes a mes, base 100."""
+    idx, filas = 100.0, []
+    for mes in sorted(IPC_MENSUAL):
+        idx *= (1 + IPC_MENSUAL[mes] / 100)
+        filas.append((mes, idx))
+    return filas
+
+
+def construir_etapa3_deflactado_sql(con: duckdb.DuckDBPyConnection) -> None:
+    """monto_real = monto / (ipc_indice / 100). Agrega '_real' y descarta el nominal."""
+    valores = ", ".join(f"({mes}, {idx})" for mes, idx in _indice_ipc_filas())
+    con.execute(f"CREATE OR REPLACE TABLE ipc AS SELECT * FROM (VALUES {valores}) AS t({MES_COL}, ipc_indice)")
+
+    cols_monetarias = _columnas_monetarias(_columnas(con, "etapa2"))
+    reales = [f"({_col(c)} / (ipc_indice / 100.0)) AS {_col(c + '_real')}" for c in cols_monetarias]
+    # Las de NO_DEFLACTAR conservan además la versión nominal (nombre original).
+    exclude_clause = ", ".join(_col(c) for c in ["ipc_indice"] + cols_monetarias if c not in NO_DEFLACTAR)
+
+    con.execute(f"""
+        CREATE OR REPLACE TABLE etapa3_deflactado AS
+        SELECT * EXCLUDE ({exclude_clause}), {", ".join(reales)}
+        FROM (SELECT e.*, i.ipc_indice FROM etapa2 e JOIN ipc i ON e.{MES_COL} = i.{MES_COL})
+    """)
+    con.execute("DROP TABLE ipc")
+    nominales = [c for c in NO_DEFLACTAR if c in cols_monetarias]
+    print(f"Deflactadas {len(cols_monetarias)} variables monetarias. "
+          f"Se conservan también en nominal: {nominales}")
+
+
+def _candidatas_delta_extra(con, tabla: str, ya_con_lags: list) -> list:
+    """Numéricas a las que se les agrega delta1_: todas menos ids/target, las que ya tienen
+    lags completos, centinelas (999999/-1: su diferencia no significa nada) y flags."""
+    tipos = con.execute(f"DESCRIBE {tabla}").df()
+    excluir = (COLS_NO_FEATURE | set(ya_con_lags) | set(COLS_EXTREMO_ALTO) | set(COLS_EXTREMO_NEG1)
+               | {"tiene_visa", "tiene_master"})
+    return [c for c, t in zip(tipos["column_name"], tipos["column_type"])
+            if c not in excluir and any(k in t.upper() for k in ("INT", "DOUBLE", "FLOAT", "DECIMAL"))]
+
+
+DELTAS_EXTRA_CREADAS = []   # se completa en construir_etapa3_lags_sql (lo usa la Etapa 6a)
+
+
+def construir_etapa3_lags_sql(con: duckdb.DuckDBPyConnection, variables: list = VARS_LAG) -> None:
+    """
+    lag1/lag2/delta1/delta2 por cliente. Si al cliente le falta un mes en el
+    medio, LAG() posicional traería el valor de un mes equivocado: se exige
+    que la distancia en PERÍODOS (año*12+mes) sea exactamente 1 o 2 (si no,
+    NULL). Usar períodos evita el bug de restar AAAAMM al cruzar de año.
+    """
+    columnas = _columnas(con, "etapa3_deflactado")
+    faltantes = [v for v in variables if v not in columnas]
+    variables = [v for v in variables if v in columnas]
+    if faltantes:
+        print(f"(Aviso: se omiten de los lags porque no existen: {faltantes})")
+
+    extra = _candidatas_delta_extra(con, "etapa3_deflactado", variables) if DELTAS_EXTRA else []
+
+    per = _periodo_sql(_col(MES_COL))
+    aux_exprs = [f"{per} AS {_col('_per')}",
+                 f"LAG({per}, 1) OVER w AS {_col('_per_lag1')}",
+                 f"LAG({per}, 2) OVER w AS {_col('_per_lag2')}"]
+    aux_cols = ["_per", "_per_lag1", "_per_lag2"]
+    for v in variables:
+        aux_exprs += [f"LAG({_col(v)}, 1) OVER w AS {_col('_val_lag1_' + v)}",
+                      f"LAG({_col(v)}, 2) OVER w AS {_col('_val_lag2_' + v)}"]
+        aux_cols += [f"_val_lag1_{v}", f"_val_lag2_{v}"]
+    for v in extra:
+        aux_exprs.append(f"LAG({_col(v)}, 1) OVER w AS {_col('_val_lag1_' + v)}")
+        aux_cols.append(f"_val_lag1_{v}")
+
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _etapa3_aux AS
+        SELECT *, {", ".join(aux_exprs)}
+        FROM etapa3_deflactado
+        WINDOW w AS (PARTITION BY {_col(ID_COL)} ORDER BY {_col(MES_COL)})
+    """)
+
+    final_exprs = []
+    for v in variables:
+        lag1 = f"CASE WHEN {_col('_per')} - {_col('_per_lag1')} = 1 THEN {_col('_val_lag1_' + v)} END"
+        lag2 = f"CASE WHEN {_col('_per')} - {_col('_per_lag2')} = 2 THEN {_col('_val_lag2_' + v)} END"
+        final_exprs += [f"({lag1}) AS {_col('lag1_' + v)}",
+                        f"({lag2}) AS {_col('lag2_' + v)}",
+                        f"({_col(v)} - ({lag1})) AS {_col('delta1_' + v)}",
+                        f"({_col(v)} - ({lag2})) AS {_col('delta2_' + v)}"]
+    DELTAS_EXTRA_CREADAS.clear()
+    for v in extra:
+        lag1 = f"CASE WHEN {_col('_per')} - {_col('_per_lag1')} = 1 THEN {_col('_val_lag1_' + v)} END"
+        final_exprs.append(f"({_col(v)} - ({lag1})) AS {_col('delta1_' + v)}")
+        DELTAS_EXTRA_CREADAS.append(f"delta1_{v}")
+
+    exclude_clause = ", ".join(_col(c) for c in aux_cols)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE etapa3_lags AS
+        SELECT * EXCLUDE ({exclude_clause}), {", ".join(final_exprs)}
+        FROM _etapa3_aux
+    """)
+    con.execute("DROP TABLE _etapa3_aux")
+    print(f"Generados lag1/lag2/delta1/delta2 para {len(variables)} variables ({len(variables) * 4} columnas)"
+          f" + delta1 para {len(extra)} variables más.")
+
+
+def construir_etapa3_ratios_sql(con: duckdb.DuckDBPyConnection) -> None:
+    """Ratios y agrupaciones (macros suma_sin_null/ratio_sin_null)."""
+    con.execute("""
+        CREATE OR REPLACE TABLE etapa3_base AS
+        SELECT *,
+            suma_sin_null(Visa_mconsumototal_real, Master_mconsumototal_real) AS tc_consumo_total,
+            suma_sin_null(Visa_msaldototal_real, Master_msaldototal_real) AS tc_saldo_total,
+            suma_sin_null(Visa_mlimitecompra_real, Master_mlimitecompra_real) AS tc_limite_total,
+            ratio_sin_null(Visa_msaldototal_real, Visa_mlimitecompra_real) AS visa_utilizacion,
+            ratio_sin_null(Master_msaldototal_real, Master_mlimitecompra_real) AS master_utilizacion,
+            suma_sin_null(ctarjeta_visa_transacciones, ctarjeta_master_transacciones) AS tc_transacciones_total,
+            suma_sin_null(
+                suma_sin_null(mprestamos_personales_real, mprestamos_prendarios_real),
+                mprestamos_hipotecarios_real
+            ) AS prestamos_total,
+            (mactivos_margen_real - mpasivos_margen_real) AS margen_neto,
+            suma_sin_null(
+                suma_sin_null(mcaja_ahorro_real, mcuenta_corriente_real),
+                mplazo_fijo_pesos_real
+            ) AS liquidez_total_pesos,
+            suma_sin_null(chomebanking_transacciones, cmobile_app_trx) AS digital_trx_total
+        FROM etapa3_lags
+    """)
+    con.execute("""
+        CREATE OR REPLACE TABLE etapa3_final AS
+        SELECT *,
+            ratio_sin_null(tc_saldo_total, tc_limite_total) AS tc_utilizacion_total,
+            ratio_sin_null(prestamos_total, mpayroll_real) AS ratio_deuda_ingreso,
+            ratio_sin_null(digital_trx_total, ctrx_quarter) AS ratio_digital_total_trx,
+            CASE WHEN prestamos_total > 0 THEN 1 ELSE 0 END AS tiene_prestamos,
+            CASE WHEN COALESCE(mpayroll_real, 0) > 0 OR COALESCE(cpayroll_trx, 0) > 0
+                 THEN 1 ELSE 0 END AS tiene_payroll,
+            ratio_sin_null(cliente_antiguedad, cliente_edad * 12) AS prop_vida_en_banco
+        FROM etapa3_base
+    """)
+    con.execute("DROP TABLE etapa3_base")
+    print("Agregadas 10 variables de ratios/agrupaciones + tiene_prestamos, tiene_payroll, prop_vida_en_banco.")
+
+
+# Dependencias de las variables derivadas: se usan en la Etapa 5 para que, si
+# se excluye una variable base, la exclusión llegue también a lo que se calculó con ella.
+DERIVADAS = {
+    "tc_consumo_total": ["Visa_mconsumototal_real", "Master_mconsumototal_real"],
+    "tc_saldo_total": ["Visa_msaldototal_real", "Master_msaldototal_real"],
+    "tc_limite_total": ["Visa_mlimitecompra_real", "Master_mlimitecompra_real"],
+    "visa_utilizacion": ["Visa_msaldototal_real", "Visa_mlimitecompra_real"],
+    "master_utilizacion": ["Master_msaldototal_real", "Master_mlimitecompra_real"],
+    "tc_utilizacion_total": ["Visa_msaldototal_real", "Master_msaldototal_real",
+                             "Visa_mlimitecompra_real", "Master_mlimitecompra_real"],
+    "tc_transacciones_total": ["ctarjeta_visa_transacciones", "ctarjeta_master_transacciones"],
+    "prestamos_total": ["mprestamos_personales_real", "mprestamos_prendarios_real", "mprestamos_hipotecarios_real"],
+    "margen_neto": ["mactivos_margen_real", "mpasivos_margen_real"],
+    "liquidez_total_pesos": ["mcaja_ahorro_real", "mcuenta_corriente_real", "mplazo_fijo_pesos_real"],
+    "digital_trx_total": ["chomebanking_transacciones", "cmobile_app_trx"],
+    "ratio_deuda_ingreso": ["mprestamos_personales_real", "mprestamos_prendarios_real",
+                            "mprestamos_hipotecarios_real", "mpayroll_real"],
+    "ratio_digital_total_trx": ["chomebanking_transacciones", "cmobile_app_trx", "ctrx_quarter"],
+    "prop_vida_en_banco": ["cliente_antiguedad", "cliente_edad"],
+}
+# Banderas que sobreviven A PROPÓSITO aunque su base se excluya (son el reemplazo
+# robusto del monto: "cobra sueldo acá", "tiene algún préstamo").
+FLAGS_QUE_SOBREVIVEN = {"tiene_payroll", "tiene_prestamos"}
+
+# Rank por mes ("rank cero fijo"): variables cuyo NIVEL driftea entre meses (límites de
+# tarjeta: el PSI las descarta) pero cuya posición RELATIVA dentro del mes sigue siendo
+# informativa. 0 sigue siendo 0, positivos -> (0, 1], negativos -> [-1, 0), NULL sigue NULL.
+# Por construcción, su distribución es casi idéntica todos los meses (PSI ~ 0).
+# v5: DESACTIVADO. En los límites (~145 valores distintos) el rank queda escalonado y daba
+# PSI 0.24–0.25 por artefacto; se reemplaza por usar los límites en nominal (NO_DEFLACTAR).
+VARS_RANK = []
+
+
+def construir_etapa3_rank_sql(con: duckdb.DuckDBPyConnection, variables: list = VARS_RANK) -> None:
+    """Agrega <var>_rank (rank cero fijo dentro de cada foto_mes) a etapa3_final."""
+    columnas = _columnas(con, "etapa3_final")
+    variables = [v for v in variables if v in columnas]
+    if not variables:
+        return
+    exprs = []
+    for v in variables:
+        x = _col(v)
+        exprs.append(f"""CASE
+            WHEN {x} > 0 THEN CUME_DIST() OVER (PARTITION BY {_col(MES_COL)}, SIGN({x}) ORDER BY {x})
+            WHEN {x} < 0 THEN -CUME_DIST() OVER (PARTITION BY {_col(MES_COL)}, SIGN({x}) ORDER BY {x} DESC)
+            WHEN {x} = 0 THEN 0 END AS {_col(v + '_rank')}""")
+    con.execute("ALTER TABLE etapa3_final RENAME TO etapa3_pre_rank")
+    con.execute(f"CREATE TABLE etapa3_final AS SELECT *, {', '.join(exprs)} FROM etapa3_pre_rank")
+    con.execute("DROP TABLE etapa3_pre_rank")
+    print(f"Agregados {len(variables)} ranks por mes: {[v + '_rank' for v in variables]}")
+
+#%% celda 20 [código]
+# Cada tabla intermedia se borra apenas deja de hacer falta.
+construir_etapa3_deflactado_sql(con); con.execute("DROP TABLE etapa2")
+construir_etapa3_lags_sql(con);       con.execute("DROP TABLE etapa3_deflactado")
+construir_etapa3_ratios_sql(con);     con.execute("DROP TABLE etapa3_lags")
+construir_etapa3_rank_sql(con)
+
+#%% celda 21 [texto]
+## Extraer los roles como DataFrames de pandas
+
+#%% celda 22 [código]
+def extraer_roles_sql(con: duckdb.DuckDBPyConnection, tabla: str = "etapa3_final") -> dict:
+    """Tabla final de DuckDB -> un DataFrame por rol, con los float64 pasados a float32
+    (la mitad de memoria; a los árboles les sobra precisión)."""
+    # El CAST a FLOAT se hace en SQL: así pandas nunca materializa la versión float64.
+    tipos = con.execute(f"DESCRIBE {tabla}").df()
+    select = ", ".join(
+        f"CAST({_col(c)} AS FLOAT) AS {_col(c)}" if t.upper() in ("DOUBLE", "FLOAT8") or t.upper().startswith("DECIMAL")
+        else _col(c)
+        for c, t in zip(tipos["column_name"], tipos["column_type"])
+    )
+    return {
+        r: con.execute(f"SELECT {select} FROM {tabla} WHERE {_col(ROL_COL)} = '{r}'").df()
+        for r in ("historico", "train", "validacion", "aplicacion")
+    }
+
+
+roles = extraer_roles_sql(con)
+print(f"Columnas tras Feature Engineering: {len(_columnas(con, 'etapa3_final'))}")
+# DuckDB ya no se usa: se cierra y se borra la base temporal para liberar disco y memoria.
+con.close()
+for _f in (DUCKDB_PATH, DUCKDB_PATH + ".wal"):
+    if os.path.exists(_f):
+        os.remove(_f)
+print(f"Memoria total: {sum(d.memory_usage(deep=True).sum() for d in roles.values()) / 1e9:.2f} GB")
+for nombre, d in roles.items():
+    print(f"  {nombre:12s}: {d.shape[0]:>8,} filas x {d.shape[1]} columnas")
+
+#%% celda 23 [texto]
+## Etapa 4 — Clustering de Clientes (No Supervisado)
+
+KMeans sobre variables de comportamiento (sin mirar el target), fit sólo en train y predict en el
+resto. El cluster entra al modelo como **dummies** `cluster_1..k` (antes entraba como número 1–5,
+lo que le sugería al modelo un orden que no existe). La tasa de BAJA por cluster es sólo un
+diagnóstico, nunca un insumo de la feature.
+
+#%% celda 24 [código]
+SEED_CLUSTER = 214_363  # misma semilla que z501_cluster_rf
+K_CLUSTERS = 5
+
+VARS_CLUSTER = [
+    "cliente_edad", "cliente_antiguedad", "cproductos",
+    "ctrx_quarter", "digital_trx_total",
+    "mcuentas_saldo_real", "mrentabilidad_real", "margen_neto",
+    "tc_utilizacion_total", "liquidez_total_pesos",
+    "tiene_visa", "tiene_master", "tiene_prestamos", "tiene_payroll",
+]
+# Nota: se quitó 'ratio_deuda_ingreso' respecto de la versión anterior, porque usa
+# mpayroll_real y mprestamos_personales_real (excluidas por la hoja de ruta).
+
+
+def construir_cluster(roles: dict, variables: list = VARS_CLUSTER,
+                       k: int = K_CLUSTERS, seed: int = SEED_CLUSTER) -> dict:
+    """RobustScaler + KMeans con recorte p1–p99 (calculado en train). fit sólo en train."""
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import RobustScaler
+
+    train = roles["train"]
+    variables = [v for v in variables if v in train.columns]
+    limites = {v: tuple(train[v].quantile([0.01, 0.99])) for v in variables}
+
+    def _matriz(df):
+        rec = pd.DataFrame({v: df[v].clip(*limites[v]) for v in variables})
+        return rec.fillna(pd.Series({v: train[v].median() for v in variables}))
+
+    scaler = RobustScaler()
+    X_train = scaler.fit_transform(_matriz(train))
+    kmeans = KMeans(n_clusters=k, n_init=20, random_state=seed)
+    labels_train = kmeans.fit_predict(X_train)
+
+    orden = pd.Series(labels_train).value_counts().index.tolist()   # 1 = el más numeroso
+    remap = {viejo: nuevo + 1 for nuevo, viejo in enumerate(orden)}
+
+    for nombre, df in roles.items():
+        labels = labels_train if nombre == "train" else kmeans.predict(scaler.transform(_matriz(df)))
+        df["cluster"] = pd.Series(labels, index=df.index).map(remap)
+        for j in range(1, k + 1):
+            df[f"cluster_{j}"] = (df["cluster"] == j).astype("int8")
+
+    print(f"Etapa 4: KMeans k={k} (fit sólo en train) sobre {len(variables)} variables.")
+    print(train["cluster"].value_counts().sort_index().to_string())
+    return roles
+
+
+def diagnostico_churn_por_cluster(roles: dict) -> pd.DataFrame:
+    """Tasa de BAJA (BAJA+1 o BAJA+2) por cluster en train/validación. Diagnóstico, NO feature."""
+    partes = []
+    for rol in ("train", "validacion"):
+        df = roles[rol]
+        es_baja = df[TARGET_COL].isin(["BAJA+1", "BAJA+2"])
+        r = es_baja.groupby(df["cluster"]).agg(n_clientes="count", tasa_baja="mean")
+        r["tasa_baja_pct"] = r.pop("tasa_baja") * 100
+        r["rol"] = rol
+        partes.append(r.reset_index())
+    reporte = pd.concat(partes, ignore_index=True).sort_values(["cluster", "rol"])
+    print("\nTasa de BAJA por cluster — diagnóstico, NO es feature:")
+    print(reporte.round(3).to_string(index=False))
+    return reporte
+
+#%% celda 25 [código]
+roles = construir_cluster(roles)
+_ = diagnostico_churn_por_cluster(roles)
+
+#%% celda 26 [texto]
+## Etapa 5 — Data Drift (PSI) y selección de columnas
+
+Umbrales de `z701_drifting`: PSI < 0.10 sin drift · 0.10–0.25 alerta temprana · > 0.25 drift sustancial.
+Se compara **Train vs Aplicación (202108)**.
+
+Cambios respecto de la versión anterior:
+- Las columnas de `VARIABLES_ROTAS` se comparan sin los meses en que se pusieron en NA a mano.
+- Las `*_rank` (Etapa 3) deberían dar PSI ~0: reemplazan a los límites de tarjeta que salen por drift.
+- Para `lag{k}_`/`delta{k}_` se usa sólo la parte de train donde el lag existe de verdad
+  (meses con al menos k meses previos en el dataset), así no se confunde NaN estructural con drift.
+- **La exclusión se propaga:** si se saca una variable base (por hoja de ruta o por PSI), también
+  salen sus `lag/delta`. Las derivadas (`DERIVADAS`) de una variable de la hoja de ruta salen
+  siempre; las de una variable con drift salen si su propio PSI está en alerta (> 0.10).
+  Las banderas `tiene_payroll`/`tiene_prestamos` sobreviven a propósito.
+
+#%% celda 27 [código]
+PSI_BUCKETS = 10
+PSI_UMBRAL_ALERTA = 0.10
+PSI_UMBRAL_SUSTANCIAL = 0.25
+
+# Variables base que la hoja de ruta pide sacar siempre (aguinaldo / cambio de estructura).
+VARS_EXCLUIR_SIEMPRE = ["mpayroll_real", "cpayroll_trx", "mprestamos_personales_real", "cprestamos_personales"]
+
+# Nunca son features (el cluster entra como dummies).
+COLS_NO_MODELO = {"cluster"}
+
+#%% celda 28 [código]
+def _psi_bins(expected: pd.Series, actual: pd.Series, buckets: int = PSI_BUCKETS,
+              valor_centinela=None) -> pd.DataFrame:
+    """Bins de PSI como z701: cuantiles sobre la unión de válidos + buckets aparte para nulos y centinela."""
+    exp_null = expected.isna().mean() if len(expected) else 0.0
+    act_null = actual.isna().mean() if len(actual) else 0.0
+    exp_v, act_v = expected.dropna(), actual.dropna()
+
+    exp_cent = act_cent = 0.0
+    if valor_centinela is not None:
+        exp_cent = float((exp_v == valor_centinela).mean()) * (1 - exp_null) if len(exp_v) else 0.0
+        act_cent = float((act_v == valor_centinela).mean()) * (1 - act_null) if len(act_v) else 0.0
+        exp_v, act_v = exp_v[exp_v != valor_centinela], act_v[act_v != valor_centinela]
+
+    union = pd.concat([exp_v, act_v])
+    cortes = None
+    if union.nunique() > 1:
+        _, cortes = pd.qcut(union, q=buckets, retbins=True, duplicates="drop")
+
+    resto_exp, resto_act = 1.0 - exp_null - exp_cent, 1.0 - act_null - act_cent
+    filas = []
+    if cortes is None or len(cortes) < 2:
+        filas.append({"Bucket": "unico", "Expected_Prop": resto_exp, "Actual_Prop": resto_act})
+    else:
+        exp_prop = pd.cut(exp_v, bins=cortes, include_lowest=True).value_counts(normalize=True, sort=False) * resto_exp
+        act_prop = pd.cut(act_v, bins=cortes, include_lowest=True).value_counts(normalize=True, sort=False) * resto_act
+        for b in exp_prop.index:
+            filas.append({"Bucket": str(b), "Expected_Prop": exp_prop.get(b, 0.0), "Actual_Prop": act_prop.get(b, 0.0)})
+    if exp_null > 0 or act_null > 0:
+        filas.append({"Bucket": "Null_Values", "Expected_Prop": exp_null, "Actual_Prop": act_null})
+    if exp_cent > 0 or act_cent > 0:
+        filas.append({"Bucket": "Centinela", "Expected_Prop": exp_cent, "Actual_Prop": act_cent})
+    return pd.DataFrame(filas).fillna(0.0)
+
+
+def psi(expected: pd.Series, actual: pd.Series, buckets: int = PSI_BUCKETS, valor_centinela=None) -> float:
+    """PSI tal cual z701_drifting, con bucket opcional para un centinela."""
+    if expected.empty and actual.empty:
+        return 0.0
+    df = _psi_bins(expected, actual, buckets=buckets, valor_centinela=valor_centinela)
+    e = np.maximum(df["Expected_Prop"].to_numpy(dtype=float), 1e-10)
+    a = np.maximum(df["Actual_Prop"].to_numpy(dtype=float), 1e-10)
+    total = float(np.sum((a - e) * np.log(a / e)))
+    return total if not np.isnan(total) else np.inf
+
+
+def _orden_lag(col: str) -> int:
+    """1 para lag1_/delta1_, 2 para lag2_/delta2_, 0 si no es un lag."""
+    for k in (1, 2):
+        if col.startswith((f"lag{k}_", f"delta{k}_")):
+            return k
+    return 0
+
+
+def _base_de(col: str) -> str:
+    """'delta2_mpayroll_real' -> 'mpayroll_real'."""
+    return col.split("_", 1)[1] if _orden_lag(col) else col
+
+
+def analizar_drift(roles: dict, columnas: list = None) -> pd.DataFrame:
+    """PSI Train vs Aplicación. Para lag{k}/delta{k} sólo filas de train con k meses previos en el dataset."""
+    train, aplic = roles["train"], roles["aplicacion"]
+    if columnas is None:
+        columnas = [c for c in train.select_dtypes(include=[np.number]).columns
+                    if c not in COLS_NO_FEATURE | COLS_NO_MODELO and not c.startswith("cluster_")]
+    per_train = train[MES_COL].map(periodo)
+
+    filas = []
+    for c in columnas:
+        if c not in aplic.columns:
+            continue
+        k = _orden_lag(c)
+        base = train[per_train >= periodo(PRIMER_MES) + k] if k else train
+        destino = aplic
+        base_c = _base_de(c)
+        if base_c in VARIABLES_ROTAS:
+            # El NA puesto a mano no es drift: se comparan sólo meses sanos. Para un lag/delta
+            # de orden k también quedan afectados los k meses siguientes al mes roto.
+            malos = {periodo(m) for m in VARIABLES_ROTAS[base_c]}
+            afectado = lambda df: df[MES_COL].map(periodo).map(lambda p: any(0 <= p - b <= k for b in malos))
+            base = base[~afectado(base)]
+            destino = aplic[~afectado(aplic)]
+        valor = psi(base[c], destino[c], valor_centinela=CENTINELA_ALTO if c in COLS_EXTREMO_ALTO else None)
+        filas.append({"columna": c, "psi": valor})
+
+    reporte = pd.DataFrame(filas).sort_values("psi", ascending=False).reset_index(drop=True)
+    reporte["alerta"] = np.select(
+        [reporte["psi"] > PSI_UMBRAL_SUSTANCIAL, reporte["psi"] > PSI_UMBRAL_ALERTA],
+        ["DRIFT SUSTANCIAL", "alerta temprana"], default="sin drift significativo")
+    print("PSI Train vs Aplicación (202108) — primeras 20:")
+    print(reporte.head(20).round(4).to_string(index=False))
+    return reporte
+
+
+def seleccionar_columnas_modelo(roles: dict, reporte_psi: pd.DataFrame,
+                                 vars_siempre: list = VARS_EXCLUIR_SIEMPRE,
+                                 umbral_excluir: float = PSI_UMBRAL_SUSTANCIAL) -> list:
+    """
+    Lista final de features. Excluye:
+      (a) variables de la hoja de ruta + TODOS sus lags/deltas + sus derivadas (salvo banderas),
+      (b) variables con PSI > umbral_excluir + sus lags/deltas + derivadas cuyo propio PSI > alerta.
+    """
+    train = roles["train"]
+    todas = [c for c in train.columns if c not in COLS_NO_FEATURE | COLS_NO_MODELO]
+    psi_de = dict(zip(reporte_psi["columna"], reporte_psi["psi"]))
+
+    por_psi = set(reporte_psi.loc[reporte_psi["psi"] > umbral_excluir, "columna"])
+    bases_siempre = set(vars_siempre)
+    # Sólo variables "base" con drift propagan a sus lags/deltas (que un delta2_ tenga
+    # drift no implica que la variable base lo tenga).
+    bases_psi = {c for c in por_psi if not _orden_lag(c)}
+
+    motivo = {}
+    for c in todas:
+        base = _base_de(c)
+        if base in bases_siempre:
+            motivo[c] = "hoja de ruta" + (" (lag/delta)" if base != c else "")
+        elif c in por_psi:
+            motivo[c] = "PSI > umbral"
+        elif base in bases_psi:
+            motivo[c] = f"lag/delta de variable con drift ({base})"
+        elif c in DERIVADAS and c not in FLAGS_QUE_SOBREVIVEN:
+            deps = set(DERIVADAS[c])
+            if deps & bases_siempre:
+                motivo[c] = f"derivada de {sorted(deps & bases_siempre)} (hoja de ruta)"
+            elif deps & bases_psi and psi_de.get(c, 0) > PSI_UMBRAL_ALERTA:
+                motivo[c] = f"derivada de {sorted(deps & bases_psi)} con PSI {psi_de[c]:.3f} > {PSI_UMBRAL_ALERTA}"
+
+    finales = [c for c in todas if c not in motivo]
+    alerta = [c for c in finales if PSI_UMBRAL_ALERTA < psi_de.get(c, 0) <= umbral_excluir]
+
+    print("Columnas excluidas y motivo:")
+    for c, m in sorted(motivo.items(), key=lambda x: (x[1], x[0])):
+        print(f"  {c:40s} {m}")
+    print(f"\nOJO — siguen en el modelo pero en alerta temprana (PSI {PSI_UMBRAL_ALERTA}–{umbral_excluir}), "
+          f"revisalas: {alerta}")
+    print(f"\nColumnas finales para el modelo: {len(finales)} (de {len(todas)})")
+    return finales
+
+#%% celda 29 [código]
+reporte_psi = analizar_drift(roles)
+columnas_modelo = seleccionar_columnas_modelo(roles, reporte_psi)
+
+#%% celda 30 [texto]
+## Etapa 6 — Comparación de modelos con Optuna (sin undersampling)
+
+Tres experimentos, **mismo objetivo y misma validación (202106)**:
+
+| Experimento | Algoritmo | Target de entrenamiento | Score usado para ordenar |
+|---|---|---|---|
+| `rf_ternario` | Random Forest | CONTINUA / BAJA+1 / BAJA+2 | P(BAJA+2) |
+| `rf_binario` | Random Forest | BAJA+1 ∪ BAJA+2 = 1, CONTINUA = 0 | P(BAJA) |
+| `lgbm_binario` | LightGBM | BAJA+1 ∪ BAJA+2 = 1, CONTINUA = 0 | P(BAJA) |
+
+**Sin undersampling:** cada trial entrena con el 100% de las filas de train (todos los CONTINUA).
+Hay un `assert` que lo verifica antes de lanzar Optuna.
+
+**Objetivo:** ganancia máxima de la curva acumulada **suavizada** sobre 202106 (sólo BAJA+2 suma).
+
+**Costo por trial:**
+- RF: árboles fijos en `RF_ARBOLES_OPTUNA` (100) y 1 semilla por trial. En un RF más árboles nunca
+  empeora, sólo reduce ruido; por eso no se optimiza y se sube recién en el semillero (`RF_ARBOLES_FINAL`).
+  Aun así, sin undersampling cada trial puede tardar 10–20 min: con el `timeout` de 2 h vas a tener
+  pocos trials. Si querés comparar en serio, subí el timeout o corré estas celdas de noche.
+- LightGBM: 3 semillas por trial (3–5 min por trial en tu máquina). 150 trials / 4 h.
+  **Warm start:** los 5 mejores trials (sin repetir) de los estudios v4 y v3 se encolan primero.
+  Se optimiza sobre las columnas de la variante elegida en la Etapa 6a.
+- **RF desactivado** (`"activo": False`): si querés volver a compararlo, activalo.
+
+Estudios en `modelos/optuna_<experimento>_v5.db` (se retoman solos si interrumpís).
+Para saltear un experimento, poné `"activo": False`.
+
+#%% celda 31 [código]
+import optuna
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+
+try:
+    import lightgbm as lgb
+except ImportError:
+    lgb = None
+    print("OJO: LightGBM no está instalado (pip install lightgbm). Se saltea 'lgbm_binario'.")
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+SEMILLA_BASE = 17
+np.random.seed(SEMILLA_BASE)
+SEMILLAS = np.random.choice(1_000_000, size=50, replace=False).tolist()
+SEMILLAS_OPTUNA = SEMILLAS[:3]          # como mucho 3 por trial
+SEMILLAS_SEMILLERO = SEMILLAS[3:]       # disjuntas de las de Optuna (47 disponibles)
+
+# Modelos en el semillero según el algoritmo ganador (LightGBM es barato -> más modelos)
+N_SEMILLERO = {"lgbm": 30, "rf": 10}
+RF_ARBOLES_OPTUNA = 100   # fijo durante Optuna
+RF_ARBOLES_FINAL = 300    # por modelo del semillero -> total = RF_ARBOLES_FINAL * N_SEMILLERO["rf"]
+
+VENTANA_SUAVIZADO = 41 if MODO_PRUEBA else 401      # envíos de la media móvil (impar)
+VERSION_ESTUDIO = "v9_prueba" if MODO_PRUEBA else "v9"
+WARM_START_TOP = 5
+
+EXPERIMENTOS = {
+    # RF desactivado en v5: en la v4 hizo 2 trials en 2 h y quedó ~40 BAJA+2 abajo de LightGBM.
+    "rf_ternario":  {"algoritmo": "rf", "target": "ternario", "semillas_optuna": 1,
+                     "n_trials": 20, "timeout": 2 * 3600, "activo": False},
+    "rf_binario":   {"algoritmo": "rf", "target": "binario", "semillas_optuna": 1,
+                     "n_trials": 20, "timeout": 2 * 3600, "activo": False},
+    "lgbm_binario": {"algoritmo": "lgbm", "target": "binario", "semillas_optuna": 3,
+                     "n_trials": 150, "timeout": 4 * 3600, "activo": True,
+                     "warm_start_db": ["optuna_lgbm_binario_v5.db", "optuna_lgbm_binario_v4.db", "optuna_lgbm_binario_v3.db"]},
+}
+if MODO_PRUEBA:
+    N_SEMILLERO = {"lgbm": 2, "rf": 2}
+    for cfg in EXPERIMENTOS.values():
+        cfg.update(n_trials=2, timeout=600)
+
+#%% celda 32 [texto]
+### Funciones de ganancia, targets, preprocesamiento y entrenamiento
+
+#%% celda 33 [código]
+def curva_ganancia(score, y_true):
+    """Ordena de mayor a menor score y acumula la ganancia (sólo BAJA+2 es acierto)."""
+    orden = np.argsort(-np.asarray(score), kind="mergesort")
+    gan = np.where(np.asarray(y_true)[orden] == "BAJA+2", ganancia_acierto, -costo_estimulo)
+    return orden, np.cumsum(gan)
+
+
+def suavizar(acum, ventana: int = VENTANA_SUAVIZADO):
+    """Media móvil centrada: un acierto suelto no mueve el óptimo."""
+    return pd.Series(acum).rolling(ventana, center=True, min_periods=1).mean().to_numpy()
+
+
+def ganancia_max_suavizada(score, y_true, ventana: int = VENTANA_SUAVIZADO) -> float:
+    return float(suavizar(curva_ganancia(score, y_true)[1], ventana).max())
+
+
+def construir_y(serie: pd.Series, target: str) -> np.ndarray:
+    if target == "ternario":
+        return serie.to_numpy()
+    if target == "binario":
+        return serie.isin(["BAJA+1", "BAJA+2"]).astype(int).to_numpy()
+    raise ValueError(target)
+
+
+def preparar_preprocesador(algoritmo: str, df_fit: pd.DataFrame, columnas: list):
+    """
+    LightGBM: nada (usa los NaN de forma nativa).
+    RF: mediana (fit en df_fit) + indicadores de faltante, SALVO para VARIABLES_ROTAS:
+    su indicador sería una "marca de mes" (sólo vale 1 en el mes roto) y el modelo
+    podría aprender algo propio de ese mes. Para el RF esas filas quedan con la mediana.
+    """
+    if algoritmo == "lgbm":
+        return None, list(columnas)
+    imp = SimpleImputer(strategy="median", add_indicator=True, keep_empty_features=True)
+    imp.fit(df_fit[columnas].astype("float32"))
+    nombres = list(imp.get_feature_names_out())
+    sacar = {f"missingindicator_{c}" for c in VARIABLES_ROTAS}
+    keep = np.array([i for i, n in enumerate(nombres) if n not in sacar])
+    return {"imp": imp, "keep": keep}, [nombres[i] for i in keep]
+
+
+def transformar(prep, df: pd.DataFrame, columnas: list) -> np.ndarray:
+    X = df[columnas].astype("float32")
+    if prep is None:
+        return X.to_numpy()
+    return prep["imp"].transform(X)[:, prep["keep"]].astype(np.float32)
+
+
+def params_finales(algoritmo: str, params: dict) -> dict:
+    """Agrega lo que no optimiza Optuna (cantidad de árboles del RF en el semillero)."""
+    p = dict(params)
+    if algoritmo == "rf":
+        p["n_estimators"] = RF_ARBOLES_FINAL
+    return p
+
+
+def entrenar(algoritmo: str, params: dict, X, y, seed: int, w=None):
+    if algoritmo == "rf":
+        p = {"n_estimators": RF_ARBOLES_OPTUNA, **params}
+        return RandomForestClassifier(**p, random_state=seed, n_jobs=-1).fit(X, y, sample_weight=w)
+    p = dict(params)
+    n_rounds = p.pop("num_boost_round")
+    p.update(objective="binary", bagging_freq=1, verbosity=-1, seed=seed, num_threads=os.cpu_count())
+    return lgb.train(p, lgb.Dataset(X, label=y, weight=w), num_boost_round=n_rounds)
+
+
+def score_modelo(modelo, X, algoritmo: str, target: str) -> np.ndarray:
+    if algoritmo == "lgbm":
+        return modelo.predict(X)
+    clases = list(modelo.classes_)
+    return modelo.predict_proba(X)[:, clases.index("BAJA+2" if target == "ternario" else 1)]
+
+
+def sugerir_params(trial, algoritmo: str) -> dict:
+    if algoritmo == "rf":   # espacio de exp_401, sin n_estimators (fijo, ver arriba)
+        return {
+            "max_depth": trial.suggest_int("max_depth", 2, 40),
+            "min_samples_split": trial.suggest_int("min_samples_split", 2, 2000),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 200),
+            "max_features": trial.suggest_float("max_features", 0.05, 0.7),
+            "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 10, 5000),
+            "max_samples": trial.suggest_float("max_samples", 0.5, 0.9),
+        }
+    return {   # mismo espacio que v3 (necesario para el warm start)
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 8, 1024, log=True),
+        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 50, 5000, log=True),
+        "feature_fraction": trial.suggest_float("feature_fraction", 0.1, 0.8),
+        "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+        "lambda_l2": trial.suggest_float("lambda_l2", 1e-3, 100, log=True),
+        "num_boost_round": trial.suggest_int("num_boost_round", 100, 2000, log=True),
+    }
+
+
+def correr_semillero(algoritmo: str, target: str, params: dict, X_fit, y_fit,
+                     X_preds: list, nombres: list, semillas: list, w_fit=None):
+    """
+    Entrena un modelo por semilla, predice sobre cada matriz de X_preds y lo DESCARTA
+    (no acumula modelos en RAM). Devuelve: lista con un array (n_semillas x n_filas) de
+    scores por cada X_pred, y las importancias promedio.
+    """
+    scores = [[] for _ in X_preds]
+    imps = []
+    for i, s in enumerate(semillas, 1):
+        t0 = time.time()
+        m = entrenar(algoritmo, params, X_fit, y_fit, s, w_fit)
+        for j, X in enumerate(X_preds):
+            scores[j].append(score_modelo(m, X, algoritmo, target))
+        imp = m.feature_importances_ if algoritmo == "rf" else m.feature_importance("gain").astype(float)
+        imps.append(imp / max(imp.sum(), 1e-12))
+        del m
+        print(f"  modelo {i}/{len(semillas)} (semilla {s}) en {(time.time() - t0) / 60:.1f} min")
+    importancias = (pd.DataFrame({"variable": nombres, "importancia_media": np.mean(imps, axis=0)})
+                    .sort_values("importancia_media", ascending=False).reset_index(drop=True))
+    return [np.array(sc) for sc in scores], importancias
+
+# ---- v9: pesos por mes -------------------------------------------------------------------
+DECAY_ELEGIDO = 1.0   # lo fija la Etapa 6a (1.0 = todos los meses pesan igual)
+
+
+def pesos_mes(meses: pd.Series, decay: float) -> np.ndarray:
+    """peso = decay ** (meses de antigüedad respecto del último mes del conjunto de entrenamiento)."""
+    per = meses.map(periodo).to_numpy()
+    return (decay ** (per.max() - per)).astype("float64")
+
+
+def pesos_df(df: pd.DataFrame, decay: float = None):
+    """Pesos de un DataFrame de entrenamiento con el decay elegido (None si no hay pesos)."""
+    d = DECAY_ELEGIDO if decay is None else decay
+    return None if d == 1.0 else pesos_mes(df[MES_COL], d)
+
+#%% celda 34 [código]
+def _trials_previos(nombre: str, dbs) -> list:
+    """Trials completos de estudios anteriores (lista de .db en MODELOS_PATH), mejor primero."""
+    if isinstance(dbs, str):
+        dbs = [dbs]
+    trials = []
+    for db in dbs or []:
+        ruta = os.path.join(MODELOS_PATH, db)
+        if not os.path.exists(ruta):
+            continue
+        try:
+            viejo = optuna.load_study(study_name=nombre, storage="sqlite:///" + ruta.replace("\\", "/"))
+        except Exception as e:
+            print(f"[{nombre}] no se pudo leer {db}: {e}")
+            continue
+        trials += [(t.value, t.params, db) for t in viejo.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    return sorted(trials, key=lambda x: x[0], reverse=True)
+
+
+def encolar_warm_start(study, nombre: str, dbs, top: int = WARM_START_TOP) -> None:
+    """Encola los 'top' mejores trials (sin repetir parámetros) de estudios anteriores."""
+    if len(study.trials) > 0:
+        return
+    vistos, n = set(), 0
+    for valor, params, db in _trials_previos(nombre, dbs):
+        clave = tuple(sorted(params.items()))
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        study.enqueue_trial(params)
+        n += 1
+        print(f"[{nombre}] warm start: encolado trial de {db} (valor allá {valor:,.0f})")
+        if n >= top:
+            break
+
+
+def correr_experimento(nombre: str, roles: dict, columnas: list) -> dict:
+    """Optuna para un experimento. Persiste en sqlite y retoma lo ya corrido."""
+    cfg = EXPERIMENTOS[nombre]
+    algoritmo, target = cfg["algoritmo"], cfg["target"]
+    if not cfg.get("activo", True):
+        print(f"[{nombre}] salteado (activo=False).")
+        return None
+    if algoritmo == "lgbm" and lgb is None:
+        print(f"[{nombre}] salteado: LightGBM no está instalado.")
+        return None
+
+    prep, _ = preparar_preprocesador(algoritmo, roles["train"], columnas)
+    X_tr = transformar(prep, roles["train"], columnas)
+    X_va = transformar(prep, roles["validacion"], columnas)
+    y_tr = construir_y(roles["train"][TARGET_COL], target)
+    y_va = roles["validacion"][TARGET_COL].to_numpy()
+    w_tr = pesos_df(roles["train"])
+    print(f"[{nombre}] decay de pesos por mes: {DECAY_ELEGIDO}")
+
+    # Sin undersampling: la matriz de Optuna tiene TODAS las filas de train.
+    assert len(X_tr) == len(roles["train"]) == len(y_tr), "Optuna debe usar el 100% de train"
+    dist = pd.Series(roles["train"][TARGET_COL]).value_counts().to_dict()
+    print(f"[{nombre}] train para Optuna: {len(X_tr):,} filas (sin undersampling) {dist}")
+
+    semillas = SEMILLAS_OPTUNA[:cfg["semillas_optuna"]]
+
+    def objective(trial):
+        params = sugerir_params(trial, algoritmo)
+        scores = [score_modelo(entrenar(algoritmo, params, X_tr, y_tr, s, w_tr), X_va, algoritmo, target)
+                  for s in semillas]
+        return ganancia_max_suavizada(np.mean(scores, axis=0), y_va)
+
+    storage = "sqlite:///" + os.path.join(MODELOS_PATH, f"optuna_{nombre}_{VERSION_ESTUDIO}.db").replace("\\", "/")
+    study = optuna.create_study(direction="maximize", study_name=nombre, storage=storage,
+                                load_if_exists=True, sampler=optuna.samplers.TPESampler(seed=SEMILLA_BASE))
+    encolar_warm_start(study, nombre, cfg.get("warm_start_db", []))
+
+    hechos = sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
+    faltan = max(0, cfg["n_trials"] - hechos)
+    print(f"[{nombre}] trials completos previos: {hechos} | a correr: {faltan} "
+          f"(timeout {cfg['timeout'] / 60:.0f} min, {len(semillas)} semilla/s por trial)")
+
+    t0 = time.time()
+    try:
+        if faltan:
+            study.optimize(objective, n_trials=faltan, timeout=cfg["timeout"], show_progress_bar=True)
+    except KeyboardInterrupt:
+        print("Interrumpido: se usa el mejor trial hasta ahora (el estudio queda guardado).")
+
+    completos = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not completos:
+        print(f"[{nombre}] sin trials completos.")
+        return None
+    print(f"[{nombre}] {(time.time() - t0) / 60:.1f} min | trials completos: {len(completos)} | "
+          f"mejor ganancia suavizada en 202106: {study.best_value:,.0f}")
+    print(f"[{nombre}] mejores parámetros: {study.best_params}")
+    return {"nombre": nombre, **cfg, "study": study, "best_value": study.best_value,
+            "best_params": study.best_params, "n_trials_ok": len(completos)}
+
+
+resultados = {}
+
+#%% celda 35 [texto]
+## Etapa 6-pre — Features de historia (v9)
+
+Para las `N_VARS_HIST` variables más importantes (ranking por ganancia de un LightGBM rápido entrenado **sólo en train**) se calculan, sobre los últimos 3 meses (t, t-1, t-2, que deben ser consecutivos):
+`_m3` (media), `_s3` (desvío), `_mn3` / `_mx3` (mínimo y máximo), `_cv3` (desvío relativo), `_xvsm3` (cuánto se aparta el mes actual de la media) y `_racha3` (0, 1 o 2 caídas consecutivas).
+
+**Límite de los datos:** hay 6 meses (03–08), así que estas columnas sólo existen desde 202105 (en train de validación: sólo 202105; en el final: 05 y 06). Las filas sin 3 meses de historia quedan en NaN, igual que los `lag2_`.
+Cada feature nueva pasa por el filtro de PSI (train con valor vs. 202108).
+
+#%% celda 36 [código]
+import warnings
+N_VARS_HIST = 25
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
+
+
+def _importancia_por_base(roles: dict, columnas: list) -> pd.Series:
+    """Ganancia de un LightGBM rápido (train), sumada por variable base (lag/delta -> su base)."""
+    X = roles["train"][columnas].astype("float32").to_numpy()
+    y = construir_y(roles["train"][TARGET_COL], "binario")
+    p = {"learning_rate": 0.05, "num_leaves": 35, "min_data_in_leaf": 373, "feature_fraction": 0.2,
+         "bagging_fraction": 0.9, "lambda_l2": 8.0, "num_boost_round": 150}
+    m = entrenar("lgbm", p, X, y, SEMILLA_BASE)
+    imp = pd.Series(m.feature_importance("gain"), index=columnas)
+    return imp.groupby([_base_de(c) for c in columnas]).sum().sort_values(ascending=False)
+
+
+def _desplazar(a: np.ndarray, ids: np.ndarray, per: np.ndarray, k: int) -> np.ndarray:
+    """a[t-k] del mismo cliente si ese mes es exactamente k meses antes; NaN si no."""
+    out = np.full(a.shape, np.nan, dtype=np.float32)
+    ok = (ids[k:] == ids[:-k]) & ((per[k:] - per[:-k]) == k)
+    out[k:] = np.where(ok, a[:-k], np.nan)
+    return out
+
+
+NUEVAS_HIST = []
+if lgb is None:
+    print("LightGBM no está instalado: no se generan features de historia.")
+else:
+    excluidas_hist = set(NO_DEFLACTAR) | set(COLS_EXTREMO_ALTO) | set(COLS_EXTREMO_NEG1) | set(VARIABLES_ROTAS) \
+        | {"mcomisiones_mantenimiento_real"}
+    ranking = _importancia_por_base(roles, [c for c in columnas_modelo if c in roles["train"].columns])
+    vars_h = []
+    for base in ranking.index:
+        if base in excluidas_hist or base.startswith("cluster_") or base not in roles["train"].columns:
+            continue
+        if roles["train"][base].nunique() <= 2:       # banderas
+            continue
+        vars_h.append(base)
+        if len(vars_h) >= N_VARS_HIST:
+            break
+    print(f"Variables con historia ({len(vars_h)}): {vars_h}")
+
+    panel = pd.concat([roles[r][[ID_COL, MES_COL] + vars_h] for r in ("historico", "train", "validacion", "aplicacion")],
+                      ignore_index=True).sort_values([ID_COL, MES_COL]).reset_index(drop=True)
+    ids = panel[ID_COL].to_numpy()
+    per = panel[MES_COL].map(periodo).to_numpy()
+    nuevo = {}
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for v in vars_h:
+            x = panel[v].to_numpy(np.float32)
+            l1, l2 = _desplazar(x, ids, per, 1), _desplazar(x, ids, per, 2)
+            st = np.stack([x, l1, l2])
+            m3, s3 = st.mean(axis=0), st.std(axis=0)
+            den = np.abs(m3)
+            nuevo[f"{v}_m3"] = m3
+            nuevo[f"{v}_s3"] = s3
+            nuevo[f"{v}_mn3"] = st.min(axis=0)
+            nuevo[f"{v}_mx3"] = st.max(axis=0)
+            nuevo[f"{v}_cv3"] = np.where(den > 1e-9, s3 / den, np.nan).astype(np.float32)
+            nuevo[f"{v}_xvsm3"] = np.where(den > 1e-9, (x - m3) / den, np.nan).astype(np.float32)
+            nuevo[f"{v}_racha3"] = np.where(np.isnan(x) | np.isnan(l1) | np.isnan(l2), np.nan,
+                                            (x < l1).astype(np.float32) + (l1 < l2)).astype(np.float32)
+    nuevo_df = pd.DataFrame(nuevo)
+    nuevo_df[ID_COL], nuevo_df[MES_COL] = ids, panel[MES_COL].to_numpy()
+    assert not nuevo_df.duplicated([ID_COL, MES_COL]).any()
+    del panel, nuevo
+    candidatas_hist = [c for c in nuevo_df.columns if c not in (ID_COL, MES_COL)]
+
+    for r in ("historico", "train", "validacion", "aplicacion"):
+        m = roles[r][[ID_COL, MES_COL]].merge(nuevo_df, on=[ID_COL, MES_COL], how="left")
+        assert len(m) == len(roles[r])
+        for c in candidatas_hist:
+            roles[r][c] = m[c].to_numpy(np.float32)
+        del m
+    del nuevo_df
+
+    # PSI de cada feature nueva: filas de train que sí tienen valor vs. aplicación (202108)
+    tr, ap = roles["train"], roles["aplicacion"]
+    psi_h = {}
+    for c in candidatas_hist:
+        a = tr[c].dropna()
+        psi_h[c] = psi(a, ap[c].dropna()) if len(a) > 1000 else np.nan
+    psi_h = pd.Series(psi_h)
+    NUEVAS_HIST = [c for c in candidatas_hist if psi_h[c] <= PSI_UMBRAL_SUSTANCIAL]
+    descartadas = [c for c in candidatas_hist if c not in NUEVAS_HIST]
+    for r in ("historico", "train", "validacion", "aplicacion"):
+        roles[r].drop(columns=descartadas, inplace=True)
+    print(f"Features de historia creadas: {len(candidatas_hist)} | descartadas por PSI > {PSI_UMBRAL_SUSTANCIAL} "
+          f"o sin datos: {len(descartadas)} | quedan {len(NUEVAS_HIST)}")
+    cobertura = {r: float(roles[r][NUEVAS_HIST].notna().any(axis=1).mean()) if NUEVAS_HIST else 0.0
+                 for r in ("train", "validacion", "aplicacion")}
+    print("Filas con al menos una feature de historia: " + ", ".join(f"{r} {100 * v:.0f}%" for r, v in cobertura.items()))
+    if descartadas:
+        print("Descartadas (primeras 15):", descartadas[:15])
+
+#%% celda 37 [texto]
+## Etapa 6a — Variantes: historia × pesos por mes (parámetros fijos)
+
+Mismo LightGBM (mejores parámetros de la v7), `N_SEMILLAS_VARIANTES` semillas para todas las variantes. Se comparan:
+
+| Variante | Columnas | Peso por mes |
+|---|---|---|
+| `v7_decay1.0` | ganadora de la v7 (referencia) | todos iguales |
+| `v7_decay0.8` / `v7_decay0.6` | ganadora de la v7 | `decay ** (meses desde el último mes de train)` |
+| `hist_decay1.0` / `0.8` / `0.6` | ganadora de la v7 + features de historia | idem |
+
+Si la diferencia es menor que el ruido (columna `ruido_en_BAJA+2`), las variantes son equivalentes y conviene la más simple (`VARIANTE_FORZADA`).
+La elegida fija `columnas_modelo` y `DECAY_ELEGIDO`, que usan Optuna, el semillero, el backtest y el entrenamiento final.
+
+#%% celda 38 [código]
+N_SEMILLAS_VARIANTES = 2 if MODO_PRUEBA else 10
+VARIANTE_FORZADA = None   # ej. "hist_decay0.8"
+DECAYS = [1.0] if MODO_PRUEBA else [1.0, 0.8, 0.6]
+
+PARAMS_DEFAULT_LGBM = {"learning_rate": 0.02, "num_leaves": 128, "min_data_in_leaf": 200,
+                       "feature_fraction": 0.25, "bagging_fraction": 0.9, "lambda_l2": 1.0,
+                       "num_boost_round": 250}
+
+if lgb is None:
+    print("LightGBM no está instalado: se saltean las variantes y se usan todas las columnas.")
+else:
+    previos = _trials_previos("lgbm_binario", ["optuna_lgbm_binario_v5.db", "optuna_lgbm_binario_v4.db", "optuna_lgbm_binario_v3.db"])
+    PARAMS_VARIANTES = previos[0][1] if previos else PARAMS_DEFAULT_LGBM
+    print(f"Parámetros fijos para las variantes ({previos[0][2] if previos else 'default'}): {PARAMS_VARIANTES}")
+
+    def _sin(cols, nombres):
+        """Saca las columnas cuya variable base (sin lag/delta ni sufijo _real) está en `nombres`."""
+        malos = set(nombres) | {n + "_real" for n in nombres}
+        return [c for c in cols if _base_de(c) not in malos]
+
+    base_cols = list(columnas_modelo)
+    # Ganadora de la v7: sin límites nominales y sin mcomisiones_mantenimiento
+    base_v7 = _sin([c for c in base_cols if _base_de(c) not in NO_DEFLACTAR], ["mcomisiones_mantenimiento"])
+    conjuntos = {"v7": base_v7}
+    if NUEVAS_HIST:
+        conjuntos["hist"] = base_v7 + NUEVAS_HIST
+    variantes = {f"{k}_decay{d}": (cols, d) for k, cols in conjuntos.items() for d in DECAYS}
+
+    y_tr_b = construir_y(roles["train"][TARGET_COL], "binario")
+    y_va_v = roles["validacion"][TARGET_COL].to_numpy()
+    semillas_v = SEMILLAS_SEMILLERO[:N_SEMILLAS_VARIANTES]
+    filas = []
+    for nombre, (cols, d) in variantes.items():
+        print(f"\n== Variante '{nombre}' ({len(cols)} columnas, decay {d}) ==")
+        t0 = time.time()
+        (sc,), _ = correr_semillero("lgbm", "binario", PARAMS_VARIANTES,
+                                    transformar(None, roles["train"], cols), y_tr_b,
+                                    [transformar(None, roles["validacion"], cols)], cols, semillas_v,
+                                    w_fit=pesos_df(roles["train"], d))
+        por_semilla = [ganancia_max_suavizada(x, y_va_v) for x in sc]
+        filas.append({"variante": nombre, "n_columnas": len(cols), "decay": d,
+                      "ganancia_semillero": ganancia_max_suavizada(sc.mean(axis=0), y_va_v),
+                      "ganancia_media_1_modelo": np.mean(por_semilla),
+                      "ruido_en_BAJA+2": np.std(por_semilla) / np.sqrt(len(por_semilla)) / ganancia_acierto,
+                      "min": (time.time() - t0) / 60})
+
+    tabla_variantes = pd.DataFrame(filas).sort_values("ganancia_semillero", ascending=False).reset_index(drop=True)
+    ref = tabla_variantes.loc[tabla_variantes["variante"] == "v7_decay1.0", "ganancia_semillero"]
+    ref = float(ref.iloc[0]) if len(ref) else tabla_variantes["ganancia_semillero"].max()
+    tabla_variantes["dif_vs_v7_en_BAJA+2"] = (tabla_variantes["ganancia_semillero"] - ref) / ganancia_acierto
+    print("\n" + tabla_variantes.round(2).to_string(index=False))
+
+    VARIANTE_ELEGIDA = VARIANTE_FORZADA or tabla_variantes.loc[0, "variante"]
+    columnas_modelo, DECAY_ELEGIDO = variantes[VARIANTE_ELEGIDA]
+    print(f"\nVariante elegida: {VARIANTE_ELEGIDA} -> {len(columnas_modelo)} columnas, decay {DECAY_ELEGIDO}")
+
+#%% celda 39 [código]
+resultados["lgbm_binario"] = correr_experimento("lgbm_binario", roles, columnas_modelo)
+
+#%% celda 40 [código]
+resultados["rf_binario"] = correr_experimento("rf_binario", roles, columnas_modelo)
+
+#%% celda 41 [código]
+resultados["rf_ternario"] = correr_experimento("rf_ternario", roles, columnas_modelo)
+
+#%% celda 42 [texto]
+### Elección del modelo
+
+Gana el de mayor ganancia suavizada en 202106. Cada BAJA+2 vale $1.07M: diferencias de 1–3
+aciertos (`dif_en_BAJA+2`) no son concluyentes. Ojo también si un experimento tuvo muchos menos
+trials que otro (columna `trials`): la comparación no es pareja. Podés forzar uno con `MODELO_FORZADO`.
+
+#%% celda 43 [código]
+MODELO_FORZADO = None   # ej. "lgbm_binario"
+
+comparacion = pd.DataFrame([
+    {"experimento": r["nombre"], "algoritmo": r["algoritmo"], "target": r["target"],
+     "trials": r["n_trials_ok"], "ganancia_suavizada_202106": r["best_value"]}
+    for r in resultados.values() if r is not None
+]).sort_values("ganancia_suavizada_202106", ascending=False).reset_index(drop=True)
+comparacion["dif_en_BAJA+2"] = ((comparacion["ganancia_suavizada_202106"].max()
+                                 - comparacion["ganancia_suavizada_202106"]) / ganancia_acierto).round(1)
+print(comparacion.to_string(index=False))
+
+GANADOR = MODELO_FORZADO or comparacion.loc[0, "experimento"]
+ALGORITMO = EXPERIMENTOS[GANADOR]["algoritmo"]
+TARGET = EXPERIMENTOS[GANADOR]["target"]
+BEST_PARAMS = params_finales(ALGORITMO, resultados[GANADOR]["best_params"])
+SEMILLAS_FINALES = SEMILLAS_SEMILLERO[:N_SEMILLERO[ALGORITMO]]
+print(f"\nModelo elegido: {GANADOR} ({ALGORITMO}, target {TARGET})\nParámetros: {BEST_PARAMS}"
+      f"\nSemillero: {len(SEMILLAS_FINALES)} modelos")
+
+#%% celda 44 [código]
+# Gráficos estándar de Optuna para el ganador (opcional; requieren plotly).
+try:
+    from optuna.visualization import plot_optimization_history, plot_param_importances, plot_slice
+    _study = resultados[GANADOR]["study"]
+    plot_optimization_history(_study).show()
+    plot_param_importances(_study).show()
+    plot_slice(_study).show()
+except Exception as e:
+    print(f"No se pudieron generar los gráficos de Optuna: {e}")
+
+#%% celda 45 [texto]
+## Etapa 7 — Semillero (entrenado en train, evaluado en 202106)
+
+Mismos hiperparámetros, cambia sólo la semilla; se promedian las probabilidades. Cada modelo se
+entrena, predice y se descarta. El gráfico muestra la ganancia en 202106 al ir sumando modelos:
+**si todavía sube al final, conviene subir `N_SEMILLERO`** (o `RF_ARBOLES_FINAL` en RF);
+si ya está plana, más modelos sólo agregan tiempo.
+
+#%% celda 46 [código]
+prep_tr, nombres_features = preparar_preprocesador(ALGORITMO, roles["train"], columnas_modelo)
+X_tr = transformar(prep_tr, roles["train"], columnas_modelo)
+X_va = transformar(prep_tr, roles["validacion"], columnas_modelo)
+y_tr = construir_y(roles["train"][TARGET_COL], TARGET)
+y_va = roles["validacion"][TARGET_COL].to_numpy()
+
+t0 = time.time()
+(scores_val,), importancias = correr_semillero(ALGORITMO, TARGET, BEST_PARAMS, X_tr, y_tr,
+                                               [X_va], nombres_features, SEMILLAS_FINALES,
+                                               w_fit=pesos_df(roles["train"]))
+print(f"Semillero de validación: {len(scores_val)} modelos en {(time.time() - t0) / 60:.1f} min")
+score_valid = scores_val.mean(axis=0)
+
+curva_semillas = [ganancia_max_suavizada(scores_val[:k].mean(axis=0), y_va) for k in range(1, len(scores_val) + 1)]
+plt.figure(figsize=(8, 4))
+plt.plot(range(1, len(curva_semillas) + 1), curva_semillas, marker="o")
+plt.xlabel("Modelos en el semillero")
+plt.ylabel("Ganancia suavizada 202106")
+plt.title("¿Sigue mejorando al sumar modelos?")
+plt.grid(alpha=0.3)
+plt.show()
+print(f"1 modelo: {curva_semillas[0]:,.0f} | {len(curva_semillas)} modelos: {curva_semillas[-1]:,.0f} "
+      f"| diferencia: {curva_semillas[-1] - curva_semillas[0]:,.0f}")
+
+#%% celda 47 [código]
+print(importancias.head(25).to_string())
+top = importancias.head(25).iloc[::-1]
+plt.figure(figsize=(10, 8))
+plt.barh(top["variable"], top["importancia_media"])
+plt.xlabel("Importancia media")
+plt.title(f"25 variables más importantes — {GANADOR}")
+plt.tight_layout()
+plt.show()
+
+#%% celda 48 [texto]
+## Etapa 8 — Cantidad de envíos óptima (sobre 202106)
+
+Corte = máximo de la curva **suavizada**. La **meseta** es el rango de envíos a menos de 2 aciertos
+del máximo: cualquier cantidad dentro de ese rango es razonable.
+
+#%% celda 49 [código]
+def elegir_corte(score, y_true, ventana: int = VENTANA_SUAVIZADO, tolerancia: float = 2 * ganancia_acierto):
+    orden, acum = curva_ganancia(score, y_true)
+    suav = suavizar(acum, ventana)
+    i = int(suav.argmax())
+    meseta = np.where(suav >= suav[i] - tolerancia)[0]
+    resumen = {
+        "n_envios_optimo": i + 1,
+        "ganancia_suavizada": float(suav[i]),
+        "ganancia_real_en_ese_corte": float(acum[i]),
+        "probabilidad_corte": float(np.asarray(score)[orden][i]),
+        "meseta_desde": int(meseta.min()) + 1,
+        "meseta_hasta": int(meseta.max()) + 1,
+        "argmax_crudo": int(acum.argmax()) + 1,
+        "ganancia_max_cruda": float(acum.max()),
+    }
+    tabla = pd.DataFrame({
+        "posicion": np.arange(1, len(acum) + 1),
+        "probabilidad": np.asarray(score)[orden],
+        "ganancia_acumulada": acum,
+        "ganancia_suavizada": suav,
+    })
+    return resumen, tabla
+
+
+resumen_corte, tabla_ganancia = elegir_corte(score_valid, y_va)
+for k, v in resumen_corte.items():
+    print(f"  {k:28s}: {v:,.5f}" if isinstance(v, float) and v < 1 else f"  {k:28s}: {v:,.0f}")
+
+#%% celda 50 [código]
+n_opt = resumen_corte["n_envios_optimo"]
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+for ax, (desde, hasta) in zip(axes, [(1, len(tabla_ganancia)),
+                                     (max(1, resumen_corte["meseta_desde"] - 3000), resumen_corte["meseta_hasta"] + 3000)]):
+    t = tabla_ganancia[tabla_ganancia["posicion"].between(desde, hasta)]
+    ax.plot(t["posicion"], t["ganancia_acumulada"], lw=0.8, alpha=0.6, label="Ganancia acumulada")
+    ax.plot(t["posicion"], t["ganancia_suavizada"], lw=2, label=f"Suavizada ({VENTANA_SUAVIZADO})")
+    ax.axvspan(resumen_corte["meseta_desde"], resumen_corte["meseta_hasta"], color="green", alpha=0.12, label="Meseta")
+    ax.axvline(n_opt, color="red", ls="--", label=f"Óptimo suavizado: {n_opt:,}")
+    ax.set_xlabel("Cantidad de clientes contactados")
+    ax.set_ylabel("Ganancia")
+    ax.grid(alpha=0.25)
+    ax.legend()
+axes[0].set_title("Curva completa (202106)")
+axes[1].set_title("Zoom alrededor de la meseta")
+plt.tight_layout()
+plt.show()
+
+#%% celda 51 [código]
+pos = np.unique(np.append(np.linspace(0, len(tabla_ganancia) - 1, 40).astype(int), n_opt - 1))
+print(tabla_ganancia.iloc[pos].assign(optimo=lambda d: d["posicion"] == n_opt)
+      .round({"probabilidad": 5, "ganancia_suavizada": 0}).to_string(index=False))
+
+#%% celda 52 [texto]
+## Etapa 8b — ¿Está bien entrenar con 202103–05 y validar con 202106?
+
+**Lo que está bien:**
+- Todos los targets usados están maduros: BAJA+2 de 202106 necesita saber si el cliente está en
+  202108, y 202108 está en el dataset. 202107 no tiene target (necesitaría 202109) y por eso no entrena.
+- No hay fuga de información: lags sólo miran hacia atrás, y medianas, clusters y cortes de outliers
+  se ajustan sólo con train. El PSI mira las features de 202108 pero nunca su target.
+
+**Lo que no replica producción:**
+- **Gap:** en producción el último mes con target es 202106 y se predice 202108 (**2 meses** de
+  distancia). En la validación actual el último mes de train es 202105 y se valida en 202106
+  (**1 mes**). La validación es, entonces, un poco optimista: el modelo "ve" un pasado más cercano
+  que el que va a tener en agosto. El código de cátedra (`exp_401`: train 202103 → test 202105)
+  respeta el gap de 2.
+- **Superposición de ventanas:** el target de 202105 (BAJA+1/BAJA+2) se define mirando 202106–202107,
+  el mismo período que valida. No es fuga directa (no se ve el target de 202106), pero comparten shocks.
+- **202106 es un mes raro:** tiene aguinaldo (`mpayroll` +45%, por eso la hoja de ruta lo saca).
+- **Un solo mes de validación** (~1.100 BAJA+2): el ruido es grande.
+
+**El backtest de abajo lo mide en vez de suponerlo.** Con los mismos hiperparámetros entrena con
+202103–04 y evalúa en 202105 (gap 1) y en 202106 (gap 2, como producción). Como los meses tienen
+distinta cantidad de BAJA+2, se compara el **% de la ganancia ideal** (ganancia / (BAJA+2 × $1.07M)).
+- Si gap 1 y gap 2 dan parecido → el esquema actual está bien.
+- Si gap 2 cae mucho → la ganancia de 202106 que ves arriba sobreestima la de agosto; conviene ser
+  conservadora con la cantidad de envíos (lado izquierdo de la meseta) y considerar tunear con gap 2
+  (`MESES_TRAIN = [202103, 202104]`, validación 202106), a costa de un mes menos de datos en Optuna.
+- También se compara la **cantidad de envíos óptima** de cada esquema: si el gap 2 pide bastantes
+  menos, es otra señal para cortar más cerca del borde izquierdo de la meseta.
+
+#%% celda 53 [código]
+CORRER_BACKTEST = True
+N_SEMILLAS_BACKTEST = 2 if MODO_PRUEBA else 5
+
+
+def evaluar_esquema(nombre, score, y_true):
+    r, _ = elegir_corte(score, y_true)
+    n_b2 = int((np.asarray(y_true) == "BAJA+2").sum())
+    return {"esquema": nombre, "BAJA+2": n_b2, "ganancia_suavizada": r["ganancia_suavizada"],
+            "%_ganancia_ideal": 100 * r["ganancia_suavizada"] / (n_b2 * ganancia_acierto),
+            "n_envios_optimo": r["n_envios_optimo"],
+            "n_envios_%_del_mes": 100 * r["n_envios_optimo"] / len(y_true)}
+
+
+meses_bt = [m for m in MESES_TRAIN if periodo(m) <= periodo(MES_VALID) - 2]
+if CORRER_BACKTEST and not meses_bt:
+    print("Backtest salteado: no hay meses de train con 2 meses de distancia a la validación.")
+elif CORRER_BACKTEST:
+    mes_gap1 = max(MESES_TRAIN)
+    tr = roles["train"]
+    df_bt, df_g1 = tr[tr[MES_COL].isin(meses_bt)], tr[tr[MES_COL] == mes_gap1]
+    print(f"Backtest: train {meses_bt} -> valida {mes_gap1} (gap 1) y {MES_VALID} (gap 2)")
+
+    prep_bt, nombres_bt = preparar_preprocesador(ALGORITMO, df_bt, columnas_modelo)
+    (sc_g1, sc_g2), _ = correr_semillero(
+        ALGORITMO, TARGET, BEST_PARAMS,
+        transformar(prep_bt, df_bt, columnas_modelo), construir_y(df_bt[TARGET_COL], TARGET),
+        [transformar(prep_bt, df_g1, columnas_modelo), transformar(prep_bt, roles["validacion"], columnas_modelo)],
+        nombres_bt, SEMILLAS_FINALES[:N_SEMILLAS_BACKTEST], w_fit=pesos_df(df_bt))
+
+    k = min(N_SEMILLAS_BACKTEST, len(scores_val))
+    backtest = pd.DataFrame([
+        evaluar_esquema(f"actual: {min(MESES_TRAIN)}–{mes_gap1} -> {MES_VALID} (gap 1)",
+                        scores_val[:k].mean(axis=0), y_va),
+        evaluar_esquema(f"{min(meses_bt)}–{max(meses_bt)} -> {mes_gap1} (gap 1)",
+                        sc_g1.mean(axis=0), df_g1[TARGET_COL].to_numpy()),
+        evaluar_esquema(f"{min(meses_bt)}–{max(meses_bt)} -> {MES_VALID} (gap 2, como producción)",
+                        sc_g2.mean(axis=0), y_va),
+    ])
+    print(backtest.round(1).to_string(index=False))
+    print(f"\n(Todas las filas con {k} semillas, para que sean comparables.)")
+
+#%% celda 54 [texto]
+## Etapa 9 — Reentrenamiento final (202103–202106) y predicción de agosto
+
+Mismos hiperparámetros y semillas, entrenando con **todos los meses con target** (`MESES_FINAL`).
+El corte se traslada **por cantidad** (los `n_envios_optimo` de 202106, reescalados por la
+cantidad de clientes de agosto). Podés pisarlo con `N_ENVIOS_MANUAL`, idealmente dentro de la meseta
+(o en su borde izquierdo si el backtest de gap 2 mostró caída).
+
+#%% celda 55 [código]
+N_ENVIOS_MANUAL = None
+
+df_final = pd.concat([roles["train"], roles["validacion"]], ignore_index=True)
+assert sorted(df_final[MES_COL].unique().tolist()) == sorted(MESES_FINAL)
+
+prep_final, nombres_final = preparar_preprocesador(ALGORITMO, df_final, columnas_modelo)
+X_final = transformar(prep_final, df_final, columnas_modelo)
+y_final = construir_y(df_final[TARGET_COL], TARGET)
+aplicacion = roles["aplicacion"]
+X_ap = transformar(prep_final, aplicacion, columnas_modelo)
+
+t0 = time.time()
+(scores_ap,), _ = correr_semillero(ALGORITMO, TARGET, BEST_PARAMS, X_final, y_final,
+                                   [X_ap], nombres_final, SEMILLAS_FINALES,
+                                   w_fit=pesos_df(df_final))
+print(f"Semillero final ({MESES_FINAL}): {len(scores_ap)} modelos en {(time.time() - t0) / 60:.1f} min")
+score_aplic = scores_ap.mean(axis=0)
+
+n_envios = N_ENVIOS_MANUAL or int(round(n_opt * len(aplicacion) / len(roles["validacion"])))
+orden_ap = np.argsort(-score_aplic, kind="mergesort")
+prediccion_final = pd.DataFrame({ID_COL: aplicacion[ID_COL].to_numpy()[orden_ap][:n_envios]})
+
+print(f"Envíos en agosto: {n_envios:,} de {len(aplicacion):,} clientes "
+      f"({'manual' if N_ENVIOS_MANUAL else 'automático'}; meseta en 202106: "
+      f"{resumen_corte['meseta_desde']:,}–{resumen_corte['meseta_hasta']:,})")
+print(f"Probabilidad del último cliente contactado en agosto: {score_aplic[orden_ap][n_envios - 1]:.5f} "
+      f"(en 202106 era {resumen_corte['probabilidad_corte']:.5f}; no tienen por qué coincidir)")
+
+#%% celda 56 [código]
+def exportar_prediccion_final(prediccion: pd.DataFrame, carpeta: str = SALIDAS_PATH,
+                               prefijo: str = "prediccion_baja_202108") -> str:
+    """CSV para el submit: nombre único con timestamp, una sola columna, sin encabezado, IDs enteros."""
+    n = len(prediccion)
+    if not (8_000 <= n <= 15_000):
+        print(f"OJO: {n:,} clientes — la campaña espera entre 8.000 y 15.000. Revisá el corte.")
+    salida = prediccion[[ID_COL]].astype("int64")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ruta = os.path.join(carpeta, f"{prefijo}_{GANADOR}_v5_{ts}.csv")
+    salida.to_csv(ruta, index=False, header=False)
+
+    meta = {"archivo": os.path.basename(ruta), "version": "v5", "modelo": GANADOR, "params": BEST_PARAMS,
+            "meses_final": MESES_FINAL, "variables_rotas": VARIABLES_ROTAS, "n_envios": n,
+            "resumen_corte_202106": resumen_corte, "n_semillas": len(SEMILLAS_FINALES),
+            "n_features": len(columnas_modelo),
+            "variante": globals().get("VARIANTE_ELEGIDA"), "no_deflactar": NO_DEFLACTAR}
+    with open(ruta.replace(".csv", "_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, default=float)
+    print(f"Guardado: {ruta} ({n:,} clientes, sin encabezado) + _meta.json")
+    return ruta
+
+
+if MODO_PRUEBA:
+    print("MODO_PRUEBA: no se exporta el submit (los datos son una muestra). Poné MODO_PRUEBA = False.")
+else:
+    exportar_prediccion_final(prediccion_final)

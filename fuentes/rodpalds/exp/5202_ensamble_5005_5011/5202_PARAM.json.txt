@@ -1,0 +1,19 @@
+{
+  "experimento": 5202,
+  "nombre": "ensamble_5005_5011",
+  "descripcion": "Ensamble por promedio de rankings: 5005 (crudo p95, hiperparametros 4102 p117, 20 semillas) + 5011 (receta del profesor: rank total sin lag2, hiperparametros p23 de 4104 elegidos por 4105, 50 semillas). Mitad B de junio (5103): +9,8 M de meseta contra 5005 (gana 93% de los remuestreos); +14,6 M entre 11.000 y 13.000 envios (96%).",
+  "fuentes": [
+    "5005_prod_eleccion_4102",
+    "5011_prod_rank_bo4105"
+  ],
+  "clientes_esperados": 164647,
+  "cortes_control": [
+    11000,
+    12000,
+    13000
+  ],
+  "_config": "5202_ensamble_5005_5011.json",
+  "_fecha_inicio": "2026-10-09 10:41:58",
+  "_script": "12_ensamble.py",
+  "_git_commit": "sin_git"
+}

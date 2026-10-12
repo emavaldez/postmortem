@@ -1,0 +1,1097 @@
+#%% celda 1 [texto]
+# c9920 — Canaritos asesinos
+
+**Pregunta:** ¿eliminar las variables que no le ganan a los canaritos mejora el modelo de `s0006`?
+
+Receta del profesor ("canaritos asesinos"): agregar un 20 % de canaritos, entrenar un LightGBM razonable, numerar las variables por importancia (1 = la más importante), calcular la media y el desvío de los números de los canaritos, y eliminar toda variable con número mayor que **media + desvío** o **media + 2 desvíos**.
+
+**Cómo funciona** (todo con *Run All*):
+
+1. **Datos:** igual que `s0006` (clase ternaria armada desde el crudo, lags, deltas, ranking con cero fijo; 760 variables reales).
+2. **Selección:** LightGBM común con los parámetros del notebook z495 del profesor, 760 variables + 152 canaritos (20 %), entrenado con **mayo** (todas las BAJA y el 10 % de CONTINUA). Se repite con 3 semillas (canaritos y undersampling distintos).
+3. **Listas:** para cada punto (media + 1 desvío, media + 2 desvíos) sobrevive la variable que pasa en al menos 2 de las 3 repeticiones. Se suma "sin eliminar" (las 760).
+4. **Comparación:** zLightGBM con la configuración de `s0006` (sus fijos y sus mejores valores), canaritos 1 a 1, marzo a mayo → junio, **5 semillas por lista**. Mismas semillas en todas las listas: la única diferencia son las variables.
+5. **Decisión:** gana una lista si mejora la ganancia de junio frente a "sin eliminar" con t pareado ≥ 2. Si ninguna gana, el notebook lo dice, no sigue y apaga la máquina.
+6. **Bayesiana** (solo la lista ganadora): igual que `s0006`, 21 corridas, AUC de junio.
+7. **Referencia de junio:** la ganadora con sus mejores valores (3 semillas) contra "sin eliminar" (las mismas 3 semillas).
+8. **Agosto:** la ganadora, marzo a junio → agosto, `N_SEMILLAS_AGOSTO` semillas, y un CSV por corte.
+9. **Apagado:** borra la máquina virtual (todo lo importante ya quedó en el bucket).
+
+**Por qué la selección se entrena con mayo:** lag2 y delta_lag2 están vacíos en marzo y abril. Si la selección usara esos meses, las 304 variables de lag2 no tendrían importancia y morirían todas sin haber sido evaluadas. Mayo es el primer mes con lag2 completo, y junio queda limpio para juzgar. Por lo mismo, la comparación y la bayesiana entrenan con marzo a mayo (en `s0006` era marzo + abril).
+
+**Si se corta** (por ejemplo, Google borra la máquina spot): cada resultado se guarda en el bucket apenas termina. Creá otra máquina, cloná el repo y hacé *Run All*: saltea lo que ya está y sigue.
+
+**Modo prueba** (`MODO_PRUEBA=1` o `MODO_PRUEBA = True` a mano): el mismo camino con el 5 % de los clientes y pocos árboles, en unos 15 minutos. Sirve para probar la máquina virtual. Escribe en otra carpeta (`.../prueba`), no se mezcla con la corrida real y no apaga la máquina, así después se larga la corrida real en la misma.
+
+#%% celda 2 [código]
+from pathlib import Path
+from urllib.request import urlretrieve
+import gc
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+
+EXP_ID = "c9920"
+
+MODO_PRUEBA = os.environ.get("MODO_PRUEBA", "0") == "1"  # o poner True a mano: prueba corta de la máquina virtual
+APAGAR_AL_TERMINAR = not MODO_PRUEBA  # al final borra la máquina virtual (solo en Google Cloud; los resultados quedan en el bucket)
+APAGAR_SI_FALLA = not MODO_PRUEBA  # si una celda falla, borra la máquina para no gastar créditos (en la prueba, no)
+
+# Datos (igual que s0006)
+DATA_URL = "https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv"
+TRAIN_MONTHS = [202103, 202104, 202105, 202106]  # semillas de agosto
+PREDICT_MONTH = 202108
+NEEDED_MONTHS = {202103, 202104, 202105, 202106, 202107, 202108}
+LAG_ORDERS = [1, 2]
+NUM_THREADS = os.cpu_count() or 4
+
+# 1) Selección: LightGBM común con los parámetros del notebook z495 del profesor
+SEL_MONTH = 202105  # primer mes con lag2 completo
+SEL_UNDERSAMPLING = 0.10  # todas las BAJA + el 10 % de CONTINUA, como z495
+SEL_CANARY_FRACTION = 0.20  # 20 % de canaritos respecto de las columnas reales
+SEL_SEEDS = [101737, 303011, 602909]  # 3 repeticiones
+SEL_VALUES = {"num_iterations": 2848, "num_leaves": 71, "min_sum_hessian_in_leaf": 0.0067}  # z495
+SEL_FIXED = {"learning_rate": 0.005, "feature_fraction": 0.50, "min_data_in_leaf": 0, "max_bin": 31}  # z495
+CUT_POINTS = {"media_1desvio": 1.0, "media_2desvios": 2.0}  # punto de asesinato = media + k * desvío
+MIN_VOTES = 2  # una variable sobrevive si sobrevive en al menos 2 de las 3 repeticiones
+
+# 2) Comparación de listas: zLightGBM con la configuración de s0006
+CMP_TRAIN_MONTHS = [202103, 202104, 202105]
+VALID_MONTH = 202106
+CMP_SEEDS = [101737, 303011, 602909, 707717, 906007]
+S0006_VALUES = {"num_iterations": 1155, "num_leaves": 126, "min_sum_hessian_in_leaf": 0.094}  # mejores de s0006
+LEARNING_RATE = 0.005
+FEATURE_FRACTION = 0.50
+FEATURE_FRACTION_BYNODE = 0.20
+MIN_DATA_IN_LEAF = 0
+MAX_BIN = 31
+WIN_MIN_T = 2.0  # una lista gana si mejora la ganancia de junio con t pareado >= 2
+FORZAR_LISTA = None  # nombre de una lista para seguir con ella aunque no gane (None = decide la regla)
+
+# 3) Bayesiana (solo la lista ganadora): como s0006, con el techo del hessian en 1 (el mejor de s0006 quedó en 0,094)
+SEARCH_SPACE = {
+    "num_iterations": (64, 4096),
+    "num_leaves": (16, 2048),
+    "min_sum_hessian_in_leaf": (1e-6, 1.0),
+}
+N_TRIALS = 21  # 1 con los valores de s0006 + 10 al azar + 10 guiadas
+N_STARTUP_TRIALS = 11
+BO_SEED = 101737
+SAMPLER_SEED = 20261010
+
+# 4) Referencia de junio: 3 semillas
+JUNE_SEEDS = CMP_SEEDS[:3]
+
+# 5) Agosto
+N_SEMILLAS_AGOSTO = 20
+SEEDS_S0004 = [101737, 303011, 602909, 707717, 906007, 568318, 641463, 591763, 616818, 193376]
+SEED_LIST_RNG = 20261009  # la misma lista de primos de s0005 y s0006
+
+# Ganancia y cortes
+GAIN_BAJA2 = 1.0725
+GAIN_OTHER = -0.0275
+GAIN_WINDOW = 501
+CORTES = list(range(9_000, 15_001, 500))
+CORTE_REF = 10_000  # el corte de s0006 y s0007
+
+PRUEBA_FRACCION_CLIENTES = 0.05
+if MODO_PRUEBA:
+    SEL_VALUES = {**SEL_VALUES, "num_iterations": 100}
+    S0006_VALUES = {**S0006_VALUES, "num_iterations": 60}
+    CMP_SEEDS = CMP_SEEDS[:2]
+    JUNE_SEEDS = CMP_SEEDS[:2]
+    SEARCH_SPACE = {"num_iterations": (20, 80), "num_leaves": (16, 128), "min_sum_hessian_in_leaf": (1e-6, 1.0)}
+    N_TRIALS, N_STARTUP_TRIALS = 3, 2
+    N_SEMILLAS_AGOSTO = 2
+    GAIN_WINDOW = 51
+    CORTES = [300, 500, 700]
+    CORTE_REF = 500
+    if FORZAR_LISTA is None:
+        FORZAR_LISTA = "media_1desvio"  # en la prueba se sigue igual, para recorrer todo el camino
+
+
+def is_prime(n):
+    if n < 2:
+        return False
+    if n % 2 == 0:
+        return n == 2
+    divisor = 3
+    while divisor * divisor <= n:
+        if n % divisor == 0:
+            return False
+        divisor += 2
+    return True
+
+
+def prime_seeds(n, exclude, rng_seed=SEED_LIST_RNG, low=100_000, high=999_999):
+    """n primos distintos de 6 cifras, siempre en el mismo orden (la lista de s0005)."""
+    rng = np.random.default_rng(rng_seed)
+    seeds, taken = [], set(exclude)
+    while len(seeds) < n:
+        candidate = int(rng.integers(low, high + 1))
+        if candidate not in taken and is_prime(candidate):
+            seeds.append(candidate)
+            taken.add(candidate)
+    return seeds
+
+
+FINAL_SEEDS = (SEEDS_S0004 + prime_seeds(max(N_SEMILLAS_AGOSTO - len(SEEDS_S0004), 0), exclude=SEEDS_S0004))[:N_SEMILLAS_AGOSTO]
+
+# Carpetas. En Google Cloud: resultados en el bucket (sobreviven si se borra la máquina) y temporales en el disco local.
+BUCKET = Path.home() / "buckets" / "b1"
+EN_GCP = BUCKET.is_dir() and "DMEYF_OUT_DIR" not in os.environ
+if EN_GCP:
+    OUT_DIR = BUCKET / "exp" / EXP_ID
+    LOCAL_DIR = Path.home() / "local" / EXP_ID
+    DATA_DIR = Path.home() / "datasets"
+else:
+    cwd = Path.cwd().resolve()
+    BASE_DIR = next((p for p in [cwd, *cwd.parents] if (p / "01_c9920_canaritos_asesinos").is_dir()), cwd)  # raíz del repo
+    OUT_DIR = Path(os.environ.get("DMEYF_OUT_DIR", BASE_DIR / "outputs" / EXP_ID))
+    LOCAL_DIR = OUT_DIR / "local"
+    DATA_DIR = Path(os.environ.get("DMEYF_DATA_DIR", BASE_DIR / "data"))
+if MODO_PRUEBA:
+    OUT_DIR, LOCAL_DIR = OUT_DIR / "prueba", LOCAL_DIR / "prueba"
+
+SEL_DIR = OUT_DIR / "1_seleccion"
+CMP_DIR = OUT_DIR / "2_comparacion"
+BO_DIR = OUT_DIR / "3_bayesiana"
+JUNE_DIR = OUT_DIR / "4_referencia_junio"
+AUG_DIR = OUT_DIR / "5_agosto"
+CUTS_DIR = OUT_DIR / "6_cortes"
+for folder in (DATA_DIR, OUT_DIR, LOCAL_DIR, SEL_DIR, CMP_DIR, BO_DIR, JUNE_DIR, AUG_DIR, CUTS_DIR):
+    folder.mkdir(parents=True, exist_ok=True)
+
+LOG_PATH = OUT_DIR / "log.txt"
+
+
+def log(*parts):
+    """Imprime y además deja la línea en log.txt (en el bucket), por si se cierra el navegador."""
+    text = " ".join(str(part) for part in parts)
+    print(text, flush=True)
+    with open(LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + text + "\n")
+
+
+def apagar_vm(motivo):
+    """Borra esta máquina virtual con el script de la cátedra (las plantillas spot se borran, no se apagan)."""
+    script = Path.home() / "machina" / "direct" / "apagar_vm.sh"
+    if not EN_GCP or not script.exists():
+        log(f"[apagado] {motivo}: no estoy en una máquina virtual de la cátedra, no apago nada.")
+        return
+    log(f"[apagado] {motivo}: borrando la máquina virtual. Los resultados quedaron en {OUT_DIR}")
+    # Si el script de la cátedra no encuentra el proyecto (fcur_project_id vacío), borra igual con los metadatos de Google (nunca una desktop).
+    respaldo = f"""bash {script}
+case "$(hostname)" in desktop*|instance-instalacion) exit 0;; esac
+MD=http://metadata.google.internal/computeMetadata/v1; H="Metadata-Flavor: Google"
+ZONA=$(curl -s -H "$H" $MD/instance/zone)
+gcloud --quiet compute instances delete "$(curl -s -H "$H" $MD/instance/name)" --zone="${{ZONA##*/}}" --project="$(curl -s -H "$H" $MD/project/project-id)"
+"""
+    with open(OUT_DIR / "apagado.txt", "a") as salida:
+        subprocess.Popen(["bash", "-c", respaldo], stdout=salida, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def _apagar_si_falla(result):
+    error = result.error_in_exec
+    if error is not None and not isinstance(error, KeyboardInterrupt):
+        log(f"[error] {type(error).__name__}: {error}")
+        if APAGAR_SI_FALLA:
+            apagar_vm("una celda falló")
+
+
+try:
+    _ip = get_ipython()
+    for _callback in list(_ip.events.callbacks["post_run_cell"]):
+        if getattr(_callback, "__name__", "") == "_apagar_si_falla":
+            _ip.events.unregister("post_run_cell", _callback)
+    _ip.events.register("post_run_cell", _apagar_si_falla)
+except NameError:
+    pass
+
+log("=" * 70)
+log(f"{EXP_ID} | modo prueba: {MODO_PRUEBA} | Google Cloud: {EN_GCP} | hilos: {NUM_THREADS}")
+log("Resultados:", OUT_DIR)
+log("Datos:", DATA_DIR, "| temporales:", LOCAL_DIR)
+log("Selección:", SEL_VALUES, SEL_FIXED, "| mes", SEL_MONTH, "| semillas", SEL_SEEDS)
+log("Comparación:", S0006_VALUES, "| meses", CMP_TRAIN_MONTHS, "->", VALID_MONTH, "| semillas", CMP_SEEDS)
+log("Semillas de agosto:", FINAL_SEEDS)
+
+#%% celda 3 [texto]
+## Instalación de zLightGBM y Optuna
+
+zLightGBM no es un paquete de Python: se compila su núcleo C++ y se coloca dentro del paquete `lightgbm==4.6.0`, en `~/zlgb` (unos minutos, una vez por máquina). Sin el parámetro `canaritos` se comporta como LightGBM común: así se usa en la selección. Con `canaritos = n`, nunca corta por las primeras n columnas.
+
+#%% celda 4 [código]
+ZLGB_URL = "https://storage.googleapis.com/open-courses/dmeyf2025-e4a2/zlightgbm_4.6.0.99.tar.gz"
+BUILD_SCRIPT = r"""
+set -euo pipefail
+TARGET="$1"
+WORK="$TARGET"_build
+mkdir -p "$WORK" && cd "$WORK"
+curl -sSfLO {url}
+tar xzf zlightgbm_4.6.0.99.tar.gz
+S=zlightgbm/src
+FILES=$(find $S/src -name '*.cpp' -not -path '*/cuda/*' -not -name lightgbm_R.cpp -not -name main.cpp | grep -v 'gpu_tree_learner\|cuda')
+g++ -O3 -std=c++17 -fPIC -shared -fopenmp -DUSE_SOCKET -DMM_MALLOC -DMM_PREFETCH -DFMT_HEADER_ONLY \
+  -I$S/include -I$S/external_libs/fmt/include -I$S/external_libs/fast_double_parser/include \
+  $FILES -o lib_lightgbm.so
+"{python}" -m pip install -q "lightgbm==4.6.0" --target "$WORK/pkg" --no-deps
+rm -rf "$TARGET" && mkdir -p "$TARGET"
+cp -r "$WORK/pkg/lightgbm" "$TARGET/lightgbm"
+cp "$WORK/lib_lightgbm.so" "$TARGET/lightgbm/lib/lib_lightgbm.so"
+""".format(url=ZLGB_URL, python=sys.executable)
+
+ZLGB_DIR = Path(os.environ.get("ZLGB_DIR", Path.home() / "zlgb"))
+if not (ZLGB_DIR / "lightgbm" / "lib" / "lib_lightgbm.so").exists():
+    log("Compilando zlightgbm en", ZLGB_DIR, "(tarda unos minutos)...")
+    start = time.perf_counter()
+    subprocess.run(["bash", "-c", BUILD_SCRIPT, "build", str(ZLGB_DIR)], check=True)
+    log(f"zlightgbm compilado en {(time.perf_counter() - start) / 60:.1f} min")
+
+if "lightgbm" in sys.modules and not Path(sys.modules["lightgbm"].__file__).resolve().is_relative_to(ZLGB_DIR.resolve()):
+    raise RuntimeError("El kernel ya tiene cargado otro lightgbm. Reiniciá el kernel y volvé a ejecutar.")
+sys.path.insert(0, str(ZLGB_DIR))
+import lightgbm as lgb
+
+if not Path(lgb.__file__).resolve().is_relative_to(ZLGB_DIR.resolve()):
+    raise RuntimeError(f"Se cargó lightgbm desde {lgb.__file__}, no desde {ZLGB_DIR}.")
+
+# Prueba: con canaritos adelante, zlightgbm nunca los usa; sin el parámetro, sí (LightGBM común).
+_rng = np.random.default_rng(0)
+_X = _rng.normal(size=(20_000, 10))
+_y = ((_X[:, 0] + _X[:, 1] * _X[:, 2] + _rng.normal(size=20_000) * 2) > 1).astype(int)
+_Xc = np.hstack([_rng.uniform(size=(20_000, 10)), _X])
+_params = dict(objective="binary", num_leaves=256, min_data_in_leaf=5, learning_rate=0.05,
+               verbose=-1, seed=1, num_threads=NUM_THREADS)
+_plain = lgb.train(_params, lgb.Dataset(_Xc, label=_y), num_boost_round=20)
+_canary = lgb.train({**_params, "canaritos": 10}, lgb.Dataset(_Xc, label=_y), num_boost_round=20)
+_splits_plain = int(_plain.feature_importance("split")[:10].sum())
+_splits_canary = int(_canary.feature_importance("split")[:10].sum())
+if _splits_canary != 0 or _splits_plain == 0:
+    raise RuntimeError("Este lightgbm no parece ser zlightgbm: el parámetro canaritos no tuvo efecto.")
+del _rng, _X, _y, _Xc, _plain, _canary
+log(f"zlightgbm OK ({lgb.__file__}): cortes en canaritos sin el parámetro {_splits_plain}, con el parámetro 0")
+
+try:
+    import optuna
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "optuna"], check=True)
+    import importlib
+    importlib.invalidate_caches()
+    import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+from optuna.trial import TrialState
+log("Optuna", optuna.__version__)
+
+#%% celda 5 [texto]
+## Datos (igual que `s0006`)
+
+- **Clase ternaria:** el crudo no la trae. Se arma con todas las fotos: para cada cliente y mes se mira si aparece uno y dos meses después (CONTINUA, BAJA+1, BAJA+2). Julio y agosto quedan sin clase. Positivos: BAJA+1 y BAJA+2.
+- `ccajas_depositos` en NA en 202105; se conservan los préstamos personales (152 campos).
+- lag1, delta_lag1, lag2 y delta_lag2 con valores crudos; después ranking con cero fijo por variable y por mes. 760 variables reales.
+- Las variables reales quedan en memoria (`R_fit`: marzo a junio ordenado por mes; `R_pred`: agosto). Los canaritos se agregan en cada entrenamiento.
+- En modo prueba se usa el 5 % de los clientes (siempre los mismos).
+
+#%% celda 6 [código]
+data_start = time.perf_counter()
+RAW_PATH = next((p for p in [DATA_DIR / "competencia_01_crudo.csv", DATA_DIR / "comptetencia_01_crudo.csv"] if p.exists()), None)
+if RAW_PATH is None:
+    RAW_PATH = DATA_DIR / "competencia_01_crudo.csv"
+    log("Bajando el dataset a", RAW_PATH)
+    urlretrieve(DATA_URL, RAW_PATH.with_suffix(".tmp"))
+    os.replace(RAW_PATH.with_suffix(".tmp"), RAW_PATH)
+log("Dataset:", RAW_PATH, f"({RAW_PATH.stat().st_size / 2**20:.0f} MB)")
+
+# Clase ternaria con todas las fotos (idéntico a s0004 y s0006).
+keys = pd.read_csv(RAW_PATH, usecols=["numero_de_cliente", "foto_mes"])
+work = keys.copy()
+work["_row_id"] = np.arange(len(work), dtype=np.int64)
+work["periodo0"] = (work["foto_mes"] // 100) * 12 + work["foto_mes"] % 100
+work = work.sort_values(["numero_de_cliente", "periodo0"], kind="mergesort")
+periods = work.groupby("numero_de_cliente", sort=False)["periodo0"]
+work["periodo1"] = periods.shift(-1)
+work["periodo2"] = periods.shift(-2)
+last_period = int(work["periodo0"].max())
+penultimate_period = last_period - 1
+clase = pd.Series(pd.NA, index=work.index, dtype="string")
+continua = work["periodo0"] < penultimate_period
+baja_1 = (work["periodo0"] < last_period) & (work["periodo1"].isna() | (work["periodo0"] + 1 < work["periodo1"]))
+baja_2 = (
+    (work["periodo0"] < penultimate_period)
+    & (work["periodo0"] + 1 == work["periodo1"])
+    & (work["periodo2"].isna() | (work["periodo0"] + 2 < work["periodo2"]))
+)
+clase.loc[continua] = "CONTINUA"
+clase.loc[baja_1] = "BAJA+1"
+clase.loc[baja_2] = "BAJA+2"
+labels = pd.Series(clase.to_numpy(), index=work["_row_id"].to_numpy()).sort_index().reset_index(drop=True)
+
+
+def release_memory():
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def client_in_sample(client_ids):
+    """Modo prueba: el mismo 5 % de los clientes siempre (por número de cliente)."""
+    if not MODO_PRUEBA:
+        return np.ones(len(client_ids), dtype=bool)
+    return (np.asarray(client_ids, dtype=np.int64) * 2654435761 % 1000) < PRUEBA_FRACCION_CLIENTES * 1000
+
+
+LOAN_COLUMNS = ["cprestamos_personales", "mprestamos_personales"]
+csv_columns = list(pd.read_csv(RAW_PATH, nrows=0).columns)
+KEY_COLUMNS = {"numero_de_cliente", "foto_mes", "clase_ternaria", "_row_id"}
+base_feature_names = [c for c in csv_columns if c not in KEY_COLUMNS]
+n_base = len(base_feature_names)
+
+key_parts, value_parts = [], []
+offset = 0
+for chunk in pd.read_csv(RAW_PATH, chunksize=25_000, low_memory=False):
+    chunk_row_ids = np.arange(offset, offset + len(chunk), dtype=np.int64)
+    offset += len(chunk)
+    keep = chunk["foto_mes"].isin(NEEDED_MONTHS).to_numpy() & client_in_sample(chunk["numero_de_cliente"].to_numpy())
+    if not keep.any():
+        continue
+    part = pd.DataFrame({
+        "numero_de_cliente": chunk["numero_de_cliente"].to_numpy()[keep],
+        "foto_mes": chunk["foto_mes"].to_numpy()[keep],
+        "_row_id": chunk_row_ids[keep],
+    })
+    part["clase_ternaria"] = labels.iloc[part["_row_id"].to_numpy()].to_numpy()
+    values = np.empty((int(keep.sum()), n_base), dtype=np.float32)
+    for j, column in enumerate(base_feature_names):
+        values[:, j] = pd.to_numeric(chunk[column], errors="coerce").astype("float32").to_numpy()[keep]
+    key_parts.append(part)
+    value_parts.append(values)
+del chunk, part, values, keys, work, clase, labels
+panel_keys = pd.concat(key_parts, ignore_index=True)
+base_values = np.concatenate(value_parts)
+del key_parts, value_parts
+release_memory()
+
+base_values[panel_keys["foto_mes"].eq(202105).to_numpy(), base_feature_names.index("ccajas_depositos")] = np.nan
+
+# Posición de la observación anterior (k = 1) y de dos antes (k = 2) del mismo cliente.
+clients = panel_keys["numero_de_cliente"].to_numpy()
+order = np.lexsort((panel_keys["_row_id"].to_numpy(), panel_keys["foto_mes"].to_numpy(), clients))
+sorted_clients = clients[order]
+sorted_positions = np.arange(len(order))
+previous = {}
+for k in LAG_ORDERS:
+    valid_sorted = sorted_positions >= k
+    valid_sorted[valid_sorted] = sorted_clients[sorted_positions[valid_sorted] - k] == sorted_clients[valid_sorted]
+    position = np.zeros(len(order), dtype=np.int64)
+    valid = np.zeros(len(order), dtype=bool)
+    position[order] = np.where(valid_sorted, order[np.maximum(sorted_positions - k, 0)], 0)
+    valid[order] = valid_sorted
+    previous[k] = (position, valid)
+del clients, order, sorted_clients, sorted_positions, valid_sorted, position, valid
+
+row_months = panel_keys["foto_mes"].to_numpy()
+train_rows = np.flatnonzero(np.isin(row_months, TRAIN_MONTHS))
+train_rows = train_rows[np.argsort(row_months[train_rows], kind="stable")]
+future_rows = np.flatnonzero(row_months == PREDICT_MONTH)
+
+feature_names = list(base_feature_names)
+for k in LAG_ORDERS:
+    for column in base_feature_names:
+        feature_names += [f"{column}_lag{k}", f"{column}_delta_lag{k}"]
+N_REAL = len(feature_names)
+feature_index = {name: i for i, name in enumerate(feature_names)}
+
+
+def fill_real_columns(rows, block=20_000):
+    """Originales, lags y deltas en el orden de feature_names."""
+    out_all = np.empty((len(rows), N_REAL), dtype=np.float32)
+    for start in range(0, len(rows), block):
+        block_rows = rows[start:start + block]
+        current = base_values[block_rows]
+        out = out_all[start:start + len(block_rows)]
+        out[:, :n_base] = current
+        for k in LAG_ORDERS:
+            position, valid = previous[k]
+            lagged = base_values[position[block_rows]]
+            lagged[~valid[block_rows]] = np.nan
+            first = n_base * (2 * k - 1)
+            out[:, first:first + 2 * n_base:2] = lagged
+            out[:, first + 1:first + 2 * n_base:2] = current - lagged
+    return out_all
+
+
+R_fit = fill_real_columns(train_rows)
+R_pred = fill_real_columns(future_rows)
+train_info = panel_keys.loc[train_rows, ["numero_de_cliente", "foto_mes", "clase_ternaria"]].reset_index(drop=True)
+lag_available = {k: {"train": previous[k][1][train_rows], "future": previous[k][1][future_rows]} for k in LAG_ORDERS}
+future_ids = panel_keys.loc[future_rows, "numero_de_cliente"].to_numpy(dtype=np.int64)
+y_fit = (~train_info["clase_ternaria"].eq("CONTINUA")).astype(np.int8).to_numpy()
+del panel_keys, base_values, previous, row_months
+release_memory()
+
+fit_months = train_info["foto_mes"].to_numpy()
+MONTH_SLICES = {}
+for month in TRAIN_MONTHS:
+    rows = np.flatnonzero(fit_months == month)
+    if len(rows) == 0 or rows[-1] - rows[0] + 1 != len(rows):
+        raise RuntimeError(f"Las filas de {month} no forman un bloque contiguo")
+    MONTH_SLICES[month] = slice(int(rows[0]), int(rows[-1]) + 1)
+del rows
+
+
+def months_slice(months):
+    months = sorted(months)
+    selector = slice(MONTH_SLICES[months[0]].start, MONTH_SLICES[months[-1]].stop)
+    if sorted(np.unique(fit_months[selector]).tolist()) != months:
+        raise RuntimeError(f"El bloque {months} no es contiguo")
+    return selector
+
+
+CMP_ROWS = months_slice(CMP_TRAIN_MONTHS)
+VALID_ROWS = MONTH_SLICES[VALID_MONTH]
+ALL_ROWS = slice(0, R_fit.shape[0])
+june_ids = train_info["numero_de_cliente"].to_numpy(dtype=np.int64)[VALID_ROWS]
+june_positive = y_fit[VALID_ROWS].astype(bool)
+june_baja2 = train_info["clase_ternaria"].eq("BAJA+2").to_numpy(dtype=bool)[VALID_ROWS]
+
+# Auditoría básica (la completa está en s0006, con el mismo código).
+assert n_base == 152 and all(c in base_feature_names for c in LOAN_COLUMNS)
+assert N_REAL == 760 and len(set(feature_names)) == N_REAL
+assert train_info["clase_ternaria"].notna().all()
+assert (np.diff(fit_months) >= 0).all()
+assert np.isnan(R_fit[MONTH_SLICES[202105], feature_index["ccajas_depositos"]]).all()
+coverage = pd.DataFrame({"foto_mes": fit_months, "tiene_lag2": lag_available[2]["train"]}).groupby("foto_mes").mean()
+assert coverage.loc[[202103, 202104], "tiene_lag2"].max() == 0
+assert coverage.loc[[202105, 202106], "tiene_lag2"].min() > 0.8
+assert lag_available[2]["future"].mean() > 0.8
+
+log(f"Clase: {train_info.groupby(['foto_mes', 'clase_ternaria']).size().unstack().to_dict('index')}")
+log(f"Filas: {R_fit.shape[0]} de marzo a junio, {R_pred.shape[0]} de agosto | {N_REAL} variables reales | "
+    f"datos en {(time.perf_counter() - data_start) / 60:.1f} min")
+
+#%% celda 7 [texto]
+## Ranking con cero fijo (igual que `s0006`)
+
+Cada variable real, por separado y por mes: 0 → 0, NA → NA, positivos en (0, 1], negativos en [−1, 0), empates con rango promedio.
+
+#%% celda 8 [código]
+def rank_cero_fijo(values):
+    ranked = np.full(values.shape, np.nan, dtype=np.float32)
+    ranked[values == 0] = 0.0
+    positive = values > 0
+    negative = values < 0
+    n_positive = int(positive.sum())
+    n_negative = int(negative.sum())
+    if n_positive:
+        ranked[positive] = pd.Series(values[positive]).rank(method="average").to_numpy() / n_positive
+    if n_negative:
+        ranked[negative] = -pd.Series(-values[negative]).rank(method="average").to_numpy() / n_negative
+    return ranked
+
+
+_test = rank_cero_fijo(np.array([0, -50, 10, np.nan, 30, -5, 10, 1000, -50, -1], dtype=np.float32))
+_expected = np.array([0, -0.875, 0.375, np.nan, 0.75, -0.5, 0.375, 1, -0.875, -0.25], dtype=np.float32)
+assert np.allclose(_test, _expected, equal_nan=True), _test
+del _test, _expected
+
+rank_start = time.perf_counter()
+for matrix, selector in [*[(R_fit, MONTH_SLICES[m]) for m in TRAIN_MONTHS], (R_pred, slice(0, R_pred.shape[0]))]:
+    block = matrix[selector]
+    na_before = np.isnan(block).sum()
+    for j in range(N_REAL):
+        block[:, j] = rank_cero_fijo(block[:, j])
+    assert np.isnan(block).sum() == na_before
+    assert np.nanmin(block) >= -1.0 and np.nanmax(block) <= 1.0
+release_memory()
+log(f"Ranking listo en {time.perf_counter() - rank_start:.0f} s")
+
+#%% celda 9 [texto]
+## Funciones comunes
+
+Métricas de junio (AUC, ganancia suavizada como en `s0006`), guardado seguro (escribe un temporal y lo renombra) y armado de matrices con canaritos.
+
+#%% celda 10 [código]
+def save_atomic(path, write):
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as handle:
+        write(handle)
+    os.replace(tmp, path)
+
+
+def save_json(path, data):
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    save_atomic(path, lambda handle: handle.write(text.encode("utf-8")))
+
+
+def save_npy(path, array):
+    save_atomic(path, lambda handle: np.save(handle, array))
+
+
+def load_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def canonical(data):
+    return json.loads(json.dumps(data))
+
+
+def auc_score(positive, scores):
+    positive = np.asarray(positive, dtype=bool)
+    n_positive = int(positive.sum())
+    n_negative = len(positive) - n_positive
+    ranks = pd.Series(np.asarray(scores, dtype=np.float64)).rank(method="average").to_numpy()
+    return float((ranks[positive].sum() - n_positive * (n_positive + 1) / 2) / (n_positive * n_negative))
+
+
+def gain_curve(baja2, scores):
+    order = np.argsort(-np.asarray(scores, dtype=np.float64), kind="stable")
+    cumulative = np.cumsum(np.where(baja2[order], GAIN_BAJA2, GAIN_OTHER))
+    smooth = pd.Series(cumulative).rolling(window=GAIN_WINDOW, center=True, min_periods=GAIN_WINDOW).mean().to_numpy()
+    return cumulative, smooth
+
+
+def june_metrics(scores):
+    _, smooth = gain_curve(june_baja2, scores)
+    best = int(np.nanargmax(smooth))
+    return {
+        "auc": auc_score(june_positive, scores),
+        "ganancia_maxima": float(smooth[best]),
+        "mejor_corte": best + 1,
+        f"ganancia_corte_{CORTE_REF}": float(smooth[CORTE_REF - 1]),
+    }
+
+
+_positive = np.array([1, 0, 1, 0, 0, 1, 0, 0], dtype=bool)
+_scores = np.array([0.9, 0.8, 0.8, 0.5, 0.4, 0.4, 0.2, 0.1])
+assert np.isclose(auc_score(_positive, _scores), 12 / 15)
+del _positive, _scores
+
+
+def zlgb_params(values, n_canaries, seed):
+    """Configuración de s0006 con canaritos 1 a 1. num_iterations va aparte."""
+    return {
+        "objective": "binary",
+        "metric": "None",
+        "boosting": "gbdt",
+        "canaritos": int(n_canaries),
+        "learning_rate": LEARNING_RATE,
+        "feature_fraction": FEATURE_FRACTION,
+        "feature_fraction_bynode": FEATURE_FRACTION_BYNODE,
+        "min_data_in_leaf": MIN_DATA_IN_LEAF,
+        "num_leaves": int(values["num_leaves"]),
+        "min_sum_hessian_in_leaf": float(values["min_sum_hessian_in_leaf"]),
+        "max_bin": MAX_BIN,
+        "num_threads": NUM_THREADS,
+        "feature_pre_filter": False,
+        "force_col_wise": True,
+        "verbose": -1,
+        "seed": int(seed),
+    }
+
+
+def with_canaries(real, columns, seed):
+    """Matriz [canaritos | variables reales elegidas], con un canarito por variable (zLightGBM los quiere adelante)."""
+    n = len(columns)
+    out = np.empty((real.shape[0], 2 * n), dtype=np.float32)
+    out[:, :n] = np.random.default_rng(seed).random((real.shape[0], n), dtype=np.float32)
+    out[:, n:] = real[:, columns]
+    return out
+
+
+def train_zlgb(columns, values, seed, train_rows):
+    """zLightGBM con las variables `columns` y n canaritos adelante. Verifica que no corte por canaritos."""
+    n = len(columns)
+    X = with_canaries(R_fit[train_rows], columns, seed)
+    names = [f"canarito_{i:04d}" for i in range(1, n + 1)] + [feature_names[j] for j in columns]
+    dataset = lgb.Dataset(X, label=y_fit[train_rows], feature_name=names, free_raw_data=True,
+                          params=zlgb_params(values, n, seed))
+    booster = lgb.train(zlgb_params(values, n, seed), dataset, num_boost_round=int(values["num_iterations"]))
+    del X, dataset
+    release_memory()
+    canary_splits = int(booster.feature_importance("split")[:n].sum())
+    if canary_splits:
+        raise RuntimeError(f"El modelo cortó {canary_splits} veces por canaritos: zlightgbm no está podando")
+    return booster
+
+
+def predict_june(booster, columns, seed):
+    return booster.predict(with_canaries(R_fit[VALID_ROWS], columns, seed + 1))
+
+
+log("Funciones listas")
+
+#%% celda 11 [texto]
+## 1. Selección: LightGBM común con 20 % de canaritos (3 repeticiones)
+
+En cada repetición:
+
+1. Filas de **mayo**: todas las BAJA+1 y BAJA+2 y el 10 % de CONTINUA (como z495).
+2. Se agregan 152 canaritos (20 % de 760) con números al azar entre 0 y 1.
+3. LightGBM común con los parámetros de z495: 2.848 árboles, 71 hojas, `min_sum_hessian_in_leaf` 0,0067, learning_rate 0,005, `feature_fraction` 0,5, `min_data_in_leaf` 0, `max_bin` 31.
+4. Importancia por **gain**. Se numeran las variables usadas: 1 = la de más gain. Las que el modelo nunca usó no reciben número (como `lgb.importance` en R) y mueren.
+5. Media y desvío de los números de los canaritos (desvío muestral, como `sd` en R) y los puntos de asesinato: media + 1 desvío y media + 2 desvíos.
+
+Para controlar que el modelo sea "razonable" se muestra su AUC en junio (solo informativo, no decide nada).
+
+#%% celda 12 [código]
+N_SEL_CANARIES = int(round(SEL_CANARY_FRACTION * N_REAL))
+SEL_CANARY_NAMES = [f"canarito_{i:04d}" for i in range(1, N_SEL_CANARIES + 1)]
+SEL_CONFIG = canonical({
+    "mes": SEL_MONTH, "undersampling": SEL_UNDERSAMPLING, "canaritos": N_SEL_CANARIES,
+    "valores": SEL_VALUES, "fijos": SEL_FIXED, "variables": feature_names, "prueba": MODO_PRUEBA,
+})
+
+
+def selection_params(seed):
+    return {
+        "objective": "binary",
+        "metric": "None",
+        "boosting": "gbdt",
+        "learning_rate": SEL_FIXED["learning_rate"],
+        "feature_fraction": SEL_FIXED["feature_fraction"],
+        "min_data_in_leaf": SEL_FIXED["min_data_in_leaf"],
+        "max_bin": SEL_FIXED["max_bin"],
+        "num_leaves": SEL_VALUES["num_leaves"],
+        "min_sum_hessian_in_leaf": SEL_VALUES["min_sum_hessian_in_leaf"],
+        "num_threads": NUM_THREADS,
+        "feature_pre_filter": False,
+        "verbose": -1,
+        "seed": int(seed),
+    }
+
+
+def run_selection(seed):
+    """Una repetición de la selección. Devuelve la tabla de importancia con los números (ids)."""
+    month = MONTH_SLICES[SEL_MONTH]
+    rng = np.random.default_rng(seed)
+    month_rows = np.arange(month.start, month.stop)
+    keep = (y_fit[month_rows] == 1) | (rng.random(len(month_rows)) < SEL_UNDERSAMPLING)
+    rows = month_rows[keep]
+    X = np.empty((len(rows), N_REAL + N_SEL_CANARIES), dtype=np.float32)  # [variables reales | 152 canaritos]
+    X[:, :N_REAL] = R_fit[rows]
+    X[:, N_REAL:] = rng.random((len(rows), N_SEL_CANARIES), dtype=np.float32)
+    names = feature_names + SEL_CANARY_NAMES
+    dataset = lgb.Dataset(X, label=y_fit[rows], feature_name=names, free_raw_data=True, params=selection_params(seed))
+    booster = lgb.train(selection_params(seed), dataset, num_boost_round=SEL_VALUES["num_iterations"])
+    X_june = np.empty((VALID_ROWS.stop - VALID_ROWS.start, N_REAL + N_SEL_CANARIES), dtype=np.float32)
+    X_june[:, :N_REAL] = R_fit[VALID_ROWS]
+    X_june[:, N_REAL:] = rng.random((len(X_june), N_SEL_CANARIES), dtype=np.float32)
+    june_auc = auc_score(june_positive, booster.predict(X_june))
+    table = pd.DataFrame({
+        "variable": names,
+        "canarito": [False] * N_REAL + [True] * N_SEL_CANARIES,
+        "gain": booster.feature_importance("gain"),
+        "splits": booster.feature_importance("split"),
+    }).sort_values("gain", ascending=False, kind="stable").reset_index(drop=True)
+    used = table["gain"] > 0
+    table["id"] = np.where(used, np.arange(1, len(table) + 1), np.nan)
+    del X, X_june, dataset, booster
+    release_memory()
+    return table, {"filas": int(len(rows)), "positivos": int(y_fit[rows].sum()), "auc_junio": june_auc}
+
+
+def cut_stats(table):
+    canary_ids = table.loc[table["canarito"] & table["id"].notna(), "id"].to_numpy(dtype=float)
+    stats = {
+        "variables_usadas": int(table["id"].notna().sum()),
+        "canaritos_usados": int(len(canary_ids)),
+        "primer_canarito": float(canary_ids.min()) if len(canary_ids) else None,
+    }
+    if len(canary_ids) >= 2:
+        mean, sd = float(canary_ids.mean()), float(canary_ids.std(ddof=1))
+        stats.update({"media": mean, "desvio": sd})
+        stats.update({f"corte_{name}": mean + k * sd for name, k in CUT_POINTS.items()})
+    else:  # sin canaritos usados no hay contra qué medir: no se mata por el punto (solo las no usadas)
+        stats.update({"media": None, "desvio": None})
+        stats.update({f"corte_{name}": float(len(table) + 1) for name in CUT_POINTS})
+    return stats
+
+
+selection = {}
+for seed in SEL_SEEDS:
+    table_path, info_path = SEL_DIR / f"importancia_seed{seed}.csv", SEL_DIR / f"resumen_seed{seed}.json"
+    if table_path.exists() and info_path.exists() and load_json(info_path)["config"] == SEL_CONFIG:
+        table, info = pd.read_csv(table_path), load_json(info_path)
+        log(f"  selección semilla {seed}: ya estaba guardada")
+    else:
+        start = time.perf_counter()
+        table, info = run_selection(seed)
+        info = {**info, **cut_stats(table), "minutos": round((time.perf_counter() - start) / 60, 1), "config": SEL_CONFIG}
+        table.to_csv(table_path.with_name(table_path.name + ".tmp"), index=False)
+        os.replace(table_path.with_name(table_path.name + ".tmp"), table_path)
+        save_json(info_path, info)
+        log(f"  selección semilla {seed}: {info['filas']} filas ({info['positivos']} positivos), "
+            f"AUC junio {info['auc_junio']:.4f}, {info['minutos']} min")
+    selection[seed] = (table, info)
+
+sel_summary = pd.DataFrame([
+    {"semilla": seed, **{k: v for k, v in info.items() if k != "config"}} for seed, (_, info) in selection.items()
+])
+sel_summary.to_csv(SEL_DIR / "resumen.csv", index=False)
+display(sel_summary.round(3))
+
+#%% celda 13 [texto]
+## 2. Listas de variables sobrevivientes
+
+En cada repetición sobrevive la variable real con número **menor** al punto de asesinato. En la lista final queda la que sobrevive en al menos 2 de las 3 repeticiones. Se muestra cuántas quedan por tipo (originales, lag1, lag2) y cuánto coinciden las repeticiones. Si una lista sale igual a otra, se descarta la repetida.
+
+#%% celda 14 [código]
+def survivors(table, cut):
+    real = table[~table["canarito"]]
+    alive = real.loc[real["id"].notna() & (real["id"] < cut), "variable"]
+    return set(alive)
+
+
+LISTS = {"sin_eliminar": list(range(N_REAL))}
+list_rows, overlap_rows = [], []
+for name in CUT_POINTS:
+    per_rep = {seed: survivors(table, info[f"corte_{name}"]) for seed, (table, info) in selection.items()}
+    votes = pd.Series(0, index=feature_names)
+    for alive in per_rep.values():
+        votes[list(alive)] += 1
+    columns = [feature_index[v] for v in feature_names if votes[v] >= MIN_VOTES]
+    sets = list(per_rep.values())
+    for i in range(len(sets)):
+        for j in range(i + 1, len(sets)):
+            union = sets[i] | sets[j]
+            overlap_rows.append({"punto": name, "par": f"{SEL_SEEDS[i]}-{SEL_SEEDS[j]}",
+                                 "coincidencia": len(sets[i] & sets[j]) / len(union) if union else 1.0})
+    duplicate = next((other for other, cols in LISTS.items() if cols == columns), None)
+    if not columns:
+        log(f"  {name}: no sobrevive ninguna variable, se descarta")
+        continue
+    if duplicate:
+        log(f"  {name}: igual a {duplicate}, se descarta")
+        continue
+    LISTS[name] = columns
+
+for name, columns in LISTS.items():
+    kinds = pd.Series(["lag2" if feature_names[j].endswith(("_lag2", "_delta_lag2")) else
+                       "lag1" if feature_names[j].endswith(("_lag1", "_delta_lag1")) else "original" for j in columns])
+    list_rows.append({"lista": name, "variables": len(columns), **kinds.value_counts().to_dict()})
+lists_table = pd.DataFrame(list_rows).fillna(0)
+display(lists_table)
+display(pd.DataFrame(overlap_rows).round(3))
+save_json(SEL_DIR / "listas.json", {name: [feature_names[j] for j in cols] for name, cols in LISTS.items()})
+lists_table.to_csv(SEL_DIR / "listas.csv", index=False)
+for name, columns in LISTS.items():
+    if name != "sin_eliminar":
+        killed = sorted(set(feature_names) - {feature_names[j] for j in columns})
+        log(f"  {name}: {len(columns)} variables ({len(killed)} eliminadas). Algunas eliminadas: {killed[:8]}")
+
+#%% celda 15 [texto]
+## 3. Comparación de listas (zLightGBM, configuración de `s0006`, mismas semillas)
+
+Cada lista con los fijos de `s0006` y sus mejores valores (1.155 / 126 / 0,094), canaritos 1 a 1, marzo a mayo → junio. Las semillas son las mismas en todas las listas (y fijan los canaritos), así que la única diferencia son las variables. Cada corrida se guarda apenas termina.
+
+#%% celda 16 [código]
+def list_hash(columns):
+    return hashlib.sha1(",".join(feature_names[j] for j in columns).encode()).hexdigest()[:12]
+
+
+def cmp_config(name, seed):
+    return canonical({"lista": name, "hash": list_hash(LISTS[name]), "seed": seed, "valores": S0006_VALUES,
+                      "meses": CMP_TRAIN_MONTHS, "valida": VALID_MONTH, "prueba": MODO_PRUEBA})
+
+
+cmp_scores, cmp_rows = {}, []
+cmp_start, n_done = time.perf_counter(), 0
+n_total = len(LISTS) * len(CMP_SEEDS)
+for seed in CMP_SEEDS:  # semilla por semilla: si se corta, ya hay pares completos para comparar
+    for name, columns in LISTS.items():
+        base = CMP_DIR / f"{name}_seed{seed}"
+        config = cmp_config(name, seed)
+        if base.with_suffix(".npy").exists() and base.with_suffix(".json").exists() \
+                and load_json(base.with_suffix(".json"))["config"] == config:
+            scores, summary = np.load(base.with_suffix(".npy")), load_json(base.with_suffix(".json"))["resumen"]
+        else:
+            start = time.perf_counter()
+            booster = train_zlgb(columns, S0006_VALUES, seed, CMP_ROWS)
+            scores = predict_june(booster, columns, seed)
+            summary = {"lista": name, "semilla": seed, "variables": len(columns), "arboles": int(booster.num_trees()),
+                       **june_metrics(scores), "minutos": round((time.perf_counter() - start) / 60, 1)}
+            del booster
+            save_json(base.with_suffix(".json"), {"resumen": summary, "config": config})
+            save_npy(base.with_suffix(".npy"), scores)
+            n_done += 1
+            per_run = (time.perf_counter() - cmp_start) / n_done
+            left = n_total - len(cmp_rows) - 1
+            log(f"  {name:15s} semilla {seed}: AUC {summary['auc']:.5f} | ganancia {summary['ganancia_maxima']:.1f} "
+                f"con {summary['mejor_corte']} | {summary['arboles']} árboles | {summary['minutos']} min | "
+                f"faltan {left} (~{left * per_run / 3600:.1f} h)")
+        cmp_scores[(name, seed)] = scores
+        cmp_rows.append(summary)
+
+cmp_table = pd.DataFrame(cmp_rows)
+cmp_table.to_csv(CMP_DIR / "corridas.csv", index=False)
+log(f"Comparación: {n_total} corridas ({n_done} nuevas) en {(time.perf_counter() - cmp_start) / 60:.0f} min")
+
+#%% celda 17 [texto]
+## 4. Decisión
+
+Para cada lista, diferencia con "sin eliminar" semilla por semilla (misma semilla = mismos canaritos y mismo azar): media, desvío y t pareado, en ganancia máxima suavizada y en AUC. También el ensamble de las semillas de cada lista.
+
+**Regla (fijada antes de ver los resultados):** gana la lista con mayor mejora media de ganancia, siempre que sea positiva y con t ≥ 2. Si ninguna cumple, no hay envío: el notebook no sigue y apaga la máquina. `FORZAR_LISTA` permite seguir con una lista igual.
+
+#%% celda 18 [código]
+decision_rows = []
+base_by_seed = cmp_table[cmp_table["lista"].eq("sin_eliminar")].set_index("semilla")
+for name in LISTS:
+    rows = cmp_table[cmp_table["lista"].eq(name)].set_index("semilla").loc[CMP_SEEDS]
+    ensemble = np.column_stack([cmp_scores[(name, s)] for s in CMP_SEEDS]).mean(axis=1)
+    ens = june_metrics(ensemble)
+    row = {"lista": name, "variables": len(LISTS[name]),
+           "ganancia_media": rows["ganancia_maxima"].mean(), "ganancia_desvio": rows["ganancia_maxima"].std(ddof=1),
+           "auc_media": rows["auc"].mean(), "ensamble_ganancia": ens["ganancia_maxima"],
+           "ensamble_corte": ens["mejor_corte"], f"ensamble_corte_{CORTE_REF}": ens[f"ganancia_corte_{CORTE_REF}"]}
+    if name != "sin_eliminar":
+        diff = rows["ganancia_maxima"] - base_by_seed.loc[CMP_SEEDS, "ganancia_maxima"]
+        diff_auc = rows["auc"] - base_by_seed.loc[CMP_SEEDS, "auc"]
+        sd = diff.std(ddof=1)
+        row.update({
+            "dif_ganancia_media": diff.mean(), "dif_ganancia_desvio": sd,
+            "t_pareado": diff.mean() / (sd / np.sqrt(len(diff))) if sd > 0 else np.nan,
+            "gana_en": f"{int((diff > 0).sum())} de {len(diff)}", "dif_auc_media": diff_auc.mean(),
+        })
+    decision_rows.append(row)
+decision = pd.DataFrame(decision_rows)
+decision.to_csv(CMP_DIR / "decision.csv", index=False)
+display(decision.round(4))
+
+candidates = decision[(decision["lista"] != "sin_eliminar") & (decision["dif_ganancia_media"] > 0)
+                      & (decision["t_pareado"] >= WIN_MIN_T)]
+WINNER = None if candidates.empty else candidates.sort_values("dif_ganancia_media").iloc[-1]["lista"]
+log("Regla: gana la mayor mejora de ganancia con t pareado >=", WIN_MIN_T, "->", WINNER or "ninguna lista gana")
+if FORZAR_LISTA is not None:
+    if FORZAR_LISTA not in LISTS:
+        raise KeyError(f"FORZAR_LISTA = {FORZAR_LISTA!r} no es una lista: {list(LISTS)}")
+    log(f"FORZAR_LISTA: se sigue con {FORZAR_LISTA}" + (" (modo prueba)" if MODO_PRUEBA else ""))
+    WINNER = FORZAR_LISTA
+save_json(CMP_DIR / "ganadora.json", {"ganadora": WINNER, "forzada": FORZAR_LISTA is not None,
+                                      "regla_t": WIN_MIN_T, "tabla": decision.to_dict("records")})
+if WINNER is None:
+    log("Ninguna lista mejora a 'sin eliminar': no hay envío. Las celdas siguientes no hacen nada y la máquina se apaga.")
+else:
+    WINNER_COLUMNS = LISTS[WINNER]
+    log(f"Lista elegida: {WINNER} ({len(WINNER_COLUMNS)} variables)")
+
+#%% celda 19 [texto]
+## 5. Optimización bayesiana de la lista elegida
+
+Igual que `s0006`: Optuna (TPE), 21 corridas = 1 con los valores de `s0006` + 10 al azar + 10 guiadas, una sola semilla (101737), AUC de junio. Cambios: entrena con marzo a mayo, usa solo las variables de la lista (con sus canaritos 1 a 1) y el techo de `min_sum_hessian_in_leaf` es 1.
+
+El estudio (SQLite) vive en el disco local porque SQLite no funciona bien sobre el bucket; después de cada corrida se copia al bucket, y al empezar se recupera de ahí si la máquina es nueva.
+
+#%% celda 20 [código]
+if WINNER is not None:
+    BO_CONFIG = canonical({"lista": WINNER, "hash": list_hash(WINNER_COLUMNS), "search_space": SEARCH_SPACE,
+                           "n_startup_trials": N_STARTUP_TRIALS, "meses": CMP_TRAIN_MONTHS, "valida": VALID_MONTH,
+                           "seed": BO_SEED, "prueba": MODO_PRUEBA,
+                           "fijos": {k: v for k, v in zlgb_params(S0006_VALUES, 0, BO_SEED).items()
+                                     if k not in ("num_leaves", "min_sum_hessian_in_leaf", "canaritos", "num_threads")}})
+    LOCAL_DB, BUCKET_DB = LOCAL_DIR / "estudio.db", BO_DIR / "estudio.db"
+    if not LOCAL_DB.exists() and BUCKET_DB.exists():
+        shutil.copy(BUCKET_DB, LOCAL_DB)
+        log("Estudio recuperado del bucket")
+    study = optuna.create_study(study_name=f"{EXP_ID}_bayesiana", storage=f"sqlite:///{LOCAL_DB.as_posix()}",
+                                direction="maximize", load_if_exists=True)
+    if not study.trials:
+        study.set_user_attr("config", BO_CONFIG)
+    elif study.user_attrs.get("config") != BO_CONFIG:
+        raise RuntimeError(f"{LOCAL_DB} es de otra configuración. Movelo (y el del bucket) para empezar de cero.")
+    study.sampler = optuna.samplers.TPESampler(n_startup_trials=N_STARTUP_TRIALS, seed=SAMPLER_SEED + len(study.trials))
+
+    def completed_trials():
+        return [t for t in study.trials if t.state == TrialState.COMPLETE]
+
+    if not any(t.params == S0006_VALUES for t in completed_trials()) \
+            and not any(t.state == TrialState.WAITING for t in study.trials):
+        study.enqueue_trial(S0006_VALUES)
+
+    bo_timing = []
+
+    def objective(trial):
+        values = {
+            "num_iterations": trial.suggest_int("num_iterations", *SEARCH_SPACE["num_iterations"]),
+            "num_leaves": trial.suggest_int("num_leaves", *SEARCH_SPACE["num_leaves"]),
+            "min_sum_hessian_in_leaf": trial.suggest_float("min_sum_hessian_in_leaf", *SEARCH_SPACE["min_sum_hessian_in_leaf"]),
+        }
+        n_before = len(completed_trials())
+        kind = "s0006" if values == S0006_VALUES else ("azar" if n_before < N_STARTUP_TRIALS else "guiada")
+        start = time.perf_counter()
+        booster = train_zlgb(WINNER_COLUMNS, values, BO_SEED, CMP_ROWS)
+        scores = predict_june(booster, WINNER_COLUMNS, BO_SEED)
+        num_trees = int(booster.num_trees())
+        del booster
+        metrics = june_metrics(scores)
+        minutes = (time.perf_counter() - start) / 60
+        save_npy(BO_DIR / f"junio_corrida_{trial.number:03d}.npy", scores)
+        for key, value in {**metrics, "num_trees": num_trees, "minutos": round(minutes, 1), "tipo": kind}.items():
+            trial.set_user_attr(key, value)
+        bo_timing.append((values["num_iterations"], minutes * 60))
+        per_iteration = sum(s for _, s in bo_timing) / sum(n for n, _ in bo_timing)
+        left = N_TRIALS - n_before - 1
+        log(f"  corrida {n_before + 1:2d}/{N_TRIALS} ({kind:6s}) iter {values['num_iterations']:4d} | hojas "
+            f"{values['num_leaves']:4d} | hessian {values['min_sum_hessian_in_leaf']:.5f} -> AUC {metrics['auc']:.5f} | "
+            f"ganancia {metrics['ganancia_maxima']:.1f} con {metrics['mejor_corte']} | {num_trees} árboles | "
+            f"{minutes:.1f} min | faltan ~{left * per_iteration * sum(SEARCH_SPACE['num_iterations']) / 2 / 3600:.1f} h")
+        return metrics["auc"]
+
+    def trials_table():
+        rows = [{"corrida": t.number, **t.params, **t.user_attrs} for t in completed_trials()]
+        table = pd.DataFrame(rows)
+        return table.sort_values("auc", ascending=False).reset_index(drop=True) if len(table) else table
+
+    def checkpoint(study_, trial_):
+        trials_table().to_csv(BO_DIR / "corridas.csv", index=False)
+        shutil.copy(LOCAL_DB, BO_DIR / "estudio.db.tmp")
+        os.replace(BO_DIR / "estudio.db.tmp", BUCKET_DB)
+
+    remaining = N_TRIALS - len(completed_trials())
+    log(f"Bayesiana: {len(completed_trials())} de {N_TRIALS} corridas hechas")
+    if remaining > 0:
+        study.optimize(objective, n_trials=remaining, callbacks=[checkpoint])
+    bo_table = trials_table()
+    bo_table.to_csv(BO_DIR / "corridas.csv", index=False)
+    display(bo_table.round(5))
+    best_trial = study.best_trial
+    BEST_VALUES = {"num_iterations": int(best_trial.params["num_iterations"]),
+                   "num_leaves": int(best_trial.params["num_leaves"]),
+                   "min_sum_hessian_in_leaf": float(best_trial.params["min_sum_hessian_in_leaf"])}
+    save_json(BO_DIR / "mejores_hiperparametros.json", {"corrida": best_trial.number, "valores": BEST_VALUES,
+                                                       **best_trial.user_attrs})
+    log("Mejores valores:", BEST_VALUES, f"| AUC junio {best_trial.value:.5f}")
+else:
+    log("Bayesiana: no corre (ninguna lista ganó)")
+
+#%% celda 21 [texto]
+## 6. Referencia de junio
+
+La lista elegida con sus mejores valores, 3 semillas (marzo a mayo → junio), contra "sin eliminar" con los valores de `s0006` y las mismas 3 semillas (ya entrenadas en la comparación). Ganancia de junio de cada ensamble por corte. La corrida 101737 se reusa de la bayesiana si es la mejor.
+
+#%% celda 22 [código]
+if WINNER is not None:
+    june_scores = {}
+    for seed in JUNE_SEEDS:
+        if seed == BO_SEED:
+            june_scores[seed] = np.load(BO_DIR / f"junio_corrida_{best_trial.number:03d}.npy")
+            continue
+        base = JUNE_DIR / f"junio_seed{seed}"
+        config = canonical({"seed": seed, "valores": BEST_VALUES, "bayesiana": BO_CONFIG})
+        if base.with_suffix(".npy").exists() and load_json(base.with_suffix(".json")) == config:
+            june_scores[seed] = np.load(base.with_suffix(".npy"))
+            continue
+        start = time.perf_counter()
+        booster = train_zlgb(WINNER_COLUMNS, BEST_VALUES, seed, CMP_ROWS)
+        june_scores[seed] = predict_june(booster, WINNER_COLUMNS, seed)
+        del booster
+        save_json(base.with_suffix(".json"), config)
+        save_npy(base.with_suffix(".npy"), june_scores[seed])
+        log(f"  referencia semilla {seed}: {june_metrics(june_scores[seed])['ganancia_maxima']:.1f} | "
+            f"{(time.perf_counter() - start) / 60:.1f} min")
+    winner_ens = np.column_stack([june_scores[s] for s in JUNE_SEEDS]).mean(axis=1)
+    base_ens = np.column_stack([cmp_scores[("sin_eliminar", s)] for s in JUNE_SEEDS]).mean(axis=1)
+    save_npy(JUNE_DIR / "junio_ensamble.npy", winner_ens)
+    june_by_cut = pd.DataFrame({"corte": CORTES})
+    for label, scores in [(WINNER + "_optimizada", winner_ens), ("sin_eliminar_s0006", base_ens)]:
+        _, smooth = gain_curve(june_baja2, scores)
+        june_by_cut[label] = [float(smooth[c - 1]) for c in CORTES]
+        m = june_metrics(scores)
+        log(f"  ensamble de {len(JUNE_SEEDS)} {label}: AUC {m['auc']:.5f} | ganancia máxima {m['ganancia_maxima']:.1f} "
+            f"con {m['mejor_corte']}")
+    june_by_cut["diferencia"] = june_by_cut.iloc[:, 1] - june_by_cut.iloc[:, 2]
+    june_by_cut.to_csv(JUNE_DIR / "ganancia_junio_por_corte.csv", index=False)
+    display(june_by_cut.round(1))
+else:
+    log("Referencia de junio: no corre (ninguna lista ganó)")
+
+#%% celda 23 [texto]
+## 7. Semillas de agosto
+
+La lista elegida con sus mejores valores, marzo a junio → agosto, `N_SEMILLAS_AGOSTO` semillas (primero las de `s0004`, después los primos de `s0005`). Cada semilla se guarda apenas termina; si la máquina se corta, al volver a correr sigue con las que faltan. Para cortar antes: *Interrupt* y después correr las celdas de cortes y apagado.
+
+#%% celda 24 [código]
+if WINNER is not None:
+    save_npy(AUG_DIR / "ids_agosto.npy", future_ids)
+
+    def aug_config(seed):
+        return canonical({"seed": seed, "lista": WINNER, "hash": list_hash(WINNER_COLUMNS), "valores": BEST_VALUES,
+                          "meses": TRAIN_MONTHS, "prueba": MODO_PRUEBA})
+
+    done = [s for s in FINAL_SEEDS if (AUG_DIR / f"seed_{s}.npy").exists()
+            and load_json(AUG_DIR / f"seed_{s}.json") == aug_config(s)]
+    pending = [s for s in FINAL_SEEDS if s not in done]
+    log(f"Agosto: {len(done)} semillas guardadas, faltan {len(pending)}")
+    try:
+        for seed in pending:
+            start = time.perf_counter()
+            booster = train_zlgb(WINNER_COLUMNS, BEST_VALUES, seed, ALL_ROWS)
+            probabilities = booster.predict(with_canaries(R_pred, WINNER_COLUMNS, seed + 1))
+            del booster
+            save_json(AUG_DIR / f"seed_{seed}.json", aug_config(seed))
+            save_npy(AUG_DIR / f"seed_{seed}.npy", probabilities)
+            done.append(seed)
+            log(f"  [{len(done)}/{len(FINAL_SEEDS)}] semilla {seed}: {(time.perf_counter() - start) / 60:.1f} min")
+    except KeyboardInterrupt:
+        log("Interrumpido: la semilla en curso se descarta; las terminadas quedaron guardadas.")
+else:
+    log("Agosto: no corre (ninguna lista ganó)")
+
+#%% celda 25 [texto]
+## 8. Promedio y cortes
+
+Promedia las semillas de agosto guardadas y escribe un CSV por corte en `6_cortes/`, con la ganancia de junio de la referencia en el mismo corte. Se puede volver a correr sola después de la primera celda (lee todo del bucket).
+
+#%% celda 26 [código]
+saved = sorted(AUG_DIR.glob("seed_*.npy"), key=lambda p: p.stat().st_mtime)
+if saved:
+    ids = np.load(AUG_DIR / "ids_agosto.npy")
+    configs = [load_json(p.with_suffix(".json")) for p in saved]
+    if any({k: v for k, v in c.items() if k != "seed"} != {k: v for k, v in configs[0].items() if k != "seed"}
+           for c in configs):
+        raise RuntimeError("Las semillas guardadas no tienen la misma configuración")
+    ensemble = np.column_stack([np.load(p) for p in saved]).mean(axis=1)
+    lista = configs[0]["lista"]
+    june_table = JUNE_DIR / "ganancia_junio_por_corte.csv"
+    june_gain = pd.read_csv(june_table).set_index("corte").iloc[:, 0] if june_table.exists() else None
+    for old in CUTS_DIR.glob("*.csv"):
+        old.unlink()
+    rows = []
+    for cut in CORTES:
+        if not MODO_PRUEBA and not 8_000 <= cut <= 15_000:
+            raise ValueError(f"El bot acepta entre 8.000 y 15.000 registros: {cut}")
+        chosen = ids[np.argsort(-ensemble, kind="stable")[:cut]]
+        assert len(np.unique(chosen)) == cut
+        path = CUTS_DIR / f"{EXP_ID}_{lista}_{len(saved)}sem_corte{cut}.csv"
+        np.savetxt(path, chosen.astype(np.int64), fmt="%d")
+        rows.append({"corte": cut, "archivo": path.name,
+                     "ganancia_junio": None if june_gain is None or cut not in june_gain.index else round(june_gain[cut], 1)})
+    cuts_table = pd.DataFrame(rows)
+    cuts_table.to_csv(OUT_DIR / "cortes.csv", index=False)
+    pd.DataFrame({"numero_de_cliente": ids, "score": ensemble}).to_csv(AUG_DIR / "probabilidades_agosto.csv.gz",
+                                                                       index=False, compression="gzip")
+    display(cuts_table)
+    log(f"Cortes: {len(CORTES)} CSV con {len(saved)} semillas de {lista} en {CUTS_DIR}")
+else:
+    log("Cortes: no hay semillas de agosto guardadas")
+
+#%% celda 27 [texto]
+## 9. Fin y apagado
+
+Si `APAGAR_AL_TERMINAR = True` y estás en una máquina virtual de la cátedra, la borra (como hacen sus scripts con las máquinas creadas desde las plantillas). Todo quedó en el bucket, en la carpeta que muestra la primera celda.
+
+#%% celda 28 [código]
+log(f"{EXP_ID} terminado (modo prueba: {MODO_PRUEBA}). Resultados en {OUT_DIR}")
+if APAGAR_AL_TERMINAR:
+    apagar_vm("fin del notebook")

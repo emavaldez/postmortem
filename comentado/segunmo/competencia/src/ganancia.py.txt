@@ -1,0 +1,47 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–13] Docstring, imports y _es_positivo(), que acepta etiquetas de texto (BAJA+2) o
+#   binarias (1).
+"""Funciones de ganancia de la campaña de retención.
+
+y_true: array de etiquetas ('BAJA+2' / otras) o binario (1 = BAJA+2).
+proba:  probabilidad predicha de BAJA+2.
+"""
+import numpy as np
+
+from config import COSTO_ESTIMULO, GANANCIA_ACIERTO, POSITIVO, UMBRAL
+
+
+def _es_positivo(y_true) -> np.ndarray:
+    y = np.asarray(y_true)
+    return (y == POSITIVO) if y.dtype.kind in "OUS" else (y == 1)
+
+
+# [Anotación · líneas 16–21] ganancia_por_umbral(): suma 1.072.500 por cada positivo y resta 27.500 por cada
+#   otro cliente con probabilidad mayor o igual al umbral (0,025 por defecto), y divide por la fracción de datos
+#   evaluada.
+def ganancia_por_umbral(y_true, proba, umbral: float = UMBRAL, prop: float = 1.0) -> float:
+    """Ganancia total si se estimula a todos los clientes con proba >= umbral.
+    `prop` es la fracción de los datos evaluada (se reescala dividiendo por prop)."""
+    pos = _es_positivo(y_true)
+    estimula = np.asarray(proba) >= umbral
+    return float((np.where(pos, GANANCIA_ACIERTO, -COSTO_ESTIMULO)[estimula]).sum() / prop)
+
+
+# [Anotación · líneas 24–28] ganancia_acumulada(): ordena por probabilidad descendente con orden estable y
+#   devuelve la suma acumulada; el elemento k − 1 es la ganancia de enviar a los k primeros.
+def ganancia_acumulada(y_true, proba) -> np.ndarray:
+    """Ganancia acumulada ordenando por proba descendente: el elemento k-1 es la ganancia de enviar a los k primeros."""
+    pos = _es_positivo(y_true)
+    orden = np.argsort(-np.asarray(proba), kind="stable")
+    return np.cumsum(np.where(pos[orden], GANANCIA_ACIERTO, -COSTO_ESTIMULO))
+
+
+# [Anotación · líneas 31–35] mejor_corte(): cantidad de envíos que maximiza la ganancia acumulada y su valor,
+#   calculados sobre los mismos datos.
+def mejor_corte(y_true, proba) -> tuple[int, float]:
+    """(cantidad óptima de envíos, ganancia máxima). OJO: óptimo ex post sobre estos datos."""
+    acum = ganancia_acumulada(y_true, proba)
+    k = int(np.argmax(acum))
+    return k + 1, float(acum[k])

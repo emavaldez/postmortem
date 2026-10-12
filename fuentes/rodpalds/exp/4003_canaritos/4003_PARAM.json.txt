@@ -1,0 +1,42 @@
+{
+  "experimento": 4003,
+  "nombre": "canaritos",
+  "descripcion": "Canaritos sobre crudo + binaria2 (train 202104). Compara todas las variables vs las que superan el p95 de los canaritos vs las que superan al mejor canarito.",
+  "dataset": "ds3001_crudo.parquet",
+  "mes_train": 202104,
+  "mes_test": 202106,
+  "clase": "clase_binaria2",
+  "usar_lag2": false,
+  "n_canaritos": 100,
+  "semillas": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "num_boost_round": 250,
+  "lgbm": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "max_bin": 31,
+    "num_leaves": 16,
+    "learning_rate": 0.019868,
+    "min_data_in_leaf": 816,
+    "feature_fraction": 0.277155,
+    "bagging_fraction": 0.63413,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "verbose": -1
+  },
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "cortes": {
+    "desde": 2000,
+    "hasta": 20000,
+    "paso": 500
+  },
+  "_fecha_inicio": "2026-10-05 01:44:15",
+  "_script": "05_canaritos.py",
+  "_git_commit": "sin_git"
+}

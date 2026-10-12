@@ -1,0 +1,13 @@
+{
+  "pruebas": 80,
+  "eleccion": "4109 prueba_23",
+  "evidencia": {
+    "meseta_B_elegido_M": 417.0,
+    "referencia": "z601",
+    "meseta_B_referencia_M": 357.0,
+    "meseta_B_z601_M": 357.0,
+    "mejor_retador_segun_A": "prueba_23",
+    "semillas_ganadas_por_el_retador": "20/20"
+  },
+  "_minutos": 168.89
+}

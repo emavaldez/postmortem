@@ -1,0 +1,10 @@
+{
+  "experimento": 1001,
+  "nombre": "dataset_base",
+  "descripcion": "Crudo -> clase_ternaria (logica catedra) + clase_binaria1 (BAJA+2) + clase_binaria2 (BAJA+1 y BAJA+2). Sin feature engineering.",
+  "dataset_entrada": "competencia_01_crudo.csv",
+  "dataset_salida": "ds1001_base.parquet",
+  "_fecha_inicio": "2026-10-05 00:42:11",
+  "_script": "01_preparar_dataset.py",
+  "_git_commit": "sin_git"
+}

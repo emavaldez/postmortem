@@ -1,0 +1,350 @@
+#%% celda 1 [texto]
+# PSEUDOETIQUETAS
+
+#%% celda 2 [texto]
+# Librerias
+
+#%% celda 3 [código]
+import os
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import rdata
+from IPython.display import display
+
+#%% celda 4 [texto]
+# URLS
+
+Ejecutar con el directorio de trabajo en `entregas/`.
+
+#%% celda 5 [código]
+carpeta_entregas = os.getcwd()
+data_folder = os.path.join(carpeta_entregas, "dataset")
+carpeta_parametros = os.path.join(carpeta_entregas, "parametros")
+carpeta_salida = os.path.join(carpeta_entregas, "entregas")
+archivo_logging = os.path.join(carpeta_entregas, "logging_python.csv")
+
+#%% celda 6 [código]
+os.listdir(data_folder)
+
+#%% celda 7 [texto]
+# Parametrizacion de la prueba
+
+#%% celda 8 [código]
+dataset_file = "competencia_01_ternaria_lf_k6_perdida4.csv"
+
+
+# Primer modelo: genera las probabilidades para las etiquetas de julio.
+train_julio = [202103, 202104, 202105, 202106]
+mes_julio = 202107
+SEED_JULIO = 230047  # misma semilla que la primera BO
+id_rds_julio = 52  # completar: parametros/<id_rds_julio>.rds
+prob_corte = 0.0035446538114082874  # corte elegido por la segunda BO; editable
+
+# Modelo final: utiliza las etiquetas de julio para predecir agosto.
+train_final = [202103, 202104, 202105, 202106, 202107]
+future = [202108]
+SEEDS = [230047, 230059, 230063, 230077, 230081]
+id_rds = 53  # completar: parametros/<id_rds>.rds de la segunda BO
+envios = 11500  # cantidad de clientes con Predicted = 1
+
+#%% celda 9 [código]
+# Mismas exclusiones que en la BO que generó las probabilidades de julio.
+columnas_excluir = [
+    "ternaria",
+    "ternaria_lag1",
+    "clase01",
+    "fold",
+    "azar",
+    "training",
+    "cprestamos_personales",
+    "mprestamos_personales",
+    "cprestamos_personales_lag1",
+    "mprestamos_personales_lag1",
+    "cprestamos_personales_delta1",
+    "mprestamos_personales_delta1",
+]
+
+if pd.isna([*future, id_rds, envios]).any():
+    raise ValueError("Completar future, id_rds y envios en esta celda.")
+
+#%% celda 10 [texto]
+# LEEMOS DATASET
+
+#%% celda 11 [código]
+dataset_url = os.path.join(data_folder, dataset_file)
+dataset = pd.read_csv(
+    dataset_url, low_memory=False,
+    dtype={"numero_de_cliente": "int32", "foto_mes": "int32"},
+)
+dataset["ternaria"] = dataset["ternaria"].fillna("")
+# Se conserva el orden del CSV, igual que en la BO.
+
+
+display(dataset.groupby(["foto_mes", "ternaria"], dropna=False).size().reset_index(name="N"))
+
+#%% celda 12 [código]
+pd.Series(dataset.columns).loc[pd.Series(dataset.columns).str.contains('ern')]
+
+#%% celda 13 [texto]
+# Parametros
+
+Los dos `.rds` deben estar copiados en `parametros/`. Se usan los HP guardados,
+sin volver a ajustar `min_data_in_leaf`.
+
+#%% celda 14 [código]
+# rdata lee también las listas anidadas del RDS, sin requerir R.
+# Convierte los vectores escalares de R en escalares de Python.
+def convertir_r(valor):
+    if isinstance(valor, dict):
+        return {k: convertir_r(v) for k, v in valor.items()}
+    if isinstance(valor, np.ndarray):
+        if valor.size == 1:
+            return convertir_r(valor.item())
+        return [convertir_r(v) for v in valor.tolist()]
+    if isinstance(valor, (list, tuple)):
+        return [convertir_r(v) for v in valor]
+    if isinstance(valor, np.generic):
+        return convertir_r(valor.item())
+    # R serializa muchos parámetros enteros como double (31.0).
+    # LightGBM Python exige int para esos valores; se conserva su valor.
+    if isinstance(valor, float) and np.isfinite(valor) and valor.is_integer():
+        return int(valor)
+    return valor
+
+parametros_julio = convertir_r(rdata.read_rds(
+    os.path.join(carpeta_parametros, f"{id_rds_julio}.rds")
+))
+parametros = convertir_r(rdata.read_rds(
+    os.path.join(carpeta_parametros, f"{id_rds}.rds")
+))
+
+#%% celda 15 [texto]
+# Dataset train y prediccion
+
+#%% celda 16 [código]
+dataset["clase01"] = dataset["ternaria"].isin(["BAJA+1", "BAJA+2"]).astype(np.int32)
+
+campos_buenos = [c for c in dataset.columns if c not in columnas_excluir]
+
+dataset_train = dataset.loc[dataset["foto_mes"].isin(train_final)].copy()
+dfuture = dataset.loc[dataset["foto_mes"].isin(future)].copy()
+
+if (len(future) != 1 or dataset_train.empty or dfuture.empty
+        or envios < 1 or envios > len(dfuture) or envios != int(envios)):
+    raise ValueError("Revisar meses y envios: se requiere un mes a predecir y filas en ambos datasets.")
+
+display(dataset_train.groupby(["foto_mes", "ternaria"], dropna=False).size().reset_index(name="N"))
+
+# Equivalente a data.matrix: variables numéricas sin tratar como categóricas.
+# Si existen columnas de texto, R las convierte a códigos de factor desde 1.
+# Los niveles se calculan por separado para train y future, igual que en R.
+def data_matrix(df):
+    matriz = df.copy()
+    for nombre in matriz.columns:
+        serie = matriz[nombre]
+        if isinstance(serie.dtype, pd.CategoricalDtype):
+            codigos = serie.cat.codes
+            matriz[nombre] = (codigos + 1).where(codigos >= 0, np.nan)
+        elif pd.api.types.is_object_dtype(serie.dtype) or pd.api.types.is_string_dtype(serie.dtype):
+            niveles = sorted(serie.dropna().unique())
+            codigos = pd.Categorical(serie, categories=niveles).codes
+            matriz[nombre] = np.where(codigos >= 0, codigos + 1, np.nan)
+    return matriz.to_numpy(dtype=np.float64)
+
+X_future = data_matrix(dfuture[campos_buenos])
+
+#%% celda 17 [texto]
+# Primer modelo: probabilidades y etiquetas de julio
+
+Se entrena con las etiquetas reales y la semilla del primer modelo de la BO.
+La probabilidad corresponde a BAJA+1 o BAJA+2. Se conservan las BAJA+1 reales de julio;
+en los demás clientes se asigna BAJA+2 si `prob >= prob_corte`, y CONTINUA en el resto.
+Las probabilidades y las etiquetas generadas permanecen en memoria.
+
+#%% celda 18 [código]
+dataset_train_julio = dataset.loc[dataset["foto_mes"].isin(train_julio)].copy()
+dataset_julio = dataset.loc[dataset["foto_mes"].eq(mes_julio)].copy()
+
+if "num_iterations" in parametros_julio:
+    params_julio = parametros_julio.copy()
+else:
+    params_julio = parametros_julio[str(SEED_JULIO)].copy()
+params_julio["seed"] = SEED_JULIO
+num_boost_round_julio = int(params_julio.pop("num_iterations"))
+
+# Mismo tipo de entrada y orden de filas que en la primera BO.
+dtrain_julio = lgb.Dataset(
+    data=dataset_train_julio[campos_buenos],
+    label=dataset_train_julio["clase01"].to_numpy(),
+    feature_name=campos_buenos,
+)
+modelo_julio = lgb.train(
+    params=params_julio,
+    train_set=dtrain_julio,
+    num_boost_round=num_boost_round_julio,
+)
+
+prob_julio = modelo_julio.predict(dataset_julio[campos_buenos])
+baja1_julio = dataset_julio["ternaria"].isin(["BAJA+1"]).to_numpy()
+etiquetas_julio = np.where(
+    baja1_julio,
+    "BAJA+1",
+    np.where(prob_julio >= prob_corte, "BAJA+2", "CONTINUA"),
+)
+cantidad_baja2_julio = int((etiquetas_julio == "BAJA+2").sum())
+
+dataset.loc[dataset["foto_mes"].eq(mes_julio), "ternaria"] = etiquetas_julio
+dataset["clase01"] = dataset["ternaria"].isin(["BAJA+1", "BAJA+2"]).astype(np.int32)
+
+# El modelo final utiliza las etiquetas recién generadas para julio.
+dataset_train = dataset.loc[dataset["foto_mes"].isin(train_final)].copy()
+X_train = data_matrix(dataset_train[campos_buenos])
+
+print("BAJA+1 reales conservadas en julio:", int(baja1_julio.sum()))
+print("BAJA+2 estimadas en julio:", cantidad_baja2_julio)
+display(dataset_train.groupby(["foto_mes", "ternaria"], dropna=False).size().reset_index(name="N"))
+
+#%% celda 19 [texto]
+# Modelo final: entreno y genero salidas
+
+#%% celda 20 [código]
+predicciones_por_semilla = {}
+
+params_base = (
+    parametros
+    if "num_iterations" in parametros
+    else next(iter(parametros.values()))
+)
+
+for seed in SEEDS:
+    params_semilla = params_base.copy()
+    params_semilla["seed"] = seed
+    num_boost_round = int(params_semilla.pop("num_iterations"))
+
+    dtrain_final = lgb.Dataset(
+        data=X_train,
+        label=dataset_train["clase01"].to_numpy(),
+        feature_name=campos_buenos,
+        categorical_feature=[],
+    )
+    modelo_final = lgb.train(
+        params=params_semilla,
+        train_set=dtrain_final,
+        num_boost_round=num_boost_round,
+    )
+
+    tb_prediccion = dfuture[["numero_de_cliente"]].copy()
+    tb_prediccion["prob"] = modelo_final.predict(X_future)
+
+    predicciones_por_semilla[seed] = tb_prediccion.sort_values(
+        "prob", ascending=False, kind="stable"
+    ).reset_index(drop=True)
+
+    print(f"Semilla={seed}: predicciones listas")
+
+#%% celda 21 [código]
+# si qremos generar archivos para mas de 1 corte
+
+# IMPORTANTE -> HACERLO SECUENCIALMENTE, SI O SI ACTUALIZAR LOGGING ANTES DE GENERAR CADA CORTE NUEVO.
+
+envios = pepe  # completar con la nueva cantidad de envios
+
+if os.path.exists(archivo_logging):
+    historico = pd.read_csv(archivo_logging)
+    id_prueba = int(historico["id_prueba"].max()) + 1
+else:
+    id_prueba = 1
+
+archivos_salida = []
+
+for seed in SEEDS:
+    tb_prediccion = predicciones_por_semilla[seed].copy()
+    tb_prediccion["Predicted"] = 0
+    tb_prediccion.loc[:envios - 1, "Predicted"] = 1
+
+    archivos_salida.append(f"p002_{seed}_{id_prueba}.csv")
+    tb_prediccion.loc[
+        tb_prediccion["Predicted"].eq(1), ["numero_de_cliente"]
+    ].to_csv(
+        os.path.join(carpeta_salida, archivos_salida[-1]),
+        sep=",",
+        header=False,
+        index=False,
+    )
+
+    print(f"Semilla={seed} Archivo={archivos_salida[-1]}")
+
+#%% celda 22 [texto]
+# Documentacion de la prueba
+
+Una fila por ejecucion, con todas las semillas usadas. Completar la nota y los resultados de Kaggle como texto. Cuando lleguen los resultados, ejecutar las dos celdas de esta seccion: actualizan la misma fila y conservan las pruebas anteriores.
+
+#%% celda 23 [código]
+# cortamos aca
+pepe
+
+#%% celda 24 [código]
+nota = "e7_p subido a con 12.5k envios"
+resultado_competencia_mean = "95.5130"  # score de Kaggle o referencia a un problema con la entrega
+resultado_competencia_std = "0.8883"
+ref_submit = "e11_p"
+
+#%% celda 25 [código]
+# Se documenta el paso de julio en nota, conservando las columnas del logging.
+nota_registro = (
+    f"{nota} | BAJA+2 estimadas para {mes_julio}; "
+    f"id_rds_julio={id_rds_julio}; "
+    f"meses_entrenamiento_julio={','.join(map(str, train_julio))}; "
+    f"seed_julio={SEED_JULIO}; prob_corte={prob_corte}; "
+    f"BAJA+1 reales={int(baja1_julio.sum())}; BAJA+2 estimadas={cantidad_baja2_julio}"
+)
+
+registro_prueba = pd.DataFrame([{
+    "id_prueba": id_prueba,
+    "ref_submit": ref_submit,
+    "notebook": "p002.ipynb",
+    "dataset": dataset_file,
+    "seeds": ",".join(map(str, SEEDS)),
+    "cantidad_registros_totales": len(dataset),
+    "cantidad_registros_entrenamiento": len(dataset_train),
+    "cantidad_registros_prediccion": len(dfuture),
+    "meses_entrenamiento": ",".join(map(str, train_final)),
+    "meses_prediccion": ",".join(map(str, future)),
+    "columnas_excluidas": ",".join(columnas_excluir),
+    "bajas":"1+2",                                       #baja+1 y baja+2 o solo baja+2
+    "id_rds": id_rds,
+    "envios": envios,
+    "archivos": ",".join(archivos_salida),
+    "nota": nota_registro,
+    "resultado_competencia_mean": resultado_competencia_mean,
+    "resultado_competencia_std": resultado_competencia_std
+}])
+
+if os.path.exists(archivo_logging):
+    historico = pd.read_csv(
+        archivo_logging,
+        dtype={
+            "ref_submit": str,
+            "seeds": str,
+            "meses_entrenamiento": str,
+            "meses_prediccion": str,
+            "nota": str,
+            "resultado_competencia_mean": str,
+            "resultado_competencia_std": str,
+        },
+    )
+    fila = historico["id_prueba"].eq(id_prueba)
+
+    if fila.any():
+        historico.loc[fila, registro_prueba.columns] = registro_prueba.to_numpy()
+        historico.to_csv(archivo_logging, index=False)
+    else:
+        registro_prueba.to_csv(archivo_logging, mode="a", header=False, index=False)
+else:
+    registro_prueba.to_csv(archivo_logging, index=False)
+
+# display(registro_prueba)
+
+#%% celda 26 [código]
+display(pd.read_csv(archivo_logging).tail(10))

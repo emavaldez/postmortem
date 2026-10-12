@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="es" data-raiz="../../">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BrunoMicali · Postmortem Primera Competencia DMEyF 2026</title>
+<meta name="description" content="Entrega de BrunoMicali (BrunoMicali/comp.1): resumen, ficha, pasos, explicaciones y código anotado.">
+<link rel="stylesheet" href="../../assets/estilo.css">
+<link rel="help" href="../../llms.txt" title="Guía para agentes">
+<link rel="alternate" type="text/markdown" href="../../md/brunomicali.md" title="Markdown"><link rel="alternate" type="application/json" href="../../data/entregas/brunomicali.json" title="JSON">
+<script src="../../assets/app.js" defer></script>
+</head>
+<body>
+<header class="barra"><div class="barra-int"><a class="marca" href="../../index.html">Postmortem · Primera Competencia</a><nav aria-label="Secciones"><a href="../../index.html">Resumen</a><a href="../../index.html#entregas" aria-current="page">Entregas</a><a href="../../comparar.html">Comparar</a><a href="../../fichas.html">Fichas</a><a href="../../tecnicas.html">Técnicas</a><a href="../../reproducibilidad.html">Reproducibilidad</a><a href="../../buscar.html">Buscar en el código</a><a href="../../glosario.html">Glosario</a><a href="../../agentes.html">Para agentes</a></nav></div></header>
+<main>
+<p class="meta"><a href="../../index.html#entregas">Entregas</a> › BrunoMicali</p>
+<h1>BrunoMicali</h1>
+<p class="bajada">Entrega de <strong>BrunoMicali</strong> · repositorio <a href="https://github.com/BrunoMicali/comp.1" rel="noopener">BrunoMicali/comp.1</a> · commit <a href="https://github.com/BrunoMicali/comp.1/tree/af345fc7f9c78c6efb5abf7d6ba8301e38595b02" rel="noopener"><code>af345fc</code></a></p>
+<p class="meta">Lectura revisada por una segunda pasada automática (datos principales de la ficha y una muestra de las anotaciones). <a href="https://share.google/JVDPtba7jA1OtMcdu" rel="noopener">Link posteado por el alumno</a> · <a href="../../comparar.html?a=brunomicali">comparar con otra entrega</a> · <a href="../../md/brunomicali.md">versión Markdown</a> · <a href="../../data/entregas/brunomicali.json">JSON</a></p>
+<nav class="chips" aria-label="En esta página"><a class="chip" href="#resumen">Resumen</a><a class="chip" href="#ficha">Ficha</a><a class="chip" href="#pasos">Pasos</a><a class="chip" href="#explicaciones">Explicaciones del alumno</a><a class="chip" href="#codigo">Código</a><a class="chip" href="#otros">Otros archivos</a></nav>
+<h2 id="resumen">Resumen</h2>
+<p style="max-width:62rem">El repositorio contiene dos archivos: README.md (89 líneas) y entrega_ensamble3prop_50sem_k10750_202108_10750.csv. No contiene código: las carpetas codigo/ y anexo_investigacion/ que el README describe no están en el repositorio, por lo que todo lo que sigue es lo que declara el README. Según ese texto, la predicción sale de un pipeline en Python de cuatro etapas (01_target.py, 03_features.py, 04_entrenar.py, 05_predecir_y_armar.py) lanzado por reproducir.py: agrega clase_ternaria, arma 462 variables (columnas originales, variables de dominio, diferencias contra 1 y 2 meses atrás y 4 proporciones), entrena 150 modelos LightGBM en tres familias de 50 semillas cada una (positivo BAJA+2 con 202103 a 202106; positivo BAJA+1 o BAJA+2 con 202103 a 202107; positivo BAJA+1 con 202103 a 202107), conservando todas las filas positivas y el 10 % del resto, y combina las familias promediando rangos por semilla y después entre las 50 semillas. Se envían los 10.750 primeros clientes de ese ordenamiento para 202108. Los hiperparámetros provienen, según el README, de la prueba 62 de una búsqueda con Optuna. El CSV del repositorio tiene 10.750 números de cliente distintos y su SHA-256 coincide con el que figura en el README.</p>
+<p style="max-width:62rem"><strong>Qué entrega.</strong> Un CSV, entrega_ensamble3prop_50sem_k10750_202108_10750.csv, incluido en el repositorio (96.750 bytes): 10.750 líneas, cada una con un número entero, sin encabezado y sin repetidos. Según el README, son numero_de_cliente de la foto 202108.</p><p style="max-width:62rem"><strong>Cómo se ejecuta.</strong> Según el README: con Python 3.10 y las versiones de codigo/requirements.txt, entrar a codigo/, correr `pip install -r requirements.txt`, ubicar el dataset en ../datos/competencia_01_crudo.csv o definir la variable de entorno DMEYF_CSV con su ruta, y correr `python reproducir.py`, que ejecuta las etapas en orden y al final compara el SHA-256 del archivo obtenido con el de codigo/sha256_esperado.txt. El README agrega que cada etapa se puede reanudar volviendo a correr el mismo comando. La carpeta codigo/ no está en el repositorio.</p>
+<h2 id="ficha">Ficha</h2><div class="tabla"><table class="ficha"><tbody>
+<tr><th scope="row">Lenguajes</th><td>Python</td></tr>
+<tr><th scope="row">Modelos</th><td>LightGBM</td></tr>
+<tr><th scope="row">Clase que entrena</th><td>No se observa en el código (el repositorio no trae código). Según el README, la etiqueta es BAJA+1 si el cliente no aparece en m+1, BAJA+2 si aparece en m+1 pero no en m+2 y CONTINUA en el resto; en 202107 sólo se conoce BAJA+1. Se entrenan tres familias con clase binaria distinta: base (positivo = BAJA+2), baja12_r (positivo = BAJA+1 o BAJA+2) y baja1_r (positivo = BAJA+1). En las dos familias _r, 202107 aporta la BAJA+1.</td></tr>
+<tr><th scope="row">Meses de entrenamiento</th><td>202103, 202104, 202105, 202106, 202107</td></tr>
+<tr><th scope="row">Meses de validación</th><td>202105, 202106</td></tr>
+<tr><th scope="row">Mes que predice</th><td>202108</td></tr>
+<tr><th scope="row">Submuestreo</th><td>No se observa en el código. Según el README, se conservan todas las filas de la clase positiva y el 10 % del resto, de forma determinística por semilla (usa la función hash() de DuckDB 1.5.5), y la probabilidad se corrige por esa tasa.</td></tr>
+<tr><th scope="row">Calidad de datos</th><td>No se observa en el código. El README no describe tratamiento de variables rotas ni de valores faltantes.</td></tr>
+<tr><th scope="row">Drifting</th><td>No se observa en el código. El README no nombra un tratamiento de drifting. Indica que se excluyen 6 variables de calendario que cambian con el foto_mes (config.EXCLUIR) y que la normalización mensual figura en la lista de lo que se probó y no se adoptó.</td></tr>
+<tr><th scope="row">Variables dentro del mes</th><td>No se observa en el código. Según el README, a las columnas originales se suman variables de dominio (tarjetas, payroll, consumo sobre límite y transacciones totales) y 4 proporciones de dónde está el dinero del cliente (comun.ext_proporciones).</td></tr>
+<tr><th scope="row">Variables históricas</th><td>No se observa en el código. Según el README, para cada variable se calculan las diferencias contra 1 y 2 meses atrás (d1 y d2). El README no nombra otras variables históricas. El total declarado, sumando todas las variables, es de 462.</td></tr>
+<tr><th scope="row">Selección de variables</th><td>No se observa en el código. Según el README, se excluyen 6 variables de calendario (config.EXCLUIR); los canaritos figuran en la lista de lo que se probó y no se adoptó.</td></tr>
+<tr><th scope="row">Optimización de hiperparámetros</th><td>No se observa en el código. Según el README, búsqueda con Optuna en anexo_investigacion/codigo/09_experimentos.py (modo optuna; el archivo no está en el repositorio), con validación walk-forward: entrena con 202103 y 202104 y valida en 202106, y entrena con 202103 y valida en 202105. La entrega usa la prueba 62 y reproducir.py no repite la búsqueda.</td></tr>
+<tr><th scope="row">Hiperparámetros finales</th><td>No se observan: el README indica que están en codigo/hiperparametros.json (archivo que no está en el repositorio), que salen de la prueba 62 de Optuna y que se usan 275 rondas (250 × 1,1); el README da como motivo que el entrenamiento final tiene más meses que la validación. También declara deterministic=True y force_row_wise=True.</td></tr>
+<tr><th scope="row">Semillas</th><td>No se observa en el código. Según el README, 50 semillas por familia (150 modelos en total). Los valores de las semillas no figuran en el repositorio.</td></tr>
+<tr><th scope="row">Cantidad de semillas</th><td>50</td></tr>
+<tr><th scope="row">Ensamble</th><td>No se observa en el código. Según el README, para cada semilla se promedian las posiciones relativas (rangos) de las tres familias (base, baja12_r y baja1_r) y después se promedia entre las 50 semillas.</td></tr>
+<tr><th scope="row">Corte</th><td>Cantidad fija: 10.750 clientes. Según el README, K = 10.750 se eligió mirando el leaderboard público (la ganancia fue pareja entre K = 10.500 y 11.000 y 10.750 es el centro de ese intervalo) y queda fijo en el código. El CSV del repositorio tiene 10.750 líneas.</td></tr>
+<tr><th scope="row">Validación</th><td>No se observa en el código. Según el README, la búsqueda de hiperparámetros usa validación walk-forward: entrena con 202103 y 202104 y valida en 202106, y entrena con 202103 y valida en 202105. El README no indica la métrica de esa validación.</td></tr>
+<tr><th scope="row">Salidas</th><td>Según el README: trabajo/base.parquet (etapa 1), variables por mes en trabajo/fe/ (etapa 2), 150 modelos en trabajo/modelos/ (etapa 3) y la carpeta resultado/ (etapa 4). trabajo/ y resultado/ no están en el repositorio. El repositorio incluye el archivo final entrega_ensamble3prop_50sem_k10750_202108_10750.csv.</td></tr>
+</tbody></table></div>
+<h3>Técnicas que usa el camino de la entrega</h3><div class="chips"><a class="chip si" href="../../tecnicas.html#modelo-lightgbm">LightGBM</a><a class="chip si" href="../../tecnicas.html#clase-binaria_baja2">Clase binaria: positivo = BAJA+2</a><a class="chip si" href="../../tecnicas.html#clase-binaria_baja1_baja2">Clase binaria: positivo = BAJA+1 o BAJA+2</a><a class="chip si" href="../../tecnicas.html#datos-submuestreo_continua">Submuestreo de la clase CONTINUA</a><a class="chip si" href="../../tecnicas.html#datos-excluye_variables">Excluye variables a mano (por ejemplo préstamos personales)</a><a class="chip si" href="../../tecnicas.html#variables-intra_mes">Variables nuevas dentro del mes (sumas, cocientes, combinaciones)</a><a class="chip si" href="../../tecnicas.html#variables-deltas">Deltas (diferencia con meses anteriores)</a><a class="chip si" href="../../tecnicas.html#hiperparametros-optuna">Optuna</a><a class="chip si" href="../../tecnicas.html#validacion-mes_futuro">Validación en un mes posterior al entrenamiento</a><a class="chip si" href="../../tecnicas.html#validacion-varios_meses_de_prueba">Prueba en más de un mes (backtesting)</a><a class="chip si" href="../../tecnicas.html#ensamble-semillerio">Promedio de varias semillas del mismo modelo</a><a class="chip si" href="../../tecnicas.html#ensamble-modelos_distintos">Combina modelos o configuraciones distintas</a><a class="chip si" href="../../tecnicas.html#corte-cantidad_fija">Envía una cantidad fija de clientes</a><a class="chip si" href="../../tecnicas.html#final-reentrena_con_todo">El modelo final se reentrena sumando los meses usados para validar</a></div>
+<h3>Técnicas que aparecen sólo en archivos de exploración</h3><div class="chips"><a class="chip exp" href="../../tecnicas.html#drifting-estandarizacion_por_mes">Estandarización o normalización por mes</a><a class="chip exp" href="../../tecnicas.html#variables-canaritos">Canaritos (variables al azar para medir ruido)</a><a class="chip exp" href="../../tecnicas.html#ensamble-stacking">Stacking (un modelo sobre las salidas de otros)</a><a class="chip exp" href="../../tecnicas.html#modelo-red_neuronal">Red neuronal</a></div>
+<h3>Reproducibilidad (hechos que se ven en el repositorio)</h3><div class="tabla"><table class="ficha"><tbody>
+<tr><th scope="row">Tiene README o texto de presentación</th><td><span class="si-no si">Sí</span></td></tr>
+<tr><th scope="row">Explica cómo ejecutar</th><td><span class="si-no si">Sí</span></td></tr>
+<tr><th scope="row">Declara versiones o dependencias</th><td><span class="si-no si">Sí</span></td></tr>
+<tr><th scope="row">Fija las semillas</th><td><span class="si-no si">Sí</span></td></tr>
+<tr><th scope="row">Usa rutas absolutas o de una máquina</th><td><span class="si-no no">No</span></td></tr>
+<tr><th scope="row">Incluye datos o predicciones</th><td><span class="si-no si">Sí</span></td></tr>
+<tr><th scope="row">Sale de un solo script o notebook</th><td><span class="si-no si">Sí</span></td></tr>
+<tr><th scope="row">Entorno declarado</th><td>Según el README: Python 3.10, DuckDB 1.5.5 y el resto de las versiones en codigo/requirements.txt (archivo que no está en el repositorio); verificación hecha en Linux x86_64; tiempos de cada etapa medidos con 2 CPU y 3 GB de RAM; unos 1,5 GB de disco para trabajo/. Declara no haberlo probado en Windows nativo ni en Mac con ARM.</td></tr></tbody></table></div>
+<h2 id="pasos">Pasos del camino de la entrega</h2><ol class="pasos">
+<li><span class="t">Decisiones previas que quedan fijas.</span> Según el README, los hiperparámetros salen de la prueba 62 de una búsqueda con Optuna con validación walk-forward (entrena con 202103 y 202104 y valida en 202106; entrena con 202103 y valida en 202105) y K = 10.750 se eligió mirando el leaderboard público. reproducir.py no repite ninguna de las dos.<div class="refs"><code>README.md</code> líneas 68–68 · <code>README.md</code> líneas 74–79</div></li>
+<li><span class="t">Etapa 1: construcción de la clase.</span> Según el README, 01_target.py agrega clase_ternaria al CSV de la cátedra y guarda trabajo/base.parquet. BAJA+1 si el cliente no aparece en m+1, BAJA+2 si aparece en m+1 pero no en m+2, CONTINUA en el resto; en 202107 sólo se conoce BAJA+1.<div class="refs"><code>README.md</code> líneas 31–31 · <code>README.md</code> líneas 52–52</div></li>
+<li><span class="t">Etapa 2: armado de variables.</span> Según el README, 03_features.py arma las variables por mes y las guarda en trabajo/fe/: columnas originales, variables de dominio (tarjetas, payroll, consumo sobre límite, transacciones totales), diferencias de cada variable contra 1 y 2 meses atrás (d1 y d2) y 4 proporciones de dónde está el dinero del cliente; se excluyen 6 variables de calendario. Total declarado: 462 variables.<div class="refs"><code>README.md</code> líneas 32–32 · <code>README.md</code> líneas 54–54</div></li>
+<li><span class="t">Submuestreo de las filas no positivas.</span> Según el README, se conservan todas las filas de la clase positiva y el 10 % del resto, de forma determinística por semilla con la función hash() de DuckDB, y la probabilidad se corrige por esa tasa. El README no indica en cuál de los scripts se aplica.<div class="refs"><code>README.md</code> líneas 15–15 · <code>README.md</code> líneas 66–66</div></li>
+<li><span class="t">Etapa 3: entrenamiento de 150 modelos LightGBM.</span> Según el README, 04_entrenar.py entrena tres familias con 50 semillas cada una y guarda los modelos en trabajo/modelos/: base (positivo BAJA+2, 202103 a 202106), baja12_r (positivo BAJA+1 o BAJA+2, 202103 a 202107) y baja1_r (positivo BAJA+1, 202103 a 202107). Usa los hiperparámetros de codigo/hiperparametros.json con 275 rondas (250 × 1,1), deterministic=True y force_row_wise=True.<div class="refs"><code>README.md</code> líneas 33–33 · <code>README.md</code> líneas 46–46 · <code>README.md</code> líneas 56–64 · <code>README.md</code> líneas 68–68</div></li>
+<li><span class="t">Etapa 4: puntaje de 202108 y combinación por rangos.</span> Según el README, 05_predecir_y_armar.py puntúa 202108 y escribe resultado/. Para cada semilla se promedian las posiciones relativas (rangos) de las tres familias y después se promedia entre las 50 semillas.<div class="refs"><code>README.md</code> líneas 34–34 · <code>README.md</code> líneas 70–70</div></li>
+<li><span class="t">Corte y archivo de salida.</span> Según el README, se envían los 10.750 primeros clientes del ordenamiento, en un CSV sin encabezado con un numero_de_cliente por línea. Como referencia, el README indica que 9.091 clientes tienen probabilidad media mayor a 2,5 % según la familia base.<div class="refs"><code>README.md</code> líneas 7–11 · <code>README.md</code> líneas 72–72</div></li>
+<li><span class="t">Comparación con el SHA-256 esperado.</span> Según el README, reproducir.py compara la suma SHA-256 del archivo obtenido con la de codigo/sha256_esperado.txt e imprime REPRODUCCIÓN EXACTA o EL ARCHIVO NO COINCIDE. El README da además el tamaño (492.769.580 bytes) y el SHA-256 del dataset de entrada, y declara que una corrida desde el CSV crudo en una carpeta vacía dio variables, modelos y archivo final idénticos byte a byte a los originales.<div class="refs"><code>README.md</code> líneas 25–27 · <code>README.md</code> líneas 38–48</div></li>
+</ol>
+<h2 id="explicaciones">Explicaciones del alumno</h2>
+<p class="meta">Textos del repositorio, tal como los escribió el autor.</p>
+<details open id="a0"><summary><code>README.md</code> <span class="meta">· 89 líneas · <a href="https://github.com/BrunoMicali/comp.1/blob/af345fc7f9c78c6efb5abf7d6ba8301e38595b02/README.md" rel="noopener">GitHub</a> · <a href="../../fuentes/brunomicali/README.md.txt">texto</a></span></summary><p>Texto de presentación de la entrega: nombre y SHA-256 del archivo entregado, pasos para reproducirlo con reproducir.py, tabla de las cuatro etapas con sus tiempos, verificación declarada, descripción del método (etiqueta, variables, tres familias de LightGBM, submuestreo, hiperparámetros, puntaje y corte), lo que el script no reproduce y el contenido de la carpeta. Nombra las carpetas codigo/ y anexo_investigacion/, que no están en el repositorio.</p><div class="explicacion"><h3>DMEyF 2026 · Competencia 01 · Entrega final</h3>
+<p>Autor: Bruno Micali Dejter</p>
+<h4>Archivo a entregar</h4>
+<p><code>entrega_ensamble3prop_50sem_k10750_202108_10750.csv</code></p>
+<p>10.750 <code>numero_de_cliente</code> de la foto 202108, uno por línea, sin encabezado, enteros y sin repetidos.</p>
+<p>SHA-256 del archivo: <code>3c85bcbe055f01522bad34dcd7a73e04b7d5f491bb8f0e871f4f1860c46bb6d9</code></p>
+<h4>Cómo reproducirlo</h4>
+<p>Requisitos: Python 3.10 y las versiones exactas de <code>codigo/requirements.txt</code>. DuckDB tiene que ser 1.5.5, porque el submuestreo de negativos usa su función <code>hash()</code>.</p>
+<pre class="bloque"><code>cd codigo
+pip install -r requirements.txt
+# dataset de la cátedra en ../datos/competencia_01_crudo.csv, o bien:
+export DMEYF_CSV=/ruta/a/competencia_01_crudo.csv
+python reproducir.py</code></pre>
+<p><code>reproducir.py</code> corre todas las etapas en orden. Al final compara la suma SHA-256 del archivo obtenido con la esperada (<code>codigo/sha256_esperado.txt</code>) e imprime <code>REPRODUCCIÓN EXACTA</code> o <code>EL ARCHIVO NO COINCIDE</code>. Cada etapa se puede reanudar: si se interrumpe, se vuelve a correr el mismo comando.</p>
+<p>Dataset de entrada verificado: <code>competencia_01_crudo.csv</code>, 492.769.580 bytes, SHA-256 <code>c72c8f5c1149f1d972e996c2963c5e3dbb31eb38cfe41c2bb1bbaf847d7a7ca1</code>.</p>
+<div class="tabla"><table><thead><tr><th>Etapa</th><th>Script</th><th>Qué hace</th><th>Tiempo (2 CPU, 3 GB de RAM)</th></tr></thead><tbody><tr><td>1</td><td><code>01_target.py</code></td><td>Agrega <code>clase_ternaria</code> al CSV y guarda <code>trabajo/base.parquet</code></td><td>~30 s</td></tr><tr><td>2</td><td><code>03_features.py</code></td><td>Arma las features por mes y las guarda en <code>trabajo/fe/</code></td><td>~3 min</td></tr><tr><td>3</td><td><code>04_entrenar.py</code></td><td>Entrena 150 modelos LightGBM y los guarda en <code>trabajo/modelos/</code></td><td>~35 min</td></tr><tr><td>4</td><td><code>05_predecir_y_armar.py</code></td><td>Puntúa 202108 y escribe <code>resultado/</code></td><td>~3 min</td></tr></tbody></table></div>
+<p>Se necesitan unos 1,5 GB de disco para <code>trabajo/</code>.</p>
+<h5>Verificación hecha</h5>
+<p>El paquete se corrió desde el CSV crudo en una carpeta vacía, y los resultados son idénticos byte a byte a los originales en las tres capas:</p>
+<ul>
+<li><strong>Features:</strong> las de los seis meses (202103 a 202108) coinciden con las del pipeline de trabajo.
+</li>
+<li><strong>Modelos:</strong> los 150 modelos coinciden con los originales.
+</li>
+<li><strong>Archivo final:</strong> el que se genera es el mismo que se entrega.
+</li></ul>
+<p>LightGBM corre con <code>deterministic=True</code> y <code>force_row_wise=True</code>. Un mismo modelo dio predicciones idénticas con 1, 2 y 4 hilos, así que el resultado no depende de la cantidad de núcleos.</p>
+<p>La verificación se hizo en Linux x86_64. En otro sistema operativo o arquitectura (Windows nativo, Mac con ARM) no está probado. Si el hash no coincide ahí, recomiendo correrlo en Linux o WSL con las mismas versiones.</p>
+<h4>Método</h4>
+<p><strong>Etiqueta.</strong> BAJA+1 si el cliente no aparece en m+1. BAJA+2 si aparece en m+1 pero no en m+2. CONTINUA en el resto. En 202107 solo se conoce BAJA+1.</p>
+<p>**Features (<code>03_features.py</code>).** Columnas originales más variables de dominio: tarjetas, payroll, consumo sobre límite y transacciones totales. Para cada variable se calculan además las diferencias contra 1 y 2 meses atrás (d1 y d2). Se excluyen 6 variables de calendario que cambian con el foto_mes (<code>config.EXCLUIR</code>). A eso se agregan 4 proporciones de dónde está el dinero del cliente (<code>comun.ext_proporciones</code>). En total son 462 variables.</p>
+<p><strong>Ensamble de tres familias LightGBM, 50 semillas cada una (150 modelos):</strong></p>
+<div class="tabla"><table><thead><tr><th>Familia</th><th>Positivo</th><th>Meses de entrenamiento</th></tr></thead><tbody><tr><td>base</td><td>BAJA+2</td><td>202103 a 202106</td></tr><tr><td>baja12_r</td><td>BAJA+1 o BAJA+2</td><td>202103 a 202107</td></tr><tr><td>baja1_r</td><td>BAJA+1</td><td>202103 a 202107</td></tr></tbody></table></div>
+<p>En las dos familias <code>_r</code>, 202107 aporta la BAJA+1 recién conocida.</p>
+<p><strong>Submuestreo.</strong> Se conservan todas las filas de la clase positiva y el 10 % del resto, de forma determinística por semilla. La probabilidad se corrige por esa tasa.</p>
+<p><strong>Hiperparámetros.</strong> Están en <code>codigo/hiperparametros.json</code> y salen de la prueba 62 de Optuna. Se usan 275 rondas (250 × 1,1), porque el entrenamiento final tiene más meses que la validación.</p>
+<p><strong>Puntaje.</strong> Para cada semilla se promedian las posiciones relativas (rangos) de las tres familias, y después se promedia entre las 50 semillas.</p>
+<p><strong>Corte.</strong> Se envían los 10.750 primeros. En el leaderboard público la ganancia fue pareja entre K = 10.500 y 11.000, y 10.750 es el centro de esa meseta. Como referencia, 9.091 clientes tienen probabilidad media mayor a 2,5 % según la familia base.</p>
+<h4>Qué no reproduce el script</h4>
+<p>Hay dos decisiones que se tomaron antes y quedan fijas en el código:</p>
+<ul>
+<li><strong>Hiperparámetros.</strong> La búsqueda con Optuna está en <code>anexo_investigacion/codigo/09_experimentos.py</code>, modo <code>optuna</code>. La validación es walk-forward: entrena con 202103 y 202104 y valida en 202106, y entrena con 202103 y valida en 202105.
+</li>
+<li><strong>K = 10.750.</strong> Se eligió mirando el leaderboard público.
+</li></ul>
+<h4>Contenido de la carpeta</h4>
+<ul>
+<li><code>codigo/</code>: el pipeline mínimo que genera el archivo.
+<ul>
+<li><code>config.py</code> y <code>comun.py</code>: las funciones copiadas literalmente del pipeline de trabajo.
+</li>
+<li>Los scripts de las cuatro etapas, <code>reproducir.py</code>, <code>requirements.txt</code>, <code>hiperparametros.json</code> y <code>sha256_esperado.txt</code>.
+</li></ul>
+</li>
+<li><code>anexo_investigacion/</code>: todo el código de trabajo y los informes de los experimentos (rondas 1 a 9).
+<ul>
+<li>Incluye lo que se probó y no se adoptó: normalización mensual, canaritos, apilado, validación adversaria, ranking, supervivencia, GRU, entre otros.
+</li>
+<li>No hace falta para reproducir la entrega.
+</li></ul>
+</li>
+<li><code>trabajo/</code> y <code>resultado/</code>: los genera la reproducción. No forman parte del zip.
+</li></ul></div></details>
+<h2 id="codigo">Código</h2>
+<p>La entrega no tiene archivos de código marcados como parte del camino que produce la predicción.</p>
+<h2 id="otros">Otros archivos de la entrega</h2>
+<p>No hay otros archivos de texto en la entrega.</p>
+<h3>Notas</h3><ul style="max-width:62rem"><li>Archivos que no son texto ni código (datos, modelos, imágenes), por extensión: .csv (1).</li><li>No cubierto por la lectura: El repositorio no contiene código: en el commit af345fc, el único de la rama main, sólo hay README.md y entrega_ensamble3prop_50sem_k10750_202108_10750.csv. Los archivos que el README nombra (codigo/config.py, codigo/comun.py, codigo/01_target.py, codigo/03_features.py, codigo/04_entrenar.py, codigo/05_predecir_y_armar.py, codigo/reproducir.py, codigo/requirements.txt, codigo/hiperparametros.json, codigo/sha256_esperado.txt y la carpeta anexo_investigacion/) no están, por lo que no se leyeron ni se anotaron. No hay archivos de rol principal.</li><li>No cubierto por la lectura: El README describe el contenido de una carpeta y menciona un zip (líneas 81 a 89); ese zip no está en el repositorio.</li><li>No cubierto por la lectura: La ficha, los pasos y las técnicas se completaron con lo que declara el README; no pudieron contrastarse con código. Las referencias de línea apuntan al README.</li><li>No cubierto por la lectura: De los datos de reproducibilidad, se comprobaron contra los archivos del repositorio tiene_readme e incluye_datos_o_predicciones. Los demás se apoyan en frases del README: explica_como_ejecutar y es_un_solo_comando en las líneas 13 a 25; declara_versiones_o_dependencias en la línea 15 (Python 3.10 y DuckDB 1.5.5; el requirements.txt que nombra no está); fija_semillas en las líneas 40 a 46 y 66 (resultados idénticos byte a byte y submuestreo determinístico por semilla; los valores de las semillas no se ven); usa_rutas_absolutas_o_de_una_maquina en las líneas 20 y 21 (ruta relativa ../datos/ o variable de entorno DMEYF_CSV).</li><li>No cubierto por la lectura: El CSV de la entrega no figura en la lista de archivos de la tarea (es un archivo de datos), por lo que no tiene entrada propia. Se contó su contenido: 10.750 líneas, todas con un entero distinto, sin encabezado; su SHA-256 es 3c85bcbe055f01522bad34dcd7a73e04b7d5f491bb8f0e871f4f1860c46bb6d9, igual al que figura en el README.</li><li>No cubierto por la lectura: El link posteado es un enlace de share.google y no se abrió; se leyó únicamente el clon del repositorio BrunoMicali/comp.1.</li><li>No cubierto por la lectura: La familia baja1_r (positivo = BAJA+1) y el uso de 202107 con la BAJA+1 como única etiqueta conocida no tienen código en el vocabulario; quedan descriptos en la ficha.</li><li>No cubierto por la lectura: Los hiperparámetros quedan fijos en codigo/hiperparametros.json según el README; como el mismo texto indica que salen de una búsqueda con Optuna, se usó el código hiperparametros.optuna y no hiperparametros.fijos.</li><li>No cubierto por la lectura: De la lista de lo probado y no adoptado que da el README (normalización mensual, canaritos, apilado, validación adversaria, ranking, supervivencia, GRU, entre otros) sólo se pasaron a códigos del vocabulario cuatro: normalización mensual (drifting.estandarizacion_por_mes), canaritos (variables.canaritos), apilado (ensamble.stacking) y GRU (modelo.red_neuronal). Validación adversaria, ranking y supervivencia quedan nombrados aquí.</li></ul>
+<footer class="pie">
+<p>Página armada el 2026-10-12 a partir de los repositorios públicos que cada alumno posteó como entrega de la Primera Competencia de DMEyF 2026 (UBA). Las descripciones y las anotaciones del código son lecturas automáticas hechas con asistencia de IA y revisadas por una segunda pasada automática; describen lo que el código hace, sin valorarlo, y pueden contener errores. El código y los textos de cada entrega pertenecen a sus autores y se muestran tal como estaban en el commit indicado en cada página.</p>
+<p>Para corregir una descripción o pedir que se retire una entrega: <a href="https://github.com/emavaldez/postmortem/issues">abrir un issue</a>. <a href="../../agentes.html">Versión para agentes</a> · <a href="../../llms.txt">llms.txt</a> · <a href="https://github.com/emavaldez/postmortem">repositorio de esta página</a>.</p>
+</footer>
+</main>
+</body>
+</html>

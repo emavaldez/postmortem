@@ -1,0 +1,159 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–20] Docstring del módulo: enumera los cuatro pasos del script (cálculo de
+#   clase_ternaria, exclusión de las columnas de config.COLUMNAS_CON_DRIFT, marca y ajuste de aguinaldo sobre
+#   mcuentas_saldo, y lags y deltas de orden 1 y 2).
+"""Calcula la clase objetivo y arma el dataset de features a partir del
+dataset crudo.
+
+Pasos:
+  1. clase_ternaria: para cada cliente y mes, mira si sigue existiendo 1 y 2
+     meses después. CONTINUA si sigue en ambos, BAJA+1 si deja de existir al
+     mes siguiente, BAJA+2 si existe un mes más pero no dos.
+  2. Se excluyen columnas con un desplazamiento fuerte de distribución entre
+     meses (ver config.COLUMNAS_CON_DRIFT) — no reflejan un cambio real del
+     cliente, sino un cambio en cómo se generó el dato en algún mes puntual.
+  3. Aguinaldo: en los meses de aguinaldo (junio y diciembre), si el saldo de
+     cuentas de un cliente sube muy por encima de su propio promedio o
+     máximo habitual (calculados con sus meses anteriores), se marca con la
+     columna `cobra_aguinaldo` y se corrige ese saldo dividiéndolo por un
+     factor fijo — queda reemplazado en la misma columna `mcuentas_saldo`.
+  4. Lags y deltas de orden 1 y 2 (valor de 1 y 2 meses atrás, y la
+     diferencia contra cada uno) sobre todas las columnas numéricas,
+     incluida la de saldo ya corregida. `cobra_aguinaldo` queda como columna
+     plana, sin lag ni delta.
+"""
+# [Anotación · líneas 21–36] Importa duckdb y, desde config.py, las rutas de entrada y salida, la lista de
+#   columnas a excluir y las tres constantes de aguinaldo. Define NO_NUMERICAS con las tres columnas que no
+#   reciben lag ni delta: numero_de_cliente, foto_mes y clase_ternaria.
+from __future__ import annotations
+
+import duckdb
+
+from config import (
+    COLUMNAS_CON_DRIFT,
+    DATASET_FE_CSV_PATH,
+    INFLACION_AGUINALDO,
+    MESES_AGUINALDO,
+    RAW_CSV_PATH,
+    UMBRAL_AGUINALDO,
+)
+
+NO_NUMERICAS = ("numero_de_cliente", "foto_mes", "clase_ternaria")
+
+
+# [Anotación · líneas 37–49] Abre una conexión DuckDB en memoria y carga data/dataset_crudo.csv en la tabla
+#   crudo con read_csv_auto. Arma la lista numericas con las columnas que no están en NO_NUMERICAS ni en
+#   COLUMNAS_CON_DRIFT y cuyo tipo es BIGINT, DOUBLE, INTEGER, FLOAT, HUGEINT, SMALLINT, TINYINT o DECIMAL, e
+#   imprime cuántas son.
+def main() -> None:
+    con = duckdb.connect()
+    con.execute(f"create or replace table crudo as select * from read_csv_auto('{RAW_CSV_PATH.as_posix()}')")
+
+    cols = [r[0] for r in con.execute("describe crudo").fetchall()]
+    tipos = {r[0]: r[1] for r in con.execute("describe crudo").fetchall()}
+    numericas = [
+        c for c in cols
+        if c not in NO_NUMERICAS and c not in COLUMNAS_CON_DRIFT
+        and tipos[c] in ("BIGINT", "DOUBLE", "INTEGER", "FLOAT", "HUGEINT", "SMALLINT", "TINYINT", "DECIMAL")
+    ]
+    print(f"columnas numéricas utilizadas: {len(numericas)} (excluidas por drift: {COLUMNAS_CON_DRIFT})", flush=True)
+
+# [Anotación · líneas 50–65] Calcula clase_ternaria en la tabla base. Cruza todos los clientes con todos los
+#   meses, marca con mes_0 = 1 los pares que existen en el dataset y mira esa marca uno y dos meses adelante:
+#   BAJA+1 si el cliente no está al mes siguiente, BAJA+2 si está al mes siguiente pero no a los dos meses,
+#   CONTINUA si está en ambos, y nulo cuando el dataset no tiene el mes siguiente o el segundo. Conserva sólo
+#   las filas existentes (mes_0 = 1).
+    # clase_ternaria
+    con.execute("""
+        create or replace table base as
+        with periodos as (select distinct foto_mes from crudo),
+        clientes as (select distinct numero_de_cliente from crudo),
+        todo as (select numero_de_cliente, foto_mes from clientes cross join periodos),
+        ct as (
+            select c.*, if(c.numero_de_cliente is null, 0, 1) as mes_0,
+            lead(mes_0, 1) over (partition by t.numero_de_cliente order by foto_mes) as mes_1,
+            lead(mes_0, 2) over (partition by t.numero_de_cliente order by foto_mes) as mes_2,
+            case when mes_1 is null then null when mes_1 = 0 then 'BAJA+1'
+                 when mes_2 is null then null when mes_2 = 0 then 'BAJA+2' else 'CONTINUA' end as clase_ternaria
+            from todo t left join crudo c using (numero_de_cliente, foto_mes)
+        ) select * exclude (mes_0, mes_1, mes_2) from ct where mes_0 = 1
+    """)
+
+# [Anotación · líneas 66–83] Para cada cliente y cada mes de junio o diciembre (MESES_AGUINALDO = 6 y 12)
+#   calcula el promedio y el máximo de mcuentas_saldo sobre todas las filas del mismo cliente con foto_mes
+#   anterior (tabla ref_aguinaldo) y los agrega a base como columnas promedio y maximo con un left join; en los
+#   demás meses quedan nulas.
+    # aguinaldo: referencia por cliente = promedio/máximo de su saldo en los
+    # meses ANTERIORES a cada mes de aguinaldo (nunca meses futuros)
+    meses_aguinaldo_sql = ", ".join(str(m) for m in MESES_AGUINALDO)
+    con.execute(f"""
+        create or replace table ref_aguinaldo as
+        select b.numero_de_cliente, b.foto_mes as mes_aguinaldo,
+               avg(h.mcuentas_saldo) as promedio, max(h.mcuentas_saldo) as maximo
+        from base b
+        join base h on h.numero_de_cliente = b.numero_de_cliente and h.foto_mes < b.foto_mes
+        where cast(b.foto_mes % 100 as int) in ({meses_aguinaldo_sql})
+        group by b.numero_de_cliente, b.foto_mes
+    """)
+    con.execute("""
+        create or replace table base as
+        select b.*, r.promedio, r.maximo
+        from base b left join ref_aguinaldo r
+        on r.numero_de_cliente = b.numero_de_cliente and r.mes_aguinaldo = b.foto_mes
+    """)
+# [Anotación · líneas 84–96] Define la condición cumple: el mes es junio o diciembre y mcuentas_saldo es mayor
+#   o igual a 1,4 (UMBRAL_AGUINALDO) veces el promedio o el máximo previos. Crea base_aguinaldo con la columna
+#   cobra_aguinaldo (1 si cumple, 0 si no) y con mcuentas_saldo dividido por 1,111 (INFLACION_AGUINALDO) en las
+#   filas que cumplen; quita promedio y maximo. Imprime la cantidad de filas marcadas.
+    cumple = f"""cast(foto_mes % 100 as int) in ({meses_aguinaldo_sql}) and (
+                    mcuentas_saldo >= {UMBRAL_AGUINALDO} * promedio
+                    or mcuentas_saldo >= {UMBRAL_AGUINALDO} * maximo)"""
+    con.execute(f"""
+        create or replace table base_aguinaldo as
+        select * exclude (mcuentas_saldo, promedio, maximo),
+               if({cumple}, 1, 0) as cobra_aguinaldo,
+               if({cumple}, mcuentas_saldo / {INFLACION_AGUINALDO}, mcuentas_saldo) as mcuentas_saldo
+        from base
+    """)
+    n_cobra = con.execute("select count(*) from base_aguinaldo where cobra_aguinaldo = 1").fetchone()[0]
+    print(f"filas marcadas con cobra_aguinaldo=1: {n_cobra:,}", flush=True)
+
+# [Anotación · líneas 97–116] Para cada columna de numericas genera cuatro expresiones SQL: el valor de la
+#   fila anterior y el de dos filas atrás del mismo cliente ordenado por foto_mes (lag_1_ y lag_2_) y la
+#   diferencia del valor actual con cada uno (delta_1_ y delta_2_). Crea la tabla fe con numero_de_cliente,
+#   foto_mes, clase_ternaria, cobra_aguinaldo, las columnas numéricas y las derivadas, ordenada por cliente y
+#   mes.
+    # cobra_aguinaldo queda como columna plana (sin lag/delta); mcuentas_saldo
+    # ya tiene el ajuste aplicado y recibe lag/delta como cualquier otra
+    # columna de `numericas`.
+    partes = []
+    for c in numericas:
+        partes += [
+            f"lag({c}, 1) over ventana as lag_1_{c}",
+            f"lag({c}, 2) over ventana as lag_2_{c}",
+            f"{c} - lag({c}, 1) over ventana as delta_1_{c}",
+            f"{c} - lag({c}, 2) over ventana as delta_2_{c}",
+        ]
+    salida = ["numero_de_cliente", "foto_mes", "clase_ternaria", "cobra_aguinaldo"] + numericas
+    con.execute(f"""
+        create or replace table fe as
+        select {', '.join(salida)}, {', '.join(partes)}
+        from base_aguinaldo
+        window ventana as (partition by numero_de_cliente order by foto_mes)
+        order by numero_de_cliente, foto_mes
+    """)
+
+# [Anotación · líneas 117–125] Imprime la cantidad de columnas de fe, crea la carpeta data/ si no existe y
+#   exporta la tabla a data/dataset_features.csv con encabezado. Las dos últimas líneas ejecutan main() cuando
+#   el archivo se corre como script.
+    n_cols = con.execute("select count(*) from (describe fe)").fetchone()[0]
+    print(f"columnas totales: {n_cols}", flush=True)
+    DATASET_FE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con.execute(f"copy fe to '{DATASET_FE_CSV_PATH.as_posix()}' (format csv, header)")
+    print(f"guardado en {DATASET_FE_CSV_PATH}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

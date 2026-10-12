@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, gc, hashlib, json, sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import yaml
+
+HERE=Path(__file__).resolve().parent
+ROOT=HERE.parent
+FE=HERE/"fe_amplia"
+sys.path.insert(0,str(FE))
+from generar_fe import generate, sha256_file
+from cargar_bloques import cargar_bloques
+
+KEYS=["numero_de_cliente","foto_mes"]
+TARGET="clase_ternaria"
+PLAN=json.loads((HERE/"plan_screening.json").read_text())
+CONFIG=json.loads((HERE/"config_screening.json").read_text())
+
+def write_json(path,obj):
+    p=Path(path);p.parent.mkdir(parents=True,exist_ok=True)
+    p.write_text(json.dumps(obj,ensure_ascii=False,indent=2))
+
+def hash_list(xs):
+    return hashlib.sha256(json.dumps(xs,ensure_ascii=False).encode()).hexdigest()
+
+def ensure_bank(data,bank):
+    got=sha256_file(data)
+    if got!=PLAN["dataset_sha256"]:
+        raise ValueError("SHA del dataset no coincide con el padre M1")
+    manifest=bank/"manifest.json"
+    if manifest.exists():
+        m=json.loads(manifest.read_text())
+        if m.get("status")!="completed" or m.get("input_sha256")!=got or m.get("config")!=CONFIG:
+            raise ValueError("Banco FE existente incompatible")
+        print("REUSAR banco FE",bank,flush=True)
+        return m
+    if bank.exists() and any(bank.iterdir()):
+        raise ValueError("Carpeta de banco no vacía sin manifest válido")
+    print("GENERAR banco FE de desarrollo",flush=True)
+    return generate(data,bank,CONFIG,blocks=PLAN["generated_blocks"],months=[202103,202104,202105,202106])
+
+def derived_for_arm(bank,arm):
+    if arm=="F0_M1_RAW":return []
+    cat=pd.read_csv(bank/"catalogo_features.csv")
+    cat=cat[cat.status.eq("generated")].copy()
+    mh=pd.to_numeric(cat.min_history,errors="coerce").fillna(0)
+    if arm=="F1_TEMPORAL_MASIVA":s=cat.loc[mh.ge(1),"feature"]
+    elif arm=="F2_REPRESENTACION_MASIVA":s=cat.loc[mh.eq(0),"feature"]
+    elif arm=="F3_TOTAL_MASIVA":s=cat["feature"]
+    else:raise ValueError(arm)
+    return s.drop_duplicates().tolist()
+
+def load_arm(bank,arm,months):
+    derived=derived_for_arm(bank,arm)
+    if arm=="F0_M1_RAW":
+        df=pd.read_parquet(bank/"raw.parquet")
+        df=df[df.foto_mes.isin(months)].reset_index(drop=True)
+    else:
+        df,_=cargar_bloques(bank,meses=months,incluir_raw=True,features=derived)
+    lab=pd.read_parquet(bank/"etiquetas.parquet")
+    lab=lab[lab.foto_mes.isin(months)].reset_index(drop=True)
+    if not df[KEYS].equals(lab[KEYS]):raise ValueError("X/y desalineados")
+    raw=[c for c in df.columns if c not in KEYS and not c.startswith("fe__")]
+    if len(raw)!=152:raise ValueError(f"Se esperaban 152 RAW y hay {len(raw)}")
+    feats=raw+derived
+    if len(feats)!=len(set(feats)):raise ValueError("Features duplicadas")
+    return df,lab,feats,derived
+
+def gains(ids,y,scores):
+    order=np.lexsort((np.asarray(ids,np.int64),-np.asarray(scores,float)))
+    out={}
+    for n in PLAN["cuts"]:
+        z=np.asarray(y,np.int8)[order[:n]]
+        hits=int(z.sum())
+        out[n]=int(hits*1072500-(n-hits)*27500)
+    return out
+
+def fit_model(x,y,params,seed,threads):
+    import lightgbm as lgb
+    p=dict(params)
+    p.update(seed=int(seed),num_threads=int(threads),deterministic=True)
+    ds=lgb.Dataset(x,label=y,free_raw_data=False)
+    return lgb.train(p,ds,num_boost_round=int(PLAN["rounds"]))
+
+def run_one(bank,out,arm,fold_name,params,threads):
+    fold=PLAN["folds"][fold_name]
+    months=sorted(set(fold["train"]+[fold["eval"]]))
+    df,lab,feats,derived=load_arm(bank,arm,months)
+    tr=df.foto_mes.isin(fold["train"]).to_numpy()
+    ev=df.foto_mes.eq(fold["eval"]).to_numpy()
+    ytr=lab.loc[tr,TARGET].eq("BAJA+2").to_numpy(np.int8)
+    yev=lab.loc[ev,TARGET].eq("BAJA+2").to_numpy(np.int8)
+    ids=df.loc[ev,"numero_de_cliente"].to_numpy(np.int64)
+    root=out/"evaluacion"/fold_name/arm
+    root.mkdir(parents=True,exist_ok=True)
+    write_json(root/"features.json",{"features":feats,"derived":derived,"hash":hash_list(feats)})
+    xtr=df.loc[tr,feats]
+    xev=df.loc[ev,feats]
+    rows=[];scores_all=[];imps=[]
+    for seed in PLAN["seeds"]:
+        cp=root/f"seed_{seed}.npz"
+        if cp.exists():
+            z=np.load(cp,allow_pickle=False)
+            scores=z["scores"];imp=z["gain"]
+            print("REUSAR",arm,fold_name,seed,flush=True)
+        else:
+            print("ENTRENAR",arm,fold_name,seed,"features",len(feats),flush=True)
+            model=fit_model(xtr,ytr,params,seed,threads)
+            scores=model.predict(xev,num_threads=threads)
+            imp=model.feature_importance(importance_type="gain").astype(float)
+            np.savez_compressed(cp,scores=scores,gain=imp,ids=ids,y=yev)
+            del model
+        g=gains(ids,yev,scores)
+        rows.append({"seed":seed,
+          "ganancia_10500":g[10500],"ganancia_11000":g[11000],"ganancia_11500":g[11500],
+          "ganancia_banda":float(np.mean([g[10500],g[11000],g[11500]]))})
+        scores_all.append(scores);imps.append(imp)
+    pd.DataFrame(rows).to_csv(root/"por_seed.csv",index=False)
+    imp=np.vstack(imps)
+    rank=np.vstack([pd.Series(-v).rank(method="min").to_numpy() for v in imp])
+    fi=pd.DataFrame({"feature":feats,"gain_medio":imp.mean(0),
+      "seeds_gain_positivo":(imp>0).sum(0),"rank_mediana":np.median(rank,axis=0),
+      "es_derivada":[x in set(derived) for x in feats]})
+    fi.sort_values(["rank_mediana","gain_medio"],ascending=[True,False]).to_csv(root/"importancias.csv",index=False)
+    ens=np.mean(np.vstack(scores_all),axis=0);ge=gains(ids,yev,ens)
+    rr=pd.DataFrame(rows)
+    summary={"arm":arm,"fold":fold_name,"n_features":len(feats),"n_derived":len(derived),
+      "n_train":int(tr.sum()),"n_eval":int(ev.sum()),"media_banda":float(rr.ganancia_banda.mean()),
+      "sd_banda":float(rr.ganancia_banda.std(ddof=1)),"media_11000":float(rr.ganancia_11000.mean()),
+      "sd_11000":float(rr.ganancia_11000.std(ddof=1)),"ensemble":{str(k):v for k,v in ge.items()}}
+    write_json(root/"resumen.json",summary)
+    del df,lab,xtr,xev,imp,rank,fi,scores_all,imps
+    gc.collect()
+
+def summarize(out):
+    rows=[]
+    for fold in PLAN["folds"]:
+        bp=out/"evaluacion"/fold/"F0_M1_RAW"/"por_seed.csv"
+        if not bp.exists():continue
+        b=pd.read_csv(bp).set_index("seed")
+        for arm,spec in PLAN["arms"].items():
+            if arm=="F0_M1_RAW" or fold not in spec["folds"]:continue
+            p=out/"evaluacion"/fold/arm/"por_seed.csv"
+            if not p.exists():continue
+            a=pd.read_csv(p).set_index("seed")
+            common=sorted(set(a.index)&set(b.index))
+            d=a.loc[common,"ganancia_banda"]-b.loc[common,"ganancia_banda"]
+            d11=a.loc[common,"ganancia_11000"]-b.loc[common,"ganancia_11000"]
+            rows.append({"fold":fold,"arm":arm,"delta_banda_medio":float(d.mean()),
+              "delta_banda_sd":float(d.std(ddof=1)),"fraccion_mejora":float((d>0).mean()),
+              "delta_11000_medio":float(d11.mean()),"n_seeds":len(common)})
+    comp=pd.DataFrame(rows);comp.to_csv(out/"comparacion_screening.csv",index=False)
+    short=[]
+    for fold in PLAN["folds"]:
+        for arm,spec in PLAN["arms"].items():
+            if arm=="F0_M1_RAW" or fold not in spec["folds"]:continue
+            p=out/"evaluacion"/fold/arm/"importancias.csv"
+            if not p.exists():continue
+            d=pd.read_csv(p)
+            d=d[d.es_derivada.astype(bool)&d.seeds_gain_positivo.ge(PLAN["shortlist"]["requires_nonzero_gain_seeds"])]
+            d=d.sort_values(["rank_mediana","gain_medio"],ascending=[True,False]).head(PLAN["shortlist"]["top_per_arm"]).copy()
+            d.insert(0,"arm",arm);d.insert(0,"fold",fold);short.append(d)
+    if short:pd.concat(short,ignore_index=True).to_csv(out/"shortlist_preliminar.csv",index=False)
+    return comp
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--data",required=True,type=Path)
+    ap.add_argument("--out",required=True,type=Path)
+    ap.add_argument("--threads",type=int,default=6)
+    ap.add_argument("--solo-generar-fe",action="store_true")
+    ap.add_argument("--arms",nargs="*",choices=list(PLAN["arms"]))
+    a=ap.parse_args();a.out.mkdir(parents=True,exist_ok=True)
+    bank=a.out/"fe_bank_dev"
+    m=ensure_bank(a.data,bank);write_json(a.out/"00_manifest_fe.json",m)
+    if a.solo_generar_fe:
+        print("OK: FE generadas; no se entrenaron modelos");return
+    params=yaml.safe_load((ROOT/"vendor/comun/config.yaml").read_text())["lightgbm"]["base"]
+    arms=a.arms or list(PLAN["arms"])
+    for arm in arms:
+        for fold in PLAN["arms"][arm]["folds"]:
+            run_one(bank,a.out,arm,fold,params,a.threads)
+    comp=summarize(a.out)
+    print(comp.to_string(index=False) if len(comp) else "Sin comparaciones")
+    print("No genera submits ni usa agosto.")
+
+if __name__=="__main__":main()

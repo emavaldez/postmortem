@@ -1,0 +1,8 @@
+{
+  "submit": "sofia9",
+  "batch_id": "1627-1791746759851003",
+  "public_gain": 100.43,
+  "csv": "SofiaCerca19Ensamble_20261011_162005_top12500.csv",
+  "sha256": "f2827098eaa3b85bfea46a3094c9da8bb58c30c05c9ebd2e46d3b134c9bdd3a0",
+  "filas": 12500
+}

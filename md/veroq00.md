@@ -1,0 +1,3844 @@
+# Veronica Quintana — entrega de la Primera Competencia DMEyF 2026
+
+- Usuario de GitHub: VeroQ00
+- Repositorio: https://github.com/VeroQ00/Churn_Prediction_1
+- Link posteado: https://github.com/VeroQ00/Churn_Prediction_1
+- Commit: a31038789365ad31f3d56ddbb68d04849b4c5001
+- Estado de la lectura: verificada
+- Página: https://emavaldez.github.io/postmortem/entregas/veroq00/
+- Datos: https://emavaldez.github.io/postmortem/data/entregas/veroq00.json
+
+## Resumen
+
+La entrega es un único notebook de R (Exp32/Experimento32.ipynb, 55 celdas de código) y un README.md sin texto. La primera parte descarga el dataset crudo, calcula la clase ternaria, pasa a NA ccajas_depositos en 202105, crea Activos_totales, Pasivos_totales y Patrimonio_neto y, para cada variable numérica, genera lag 1 y 2, delta 1 y 2, tendencia y promedio de 3 meses (función C++ con Rcpp) e indicadores de faltante y de cero; después reemplaza cada variable por su ranking mensual con cero fijo y graba competencia_01_ct10.csv.gz. La segunda parte define la clase binaria (BAJA+1 o BAJA+2), excluye 42 variables de préstamos personales, selecciona variables con canaritos, elimina registros CONTINUA con un LightGBM auxiliar ajustado en 2 particiones cruzadas y corre una optimización bayesiana (mlr3mbo) de num_iterations, num_leaves y min_sum_hessian_in_leaf entrenando en 202103 y 202104 y midiendo AUC en 202106. Luego evalúa 202106 con 5 semillas y calcula la ganancia por corte, reentrena con 202103 a 202106 reincorporando las 42 variables de préstamos, predice 202108 con una lista de 50 semillas, promedia las probabilidades de las semillas completadas y escribe listas de clientes para cortes de 10.000 a 12.500. La última celda calcula la importancia de variables de los modelos guardados.
+
+**Qué entrega.** Listas de numero_de_cliente de 202108, un identificador por línea y sin encabezado, con los 10.000, 10.500, 11.000, 11.500, 12.000 y 12.500 clientes de mayor probabilidad, una por cada semilla y una para el promedio de semillas (Entrega_32_<etiqueta>_top_<corte>.csv). No se observa en el código cuál de esos archivos se envió; el repositorio no los incluye.
+
+**Cómo se ejecuta.** No se indica: Exp32/README.md no tiene texto (1 byte). El notebook contiene las etapas en orden, desde la descarga del dataset hasta los archivos de campaña, con rutas bajo /home/ds/buckets/b1; algunos comentarios de celda señalan dependencias de orden (por ejemplo, 'Ejecutar antes del filtrado de registros y de la bayesiana').
+
+## Ficha
+
+- **Lenguajes:** R
+- **Modelos:** LightGBM
+- **Clase que entrena:** Binaria: clase01 = 1 si clase_ternaria es BAJA+1 o BAJA+2 y 0 si es CONTINUA. La clase_ternaria se calcula en el mismo notebook a partir de la presencia del cliente en los dos meses siguientes.
+- **Meses de entrenamiento:** 202103, 202104, 202105, 202106
+- **Meses de validación:** 202106
+- **Mes que predice:** 202108
+- **Submuestreo:** El modelo final y la optimización no submuestrean al azar: PARAM$trainingstrategy$undersampling = 1.0 se define y no vuelve a aparecer. Antes de entrenar se eliminan los registros CONTINUA cuya probabilidad prob30 supera 0,5; prob30 la calcula un LightGBM auxiliar en 2 particiones cruzadas, entrenado con todos los positivos y el 10% de CONTINUA (undersampling30 = 0.1). Según la salida guardada en el notebook original, en el entrenamiento final se eliminan entre 3.941 y 4.198 registros por mes (se conserva entre 97,44% y 97,58% de cada mes).
+- **Calidad de datos:** ccajas_depositos se pasa a NA en 202105. Para cada variable se crean indicadores missing_ (valor faltante) y las_zero_ (valor igual a cero). No se observa en el código otro tratamiento de variables por mes.
+- **Drifting:** Cada variable numérica (originales, lags, deltas, tendencias y promedios) se reemplaza por su ranking dentro de cada foto_mes: los valores distintos negativos se escalan de -1 a menos de 0, los positivos de más de 0 a 1 y el cero queda en 0; la variable original se elimina.
+- **Variables dentro del mes:** Activos_totales (suma de 6 variables de saldos, plazos fijos e inversiones), Pasivos_totales (suma de 5 variables de préstamos y saldos de tarjetas), Patrimonio_neto (diferencia), y los indicadores missing_ y las_zero_ de cada variable.
+- **Variables históricas:** Para cada columna numérica (155 según la salida guardada en el notebook original): Lag1_, Lag2_, Delta1_ y Delta2_ por mes exacto, y tendencia (_tend3, pendiente por mínimos cuadrados) y promedio (_avg3) sobre el mes actual y los 2 anteriores, calculados con una función C++ vía Rcpp.
+- **Selección de variables:** Canaritos: se agregan variables uniformes al azar en proporción 0.20, se entrena un LightGBM de 200 rondas con 202103 y 202104 y se conservan las variables con posición de importancia menor a la media de las posiciones de los canaritos más 2 desvíos (353 de 3.214 según la salida guardada en el notebook original). Para la selección, la optimización y la evaluación de junio se excluyen a mano 42 variables de préstamos personales; en el entrenamiento final esas 42 se reincorporan (395 predictores según la salida guardada en el notebook original).
+- **Optimización de hiperparámetros:** Optimización bayesiana con mlr3mbo y bbotk (sustituto regr.km, expected improvement, bayesopt_ego), terminación a las 10 evaluaciones, sobre num_iterations (64 a 4096), num_leaves (16 a 2048) y min_sum_hessian_in_leaf (1e-06 a 0.1). Entrena en 202103 y 202104 filtrados y maximiza el AUC en 202106. Según la salida guardada en el notebook original, se registran 12 evaluaciones.
+- **Hiperparámetros finales:** Parámetros fijos del código: gbdt, objective binary, learning_rate 0.005, feature_fraction 0.50, feature_fraction_bynode 0.20, max_bin 31, min_data_in_leaf 0, max_depth -1, lambda_l1 y lambda_l2 en 0, sin bagging. Los otros tres salen de la fila de mayor métrica de BO_log.txt; según la salida guardada en el notebook original son num_iterations 2865, num_leaves 463 y min_sum_hessian_in_leaf 0,01509907.
+- **Semillas:** PARAM$semilla_primigenia = 200003 se usa en canaritos, en el filtro y en la optimización. Para el modelo final se sortean 50 semillas sin reposición entre 100.000 y 1.000.000 con set.seed(200003) y se guardan en semillas_modelos.csv; N_SEMILLAS_AGOSTO = 50. Según la salida guardada en el notebook original, el bucle de entrenamiento termina durante el modelo 16 y el promedio incluye 15 semillas.
+- **Cantidad de semillas:** 50
+- **Ensamble:** Promedio de las probabilidades de 202108 de un mismo LightGBM entrenado con distintas semillas; entran sólo las semillas que tienen archivo de predicción completo.
+- **Corte:** Cantidades fijas escritas en el código: los 10.000, 10.500, 11.000, 11.500, 12.000 y 12.500 clientes de mayor probabilidad. La evaluación de 202106 calcula la ganancia para cortes de 8.000 a 15.000; no se observa en el código una regla que derive de esa tabla los cortes de agosto.
+- **Validación:** Mes futuro: la optimización entrena en 202103 y 202104 y mide AUC en 202106. Aparte, con las 5 primeras semillas y el mismo entrenamiento, se calcula en 202106 la ganancia acumulada (1.072.500 por BAJA+2, -27.500 por el resto) en cortes de 8.000 a 15.000 cada 500, por semilla y para el promedio. PARAM$training_pct = 70 se define y no vuelve a aparecer.
+- **Salidas:** En /home/ds/buckets/b1: datasets/competencia_01_ct10.csv.gz; en exp/Experimento 32: BO_log.txt, canaritos/ (seleccion.rds, modelo y CSV de importancia), filtro_bayesiana.rds, evaluacion_junio_5_semillas_canaritos_filtro30/ (modelos, predicciones, ganancia_por_corte.csv, curva en PNG) y agosto_v01/ con modelos/modelo_<semilla>.txt, probabilidades/probabilidades_202108_seed_<semilla>.csv, probabilidades_202108_promedio_semillas.csv, campania/Entrega_32_<etiqueta>_top_<corte>.csv y feature_importance/. Ninguno de estos archivos está en el repositorio.
+
+## Técnicas en el camino de la entrega
+
+- LightGBM (`modelo.lightgbm`)
+- Clase binaria: positivo = BAJA+1 o BAJA+2 (`clase.binaria_baja1_baja2`)
+- Submuestreo de la clase CONTINUA (`datos.submuestreo_continua`)
+- Variables rotas en algún mes pasadas a NA o corregidas (`datos.variables_rotas_a_na`)
+- Excluye variables a mano (por ejemplo préstamos personales) (`datos.excluye_variables`)
+- Rank o percentil de variables dentro de cada mes (`drifting.rank_por_mes`)
+- Rank con cero fijo (`drifting.rank_cero_fijo`)
+- Variables nuevas dentro del mes (sumas, cocientes, combinaciones) (`variables.intra_mes`)
+- Lags (`variables.lags`)
+- Deltas (diferencia con meses anteriores) (`variables.deltas`)
+- Tendencias (pendiente en una ventana) (`variables.tendencias`)
+- Promedios móviles o de ventana (`variables.promedios_ventana`)
+- Canaritos (variables al azar para medir ruido) (`variables.canaritos`)
+- Selección de variables por importancia (`variables.seleccion_por_importancia`)
+- Optimización bayesiana (mlrMBO, mlr3mbo, bbotk, skopt u otra) (`hiperparametros.optimizacion_bayesiana`)
+- Validación en un mes posterior al entrenamiento (`validacion.mes_futuro`)
+- Usa la ganancia de la competencia como métrica (`validacion.ganancia_como_metrica`)
+- Promedio de varias semillas del mismo modelo (`ensamble.semillerio`)
+- Envía una cantidad fija de clientes (`corte.cantidad_fija`)
+- Genera archivos con varios cortes (`corte.varios_cortes`)
+- El modelo final se reentrena sumando los meses usados para validar (`final.reentrena_con_todo`)
+
+## Reproducibilidad (hechos)
+
+- Tiene README o texto de presentación: no
+- Explica cómo ejecutar: no
+- Declara versiones o dependencias: no
+- Fija las semillas: sí
+- Usa rutas absolutas o de una máquina: sí
+- Incluye datos o predicciones: no
+- Sale de un solo script o notebook: sí
+- Entorno declarado: No hay texto que lo declare. En el código: rutas bajo /home/ds/buckets/b1 (datasets y exp), num_threads = 4 en los parámetros de LightGBM e instalación de paquetes con install.packages sin versiones. Los metadatos del notebook original indican kernel de R (ir), versión 4.6.1.
+
+## Pasos del camino de la entrega
+
+1. **Descarga del dataset y cálculo de la clase ternaria.** Descarga competencia_01_crudo.csv si no está en /home/ds/buckets/b1/datasets y calcula clase_ternaria (CONTINUA, BAJA+1, BAJA+2) a partir de los períodos en que cada cliente aparece en los dos meses siguientes. (`Exp32/Experimento32.ipynb` líneas 1–19; `Exp32/Experimento32.ipynb` líneas 21–64)
+2. **Corrección de una variable y variables de patrimonio.** Pasa a NA ccajas_depositos en 202105 y crea Activos_totales, Pasivos_totales y Patrimonio_neto como sumas y diferencia de saldos, inversiones, préstamos y tarjetas. (`Exp32/Experimento32.ipynb` líneas 70–72; `Exp32/Experimento32.ipynb` líneas 74–108)
+3. **Lags y deltas de orden 1 y 2.** Para cada columna numérica (155 según la salida guardada en el notebook original) crea Lag1_, Lag2_, Delta1_ y Delta2_ buscando la fila del mismo cliente en el mes anterior exacto y dos meses atrás exactos. (`Exp32/Experimento32.ipynb` líneas 113–218)
+4. **Tendencia y promedio en ventana de 3 meses.** Una función C++ compilada con Rcpp calcula, para cada columna numérica que no es lag ni delta, la pendiente por mínimos cuadrados y el promedio sobre el mes actual y los 2 anteriores (variables _tend3 y _avg3). (`Exp32/Experimento32.ipynb` líneas 229–350; `Exp32/Experimento32.ipynb` líneas 352–388)
+5. **Indicadores de faltante y de cero.** Para cada variable numérica, incluidas las históricas, crea missing_<variable> (1 si es NA) y las_zero_<variable> (1 si es cero). (`Exp32/Experimento32.ipynb` líneas 390–426)
+6. **Ranking mensual con cero fijo y grabado del dataset.** Reemplaza cada variable por rank_<variable>, calculada dentro de cada foto_mes con una escala de -1 a 1 que deja el cero en 0, elimina la variable original y graba competencia_01_ct10.csv.gz (3.258 columnas según la salida guardada en el notebook original). (`Exp32/Experimento32.ipynb` líneas 428–541; `Exp32/Experimento32.ipynb` líneas 543–547)
+7. **Parámetros del experimento y de LightGBM.** Define PARAM (experimento, semilla_primigenia 200003, meses, filtro, 10 iteraciones de optimización), los parámetros fijos de LightGBM y el espacio de búsqueda de num_iterations, num_leaves y min_sum_hessian_in_leaf. (`Exp32/Experimento32.ipynb` líneas 585–612; `Exp32/Experimento32.ipynb` líneas 614–669)
+8. **Clase binaria, predictores y exclusión de préstamos personales.** Con 202103 y 202104 define clase01 = 1 para BAJA+1 y BAJA+2, arma la lista de predictores y quita 42 variables derivadas de cprestamos_personales y mprestamos_personales. (`Exp32/Experimento32.ipynb` líneas 710–731; `Exp32/Experimento32.ipynb` líneas 733–752)
+9. **Selección de variables con canaritos.** Agrega columnas al azar en proporción 0.20, entrena un LightGBM de 200 rondas, ordena por importancia y conserva las variables ubicadas antes de la posición media de los canaritos más 2 desvíos. Según la salida guardada en el notebook original, de 3.214 variables quedan 353. (`Exp32/Experimento32.ipynb` líneas 760–1072)
+10. **Filtrado de registros CONTINUA con un modelo auxiliar.** Un LightGBM auxiliar entrenado en 2 particiones cruzadas (todos los positivos y 10% de CONTINUA) predice cada registro con el modelo de la otra partición; se eliminan del entrenamiento los CONTINUA con probabilidad mayor a 0,5. El resultado se guarda en un checkpoint y se aplica a 202103 y 202104 antes de la optimización. (`Exp32/Experimento32.ipynb` líneas 1074–1192; `Exp32/Experimento32.ipynb` líneas 1197–1334; `Exp32/Experimento32.ipynb` líneas 1374–1415)
+11. **Optimización bayesiana con validación en 202106.** Con mlr3mbo y bbotk busca num_iterations, num_leaves y min_sum_hessian_in_leaf entrenando en 202103 y 202104 filtrados y midiendo AUC en 202106; cada evaluación se registra en BO_log.txt. Según la salida guardada en el notebook original, termina tras 12 evaluaciones y la de mayor AUC (0,9227351) tiene num_iterations 2865, num_leaves 463 y min_sum_hessian_in_leaf 0,01509907. (`Exp32/Experimento32.ipynb` líneas 1344–1372; `Exp32/Experimento32.ipynb` líneas 1417–1439; `Exp32/Experimento32.ipynb` líneas 1441–1539)
+12. **Lista de semillas y parámetros finales.** Redefine train_final = 202103 a 202106 y future = 202108, genera o recupera una lista de 50 semillas (sorteadas entre 100.000 y 1.000.000 con set.seed(200003)) y forma param_final con los parámetros fijos más la fila de mayor métrica de BO_log.txt. (`Exp32/Experimento32.ipynb` líneas 1541–1802; `Exp32/Experimento32.ipynb` líneas 1804–1863)
+13. **Evaluación en 202106 con 5 semillas y ganancia por corte.** Entrena en 202103 y 202104 filtrados con param_final y las 5 primeras semillas, predice 202106 y calcula la ganancia acumulada (1.072.500 por BAJA+2, -27.500 por el resto) para cortes de 8.000 a 15.000 cada 500, por semilla y para el promedio; guarda tablas, listas y la curva. Según la salida guardada en el notebook original, la tabla del promedio va de 451.000.000 (8.000 envíos) a 456.500.000 (15.000) y su valor más alto es 479.050.000 en 11.500 envíos. (`Exp32/Experimento32.ipynb` líneas 1865–2466)
+14. **Entrenamiento final con 202103 a 202106 y predicción de 202108 por semilla.** Parte de las variables seleccionadas, reincorpora las 42 de préstamos personales, filtra los CONTINUA de los cuatro meses con el modelo auxiliar y entrena un LightGBM por semilla con param_final; guarda cada modelo y las probabilidades de todos los clientes de 202108. Según la salida guardada en el notebook original, se usan 395 predictores y la salida del bucle termina durante el modelo 16 de 50. (`Exp32/Experimento32.ipynb` líneas 2468–2718; `Exp32/Experimento32.ipynb` líneas 2720–2772; `Exp32/Experimento32.ipynb` líneas 2774–2973)
+15. **Promedio de semillas y archivos de campaña.** Promedia las probabilidades de las semillas con predicción completa y escribe, para cada semilla y para el promedio, listas de numero_de_cliente con los 10.000, 10.500, 11.000, 11.500, 12.000 y 12.500 de mayor probabilidad. Según la salida guardada en el notebook original, el promedio se calcula con 15 semillas completas de 50 seleccionadas. (`Exp32/Experimento32.ipynb` líneas 2975–3198; `Exp32/Experimento32.ipynb` líneas 3200–3303)
+16. **Importancia de variables de los modelos guardados.** Carga los modelos de las semillas completadas, calcula la importancia por Gain de cada uno, la promedia y grafica las 20 primeras variables. En el notebook original esta celda no tiene número de ejecución ni salida guardada. (`Exp32/Experimento32.ipynb` líneas 3305–3491)
+
+## Archivos
+
+- `Exp32/Experimento32.ipynb` · principal · Jupyter (R) · 3491 líneas — [texto](https://emavaldez.github.io/postmortem/fuentes/veroq00/Exp32/Experimento32.ipynb.txt) — Notebook de R con todo el proceso: descarga del dataset, clase ternaria, creación de variables y ranking mensual, selección con canaritos, filtrado de registros CONTINUA, optimización bayesiana, evaluación en 202106, entrenamiento final con semillas, predicción de 202108 y archivos de campaña.
+
+## Código principal con anotaciones
+
+Las líneas que empiezan con `# [Anotación …]` no son del autor: las agrega esta página para describir cada bloque.
+
+### Exp32/Experimento32.ipynb
+
+Notebook de R con todo el proceso: descarga del dataset, clase ternaria, creación de variables y ranking mensual, selección con canaritos, filtrado de registros CONTINUA, optimización bayesiana, evaluación en 202106, entrenamiento final con semillas, predicción de 202108 y archivos de campaña.
+
+```r
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–19] Define la carpeta /home/ds/buckets/b1/datasets y descarga competencia_01_crudo.csv
+#   desde storage.googleapis.com sólo si el archivo todavía no existe en esa carpeta.
+#%% celda 1 [código]
+# Destino del dataset
+carpeta_destino <- "/home/ds/buckets/b1/datasets"
+archivo <- file.path(carpeta_destino, "competencia_01_crudo.csv")
+
+# Descargar solo si todavía no existe
+if (!file.exists(archivo)) {
+  download.file(
+    url = paste0(
+      "https://storage.googleapis.com/open-courses/",
+      "dmeyf2026-9c6f/competencia_01_crudo.csv"
+    ),
+    destfile = archivo,
+    method = "libcurl",
+    mode = "wb"
+  )
+}
+
+cat("Dataset guardado en:", archivo, "\n")
+
+# [Anotación · líneas 21–64] Lee el dataset crudo y calcula clase_ternaria: convierte foto_mes en un número de
+#   período consecutivo (año*12 + mes), obtiene para cada cliente los dos períodos siguientes en los que aparece
+#   y asigna CONTINUA a los períodos anteriores al anteúltimo, BAJA+1 cuando el cliente no figura en el período
+#   siguiente y BAJA+2 cuando figura en el siguiente pero no dos períodos después. Pega el resultado como
+#   columna del dataset.
+#%% celda 2 [código]
+#Clase Ternaria
+
+require( "data.table" )
+
+# leo el dataset
+dataset <- fread("/home/ds/buckets/b1/datasets/competencia_01_crudo.csv" )
+
+# calculo el periodo0 consecutivo
+dsimple <- dataset[, list(
+    "pos" = .I,
+    numero_de_cliente,
+    periodo0 = as.integer(foto_mes/100)*12 +  foto_mes%%100 ) ]
+
+
+# ordeno
+setorder( dsimple, numero_de_cliente, periodo0 )
+
+# calculo topes
+periodo_ultimo <- dsimple[, max(periodo0) ]
+periodo_anteultimo <- periodo_ultimo - 1
+
+
+# calculo los leads de orden 1 y 2
+dsimple[, c("periodo1", "periodo2") :=
+    shift(periodo0, n=1:2, fill=NA, type="lead"),  numero_de_cliente ]
+
+# assign most common class values = "CONTINUA"
+dsimple[ periodo0 < periodo_anteultimo, clase_ternaria := "CONTINUA" ]
+
+# calculo BAJA+1
+dsimple[ periodo0 < periodo_ultimo &
+    ( is.na(periodo1) | periodo0 + 1 < periodo1 ),
+    clase_ternaria := "BAJA+1" ]
+
+# calculo BAJA+2
+dsimple[ periodo0 < periodo_anteultimo & (periodo0+1 == periodo1 )
+    & ( is.na(periodo2) | periodo0 + 2 < periodo2 ),
+    clase_ternaria := "BAJA+2" ]
+
+
+# pego el resultado en el dataset original y grabo
+setorder( dsimple, pos )
+dataset[, clase_ternaria := dsimple$clase_ternaria ]
+
+# [Anotación · líneas 66–72] Ordena el dataset y muestra la cantidad de registros por foto_mes y
+#   clase_ternaria. Después pasa a NA la variable ccajas_depositos en 202105.
+#%% celda 3 [código]
+setorder( dataset, foto_mes, clase_ternaria, numero_de_cliente)
+dataset[, .N, list(foto_mes, clase_ternaria)]
+
+#%% celda 4 [código]
+# Mayo 2021: reemplazar por NA porque no hubo actualizaciones
+dataset[foto_mes == 202105, ccajas_depositos := NA]
+
+# [Anotación · líneas 74–111] Crea tres variables por fila: Activos_totales (suma de mcuentas_saldo, plazos
+#   fijos en pesos y dólares e inversiones), Pasivos_totales (suma de préstamos personales, prendarios e
+#   hipotecarios y saldos totales de Master y Visa) y Patrimonio_neto como la diferencia. Las sumas usan na.rm =
+#   FALSE, por lo que un componente faltante deja el total en NA. Muestra las dimensiones.
+#%% celda 5 [código]
+# ============================================================
+# PATRIMONIO NETO: Activos - Pasivos
+# ============================================================
+
+activos <- c(
+  "mcuentas_saldo",
+  "mplazo_fijo_pesos",
+  "mplazo_fijo_dolares",
+  "minversion1_pesos",
+  "minversion1_dolares",
+  "minversion2"
+)
+
+pasivos <- c(
+  "mprestamos_personales",
+  "mprestamos_prendarios",
+  "mprestamos_hipotecarios",
+  "Master_msaldototal",
+  "Visa_msaldototal"
+)
+
+# Solo usar variables que existan en el dataset
+activos <- intersect(activos, names(dataset))
+pasivos <- intersect(pasivos, names(dataset))
+
+# Crear agregados conservando los faltantes
+dataset[, Activos_totales := rowSums(.SD, na.rm = FALSE),
+        .SDcols = activos]
+
+dataset[, Pasivos_totales := rowSums(.SD, na.rm = FALSE),
+        .SDcols = pasivos]
+
+# Patrimonio neto
+dataset[, Patrimonio_neto := Activos_totales - Pasivos_totales]
+
+#%% celda 6 [código]
+dim(dataset)
+
+# [Anotación · líneas 113–144] Verifica que no haya faltantes en numero_de_cliente ni foto_mes y que haya una
+#   sola fila por cliente y mes, ordena por cliente y mes y arma la lista de columnas numéricas sobre las que se
+#   calculan lags y deltas: todas menos numero_de_cliente, foto_mes, columnas auxiliares y las que ya empiezan
+#   con Lag1_, Lag2_, Delta1_ o Delta2_.
+#%% celda 7 [código]
+library(data.table)
+setDT(dataset)
+
+# Verificar identificadores
+if (anyNA(dataset$numero_de_cliente) || anyNA(dataset$foto_mes)) {
+  stop("Hay valores faltantes en numero_de_cliente o foto_mes.")
+}
+
+# Verificar que haya una sola fila por cliente y mes
+if (anyDuplicated(dataset[, .(numero_de_cliente, foto_mes)])) {
+  stop("Hay registros duplicados por cliente y mes.")
+}
+
+setorder(dataset, numero_de_cliente, foto_mes)
+
+# Variables originales: excluir auxiliares y columnas ya generadas
+columnas <- names(dataset)[vapply(dataset, is.numeric, logical(1))]
+
+columnas <- setdiff(
+  columnas,
+  c(
+    "numero_de_cliente", "foto_mes", "clase_ternaria",
+    ".mes_aux", ".mes_lag1", ".mes_lag2"
+  )
+)
+
+columnas <- columnas[!grepl("^(Lag[12]_|Delta[12]_)", columnas)]
+
+if (!length(columnas)) {
+  stop("No hay variables numéricas para crear lags y deltas.")
+}
+
+# [Anotación · líneas 146–185] Calcula un índice mensual consecutivo y, uniendo una tabla (cliente, mes, fila)
+#   consigo misma, obtiene para cada registro la fila del mismo cliente en el mes anterior exacto (idx1) y dos
+#   meses atrás exactos (idx2); si ese mes no existe para el cliente, el índice queda en NA.
+# Índice mensual consecutivo
+mes <- (dataset$foto_mes %/% 100L) * 12L +
+  dataset$foto_mes %% 100L
+
+# Tabla pequeña para localizar cada registro por cliente y mes
+indice <- data.table(
+  numero_de_cliente = dataset$numero_de_cliente,
+  mes_idx = mes,
+  fila = seq_len(nrow(dataset))
+)
+
+# Mes anterior exacto de cada registro
+consulta <- data.table(
+  numero_de_cliente = dataset$numero_de_cliente,
+  mes_idx = mes - 1L
+)
+
+idx1 <- indice[
+  consulta,
+  on = .(numero_de_cliente, mes_idx),
+  fila
+]
+
+# Dos meses atrás exactos, aunque falte el mes intermedio
+consulta[, mes_idx := mes - 2L]
+
+idx2 <- indice[
+  consulta,
+  on = .(numero_de_cliente, mes_idx),
+  fila
+]
+
+# Si no existe el mes buscado, el índice queda en NA
+stopifnot(
+  length(idx1) == nrow(dataset),
+  length(idx2) == nrow(dataset)
+)
+
+rm(indice, consulta, mes)
+gc()
+
+# [Anotación · líneas 187–218] Para cada columna de la lista crea por referencia cuatro variables: Lag1_ y
+#   Lag2_ (valor del mes anterior y de dos meses atrás) y Delta1_ y Delta2_ (valor actual menos cada lag).
+#   Imprime el avance, elimina columnas auxiliares de ejecuciones previas y libera memoria.
+# Crear columnas sin volver a agrupar por cliente
+for (i in seq_along(columnas)) {
+
+  col <- columnas[i]
+  actual <- as.numeric(dataset[[col]])
+
+  lag1 <- actual[idx1]
+  lag2 <- actual[idx2]
+
+  set(dataset, j = paste0("Lag1_", col), value = lag1)
+  set(dataset, j = paste0("Lag2_", col), value = lag2)
+  set(dataset, j = paste0("Delta1_", col), value = actual - lag1)
+  set(dataset, j = paste0("Delta2_", col), value = actual - lag2)
+
+  cat(i, "de", length(columnas), "-", col, "\n")
+  flush.console()
+}
+
+# Limpiar auxiliares que pudiera dejar una ejecución anterior
+auxiliares <- intersect(
+  names(dataset),
+  c(".mes_aux", ".mes_lag1", ".mes_lag2")
+)
+
+if (length(auxiliares)) {
+  dataset[, (auxiliares) := NULL]
+}
+
+rm(idx1, idx2, actual, lag1, lag2)
+gc()
+
+dim(dataset)
+
+# [Anotación · líneas 220–227] Muestra cuántas columnas hay de cada tipo y cuántas columnas nuevas hay con
+#   cada prefijo (Lag1_, Lag2_, Delta1_, Delta2_).
+#%% celda 8 [código]
+# Tipo de cada columna
+table(vapply(dataset, function(x) class(x)[1], character(1)))
+
+# Cantidad de columnas nuevas por tipo
+sapply(c("Lag1_", "Lag2_", "Delta1_", "Delta2_"), function(prefijo) {
+  sum(startsWith(names(dataset), prefijo))
+})
+
+# [Anotación · líneas 229–283] Fija VENTANA_HISTORIA = 3 (mes actual y los 2 anteriores) y arma
+#   cols_lagueables: columnas numéricas sin identificadores y sin variables ya generadas (excluye los prefijos
+#   Lag, Delta, rank_, missing_ y las_zero_ y los sufijos _tend, _min, _max, _avg, _ratioavg y _ratiomax), lo
+#   que incluye Activos_totales, Pasivos_totales y Patrimonio_neto. Repite las verificaciones de claves y
+#   calcula el índice mensual y un identificador consecutivo de cliente.
+#%% celda 9 [código]
+library(data.table)
+library(Rcpp)
+
+setDT(dataset)
+setorder(dataset, numero_de_cliente, foto_mes)
+
+# Ventana: mes actual + los 2 meses anteriores
+VENTANA_HISTORIA <- 3L
+
+# Solo variables originales numéricas
+# Excluir ID, mes, clase, auxiliares y variables ya generadas
+cols_lagueables <- names(dataset)[
+  vapply(dataset, is.numeric, logical(1))
+]
+
+cols_lagueables <- setdiff(
+  cols_lagueables,
+  c(
+    "numero_de_cliente", "foto_mes", "clase_ternaria",
+    ".mes_aux", ".mes_lag1", ".mes_lag2"
+  )
+)
+
+cols_lagueables <- cols_lagueables[
+  !grepl(
+    "^(Lag[12]_|Delta[12]_|rank_|missing_|las_zero_)",
+    cols_lagueables
+  ) &
+  !grepl(
+    "_(tend|min|max|avg|ratioavg|ratiomax)[0-9]+$",
+    cols_lagueables
+  )
+]
+
+# Validaciones
+stopifnot(
+  nrow(dataset) > 0L,
+  !anyNA(dataset$numero_de_cliente),
+  !anyNA(dataset$foto_mes),
+  VENTANA_HISTORIA >= 2L
+)
+
+if (anyDuplicated(dataset[, .(numero_de_cliente, foto_mes)])) {
+  stop("Hay registros duplicados por cliente y mes.")
+}
+
+# Índice mensual: conserva las distancias reales entre meses
+mes_hist <- as.integer(
+  (dataset$foto_mes %/% 100L) * 12L +
+    dataset$foto_mes %% 100L
+)
+
+# Identificador consecutivo de cada cliente, con datos ordenados
+grupo_hist <- as.integer(rleid(dataset$numero_de_cliente))
+
+# [Anotación · líneas 285–350] Compila con Rcpp la función C++ fhist_tend_avg. Para cada registro recorre
+#   hacia atrás las filas del mismo cliente dentro de la ventana, descarta valores no finitos y acumula sumas
+#   usando como x la distancia en meses al mes actual; con al menos 2 valores devuelve la pendiente por mínimos
+#   cuadrados (tendencia) y el promedio, y NA en caso contrario.
+# Tendencia por mínimos cuadrados y promedio
+# Solo usa el mes actual y meses anteriores dentro de la ventana
+cppFunction('
+Rcpp::List fhist_tend_avg(
+    Rcpp::NumericVector valores,
+    Rcpp::IntegerVector meses,
+    Rcpp::IntegerVector grupos,
+    int ventana) {
+
+  int n = valores.size();
+
+  Rcpp::NumericVector tendencia(n, NA_REAL);
+  Rcpp::NumericVector promedio(n, NA_REAL);
+
+  for (int i = 0; i < n; i++) {
+
+    if (i % 10000 == 0) Rcpp::checkUserInterrupt();
+
+    int cantidad = 0;
+    double sx = 0.0;
+    double sy = 0.0;
+    double sxx = 0.0;
+    double sxy = 0.0;
+
+    int mes_desde = meses[i] - ventana + 1;
+
+    for (int j = i; j >= 0; j--) {
+
+      if (grupos[j] != grupos[i]) break;
+      if (meses[j] < mes_desde) break;
+
+      double y = valores[j];
+
+      // Excluir NA, NaN e infinitos
+      if (!R_FINITE(y)) continue;
+
+      // Distancia mensual respecto al mes actual
+      double x = meses[j] - meses[i];
+
+      cantidad++;
+      sx += x;
+      sy += y;
+      sxx += x * x;
+      sxy += x * y;
+    }
+
+    if (cantidad >= 2) {
+
+      double denominador =
+        cantidad * sxx - sx * sx;
+
+      if (denominador > 0.0) {
+        tendencia[i] =
+          (cantidad * sxy - sx * sy) / denominador;
+      }
+
+      promedio[i] = sy / cantidad;
+    }
+  }
+
+  return Rcpp::List::create(
+    Rcpp::Named("tendencia") = tendencia,
+    Rcpp::Named("promedio") = promedio
+  );
+}
+')
+
+# [Anotación · líneas 352–388] Aplica fhist_tend_avg a cada columna de cols_lagueables y agrega dos variables
+#   por columna: <variable>_tend3 y <variable>_avg3. Al terminar reordena el dataset por foto_mes y
+#   numero_de_cliente.
+#%% celda 10 [código]
+# Crear variables históricas por referencia
+for (i in seq_along(cols_lagueables)) {
+
+  campo <- cols_lagueables[i]
+
+  historia <- fhist_tend_avg(
+    valores = as.numeric(dataset[[campo]]),
+    meses = mes_hist,
+    grupos = grupo_hist,
+    ventana = VENTANA_HISTORIA
+  )
+
+  set(
+    dataset,
+    j = paste0(campo, "_tend", VENTANA_HISTORIA),
+    value = historia$tendencia
+  )
+
+  set(
+    dataset,
+    j = paste0(campo, "_avg", VENTANA_HISTORIA),
+    value = historia$promedio
+  )
+
+  rm(historia)
+
+  cat(i, "de", length(cols_lagueables), "-", campo, "\n")
+  flush.console()
+}
+
+rm(mes_hist, grupo_hist)
+gc()
+
+setorder(dataset, foto_mes, numero_de_cliente)
+
+dim(dataset)
+
+# [Anotación · líneas 390–426] Para cada variable numérica existente (originales, lags, deltas, tendencias y
+#   promedios) crea dos indicadores enteros: missing_<variable>, que vale 1 si el valor es NA, y
+#   las_zero_<variable>, que vale 1 si el valor es cero, 0 si es otro número y NA si falta.
+#%% celda 11 [código]
+library(data.table)
+setDT(dataset)
+
+# Predictores numéricos, incluidos lags y deltas
+variables <- names(dataset)[
+  vapply(dataset, is.numeric, logical(1))
+]
+
+variables <- setdiff(
+  variables,
+  c("numero_de_cliente", "foto_mes", "clase_ternaria",
+    ".mes_aux", ".mes_lag1", ".mes_lag2")
+)
+
+variables <- variables[
+  !grepl("^(rank_|missing_|las_zero_)", variables)
+]
+
+for (variable in variables) {
+
+  # 1 si es NA/NaN; 0 si no
+  set(
+    dataset,
+    j = paste0("missing_", variable),
+    value = as.integer(is.na(dataset[[variable]]))
+  )
+
+  # 1 si es cero; NA si falta; 0 para el resto
+  set(
+    dataset,
+    j = paste0("las_zero_", variable),
+    value = as.integer(dataset[[variable]] == 0)
+  )
+}
+
+gc()
+
+# [Anotación · líneas 428–479] Prepara el ranking: conserva sin transformar numero_de_cliente, foto_mes y
+#   clase_ternaria, toma como variables a rankear todas las demás que no empiezan con rank_, missing_ ni
+#   las_zero_, y detiene la ejecución si no queda ninguna o si alguna no es numérica.
+#%% celda 12 [código]
+library(data.table)
+setDT(dataset)
+
+# Columnas que se conservan sin transformar
+conservar <- c(
+  "numero_de_cliente",
+  "foto_mes",
+  "clase_ternaria"
+)
+
+# Eliminar auxiliares si existen
+auxiliares <- intersect(
+  names(dataset),
+  c(".mes_aux", ".mes_lag1", ".mes_lag2")
+)
+
+if (length(auxiliares)) {
+  dataset[, (auxiliares) := NULL]
+}
+
+# Variables a rankear, incluidos lags y deltas
+variables <- setdiff(names(dataset), conservar)
+
+# Conservar indicadores y rankings existentes sin transformarlos
+variables <- variables[
+  !grepl("^(rank_|missing_|las_zero_)", variables)
+]
+
+if (!length(variables)) {
+  stop(
+    "No hay variables originales para rankear. ",
+    "Si ya ejecutaste esta transformación, recargá el dataset ",
+    "y recreá los lags, deltas e indicadores."
+  )
+}
+
+# Verificar que las variables a rankear sean numéricas
+no_numericas <- variables[
+  !vapply(
+    variables,
+    function(campo) is.numeric(dataset[[campo]]),
+    logical(1)
+  )
+]
+
+if (length(no_numericas)) {
+  stop(
+    "Variables no numéricas: ",
+    paste(no_numericas, collapse = ", ")
+  )
+}
+
+# [Anotación · líneas 481–517] Define ranking_mensual: ordena los valores distintos no faltantes y les asigna
+#   una escala equiespaciada, de -1 a menos de 0 para los negativos y de más de 0 a 1 para los positivos; el
+#   cero recibe 0, los empates comparten valor y los NA se mantienen.
+# Ranking equiespaciado entre valores distintos de cada mes
+# Negativos: [-1, 0)
+# Positivos: (0, 1]
+# Solo los ceros originales reciben cero
+# Los faltantes se mantienen como NA
+ranking_mensual <- function(x) {
+
+  valores <- sort(unique(x[!is.na(x)]))
+
+  if (!length(valores)) {
+    return(rep(NA_real_, length(x)))
+  }
+
+  escala <- numeric(length(valores))
+
+  negativos <- which(valores < 0)
+  positivos <- which(valores > 0)
+
+  if (length(negativos) > 0L) {
+    n_neg <- length(negativos)
+
+    escala[negativos] <-
+      -rev(seq_len(n_neg)) / n_neg
+  }
+
+  if (length(positivos) > 0L) {
+    n_pos <- length(positivos)
+
+    escala[positivos] <-
+      seq_len(n_pos) / n_pos
+  }
+
+  escala[valores == 0] <- 0
+
+  # Empates reciben el mismo ranking
+  escala[match(x, valores)]
+}
+
+# [Anotación · líneas 519–547] Para cada variable calcula rank_<variable> aplicando ranking_mensual dentro de
+#   cada foto_mes y elimina la variable original; los indicadores missing_ y las_zero_ quedan sin cambios. Graba
+#   el dataset resultante en /home/ds/buckets/b1/datasets/competencia_01_ct10.csv.gz.
+# Rankear por mes y eliminar cada variable original
+# Los indicadores missing_ y las_zero_ se conservan
+for (i in seq_along(variables)) {
+
+  variable <- variables[i]
+  nueva <- paste0("rank_", variable)
+
+  dataset[, (nueva) :=
+    ranking_mensual(get(variable)),
+    by = foto_mes
+  ]
+
+  set(dataset, j = variable, value = NULL)
+
+  cat(i, "de", length(variables), "-", nueva, "\n")
+  flush.console()
+}
+
+gc()
+
+# Ver resultado
+dim(dataset)
+head(dataset)
+
+#%% celda 13 [código]
+fwrite( dataset,
+    file =  "/home/ds/buckets/b1/datasets/competencia_01_ct10.csv.gz",
+    sep = ","
+)
+
+# [Anotación · líneas 549–583] Muestra la fecha y hora, borra todos los objetos de la sesión, instala paquetes
+#   con install.packages (R.utils, rlist, digest, bbotk, mlr3, mlr3mbo, mlr3learners, DiceKriging, lightgbm) y
+#   carga las librerías, incluidas data.table, paradox y lightgbm.
+#%% celda 14 [código]
+#limpio ambiente en R
+format(Sys.time(), "%a %b %d %X %Y")
+
+#%% celda 15 [código]
+# limpio la memoria
+rm(list=ls(all.names=TRUE)) # remove all objects
+gc(full=TRUE, verbose=FALSE) # garbage collection
+
+#%% celda 16 [código]
+# instalo paquetes
+install.packages(
+  c("R.utils", "rlist", "digest"),
+  repos = "https://cloud.r-project.org"
+)
+
+#%% celda 17 [código]
+# Librerias  modernas  para la Bayesian Optimization
+install.packages( c("bbotk", "mlr3", "mlr3mbo", "mlr3learners", "DiceKriging") )
+
+#%% celda 18 [código]
+# el LightGBM
+install.packages(c("lightgbm"))
+
+#%% celda 19 [código]
+library(data.table)
+library(R.utils)
+library(rlist)
+library(bbotk)
+library(mlr3)
+library(mlr3mbo)
+library(mlr3learners)
+library(paradox)
+library(DiceKriging)
+library(lightgbm)
+
+# [Anotación · líneas 585–612] Define la lista PARAM: experimento = 'Experimento 32', semilla_primigenia =
+#   200003, training_pct = 70, train = 202103 y 202104, train_final = 202103 y 202104 (se redefine más
+#   adelante), future = 202106, cortes de 9.000 a 15.000 cada 500, undersampling = 1.0, parámetros del modelo
+#   auxiliar de filtrado (undersampling30 = 0.1, umbral = 0.5) y 10 iteraciones para la optimización bayesiana.
+#%% celda 20 [código]
+#DEFINICION DE PARAMETROS
+PARAM <- list()
+PARAM$experimento <- "Experimento 32"
+PARAM$semilla_primigenia <-  200003
+
+#%% celda 21 [código]
+# training y future
+PARAM$training_pct <- 70          #Asigna el 70% de los registros a entrenamiento y el 30% restante a validación.
+PARAM$train <- c(202103, 202104)          #Usa abril de 2021 para esa búsqueda de hiperparámetros.
+PARAM$train_final <- c(202103, 202104)   #Una vez elegidos los hiperparámetros, entrena el modelo final con todos los registros de abril de 2021.
+PARAM$future <- c(202106)         #Aplica el modelo a junio de 2021 para obtener predicciones y evaluar la ganancia si hay etiquetas disponibles.
+PARAM$cortes <- seq(9000, 15000, by= 500) #Evalúa seleccionar los 9.000, 9.500, 10.000… hasta 15.000 clientes con mayor probabilidad predicha.
+
+#%% celda 22 [código]
+# Undersampling del entrenamiento principal
+# 1.0 = 100% de CONTINUA
+# 0.1 = 10% de CONTINUA
+PARAM$trainingstrategy$undersampling <- 1.0
+
+# Configuración del modelo auxiliar de filtrado
+PARAM$ruido <- list(
+  undersampling30 = 0.1,
+  umbral = 0.5
+)
+
+#%% celda 23 [código]
+PARAM$hyperparametertuning$iteraciones <- 10 # iteraciones bayesianas
+
+# [Anotación · líneas 614–669] Define los parámetros fijos de LightGBM (gbdt, objective binary, metric auc,
+#   max_bin 31, learning_rate 0.005, feature_fraction 0.50, feature_fraction_bynode 0.20, min_data_in_leaf 0,
+#   sin bagging, lambda_l1 y lambda_l2 en 0, num_threads 4, seed 200003) y el espacio de búsqueda:
+#   num_iterations entre 64 y 4096, num_leaves entre 16 y 2048 y min_sum_hessian_in_leaf entre 1e-06 y 0.1.
+#%% celda 24 [código]
+# Parametros LightGBM
+
+# parametros fijos del LightGBM que se pisaran con la parte variable de la BO
+PARAM$lgbm$param_fijos <-  list(
+  boosting= "gbdt", # puede ir  dart  , ni pruebe random_forest
+  objective= "binary",
+  metric= "auc",
+  feature_pre_filter= FALSE,
+  first_metric_only= FALSE,
+  boost_from_average= TRUE,
+  force_row_wise= TRUE,
+  deterministic= TRUE,
+  verbosity= -100,
+  num_threads = 4L,
+
+  seed= PARAM$semilla_primigenia,
+
+  max_depth= -1L,
+  min_gain_to_split= 0,
+  lambda_l1= 0.0,
+  lambda_l2= 0.0,
+  max_bin= 31L,
+
+  bagging_fraction= 1.0,
+  pos_bagging_fraction= 1.0,
+  neg_bagging_fraction= 1.0,
+  is_unbalance= FALSE,
+  scale_pos_weight= 1.0,
+
+  drop_rate= 0.1,
+  max_drop= 50,
+  skip_drop= 0.5,
+
+  extra_trees= FALSE,
+
+  early_stopping= 0,
+  min_data_in_leaf= 0,     # fijo, esto es FUNDAMENTAL
+  feature_fraction= 0.50,  # fijo
+  feature_fraction_bynode = 0.20,
+  learning_rate= 0.005,    # fijo
+  
+  num_iterations= 20000,     # se modificara
+  num_leaves= 1024,          # se modificara
+  min_sum_hessian_in_leaf= 1e-06  # se modificara
+)
+
+#%% celda 25 [código]
+# Aqui se cargan los bordes de los hiperparametros de la BO
+#  es vital entender que se optimiza min_sum_hessian_in_leaf y que  min_data_in_leaf se deja fijo en CERO
+
+PARAM$hypeparametertuning$hs <- ps(
+  num_iterations= p_int(lower= 64L,  upper= 4096L),
+  num_leaves= p_int(lower= 16L,  upper= 2048L),
+  min_sum_hessian_in_leaf= p_dbl( lower=1e-06, upper=0.1)
+)
+
+# [Anotación · líneas 671–708] Define loguear, que agrega a un archivo de texto una línea separada por
+#   tabuladores con la fecha y los valores de una lista (escribe los títulos si el archivo no existe). Después
+#   crea la carpeta /home/ds/buckets/b1/exp/Experimento 32 y la fija como directorio de trabajo.
+#%% celda 26 [código]
+# logueo al archivo BO_log.txt
+loguear  <- function( preg, arch=NA, verbose=TRUE )
+{
+  t0 <- Sys.time()
+  reg <- copy( preg )
+  if( "feature_contri" %in%  names(reg) ) {
+    reg$feature_contri <- reg$feature_contri[1]
+  }
+  archivo <- arch
+  if( is.na(arch) ) archivo <- paste0( folder, substitute( reg), ext )
+
+
+  if( !file.exists( archivo ) )
+  {
+    # Escribo los titulos
+    linea  <- paste0( "fecha\t",
+                      paste( list.names(reg), collapse="\t" ), "\n" )
+
+    cat( linea, file=archivo )
+  }
+
+  # escribo el registro
+  linea  <- paste0( format(t0, "%Y%m%d.%H%M%S"),  "\t",     # la fecha y hora
+                    gsub( ", ", "\t", toString( reg ) ),  "\n" )
+
+  cat( linea, file=archivo, append=TRUE )  # grabo al archivo
+
+  if( verbose )  cat( linea )   # imprimo por pantalla
+}
+
+#%% celda 27 [código]
+setwd("/home/ds/buckets/b1/exp")
+dir.create(PARAM$experimento, showWarnings = FALSE)
+setwd(file.path("/home/ds/buckets/b1/exp", PARAM$experimento))
+
+# Mostrar dónde se guardarán los resultados
+getwd()
+
+# [Anotación · líneas 710–731] Lee competencia_01_ct10.csv.gz, se queda con los meses de PARAM$train (202103 y
+#   202104), verifica que no haya clase faltante, crea clase01 = 1 para BAJA+1 y BAJA+2 y 0 para el resto, y
+#   marca todos los registros con training = 1.
+#%% celda 28 [código]
+dataset <- fread(
+  "/home/ds/buckets/b1/datasets/competencia_01_ct10.csv.gz",
+  stringsAsFactors = TRUE
+)
+
+#%% celda 29 [código]
+dataset_train <- dataset[foto_mes %in% PARAM$train]
+
+#%% celda 30 [código]
+stopifnot(
+  !anyNA(dataset_train$clase_ternaria)
+)
+
+#%% celda 31 [código]
+dataset_train[,
+  clase01 := ifelse(clase_ternaria %in% c("BAJA+2","BAJA+1"), 1L, 0L)
+]
+
+#%% celda 32 [código]
+# Usar todos los registros de dataset_train para entrenar
+dataset_train[, training := 1L]
+
+# [Anotación · líneas 733–758] Arma campos_buenos con todas las columnas menos numero_de_cliente,
+#   clase_ternaria, clase01 y columnas auxiliares del filtrado (foto_mes no está en la lista de exclusión).
+#   Después quita 42 variables derivadas de cprestamos_personales y mprestamos_personales (versiones rank_,
+#   las_zero_ y missing_ de la variable, sus lags, deltas, tendencia y promedio). Carga lightgbm.
+#%% celda 33 [código]
+# Campos predictivos para LightGBM
+campos_buenos <- setdiff(
+  colnames(dataset_train),
+  c(
+    "numero_de_cliente",
+    "clase_ternaria",
+    "clase01",
+    "fold",
+    "azar",
+    "training",
+    "training30",
+    "prob30",
+    "aporta"
+  )
+)
+
+#%% celda 34 [código]
+#Variables excluidas
+campos_buenos <- setdiff( campos_buenos, c("rank_cprestamos_personales", "rank_mprestamos_personales", "rank_Lag1_cprestamos_personales", "rank_Lag2_cprestamos_personales", "rank_Delta1_cprestamos_personales", "rank_Delta2_cprestamos_personales", "rank_Lag1_mprestamos_personales", "rank_Lag2_mprestamos_personales", "rank_Delta1_mprestamos_personales", "rank_Delta2_mprestamos_personales", "rank_cprestamos_personales_tend3", "rank_cprestamos_personales_avg3", "rank_mprestamos_personales_tend3", "rank_mprestamos_personales_avg3","las_zero_cprestamos_personales", "las_zero_mprestamos_personales", "las_zero_Lag1_cprestamos_personales", "las_zero_Lag2_cprestamos_personales", "las_zero_Delta1_cprestamos_personales", "las_zero_Delta2_cprestamos_personales", "las_zero_Lag1_mprestamos_personales", "las_zero_Lag2_mprestamos_personales", "las_zero_Delta1_mprestamos_personales", "las_zero_Delta2_mprestamos_personales", "las_zero_cprestamos_personales_tend3", "las_zero_cprestamos_personales_avg3", "las_zero_mprestamos_personales_tend3", "las_zero_mprestamos_personales_avg3","missing_cprestamos_personales", "missing_mprestamos_personales", "missing_Lag1_cprestamos_personales", "missing_Lag2_cprestamos_personales", "missing_Delta1_cprestamos_personales", "missing_Delta2_cprestamos_personales", "missing_Lag1_mprestamos_personales", "missing_Lag2_mprestamos_personales", "missing_Delta1_mprestamos_personales", "missing_Delta2_mprestamos_personales", "missing_cprestamos_personales_tend3", "missing_cprestamos_personales_avg3", "missing_mprestamos_personales_tend3", "missing_mprestamos_personales_avg3") )
+
+#%% celda 35 [código]
+library(lightgbm)
+
+# Verificar que la función esté disponible
+is.function(lightgbm::lgb.Dataset)
+
+# [Anotación · líneas 760–796] Activa la selección con canaritos (PARAM$usar_canaritos = TRUE) y define su
+#   configuración: proporción 0.20 de canaritos sobre la cantidad de variables, multiplicador de desvío 2,
+#   semilla 200003, 200 rondas y un LightGBM con learning_rate 0.05, num_leaves 18, max_depth 6,
+#   min_data_in_leaf 800 y feature_fraction 0.85.
+#%% celda 36 [código]
+# ============================================================
+# Selección de variables con canaritos
+# Ejecutar antes del filtrado de registros y de la bayesiana
+# ============================================================
+
+library(data.table)
+library(lightgbm)
+library(digest)
+
+# Activar o desactivar la selección
+PARAM$usar_canaritos <- TRUE
+
+PARAM$canaritos <- list(
+  proporcion = 0.20,
+  multiplicador_desvio = 2,
+  semilla = PARAM$semilla_primigenia,
+  rondas = 200L,
+
+  modelo = list(
+    objective = "binary",
+    metric = "auc",
+    boosting = "gbdt",
+    learning_rate = 0.05,
+    num_leaves = 18L,
+    max_depth = 6L,
+    min_data_in_leaf = 800L,
+    feature_fraction = 0.85,
+    bagging_fraction = 1.0,
+    max_bin = 31L,
+    feature_pre_filter = FALSE,
+    deterministic = FALSE,
+    device_type = "cpu",
+    verbosity = -1L,
+    num_threads = 4L
+  )
+)
+
+# [Anotación · líneas 798–856] Crea la carpeta canaritos del experimento y calcula una firma (digest) de la
+#   configuración, los meses, las variables, los datos y la versión de lightgbm. Si ya existe seleccion.rds, lo
+#   lee y detiene la ejecución cuando la firma guardada no coincide con la actual.
+if (PARAM$usar_canaritos) {
+
+  carpeta_canaritos <- file.path(
+    "/home/ds/buckets/b1/exp",
+    PARAM$experimento,
+    "canaritos"
+  )
+
+  dir.create(
+    carpeta_canaritos,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  archivo_seleccion <- file.path(
+    carpeta_canaritos,
+    "seleccion.rds"
+  )
+
+  campos_originales <- campos_buenos
+
+  stopifnot(
+    length(campos_originales) > 0L,
+    !anyDuplicated(campos_originales),
+    !anyNA(dataset_train$clase01),
+    length(unique(dataset_train$clase01)) == 2L
+  )
+
+  # Firma de los datos y parámetros del selector.
+  # Se calcula columna por columna para evitar una copia grande.
+  firma <- digest::digest(list(
+    version = "canaritos_cpu_v1",
+    meses = PARAM$train,
+    configuracion = PARAM$canaritos,
+    campos = campos_originales,
+    ids = digest::digest(dataset_train$numero_de_cliente),
+    foto_mes = digest::digest(dataset_train$foto_mes),
+    target = digest::digest(dataset_train$clase01),
+    datos = vapply(
+      campos_originales,
+      function(campo) digest::digest(dataset_train[[campo]]),
+      character(1)
+    ),
+    lightgbm = as.character(packageVersion("lightgbm"))
+  ))
+
+  if (file.exists(archivo_seleccion)) {
+
+    seleccion <- readRDS(archivo_seleccion)
+
+    if (!identical(seleccion$firma, firma)) {
+      stop(
+        "Cambió la configuración o los datos del selector. ",
+        "Usá otro PARAM$experimento."
+      )
+    }
+
+    cat("Selección con canaritos recuperada.\n")
+
+# [Anotación · líneas 857–919] Si no hay selección guardada: agrega a una copia de los predictores una
+#   cantidad de columnas canarito_NNNN igual al 20% de las variables (redondeado hacia arriba), con valores
+#   uniformes al azar generados con set.seed(200003), y entrena un LightGBM de 200 rondas sobre variables y
+#   canaritos con clase01 como objetivo.
+  } else {
+
+    nreales <- length(campos_originales)
+
+    ncanaritos <- as.integer(
+      ceiling(PARAM$canaritos$proporcion * nreales)
+    )
+
+    stopifnot(ncanaritos >= 2L)
+
+    nombres_can <- sprintf(
+      "canarito_%04d",
+      seq_len(ncanaritos)
+    )
+
+    stopifnot(
+      !any(nombres_can %in% names(dataset_train))
+    )
+
+    # Copia de los predictores solo para el selector
+    datos_selector <- copy(
+      dataset_train[, campos_originales, with = FALSE]
+    )
+
+    set.seed(
+      PARAM$canaritos$semilla,
+      kind = "Mersenne-Twister",
+      normal.kind = "Inversion",
+      sample.kind = "Rejection"
+    )
+
+    for (nombre in nombres_can) {
+      set(
+        datos_selector,
+        j = nombre,
+        value = runif(nrow(datos_selector))
+      )
+    }
+
+    parametros_selector <- PARAM$canaritos$modelo
+
+    parametros_selector$seed <- PARAM$canaritos$semilla
+    parametros_selector$feature_fraction_seed <- PARAM$canaritos$semilla
+    parametros_selector$bagging_seed <- PARAM$canaritos$semilla
+    parametros_selector$data_random_seed <- PARAM$canaritos$semilla
+
+    dselector <- lgb.Dataset(
+      data = data.matrix(datos_selector),
+      label = dataset_train$clase01,
+      params = parametros_selector,
+      free_raw_data = TRUE
+    )
+
+    dselector$construct()
+
+    rm(datos_selector)
+    gc()
+
+    modelo_selector <- lgb.train(
+      params = parametros_selector,
+      data = dselector,
+      nrounds = PARAM$canaritos$rondas
+    )
+
+# [Anotación · líneas 921–987] Obtiene la importancia del modelo, completa con cero las variables sin splits y
+#   ordena por Gain descendente, Frequency descendente y nombre. Calcula la media y el desvío de las posiciones
+#   que ocupan los canaritos y fija el corte en media + 2 desvíos; quedan seleccionadas las variables no
+#   canarito con posición menor al corte, en su orden original.
+    importancia <- as.data.table(
+      lgb.importance(
+        modelo_selector,
+        percentage = FALSE
+      )
+    )
+
+    # Incluir también variables sin splits con importancia cero
+    tb_canaritos <- merge(
+      data.table(
+        Feature = c(campos_originales, nombres_can)
+      ),
+      importancia,
+      by = "Feature",
+      all.x = TRUE,
+      sort = FALSE
+    )
+
+    for (columna in c("Gain", "Cover", "Frequency")) {
+
+      if (!columna %in% names(tb_canaritos)) {
+        tb_canaritos[, (columna) := 0]
+      }
+
+      set(
+        tb_canaritos,
+        i = which(is.na(tb_canaritos[[columna]])),
+        j = columna,
+        value = 0
+      )
+    }
+
+    # Mismo orden y desempate que el notebook adjunto
+    setorderv(
+      tb_canaritos,
+      c("Gain", "Frequency", "Feature"),
+      c(-1L, -1L, 1L)
+    )
+
+    tb_canaritos[, id := seq_len(.N)]
+    tb_canaritos[, es_canarito := Feature %in% nombres_can]
+
+    ids_can <- tb_canaritos[es_canarito == TRUE, id]
+
+    media_ids <- mean(ids_can)
+    desvio_ids <- sd(ids_can)
+
+    punto_asesinato <- media_ids +
+      PARAM$canaritos$multiplicador_desvio * desvio_ids
+
+    # Conservar únicamente variables reales con id < corte
+    tb_canaritos[, seleccionada :=
+      !es_canarito & id < punto_asesinato
+    ]
+
+    if (all(tb_canaritos[es_canarito == TRUE, Gain] == 0)) {
+      warning(
+        "Todos los canaritos tienen Gain cero; ",
+        "el corte depende del desempate."
+      )
+    }
+
+    # Mantener el orden original de las variables
+    campos_seleccionados <- campos_originales[
+      campos_originales %in%
+        tb_canaritos[seleccionada == TRUE, Feature]
+    ]
+
+# [Anotación · líneas 989–1021] Detiene la ejecución si no quedó ninguna variable; guarda el modelo selector
+#   en modelo_selector.txt y la selección (firma, variables, tabla de importancia, media, desvío, corte y
+#   cantidades) en seleccion.rds mediante un archivo temporal que luego renombra.
+    if (!length(campos_seleccionados)) {
+      stop("El selector eliminó todas las variables reales.")
+    }
+
+    seleccion <- list(
+      firma = firma,
+      campos = campos_seleccionados,
+      importancia = tb_canaritos,
+      media_ids = media_ids,
+      desvio_ids = desvio_ids,
+      punto_asesinato = punto_asesinato,
+      nreales = nreales,
+      ncanaritos = ncanaritos
+    )
+
+    lgb.save(
+      modelo_selector,
+      file.path(carpeta_canaritos, "modelo_selector.txt")
+    )
+
+    temporal <- paste0(archivo_seleccion, ".tmp")
+    saveRDS(seleccion, temporal)
+
+    if (!file.rename(temporal, archivo_seleccion)) {
+      stop("No se pudo guardar la selección.")
+    }
+
+    rm(
+      dselector, modelo_selector,
+      importancia, tb_canaritos
+    )
+    gc()
+  }
+
+# [Anotación · líneas 1023–1072] Reemplaza campos_buenos por las variables seleccionadas, imprime un resumen
+#   (variables iniciales, canaritos, conservadas, eliminadas, porcentaje, corte) y escribe
+#   resumen_eliminacion.csv, feature_importance_todas_incluye_canaritos.csv y
+#   variables_reales_seleccionadas.csv. Con la selección desactivada sólo imprime un aviso.
+  # Aplicar la selección al filtrado y la bayesiana
+  campos_buenos <- seleccion$campos
+
+  resumen_canaritos <- data.table(
+    variables_iniciales = seleccion$nreales,
+    canaritos = seleccion$ncanaritos,
+    variables_conservadas = length(campos_buenos),
+    variables_eliminadas =
+      seleccion$nreales - length(campos_buenos),
+    porcentaje_conservado = round(
+      100 * length(campos_buenos) / seleccion$nreales,
+      2
+    ),
+    media_ids = seleccion$media_ids,
+    desvio_ids = seleccion$desvio_ids,
+    corte = seleccion$punto_asesinato
+  )
+
+  print(resumen_canaritos)
+
+  fwrite(
+    resumen_canaritos,
+    file.path(carpeta_canaritos, "resumen_eliminacion.csv")
+  )
+
+  fwrite(
+    seleccion$importancia,
+    file.path(
+      carpeta_canaritos,
+      "feature_importance_todas_incluye_canaritos.csv"
+    )
+  )
+
+  fwrite(
+    data.table(Feature = campos_buenos),
+    file.path(
+      carpeta_canaritos,
+      "variables_reales_seleccionadas.csv"
+    )
+  )
+
+  print(head(
+    seleccion$importancia[seleccionada == TRUE],
+    20L
+  ))
+
+} else {
+
+  cat("Canaritos desactivados: se conservan los predictores actuales.\n")
+}
+
+# [Anotación · líneas 1074–1104] Define filtrar_continua. Crea clase01, reparte los registros en 2 particiones
+#   al azar dentro de cada combinación de foto_mes y clase01 (set.seed con la semilla recibida) y asigna a cada
+#   registro un número uniforme al azar (semilla + 1) para el submuestreo.
+#%% celda 37 [código]
+library(data.table)
+library(lightgbm)
+
+filtrar_continua <- function(dt, campos, semilla,
+                             undersampling30 = 0.1,
+                             umbral = 0.5) {
+
+  setDT(dt)
+
+  stopifnot(
+    all(campos %in% names(dt)),
+    !anyNA(dt$clase_ternaria)
+  )
+
+  dt[, clase01 := as.integer(
+    clase_ternaria %in% c("BAJA+1", "BAJA+2")
+  )]
+
+  # Partición estratificada
+  set.seed(semilla)
+
+  dt[, fold := sample(
+    rep(1:2, length.out = .N)
+  ), by = .(foto_mes, clase01)]
+
+  # Aleatoriedad para undersampling
+  set.seed(semilla + 1L)
+  dt[, azar := runif(.N)]
+
+  dt[, prob30 := NA_real_]
+
+# [Anotación · líneas 1106–1126] Parámetros fijos del modelo auxiliar: LightGBM gbdt con metric
+#   average_precision, learning_rate 0.005, num_iterations 2180, num_leaves 30, min_sum_hessian_in_leaf
+#   0.1141634103, min_data_in_leaf 1, feature_fraction 0.50 y max_bin 31.
+  parametros30 <- list(
+    boosting = "gbdt",
+    objective = "binary",
+    metric = "average_precision",
+    feature_pre_filter = FALSE,
+    boost_from_average = TRUE,
+    force_row_wise = TRUE,
+    deterministic = TRUE,
+    verbosity = -1,
+    seed = semilla,
+    max_depth = -1L,
+    min_data_in_leaf = 1L,
+    max_bin = 31L,
+    bagging_fraction = 1.0,
+    feature_fraction = 0.50,
+    learning_rate = 0.005,
+    num_iterations = 2180L,
+    num_leaves = 30L,
+    min_sum_hessian_in_leaf = 0.1141634103,
+    num_threads = 4L
+  )
+
+# [Anotación · líneas 1128–1163] Para cada una de las 2 particiones entrena el modelo auxiliar con la otra
+#   partición, usando todos los positivos y los negativos cuyo número al azar es menor o igual a
+#   undersampling30, y guarda en prob30 la probabilidad predicha para los registros de la partición que quedó
+#   afuera.
+  for (f in 1:2) {
+
+    idx_train <- dt$fold != f &
+      (
+        dt$clase01 == 1L |
+        dt$azar <= undersampling30
+      )
+
+    idx_pred <- dt$fold == f
+
+    d30 <- lgb.Dataset(
+      data = data.matrix(
+        dt[idx_train, ..campos]
+      ),
+      label = dt$clase01[idx_train],
+      free_raw_data = TRUE
+    )
+
+    p30 <- parametros30
+    p30$seed <- semilla + f
+
+    modelo30 <- lgb.train(
+      data = d30,
+      params = p30
+    )
+
+    probabilidades <- predict(
+      modelo30,
+      data.matrix(dt[idx_pred, ..campos])
+    )
+
+    dt[idx_pred, prob30 := probabilidades]
+
+    rm(d30, modelo30, probabilidades)
+    gc()
+  }
+
+# [Anotación · líneas 1165–1195] Marca como registros que se conservan (aporta) todos los positivos y los
+#   negativos con prob30 menor o igual al umbral; imprime por mes cuántos se eliminan y devuelve sólo los
+#   conservados, sin las columnas auxiliares. La celda siguiente instala el paquete digest.
+  stopifnot(!anyNA(dt$prob30))
+
+  dt[, aporta := (
+    clase01 == 1L |
+    (clase01 == 0L & prob30 <= umbral)
+  )]
+
+  # Mostrar registros descartados por mes
+  print(dt[, .(
+    total = .N,
+    eliminados = sum(!aporta),
+    conservados = sum(aporta),
+    porcentaje_conservado = round(
+      100 * mean(aporta), 2
+    )
+  ), by = foto_mes])
+
+  # Devolver únicamente registros aceptados
+  resultado <- dt[aporta == TRUE]
+
+  resultado[, c(
+    "fold", "azar", "prob30", "aporta"
+  ) := NULL]
+
+  gc()
+
+  return(resultado)
+}
+
+#%% celda 38 [código]
+install.packages("digest")
+
+# [Anotación · líneas 1197–1242] Define filtrar_con_checkpoint: verifica columnas y claves únicas (cliente,
+#   mes) y arma una descripción de la configuración del filtro (semilla, undersampling30, umbral, variables,
+#   meses y un hash xxhash64 de los datos).
+#%% celda 39 [código]
+library(data.table)
+
+filtrar_con_checkpoint <- function(
+    dt, campos, semilla, archivo,
+    undersampling30 = 0.1, umbral = 0.5) {
+
+  if (!requireNamespace("digest", quietly = TRUE)) {
+    stop("Instalá primero el paquete digest")
+  }
+
+  setDT(dt)
+
+  stopifnot(
+    all(c("numero_de_cliente", "foto_mes",
+          "clase_ternaria") %in% names(dt)),
+    all(campos %in% names(dt))
+  )
+
+  # Identificación única de cada registro
+  claves <- c("numero_de_cliente", "foto_mes")
+
+  if (anyDuplicated(dt[, ..claves])) {
+    stop("Hay clientes y meses duplicados")
+  }
+
+  # Identificar configuración y datos de entrada
+  configuracion <- list(
+    version_filtro = "modelo30_crossfit_v1",
+    semilla = semilla,
+    undersampling30 = undersampling30,
+    umbral = umbral,
+    campos = campos,
+    meses = sort(unique(dt$foto_mes)),
+    datos_hash = digest::digest(
+      dt[, c(claves, "clase_ternaria", campos),
+         with = FALSE],
+      algo = "xxhash64"
+    )
+  )
+
+  dir.create(
+    dirname(archivo),
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+# [Anotación · líneas 1244–1308] Si el archivo de checkpoint existe, lo lee y detiene la ejecución cuando su
+#   configuración no coincide; si coincide, recupera qué registros se conservaban. Si no existe, ejecuta
+#   filtrar_continua sobre una copia, registra por (cliente, mes) si se conserva, verifica que ningún registro
+#   distinto de CONTINUA haya sido eliminado y guarda el checkpoint en un .rds.
+  if (file.exists(archivo)) {
+
+    cat("\nCheckpoint encontrado:", archivo, "\n")
+
+    checkpoint <- readRDS(archivo)
+
+    if (!identical(checkpoint$configuracion,
+                   configuracion)) {
+      stop(
+        "El checkpoint no corresponde a estos datos ",
+        "o a esta configuración. Usá otro nombre ",
+        "de checkpoint para el nuevo experimento."
+      )
+    }
+
+    seleccion <- checkpoint$seleccion
+
+    cat("Recuperando exactamente el filtrado anterior.\n")
+
+  } else {
+
+    cat("\nNo existe checkpoint. Ejecutando modelo30...\n")
+
+    # Esta función fue agregada en la celda anterior
+    # Debe conservar todos los positivos y filtrar CONTINUA
+    filtrados <- filtrar_continua(
+      dt = copy(dt),
+      campos = campos,
+      semilla = semilla,
+      undersampling30 = undersampling30,
+      umbral = umbral
+    )
+
+    # Guardar la selección sin duplicar todas las variables
+    seleccion <- dt[, c(claves, "clase_ternaria"),
+                    with = FALSE]
+
+    seleccion[, conservar := FALSE]
+
+    seleccion[
+      filtrados[, ..claves],
+      conservar := TRUE,
+      on = claves
+    ]
+
+    stopifnot(
+      seleccion[clase_ternaria != "CONTINUA",
+                all(conservar)]
+    )
+
+    checkpoint <- list(
+      configuracion = configuracion,
+      seleccion = seleccion
+    )
+
+    temporal <- paste0(archivo, ".tmp")
+
+    saveRDS(checkpoint, temporal, compress = "xz")
+
+    if (!file.rename(temporal, archivo)) {
+      stop("No se pudo guardar el checkpoint")
+    }
+
+    cat("Checkpoint guardado:", archivo, "\n")
+  }
+
+# [Anotación · líneas 1310–1334] Aplica la selección al dataset recibido, imprime por mes el total, los
+#   conservados y los eliminados, y devuelve sólo los registros conservados.
+  # Aplicar la selección guardada
+  dt[
+    seleccion[, c(claves, "conservar"), with = FALSE],
+    conservar := i.conservar,
+    on = claves
+  ]
+
+  stopifnot(
+    !anyNA(dt$conservar),
+    dt[clase_ternaria != "CONTINUA", all(conservar)]
+  )
+
+  cat("\nResumen del filtrado:\n")
+
+  print(dt[, .(
+    total = .N,
+    conservados = sum(conservar),
+    eliminados = sum(!conservar)
+  ), by = foto_mes])
+
+  resultado <- dt[conservar == TRUE]
+  resultado[, conservar := NULL]
+
+  return(resultado)
+}
+
+# [Anotación · líneas 1336–1372] Recupera de BO_log.txt, si existe, el número de la última iteración. Define
+#   Estimar_lightgbm, la función que evalúa la optimización: combina los parámetros fijos con los propuestos,
+#   entrena un LightGBM con dtrain usando dvalidate como validación, registra la iteración en BO_log.txt y
+#   devuelve modelo$best_score como métrica.
+#%% celda 40 [código]
+giter <- 0
+
+if( file.exists("BO_log.txt") ){
+  tb_BO <- fread("BO_log.txt")
+  giter <- tb_BO[, max(iter)]
+}
+
+#%% celda 41 [código]
+# En el argumento x llegan los parametros de la bayesiana
+
+Estimar_lightgbm <- function(xs) {
+
+  flush.console()
+  giter <<- giter + 1
+
+  # x pisa (o agrega) a param_fijos
+  param_completo <- modifyList(PARAM$lgbm$param_fijos, xs)
+  xx <- copy(param_completo)
+
+  # entreno LightGBM
+  modelo <- lgb.train(
+    data= dtrain,
+    valids= list( "val"=dvalidate),
+    param= param_completo
+  )
+
+
+  # obtengo la ganancia métrica de validación
+  xx$iter <- giter
+  xx$metrica <- modelo$best_score
+
+  loguear( xx, "BO_log.txt")
+  set.seed(PARAM$semilla_primigenia, kind = "L'Ecuyer-CMRG")  # le reordeno a mlr3MBO
+
+  return( list( metrica = xx$metrica) )
+}
+
+# [Anotación · líneas 1374–1415] Aplica filtrar_con_checkpoint a los registros de 202103 y 202104 con las
+#   variables seleccionadas, semilla 200003, undersampling30 = 0.1 y umbral = 0.5 (checkpoint
+#   filtro_bayesiana.rds), y construye dtrain con los registros que quedan y clase01 como etiqueta.
+#%% celda 42 [código]
+# ============================================================
+# Filtrado de CONTINUA con checkpoint para la bayesiana
+# ============================================================
+
+# Archivo donde se guarda qué registros fueron eliminados
+archivo_filtro_bo <- file.path(
+  "/home/ds/buckets/b1/exp",
+  PARAM$experimento,
+  "filtro_bayesiana.rds"
+)
+
+# Filtrar o recuperar exactamente los mismos registros
+dataset_train <- filtrar_con_checkpoint(
+  dt = dataset_train,
+  campos = campos_buenos,
+  semilla = PARAM$semilla_primigenia,
+  archivo = archivo_filtro_bo,
+  undersampling30 = PARAM$ruido$undersampling30,
+  umbral = PARAM$ruido$umbral
+)
+
+# Todos los registros que superaron el filtro
+dataset_train[, training := 1L]
+
+# Dataset de entrenamiento de LightGBM
+dtrain <- lgb.Dataset(
+  data = data.matrix(
+    dataset_train[
+      training == 1L,
+      campos_buenos,
+      with = FALSE
+    ]
+  ),
+  label = dataset_train[
+    training == 1L, clase01
+  ],
+  free_raw_data = FALSE
+)
+
+nrow(dtrain)
+ncol(dtrain)
+
+# [Anotación · líneas 1417–1439] Toma 202106 completo como validación, verifica que tenga clase, crea clase01
+#   y construye dvalidate con las mismas variables.
+#%% celda 43 [código]
+dataset_valid <- dataset[foto_mes == 202106]
+
+stopifnot(
+  nrow(dataset_valid) > 0L,
+  !anyNA(dataset_valid$clase_ternaria)
+)
+
+dataset_valid[, clase01 :=
+  as.integer(clase_ternaria %in% c("BAJA+1", "BAJA+2"))]
+
+#%% celda 44 [código]
+# Preparar la validación para LightGBM
+dvalidate <- lgb.Dataset(
+  data = data.matrix(
+    dataset_valid[, campos_buenos, with = FALSE]
+  ),
+  label = dataset_valid$clase01,
+  free_raw_data = FALSE
+)
+
+nrow(dvalidate)
+ncol(dvalidate)
+
+# [Anotación · líneas 1441–1480] Configura la optimización bayesiana con bbotk y mlr3mbo: objetivo a maximizar
+#   = métrica devuelta por Estimar_lightgbm, terminación a las 10 evaluaciones, modelo sustituto de kriging
+#   (regr.km), función de adquisición expected improvement optimizada con búsqueda al azar de 1.000 puntos, y
+#   bucle bayesopt_ego.
+#%% celda 45 [código]
+# Aqui comienza la configuracion de la Bayesian Optimization
+
+# en este archivo quedan la evolucion binaria de la BO
+kbayesiana <- "bayesiana.RDATA"
+
+funcion_optimizar <- Estimar_lightgbm # la funcion que voy a maximizar
+
+objective <- ObjectiveRFun$new(
+  fun= funcion_optimizar,
+  domain= PARAM$hypeparametertuning$hs,
+  codomain= ps(metrica = p_dbl(tags="maximize")),
+  id= "BO_lightgbm"
+)
+
+
+instance <- OptimInstanceBatchSingleCrit$new(
+  objective= objective,
+  terminator=  trm("evals", n_evals = PARAM$hyperparametertuning$iteraciones)
+)
+
+
+surrogate <- srlrn(lrn("regr.km",
+  optim.method = "BFGS",
+  nugget.estim = TRUE,
+  control= list(trace = FALSE)))
+
+acq_function  <- acqf("ei")                 # expected improvement
+
+acq_optimizer  <- acqo(
+  optimizer  = opt("random_search", batch_size= 1000),
+  terminator = trm("evals", n_evals= 1000)
+)
+
+optimizer <- opt("mbo",
+  loop_function = bayesopt_ego,
+  surrogate= surrogate,
+  acq_function= acq_function,
+  acq_optimizer= acq_optimizer
+)
+
+# [Anotación · líneas 1482–1539] Si existe BO_log.txt, incorpora al archivo de la instancia las evaluaciones
+#   anteriores completas (num_iterations, num_leaves, min_sum_hessian_in_leaf y métrica) y, si el total
+#   registrado es menor que 10, ejecuta optimizer$optimize para las evaluaciones pendientes.
+#%% celda 46 [código]
+# Ejecutar después de crear una NUEVA instance y optimizer
+
+if (file.exists("BO_log.txt")) {
+
+  historial <- fread("BO_log.txt")
+
+  parametros <- c(
+    "num_iterations",
+    "num_leaves",
+    "min_sum_hessian_in_leaf"
+  )
+
+  # Comprobar que el registro tiene las columnas necesarias
+  stopifnot(
+    all(c(parametros, "metrica", "iter") %in% names(historial))
+  )
+
+  # Recuperar únicamente evaluaciones completas
+  historial <- historial[
+    complete.cases(historial[, c(parametros, "metrica"), with = FALSE]) &
+      is.finite(metrica)
+  ]
+
+  if (nrow(historial) > 0L) {
+
+    # Restaurar los tipos de los parámetros
+    historial[, num_iterations := as.integer(num_iterations)]
+    historial[, num_leaves := as.integer(num_leaves)]
+
+    # Incorporar los parámetros y sus resultados a la bayesiana
+    instance$archive$add_evals(
+      xdt = historial[, ..parametros],
+      ydt = historial[, .(metrica)]
+    )
+
+    giter <- max(historial$iter)
+
+    cat(
+      "Evaluaciones anteriores recuperadas:",
+      nrow(historial), "\n"
+    )
+  }
+}
+
+# El límite cuenta las evaluaciones recuperadas y las nuevas
+total <- PARAM$hyperparametertuning$iteraciones
+completadas <- nrow(instance$archive$data)
+
+if (completadas < total) {
+
+  cat("Evaluaciones pendientes:", total - completadas, "\n")
+  bayesiana_salida <- optimizer$optimize(instance)
+
+} else {
+
+  cat("Ya se alcanzó el total de evaluaciones:", total, "\n")
+}
+
+# [Anotación · líneas 1541–1587] Configuración de la etapa final: train_final = 202103, 202104, 202105 y
+#   202106; future = 202108; cantidad_semillas = 50 y N_SEMILLAS_AGOSTO = 50. Crea la carpeta agosto_v01 dentro
+#   del experimento con las subcarpetas modelos, probabilidades, campania y feature_importance.
+#%% celda 47 [código]
+# ============================================================
+# 1. Configuración de agosto
+# ============================================================
+
+library(data.table)
+
+PARAM$train_final <- c(202103, 202104, 202105, 202106)
+PARAM$future <- c(202108)
+
+# Cantidad total de semillas disponibles
+PARAM$cantidad_semillas <- 50L
+
+# ============================================================
+# CAMBIAR AQUÍ cuántas semillas querés ejecutar en agosto
+# ============================================================
+N_SEMILLAS_AGOSTO <- 50L
+
+# Carpeta principal: contiene los resultados de la bayesiana
+carpeta_base <- file.path(
+  "/home/ds/buckets/b1/exp",
+  PARAM$experimento
+)
+
+# Carpeta para los modelos y predicciones de agosto
+# Cambiar cuando quieras una nueva configuración de agosto
+PARAM$version_agosto <- "agosto_v01"
+
+carpeta_experimento <- file.path(
+  carpeta_base,
+  PARAM$version_agosto
+)
+
+dir.create(
+  carpeta_experimento,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+for (carpeta in c(
+  "modelos", "probabilidades", "campania", "feature_importance"
+)) {
+  dir.create(
+    file.path(carpeta_experimento, carpeta),
+    showWarnings = FALSE
+  )
+}
+
+# [Anotación · líneas 1589–1607] Define la ruta de semillas_modelos.csv en la carpeta de agosto y, si no
+#   existe pero hay una lista con ese nombre en la carpeta base del experimento, la copia.
+# Lista completa de semillas disponibles
+archivo_semillas <- file.path(
+  carpeta_experimento,
+  "semillas_modelos.csv"
+)
+
+semillas_anteriores <- file.path(
+  carpeta_base,
+  "semillas_modelos.csv"
+)
+
+# Copiar la lista original una sola vez, si existe
+if (!file.exists(archivo_semillas) &&
+    file.exists(semillas_anteriores)) {
+
+  if (!file.copy(semillas_anteriores, archivo_semillas)) {
+    stop("No se pudo copiar el archivo de semillas.")
+  }
+}
+
+# [Anotación · líneas 1609–1694] Si existe semillas_modelos.csv lo lee. Si no, reconstruye la lista a partir
+#   de semillas_completadas.csv (de la carpeta de agosto o de la base) y de los números de semilla presentes en
+#   los nombres de los modelos y archivos de probabilidades ya guardados.
+# ============================================================
+# Recuperar las semillas guardadas
+# ============================================================
+
+# Recuperación de la versión anterior que usaba por error
+# semillas_completadas.csv para guardar la lista.
+# También contempla modelos o probabilidades ya generados.
+recuperacion <- !file.exists(archivo_semillas)
+
+if (!recuperacion) {
+
+  tabla_semillas <- fread(archivo_semillas)
+
+} else {
+
+  archivo_completadas <- file.path(
+    carpeta_experimento,
+    "semillas_completadas.csv"
+  )
+
+  archivo_completadas_base <- file.path(
+    carpeta_base,
+    "semillas_completadas.csv"
+  )
+
+  semillas_recuperadas <- integer()
+
+  if (file.exists(archivo_completadas)) {
+
+    tabla_anterior <- fread(archivo_completadas)
+
+    if (!"seed" %in% names(tabla_anterior)) {
+      stop("El archivo anterior no contiene la columna seed.")
+    }
+
+    semillas_recuperadas <- tabla_anterior$seed
+
+  } else if (file.exists(archivo_completadas_base)) {
+
+    tabla_anterior <- fread(archivo_completadas_base)
+
+    if (!"seed" %in% names(tabla_anterior)) {
+      stop("El archivo anterior no contiene la columna seed.")
+    }
+
+    semillas_recuperadas <- tabla_anterior$seed
+  }
+
+  # Recuperar también las semillas identificadas en los archivos
+  archivos_modelos <- list.files(
+    file.path(carpeta_experimento, "modelos"),
+    pattern = "^modelo_[0-9]+\\.txt$"
+  )
+
+  archivos_prob <- list.files(
+    file.path(carpeta_experimento, "probabilidades"),
+    pattern = "^probabilidades_202108_seed_[0-9]+\\.csv$"
+  )
+
+  seeds_modelos <- as.integer(sub(
+    "^modelo_([0-9]+)\\.txt$",
+    "\\1",
+    archivos_modelos
+  ))
+
+  seeds_prob <- as.integer(sub(
+    "^probabilidades_202108_seed_([0-9]+)\\.csv$",
+    "\\1",
+    archivos_prob
+  ))
+
+  tabla_semillas <- data.table(
+    seed = unique(c(
+      semillas_recuperadas,
+      seeds_modelos,
+      seeds_prob
+    ))
+  )
+
+  if (nrow(tabla_semillas) > 0L) {
+    cat(
+      "Semillas recuperadas de la versión anterior:",
+      nrow(tabla_semillas), "\n"
+    )
+  }
+}
+
+# [Anotación · líneas 1696–1713] Verifica que la columna seed exista y que las semillas sean enteros no
+#   negativos, sin faltantes ni duplicados, y las convierte a enteros.
+if (!"seed" %in% names(tabla_semillas)) {
+  stop("El archivo de semillas no contiene la columna seed.")
+}
+
+stopifnot(
+  is.numeric(tabla_semillas$seed),
+  !anyNA(tabla_semillas$seed),
+  all(is.finite(tabla_semillas$seed)),
+  all(tabla_semillas$seed == trunc(tabla_semillas$seed)),
+  all(tabla_semillas$seed >= 0),
+  all(tabla_semillas$seed <= .Machine$integer.max)
+)
+
+semillas <- as.integer(tabla_semillas$seed)
+
+stopifnot(!anyDuplicated(semillas))
+
+rm(tabla_semillas)
+
+# [Anotación · líneas 1715–1767] Si hay menos de 50 semillas, fija set.seed(200003) y sortea sin reposición
+#   las que faltan entre los enteros de 100.000 a 1.000.000 que no estén ya en la lista, agregándolas al final.
+#   Guarda la lista (columnas modelo y seed) en semillas_modelos.csv cuando fue creada, recuperada o ampliada.
+# ============================================================
+# Ampliar la lista conservando las semillas anteriores
+# ============================================================
+
+faltan <- PARAM$cantidad_semillas - length(semillas)
+
+if (faltan > 0L) {
+
+  set.seed(
+    PARAM$semilla_primigenia,
+    kind = "Mersenne-Twister",
+    normal.kind = "Inversion",
+    sample.kind = "Rejection"
+  )
+
+  disponibles <- setdiff(
+    100000L:1000000L,
+    semillas
+  )
+
+  stopifnot(faltan <= length(disponibles))
+
+  semillas_nuevas <- sample(
+    disponibles,
+    size = faltan,
+    replace = FALSE
+  )
+
+  # Conservar las anteriores y su orden
+  semillas <- c(semillas, semillas_nuevas)
+
+  cat("Semillas nuevas agregadas:", faltan, "\n")
+
+  rm(disponibles, semillas_nuevas)
+}
+
+# Guardar si se creó, recuperó o amplió la lista
+if (recuperacion || faltan > 0L) {
+
+  temporal <- paste0(archivo_semillas, ".tmp")
+
+  fwrite(
+    data.table(
+      modelo = seq_along(semillas),
+      seed = semillas
+    ),
+    temporal
+  )
+
+  if (!file.rename(temporal, archivo_semillas)) {
+    stop("No se pudo guardar la lista de semillas.")
+  }
+}
+
+# [Anotación · líneas 1769–1802] Guarda la lista en PARAM$semillas, toma las primeras N_SEMILLAS_AGOSTO como
+#   semillas_agosto, las imprime y vuelve al directorio base del experimento.
+PARAM$semillas <- semillas
+
+# ============================================================
+# Seleccionar las primeras N para ejecutar en agosto
+# ============================================================
+
+stopifnot(
+  length(N_SEMILLAS_AGOSTO) == 1L,
+  !is.na(N_SEMILLAS_AGOSTO),
+  N_SEMILLAS_AGOSTO >= 1L,
+  N_SEMILLAS_AGOSTO == as.integer(N_SEMILLAS_AGOSTO),
+  N_SEMILLAS_AGOSTO <= length(PARAM$semillas)
+)
+
+semillas_agosto <- head(
+  PARAM$semillas,
+  N_SEMILLAS_AGOSTO
+)
+
+cat(
+  "\nSemillas disponibles:", length(PARAM$semillas),
+  "\nSemillas seleccionadas para agosto:", length(semillas_agosto),
+  "\n"
+)
+
+print(semillas_agosto)
+
+cat(
+  "\nResultados de agosto se guardarán en:",
+  carpeta_experimento, "\n"
+)
+
+# Mantener la carpeta principal para recuperar BO_log.txt
+setwd(carpeta_base)
+
+# [Anotación · líneas 1804–1863] Lee BO_log.txt, conserva las evaluaciones completas, las ordena por métrica
+#   descendente y las imprime. Toma num_iterations, num_leaves y min_sum_hessian_in_leaf de la primera fila y
+#   los combina con los parámetros fijos para formar param_final.
+#%% celda 48 [código]
+# ============================================================
+# 2. Recuperar y mostrar resultados de la bayesiana
+# ============================================================
+
+tb_bayesiana <- fread("BO_log.txt")
+
+columnas_necesarias <- c(
+  "iter",
+  "num_iterations",
+  "num_leaves",
+  "min_sum_hessian_in_leaf",
+  "metrica"
+)
+
+stopifnot(
+  all(columnas_necesarias %in% names(tb_bayesiana))
+)
+
+# Conservar evaluaciones completas
+tb_bayesiana <- tb_bayesiana[
+  complete.cases(tb_bayesiana[, ..columnas_necesarias]) &
+    is.finite(metrica)
+]
+
+stopifnot(nrow(tb_bayesiana) > 0L)
+
+# Ordenar de mejor a peor
+setorder(tb_bayesiana, -metrica)
+
+# Mostrar todas las configuraciones evaluadas
+print(
+  tb_bayesiana[, ..columnas_necesarias],
+  nrows = nrow(tb_bayesiana)
+)
+
+# Guardar los mejores hiperparámetros
+PARAM$out$lgbm$mejores_hiperparametros <- as.list(
+  tb_bayesiana[1, .(
+    num_iterations,
+    num_leaves,
+    min_sum_hessian_in_leaf
+  )]
+)
+
+# Guardar la mejor métrica
+PARAM$out$lgbm$y <- tb_bayesiana$metrica[1]
+
+cat("\nMejor métrica en junio:", PARAM$out$lgbm$y, "\n")
+cat("\nMejores hiperparámetros:\n")
+print(PARAM$out$lgbm$mejores_hiperparametros)
+
+# Combinar con los parámetros fijos para el entrenamiento final
+param_final <- modifyList(
+  PARAM$lgbm$param_fijos,
+  PARAM$out$lgbm$mejores_hiperparametros
+)
+
+cat("\nParámetros del modelo final:\n")
+print(param_final)
+
+# [Anotación · líneas 1865–1928] Abre un bloque local para la evaluación en junio: entrenamiento en 202103 y
+#   202104, evaluación en 202106, las 5 primeras semillas de la lista, cortes de 8.000 a 15.000 cada 500,
+#   ganancia de 1.072.500 por BAJA+2 y -27.500 por el resto. Crea la carpeta
+#   evaluacion_junio_5_semillas_canaritos_filtro30 con subcarpetas y define guardar_csv, que escribe a un
+#   archivo temporal y lo renombra.
+#%% celda 49 [código]
+# ============================================================
+# Evaluación de junio con 5 semillas
+# Entrenamiento: marzo-abril | Predicción: junio
+# Aplica las variables seleccionadas con canaritos
+# ============================================================
+
+local({
+
+  library(data.table)
+  library(lightgbm)
+
+  MESES_TRAIN <- c(202103L, 202104L)
+  MES_EVALUACION <- 202106L
+
+  stopifnot(
+    length(PARAM$semillas) >= 5L,
+    !anyNA(PARAM$semillas),
+    !anyDuplicated(PARAM$semillas)
+  )
+
+  semillas_junio <- as.integer(PARAM$semillas[1:5])
+
+  CORTES_JUNIO <- seq(8000L, 15000L, by = 500L)
+  EXCLUIR_JUNIO <- character()
+  # EXCLUIR_JUNIO <- c("rank_variable1", "rank_variable2")
+
+  GANANCIA_BAJA2 <- 1072500
+  COSTO_OTROS <- -27500
+  HILOS_JUNIO <- 4L
+
+  if (is.null(PARAM$usar_canaritos)) {
+    stop("Definí PARAM$usar_canaritos <- TRUE o FALSE.")
+  }
+
+  ETIQUETA <- if (isTRUE(PARAM$usar_canaritos)) {
+    "evaluacion_junio_5_semillas_canaritos_filtro30"
+  } else {
+    "evaluacion_junio_5_semillas_filtro30"
+  }
+
+  carpeta <- file.path(
+    "/home/ds/buckets/b1/exp",
+    PARAM$experimento,
+    ETIQUETA
+  )
+
+  dir.create(carpeta, recursive = TRUE, showWarnings = FALSE)
+
+  for (subcarpeta in c("modelos", "probabilidades", "campania")) {
+    dir.create(
+      file.path(carpeta, subcarpeta),
+      showWarnings = FALSE
+    )
+  }
+
+  guardar_csv <- function(tabla, archivo) {
+    temporal <- paste0(archivo, ".tmp")
+    fwrite(tabla, temporal, quote = FALSE)
+
+    if (!file.rename(temporal, archivo)) {
+      stop("No se pudo guardar: ", archivo)
+    }
+  }
+
+# [Anotación · líneas 1930–1958] Elimina del entorno global los datasets y modelos anteriores, vuelve a leer
+#   competencia_01_ct10.csv.gz y arma la lista inicial de predictores para junio.
+  # ==========================================================
+  # 1. Liberar datos anteriores y leer el dataset
+  # ==========================================================
+
+  rm(
+    list = intersect(
+      c(
+        "dataset", "dataset_train", "dataset_valid",
+        "dtrain", "dvalidate", "modelo"
+      ),
+      ls(envir = .GlobalEnv)
+    ),
+    envir = .GlobalEnv
+  )
+  gc()
+
+  datos <- fread(
+    "/home/ds/buckets/b1/datasets/competencia_01_ct10.csv.gz",
+    stringsAsFactors = TRUE
+  )
+
+  campos_junio <- setdiff(
+    names(datos),
+    c(
+      "numero_de_cliente","clase_ternaria", "clase01", "fold", "azar",
+      "training", "training30", "prob30", "aporta",
+      EXCLUIR_JUNIO
+    )
+  )
+
+# [Anotación · líneas 1960–2004] Con canaritos activados, lee seleccion.rds, verifica que PARAM$train sea
+#   202103 y 202104 y que las variables seleccionadas existan, y usa esas variables como predictores de junio.
+  # ==========================================================
+  # 2. Aplicar la selección de canaritos
+  # ==========================================================
+
+  if (isTRUE(PARAM$usar_canaritos)) {
+
+    archivo_seleccion <- file.path(
+      "/home/ds/buckets/b1/exp",
+      PARAM$experimento,
+      "canaritos",
+      "seleccion.rds"
+    )
+
+    if (!file.exists(archivo_seleccion)) {
+      stop("Primero ejecutá la selección de canaritos.")
+    }
+
+    if (!setequal(PARAM$train, MESES_TRAIN)) {
+      stop(
+        "Para evaluar junio, ejecutá los canaritos con ",
+        "PARAM$train <- c(202103, 202104)."
+      )
+    }
+
+    seleccion_junio <- readRDS(archivo_seleccion)
+
+    stopifnot(
+      is.character(seleccion_junio$campos),
+      length(seleccion_junio$campos) > 0L,
+      !anyNA(seleccion_junio$campos),
+      !anyDuplicated(seleccion_junio$campos),
+      all(seleccion_junio$campos %in% campos_junio |
+            seleccion_junio$campos %in% EXCLUIR_JUNIO)
+    )
+
+    campos_junio <- seleccion_junio$campos[
+      !seleccion_junio$campos %in% EXCLUIR_JUNIO
+    ]
+
+    rm(seleccion_junio)
+  }
+
+  stopifnot(length(campos_junio) > 0L)
+
+  cat("\nPredictores para junio:", length(campos_junio), "\n")
+
+# [Anotación · líneas 2006–2060] Separa los registros de entrenamiento (202103 y 202104) y de evaluación
+#   (202106) con las columnas necesarias, verifica clases y unicidad de clientes, convierte los identificadores
+#   a texto sin notación científica y arma la tabla de referencia (cliente, mes, clase_ternaria) de 202106.
+  columnas_necesarias <- unique(c(
+    "numero_de_cliente", "foto_mes", "clase_ternaria",
+    campos_junio
+  ))
+
+  tr <- datos[
+    foto_mes %in% MESES_TRAIN,
+    columnas_necesarias,
+    with = FALSE
+  ]
+
+  fu <- datos[
+    foto_mes == MES_EVALUACION,
+    columnas_necesarias,
+    with = FALSE
+  ]
+
+  rm(datos)
+  gc()
+
+  stopifnot(
+    all(MESES_TRAIN %in% tr$foto_mes),
+    nrow(fu) >= max(CORTES_JUNIO),
+    !anyNA(tr$clase_ternaria),
+    !anyNA(fu$clase_ternaria),
+    all(tr$clase_ternaria %in%
+          c("CONTINUA", "BAJA+1", "BAJA+2")),
+    all(fu$clase_ternaria %in%
+          c("CONTINUA", "BAJA+1", "BAJA+2")),
+    !anyNA(fu$numero_de_cliente),
+    !anyDuplicated(fu$numero_de_cliente)
+  )
+
+  ids_numericos <- as.numeric(
+    as.character(fu$numero_de_cliente)
+  )
+
+  stopifnot(
+    all(is.finite(ids_numericos)),
+    all(ids_numericos == trunc(ids_numericos)),
+    all(abs(ids_numericos) < 2^53)
+  )
+
+  ids <- sprintf("%.0f", ids_numericos)
+
+  stopifnot(
+    !anyDuplicated(ids),
+    all(grepl("^[0-9]+$", ids))
+  )
+
+  referencia <- data.table(
+    numero_de_cliente = ids,
+    foto_mes = MES_EVALUACION,
+    clase_ternaria = as.character(fu$clase_ternaria)
+  )
+
+# [Anotación · líneas 2062–2113] Toma param_final como parámetros, arma una descripción de la configuración
+#   (meses, semillas, variables, parámetros, clase objetivo, filtro) y la compara con configuracion.rds si
+#   existe, deteniendo la ejecución cuando difiere; si no existe la guarda. Escribe semillas_modelos.csv con las
+#   5 semillas.
+  parametros <- param_final
+  parametros$num_threads <- HILOS_JUNIO
+
+  # ==========================================================
+  # 3. Verificar configuración y guardar la lista de semillas
+  # ==========================================================
+
+  configuracion <- list(
+    train = MESES_TRAIN,
+    future = MES_EVALUACION,
+    semillas = semillas_junio,
+    campos = campos_junio,
+    parametros = parametros,
+    target = c("BAJA+1", "BAJA+2"),
+    usar_canaritos = isTRUE(PARAM$usar_canaritos),
+    filtro = list(
+      version = "modelo30_crossfit_v1",
+      undersampling30 = PARAM$ruido$undersampling30,
+      umbral = PARAM$ruido$umbral,
+      semilla = PARAM$semilla_primigenia
+    )
+  )
+
+  archivo_config <- file.path(carpeta, "configuracion.rds")
+
+  if (file.exists(archivo_config)) {
+
+    if (!identical(readRDS(archivo_config), configuracion)) {
+      stop(
+        "Cambió la configuración. Cambiá ETIQUETA ",
+        "para guardar los nuevos resultados en otra carpeta."
+      )
+    }
+
+  } else {
+
+    temporal <- paste0(archivo_config, ".tmp")
+    saveRDS(configuracion, temporal)
+
+    if (!file.rename(temporal, archivo_config)) {
+      stop("No se pudo guardar la configuración.")
+    }
+  }
+
+  # Lista de las 5 semillas previstas para esta evaluación
+  guardar_csv(
+    data.table(
+      modelo = seq_along(semillas_junio),
+      seed = semillas_junio
+    ),
+    file.path(carpeta, "semillas_modelos.csv")
+  )
+
+# [Anotación · líneas 2115–2147] Filtra los registros de entrenamiento con filtrar_con_checkpoint (checkpoint
+#   filtro_junio.rds), construye el lgb.Dataset de entrenamiento con etiqueta 1 para BAJA+1 y BAJA+2, y la
+#   matriz de predictores de 202106.
+  # ==========================================================
+  # 4. Filtrar registros y preparar LightGBM
+  # ==========================================================
+
+  tr <- filtrar_con_checkpoint(
+    dt = tr,
+    campos = campos_junio,
+    semilla = PARAM$semilla_primigenia,
+    archivo = file.path(carpeta, "filtro_junio.rds"),
+    undersampling30 = PARAM$ruido$undersampling30,
+    umbral = PARAM$ruido$umbral
+  )
+
+  gc()
+
+  dtrain_junio <- lgb.Dataset(
+    data = data.matrix(tr[, campos_junio, with = FALSE]),
+    label = as.integer(
+      tr$clase_ternaria %in% c("BAJA+1", "BAJA+2")
+    ),
+    params = parametros,
+    free_raw_data = TRUE
+  )
+
+  dtrain_junio$construct()
+
+  rm(tr)
+  gc()
+
+  X_junio <- data.matrix(fu[, campos_junio, with = FALSE])
+
+  rm(fu, ids_numericos)
+  gc()
+
+# [Anotación · líneas 2149–2218] Define evaluar: ordena los clientes de 202106 por probabilidad descendente,
+#   calcula la ganancia acumulada y la cantidad acumulada de BAJA+2, guarda la tabla completa de predicciones,
+#   extrae el resumen en los cortes definidos, escribe un archivo de identificadores por cada corte y devuelve
+#   el resumen y la curva de ganancia hasta 30.000 envíos.
+  # ==========================================================
+  # 5. Función para calcular ganancias y generar campañas
+  # ==========================================================
+
+  evaluar <- function(prob, etiqueta) {
+
+    stopifnot(
+      length(prob) == nrow(referencia),
+      all(is.finite(prob)),
+      all(prob >= 0 & prob <= 1)
+    )
+
+    tabla <- copy(referencia)
+    set(tabla, j = "prob", value = prob)
+
+    tabla[, id_orden := as.numeric(numero_de_cliente)]
+    setorder(tabla, -prob, id_orden)
+    tabla[, id_orden := NULL]
+
+    tabla[, gan := fifelse(
+      clase_ternaria == "BAJA+2",
+      GANANCIA_BAJA2,
+      COSTO_OTROS
+    )]
+
+    tabla[, ganancia_acumulada := cumsum(gan)]
+    tabla[, baja2_acumuladas := cumsum(
+      clase_ternaria == "BAJA+2"
+    )]
+    tabla[, envios := seq_len(.N)]
+
+    guardar_csv(
+      tabla,
+      file.path(
+        carpeta,
+        "probabilidades",
+        paste0("predicciones_junio_", etiqueta, ".csv")
+      )
+    )
+
+    resumen <- tabla[
+      envios %in% CORTES_JUNIO,
+      .(
+        modelo = etiqueta,
+        envios,
+        baja2 = baja2_acumuladas,
+        ganancia_total = ganancia_acumulada
+      )
+    ]
+
+    for (corte in CORTES_JUNIO) {
+      writeLines(
+        tabla$numero_de_cliente[seq_len(corte)],
+        file.path(
+          carpeta,
+          "campania",
+          paste0("junio_", etiqueta, "_top_", corte, ".csv")
+        ),
+        useBytes = TRUE
+      )
+    }
+
+    list(
+      resumen = resumen,
+      curva = tabla[
+        envios <= min(30000L, nrow(tabla)),
+        .(envios, ganancia_acumulada)
+      ]
+    )
+  }
+
+# [Anotación · líneas 2220–2293] Recorre las 5 semillas. Si ya existe el archivo de predicciones de la
+#   semilla, lo lee, verifica que tenga los mismos clientes, mes, clases y probabilidades entre 0 y 1, y
+#   reutiliza esas probabilidades alineadas por cliente.
+  # ==========================================================
+  # 6. Entrenar o recuperar las 5 semillas
+  # ==========================================================
+
+  suma_prob <- numeric(nrow(referencia))
+  resultados <- vector("list", length(semillas_junio))
+  curvas <- vector("list", length(semillas_junio))
+
+  for (i in seq_along(semillas_junio)) {
+
+    semilla <- semillas_junio[i]
+    etiqueta <- paste0("seed_", semilla)
+
+    cat(
+      "\nModelo", i, "de", length(semillas_junio),
+      "| seed:", semilla, "\n"
+    )
+    flush.console()
+
+    archivo_modelo <- file.path(
+      carpeta,
+      "modelos",
+      paste0("modelo_", semilla, ".txt")
+    )
+
+    archivo_prob <- file.path(
+      carpeta,
+      "probabilidades",
+      paste0("predicciones_junio_", etiqueta, ".csv")
+    )
+
+    if (file.exists(archivo_prob)) {
+
+      cat("Recuperando probabilidades guardadas...\n")
+
+      anterior <- fread(
+        archivo_prob,
+        colClasses = c(numero_de_cliente = "character")
+      )
+
+      stopifnot(
+        all(c(
+          "numero_de_cliente", "foto_mes",
+          "clase_ternaria", "prob"
+        ) %in% names(anterior)),
+        !anyNA(anterior$numero_de_cliente),
+        !anyDuplicated(anterior$numero_de_cliente),
+        nrow(anterior) == nrow(referencia),
+        setequal(
+          anterior$numero_de_cliente,
+          referencia$numero_de_cliente
+        ),
+        !anyNA(anterior$foto_mes),
+        all(anterior$foto_mes == MES_EVALUACION),
+        is.numeric(anterior$prob),
+        all(is.finite(anterior$prob)),
+        all(anterior$prob >= 0 & anterior$prob <= 1)
+      )
+
+      orden <- match(
+        referencia$numero_de_cliente,
+        anterior$numero_de_cliente
+      )
+
+      stopifnot(
+        identical(
+          as.character(anterior$clase_ternaria[orden]),
+          referencia$clase_ternaria
+        )
+      )
+
+      prob <- anterior$prob[orden]
+      rm(anterior, orden)
+
+# [Anotación · líneas 2294–2346] Si no hay predicciones guardadas, carga el modelo de la semilla si existe o
+#   lo entrena con param_final y esa semilla y lo guarda; predice 202106, evalúa con evaluar y acumula las
+#   probabilidades y los resultados de cada semilla.
+    } else {
+
+      if (file.exists(archivo_modelo)) {
+
+        cat("Recuperando modelo guardado...\n")
+        modelo <- lgb.load(archivo_modelo)
+
+      } else {
+
+        p <- parametros
+        p$seed <- semilla
+
+        tiempo <- system.time({
+          modelo <- lgb.train(
+            data = dtrain_junio,
+            params = p
+          )
+        })
+
+        cat(
+          "Entrenamiento:",
+          tiempo[["elapsed"]], "segundos\n"
+        )
+
+        temporal <- paste0(archivo_modelo, ".tmp")
+        lgb.save(modelo, temporal)
+
+        if (!file.rename(temporal, archivo_modelo)) {
+          stop("No se pudo guardar el modelo.")
+        }
+      }
+
+      prob <- predict(
+        modelo,
+        X_junio,
+        params = list(num_threads = HILOS_JUNIO)
+      )
+
+      rm(modelo)
+      invisible(gc())
+    }
+
+    evaluacion <- evaluar(prob, etiqueta)
+
+    suma_prob <- suma_prob + prob
+    resultados[[i]] <- evaluacion$resumen
+    curvas[[i]] <- evaluacion$curva
+
+    rm(prob, evaluacion)
+  }
+
+  rm(dtrain_junio, X_junio)
+  gc()
+
+# [Anotación · líneas 2348–2386] Evalúa el promedio de las probabilidades de las 5 semillas, une los resúmenes
+#   por semilla y del promedio en ganancia_por_corte.csv, y guarda e imprime la tabla del promedio (envíos,
+#   BAJA+2 detectadas, ganancia total) en ganancia_promedio_5_semillas.csv.
+  # ==========================================================
+  # 7. Promedio de las 5 semillas y tabla de ganancias
+  # ==========================================================
+
+  evaluacion_promedio <- evaluar(
+    suma_prob / length(semillas_junio),
+    "promedio_5_semillas"
+  )
+
+  resumen_total <- rbindlist(c(
+    resultados,
+    list(evaluacion_promedio$resumen)
+  ))
+
+  guardar_csv(
+    resumen_total,
+    file.path(carpeta, "ganancia_por_corte.csv")
+  )
+
+  tabla_ganancias <- resumen_total[
+    modelo == "promedio_5_semillas",
+    .(
+      Envios = envios,
+      BAJA2_detectadas = baja2,
+      Ganancia_total = ganancia_total
+    )
+  ]
+
+  guardar_csv(
+    tabla_ganancias,
+    file.path(carpeta, "ganancia_promedio_5_semillas.csv")
+  )
+
+  cat(
+    "\nGANANCIA TOTAL DEL PROMEDIO DE LAS 5 SEMILLAS\n",
+    "Cortes entre 8.000 y 15.000 envíos\n\n"
+  )
+
+  print(tabla_ganancias, nrows = nrow(tabla_ganancias))
+
+# [Anotación · líneas 2388–2466] Dibuja la curva de ganancia acumulada según la cantidad de envíos para cada
+#   semilla y para el promedio, la muestra en el notebook y la guarda en curva_ganancia_total_junio.png. Cierra
+#   el bloque local.
+  # ==========================================================
+  # 8. Curva de ganancia total acumulada
+  # ==========================================================
+
+  dibujar_curva <- function() {
+
+    colores <- c(
+      "#999999", "#6B8EAD", "#B7986B",
+      "#8D79A8", "#79A88D"
+    )
+
+    valores <- c(
+      0,
+      unlist(lapply(
+        curvas,
+        function(x) x$ganancia_acumulada
+      )),
+      evaluacion_promedio$curva$ganancia_acumulada
+    )
+
+    plot(
+      evaluacion_promedio$curva$envios,
+      evaluacion_promedio$curva$ganancia_acumulada,
+      type = "n",
+      ylim = range(valores, finite = TRUE),
+      xlab = "Cantidad de envíos",
+      ylab = "Ganancia total acumulada (pesos)",
+      main = "Junio: ganancia total de 5 semillas y promedio"
+    )
+
+    for (i in seq_along(curvas)) {
+      lines(
+        curvas[[i]]$envios,
+        curvas[[i]]$ganancia_acumulada,
+        col = colores[i],
+        lwd = 1
+      )
+    }
+
+    lines(
+      evaluacion_promedio$curva$envios,
+      evaluacion_promedio$curva$ganancia_acumulada,
+      col = "#800020",
+      lwd = 3
+    )
+
+    abline(h = 0, lty = 2)
+
+    legend(
+      "topright",
+      legend = c(
+        paste0("Seed ", semillas_junio),
+        "Promedio 5 semillas"
+      ),
+      col = c(colores, "#800020"),
+      lwd = c(rep(1, length(semillas_junio)), 3),
+      cex = 0.8,
+      bty = "n"
+    )
+  }
+
+  dibujar_curva()
+
+  png(
+    file.path(carpeta, "curva_ganancia_total_junio.png"),
+    width = 1600,
+    height = 900,
+    res = 150
+  )
+
+  tryCatch(
+    dibujar_curva(),
+    finally = dev.off()
+  )
+
+  cat("\nResultados guardados en:", carpeta, "\n")
+})
+
+gc()
+
+# [Anotación · líneas 2468–2506] Preparación del entrenamiento final: cambia al directorio de agosto, elimina
+#   datasets y modelos anteriores, vuelve a leer competencia_01_ct10.csv.gz y arma la lista inicial de
+#   predictores (EXCLUIR_AGOSTO está vacío).
+#%% celda 50 [código]
+# ============================================================
+# 3. Preparar marzo–junio y agosto
+# Reincorporar las 42 variables de préstamos para agosto
+# ============================================================
+
+library(data.table)
+
+setwd(carpeta_experimento)
+
+# Liberar datos anteriores y objetos de entrenamiento de la BO
+rm(list = intersect(
+  c(
+    "dataset", "dataset_train", "dataset_valid",
+    "dfuture", "dtrain", "dvalidate", "modelo"
+  ),
+  ls()
+))
+gc()
+
+# Volver a leer el dataset
+dataset <- fread(
+  "/home/ds/buckets/b1/datasets/competencia_01_ct10.csv.gz",
+  stringsAsFactors = TRUE
+)
+
+# Exclusiones adicionales para agosto
+EXCLUIR_AGOSTO <- character()
+# EXCLUIR_AGOSTO <- c("rank_variable1", "rank_variable2")
+
+# Predictores candidatos
+campos_buenos <- setdiff(
+  names(dataset),
+  c(
+    "numero_de_cliente","clase_ternaria", "clase01", "fold", "azar",
+    "training", "training30", "prob30", "aporta",
+    EXCLUIR_AGOSTO
+  )
+)
+
+# [Anotación · líneas 2508–2566] Con canaritos activados, lee seleccion.rds, verifica su contenido y usa las
+#   variables seleccionadas como predictores, en el mismo orden.
+# ============================================================
+# Recuperar y aplicar la selección de canaritos
+# ============================================================
+
+if (is.null(PARAM$usar_canaritos)) {
+  stop(
+    "Definí PARAM$usar_canaritos <- TRUE o FALSE ",
+    "antes de ejecutar esta celda."
+  )
+}
+
+if (isTRUE(PARAM$usar_canaritos)) {
+
+  archivo_seleccion <- file.path(
+    "/home/ds/buckets/b1/exp",
+    PARAM$experimento,
+    "canaritos",
+    "seleccion.rds"
+  )
+
+  if (!file.exists(archivo_seleccion)) {
+    stop(
+      "No se encontró la selección de canaritos. ",
+      "Ejecutá primero la celda de selección."
+    )
+  }
+
+  seleccion_agosto <- readRDS(archivo_seleccion)
+
+  stopifnot(
+    is.character(seleccion_agosto$campos),
+    length(seleccion_agosto$campos) > 0L,
+    !anyNA(seleccion_agosto$campos),
+    !anyDuplicated(seleccion_agosto$campos),
+    all(seleccion_agosto$campos %in% campos_buenos |
+          seleccion_agosto$campos %in% EXCLUIR_AGOSTO)
+  )
+
+  # Mantener el orden de las variables seleccionadas
+  campos_buenos <- seleccion_agosto$campos[
+    !seleccion_agosto$campos %in% EXCLUIR_AGOSTO
+  ]
+
+  cat(
+    "\nCanaritos activados.",
+    "\nPredictores recuperados de la selección:",
+    length(campos_buenos), "\n"
+  )
+
+  rm(seleccion_agosto)
+
+} else {
+
+  cat(
+    "\nCanaritos desactivados.",
+    "\nPredictores candidatos:",
+    length(campos_buenos), "\n"
+  )
+}
+
+# [Anotación · líneas 2568–2643] Construye los nombres de las 42 variables de préstamos personales
+#   (cprestamos_personales y mprestamos_personales, con sus lags, deltas, tendencia y promedio, en versiones
+#   rank_, las_zero_ y missing_), verifica que existan en el dataset y las agrega a los predictores sin
+#   duplicar; imprime cuántas se incorporan y el total.
+# ============================================================
+# Reincorporar las 42 variables de préstamos para agosto
+# No modificar la selección guardada para la BO
+# ============================================================
+
+bases_prestamos <- c(
+  "cprestamos_personales",
+  "mprestamos_personales"
+)
+
+campos_prestamos <- unlist(
+  lapply(bases_prestamos, function(variable) {
+    c(
+      variable,
+      paste0("Lag1_", variable),
+      paste0("Lag2_", variable),
+      paste0("Delta1_", variable),
+      paste0("Delta2_", variable),
+      paste0(variable, "_tend3"),
+      paste0(variable, "_avg3")
+    )
+  }),
+  use.names = FALSE
+)
+
+variables_prestamos <- unlist(
+  lapply(
+    c("rank_", "las_zero_", "missing_"),
+    function(prefijo) paste0(prefijo, campos_prestamos)
+  ),
+  use.names = FALSE
+)
+
+# Verificar que existan todas
+faltantes <- setdiff(variables_prestamos, names(dataset))
+
+if (length(faltantes)) {
+  stop(
+    "Faltan variables de préstamos: ",
+    paste(faltantes, collapse = ", ")
+  )
+}
+
+# Evitar instrucciones contradictorias
+conflictos <- intersect(variables_prestamos, EXCLUIR_AGOSTO)
+
+if (length(conflictos)) {
+  stop(
+    "Estas variables de préstamos también están en EXCLUIR_AGOSTO: ",
+    paste(conflictos, collapse = ", ")
+  )
+}
+
+cantidad_antes <- length(campos_buenos)
+
+# Agregar las 42 variables sin duplicar las que ya estaban
+campos_buenos <- unique(c(
+  campos_buenos,
+  variables_prestamos
+))
+
+stopifnot(
+  length(variables_prestamos) == 42L,
+  all(variables_prestamos %in% campos_buenos),
+  length(campos_buenos) > 0L,
+  all(campos_buenos %in% names(dataset))
+)
+
+cat(
+  "\nVariables de préstamos incluidas:",
+  length(variables_prestamos),
+  "\nVariables adicionales incorporadas:",
+  length(campos_buenos) - cantidad_antes,
+  "\nTotal de predictores para agosto:",
+  length(campos_buenos), "\n"
+)
+
+# [Anotación · líneas 2645–2690] Separa el entrenamiento (meses de PARAM$train_final: 202103 a 202106) y los
+#   registros a predecir (202108) con las columnas necesarias, libera el dataset completo, verifica clases,
+#   columnas y unicidad de clientes, crea clase01 = 1 para BAJA+1 y BAJA+2 e imprime la cantidad por mes y
+#   clase.
+# ============================================================
+# Separar entrenamiento y predicción
+# ============================================================
+
+columnas_necesarias <- unique(c(
+  "numero_de_cliente",
+  "foto_mes",
+  "clase_ternaria",
+  campos_buenos
+))
+
+dataset_train <- dataset[
+  foto_mes %in% PARAM$train_final,
+  columnas_necesarias,
+  with = FALSE
+]
+
+dfuture <- dataset[
+  foto_mes %in% PARAM$future,
+  columnas_necesarias,
+  with = FALSE
+]
+
+# Liberar el dataset completo
+rm(dataset)
+gc()
+
+stopifnot(
+  all(PARAM$train_final %in% dataset_train$foto_mes),
+  all(PARAM$future %in% dfuture$foto_mes),
+  nrow(dfuture) > 0L,
+  !anyNA(dataset_train$clase_ternaria),
+  all(dataset_train$clase_ternaria %in%
+        c("CONTINUA", "BAJA+1", "BAJA+2")),
+  all(campos_buenos %in% names(dataset_train)),
+  all(campos_buenos %in% names(dfuture)),
+  !anyNA(dfuture$numero_de_cliente),
+  !anyDuplicated(dfuture$numero_de_cliente)
+)
+
+dataset_train[, clase01 :=
+  as.integer(clase_ternaria %in% c("BAJA+1", "BAJA+2"))]
+
+print(
+  dataset_train[, .N, by = .(foto_mes, clase_ternaria)]
+)
+
+# [Anotación · líneas 2692–2718] Convierte los numero_de_cliente de 202108 a texto entero, verifica que sean
+#   únicos y numéricos, e imprime la cantidad de registros de entrenamiento, clientes de agosto y predictores.
+# ============================================================
+# Preparar IDs de agosto
+# ============================================================
+
+ids_numericos <- as.numeric(
+  as.character(dfuture$numero_de_cliente)
+)
+
+stopifnot(
+  all(is.finite(ids_numericos)),
+  all(ids_numericos == trunc(ids_numericos)),
+  all(abs(ids_numericos) < 2^53)
+)
+
+ids_agosto <- sprintf("%.0f", ids_numericos)
+
+stopifnot(
+  !anyDuplicated(ids_agosto),
+  all(grepl("^[0-9]+$", ids_agosto))
+)
+
+cat(
+  "\nRegistros de entrenamiento:", nrow(dataset_train),
+  "\nClientes de agosto:", length(ids_agosto),
+  "\nPredictores utilizados:", length(campos_buenos),
+  "\n"
+)
+
+# [Anotación · líneas 2720–2772] Filtra los registros de 202103 a 202106 con filtrar_con_checkpoint
+#   (checkpoint filtro_agosto.rds, semilla 200003, undersampling30 = 0.1, umbral = 0.5), construye dtrain_final
+#   con los registros conservados y la matriz X_agosto con todos los clientes de 202108.
+#%% celda 51 [código]
+# ============================================================
+# 4. Preparar LightGBM con checkpoint del filtrado
+# ============================================================
+
+objetos_liberar <- intersect(
+  c("dtrain", "dvalidate", "dataset_valid"),
+  ls()
+)
+
+rm(list = objetos_liberar)
+gc()
+
+# Checkpoint del filtrado marzo-junio
+archivo_filtro_agosto <- file.path(
+  carpeta_experimento,
+  "filtro_agosto.rds"
+)
+
+dataset_train <- filtrar_con_checkpoint(
+  dt = dataset_train,
+  campos = campos_buenos,
+  semilla = PARAM$semilla_primigenia,
+  archivo = archivo_filtro_agosto,
+  undersampling30 = PARAM$ruido$undersampling30,
+  umbral = PARAM$ruido$umbral
+)
+
+param_final$num_threads <- 4L
+
+dtrain_final <- lgb.Dataset(
+  data = data.matrix(
+    dataset_train[, campos_buenos, with = FALSE]
+  ),
+  label = dataset_train$clase01,
+  params = param_final,
+  free_raw_data = TRUE
+)
+
+dtrain_final$construct()
+
+rm(dataset_train)
+gc()
+
+# Agosto: predecir todos los clientes
+X_agosto <- data.matrix(
+  dfuture[, campos_buenos, with = FALSE]
+)
+
+rm(dfuture, ids_numericos)
+gc()
+
+suma_prob <- numeric(length(ids_agosto))
+
+# [Anotación · líneas 2774–2814] Verifica las semillas y los identificadores de agosto, crea las carpetas de
+#   salida, define guardar_csv (archivo temporal y renombrado) e inicia vacío el registro de semillas
+#   completadas.
+#%% celda 52 [código]
+# ============================================================
+# 5. Entrenar o recuperar las semillas seleccionadas de agosto
+# ============================================================
+
+library(data.table)
+library(lightgbm)
+
+setwd(carpeta_experimento)
+
+param_final$num_threads <- 4L
+
+stopifnot(
+  length(semillas_agosto) > 0L,
+  !anyNA(semillas_agosto),
+  !anyDuplicated(semillas_agosto),
+  length(ids_agosto) > 0L,
+  !anyNA(ids_agosto),
+  !anyDuplicated(ids_agosto),
+  nrow(X_agosto) == length(ids_agosto)
+)
+
+for (carpeta in c(
+  "modelos", "probabilidades", "feature_importance"
+)) {
+  dir.create(carpeta, showWarnings = FALSE)
+}
+
+# Guardado mediante archivo temporal
+guardar_csv <- function(tabla, archivo) {
+
+  temporal <- paste0(archivo, ".tmp")
+  fwrite(tabla, temporal, quote = FALSE)
+
+  if (!file.rename(temporal, archivo)) {
+    stop("No se pudo guardar: ", archivo)
+  }
+}
+
+# Reconstruir el registro de esta ejecución
+semillas_completadas <- integer()
+
+# [Anotación · líneas 2816–2866] Recorre semillas_agosto. Si ya existe
+#   probabilidades_202108_seed_<semilla>.csv, lo lee y verifica que contenga los mismos clientes, el mes 202108
+#   y probabilidades entre 0 y 1.
+for (i in seq_along(semillas_agosto)) {
+
+  semilla <- semillas_agosto[i]
+
+  cat(
+    "\nModelo", i, "de", length(semillas_agosto),
+    "| seed:", semilla, "\n"
+  )
+  flush.console()
+
+  archivo_modelo <- file.path(
+    "modelos",
+    paste0("modelo_", semilla, ".txt")
+  )
+
+  archivo_prob <- file.path(
+    "probabilidades",
+    paste0("probabilidades_202108_seed_", semilla, ".csv")
+  )
+
+  modelo <- NULL
+  tabla_prob <- NULL
+
+  # ==========================================================
+  # Recuperar probabilidades completas, si ya existen
+  # ==========================================================
+
+  if (file.exists(archivo_prob)) {
+
+    cat("Recuperando probabilidades guardadas...\n")
+    flush.console()
+
+    tabla_prob <- fread(
+      archivo_prob,
+      colClasses = c(numero_de_cliente = "character")
+    )
+
+    stopifnot(
+      all(c(
+        "numero_de_cliente", "foto_mes", "prob"
+      ) %in% names(tabla_prob)),
+      nrow(tabla_prob) == length(ids_agosto),
+      !anyNA(tabla_prob$numero_de_cliente),
+      !anyDuplicated(tabla_prob$numero_de_cliente),
+      setequal(tabla_prob$numero_de_cliente, ids_agosto),
+      !anyNA(tabla_prob$foto_mes),
+      all(tabla_prob$foto_mes == 202108L),
+      is.numeric(tabla_prob$prob),
+      all(is.finite(tabla_prob$prob)),
+      all(tabla_prob$prob >= 0 & tabla_prob$prob <= 1)
+    )
+
+# [Anotación · líneas 2868–2907] Si no hay probabilidades guardadas: carga modelos/modelo_<semilla>.txt si
+#   existe; si no, entrena un LightGBM sobre dtrain_final con param_final y seed igual a la semilla, y guarda el
+#   modelo mediante archivo temporal.
+  } else {
+
+    # ========================================================
+    # Recuperar o entrenar el modelo
+    # ========================================================
+
+    if (file.exists(archivo_modelo)) {
+
+      cat("Recuperando modelo guardado...\n")
+      flush.console()
+
+      modelo <- lgb.load(archivo_modelo)
+
+    } else {
+
+      parametros_modelo <- param_final
+      parametros_modelo$seed <- semilla
+
+      cat("Entrenando con 8 hilos...\n")
+      flush.console()
+
+      tiempo <- system.time({
+        modelo <- lgb.train(
+          data = dtrain_final,
+          params = parametros_modelo
+        )
+      })
+
+      cat(
+        "Entrenamiento:",
+        tiempo[["elapsed"]], "segundos\n"
+      )
+
+      temporal <- paste0(archivo_modelo, ".tmp")
+      lgb.save(modelo, temporal)
+
+      if (!file.rename(temporal, archivo_modelo)) {
+        stop("No se pudo guardar el modelo: ", archivo_modelo)
+      }
+    }
+
+# [Anotación · líneas 2909–2946] Predice la probabilidad de los clientes de 202108, verifica que sea finita y
+#   esté entre 0 y 1, y guarda la tabla (numero_de_cliente, foto_mes, prob) ordenada por probabilidad
+#   descendente en el archivo de la semilla.
+    # ========================================================
+    # Predecir agosto y guardar las probabilidades completas
+    # ========================================================
+
+    cat("Prediciendo agosto...\n")
+    flush.console()
+
+    tiempo <- system.time({
+      prob <- predict(
+        modelo,
+        X_agosto,
+        params = list(num_threads = 4L)
+      )
+    })
+
+    cat(
+      "Predicción:",
+      tiempo[["elapsed"]], "segundos\n"
+    )
+
+    stopifnot(
+      length(prob) == length(ids_agosto),
+      all(is.finite(prob)),
+      all(prob >= 0 & prob <= 1)
+    )
+
+    tabla_prob <- data.table(
+      numero_de_cliente = ids_agosto,
+      foto_mes = 202108L,
+      prob = prob
+    )
+
+    setorder(tabla_prob, -prob, numero_de_cliente)
+
+    guardar_csv(tabla_prob, archivo_prob)
+
+    rm(prob)
+  }
+
+# [Anotación · líneas 2948–2973] Agrega la semilla al registro de completadas y reescribe
+#   semillas_completadas.csv después de cada modelo; al final imprime cuántas semillas se completaron.
+  # Registrar solo después de validar o guardar la predicción
+  semillas_completadas <- c(
+    semillas_completadas,
+    semilla
+  )
+
+  guardar_csv(
+    data.table(seed = semillas_completadas),
+    "semillas_completadas.csv"
+  )
+
+  cat(
+    "Semilla completada:", semilla,
+    "| Completadas:", length(semillas_completadas), "\n"
+  )
+  flush.console()
+
+  rm(modelo, tabla_prob)
+  invisible(gc())
+}
+
+cat(
+  "\nProceso terminado:",
+  length(semillas_completadas),
+  "semillas completas.\n"
+)
+
+# [Anotación · líneas 2975–3020] Celda de promedio: reconstruye la ruta de la carpeta de agosto, lee
+#   semillas_modelos.csv y toma las primeras N_SEMILLAS_AGOSTO semillas.
+#%% celda 53 [código]
+# ============================================================
+# 6. Promediar las predicciones completas de agosto
+# Puede ejecutarse aunque el entrenamiento se haya interrumpido
+# ============================================================
+
+library(data.table)
+
+carpeta_experimento <- file.path(
+  "/home/ds/buckets/b1/exp",
+  PARAM$experimento,
+  PARAM$version_agosto
+)
+
+# ============================================================
+# Recuperar la lista COMPLETA de semillas disponibles
+# ============================================================
+
+archivo_semillas <- file.path(
+  carpeta_experimento,
+  "semillas_modelos.csv"
+)
+
+if (!file.exists(archivo_semillas)) {
+  stop("Primero ejecutá la celda de configuración de agosto.")
+}
+
+semillas_guardadas <- as.integer(
+  fread(archivo_semillas)$seed
+)
+
+stopifnot(
+  length(semillas_guardadas) > 0L,
+  !anyNA(semillas_guardadas),
+  !anyDuplicated(semillas_guardadas),
+  length(N_SEMILLAS_AGOSTO) == 1L,
+  !is.na(N_SEMILLAS_AGOSTO),
+  N_SEMILLAS_AGOSTO >= 1L,
+  N_SEMILLAS_AGOSTO == as.integer(N_SEMILLAS_AGOSTO),
+  N_SEMILLAS_AGOSTO <= length(semillas_guardadas)
+)
+
+semillas_agosto <- head(
+  semillas_guardadas,
+  N_SEMILLAS_AGOSTO
+)
+
+# [Anotación · líneas 3022–3053] Obtiene los identificadores de 202108 desde memoria o, si la sesión se
+#   reinició, leyendo sólo numero_de_cliente y foto_mes del dataset; verifica que sean únicos y numéricos.
+# ============================================================
+# Recuperar los IDs originales de agosto
+# ============================================================
+
+if (exists("ids_agosto", inherits = FALSE)) {
+
+  ids <- as.character(ids_agosto)
+
+} else {
+
+  # Después de reiniciar: leer únicamente ID y mes
+  referencia <- fread(
+    "/home/ds/buckets/b1/datasets/competencia_01_ct10.csv.gz",
+    select = c("numero_de_cliente", "foto_mes"),
+    colClasses = c(numero_de_cliente = "character")
+  )
+
+  ids <- referencia[
+    foto_mes == 202108L,
+    numero_de_cliente
+  ]
+
+  rm(referencia)
+  gc()
+}
+
+stopifnot(
+  length(ids) > 0L,
+  !anyNA(ids),
+  !anyDuplicated(ids),
+  all(grepl("^[0-9]+$", ids))
+)
+
+# [Anotación · líneas 3055–3138] Para cada semilla busca su archivo de probabilidades; lo omite si no existe,
+#   no se puede leer o no cumple las verificaciones (mismos clientes, mes 202108, probabilidades entre 0 y 1).
+#   Suma las probabilidades alineadas por cliente y registra las semillas incluidas; detiene la ejecución si no
+#   hay ninguna.
+# ============================================================
+# Leer y validar las predicciones individuales
+# ============================================================
+
+# Reconstruir desde cero en cada ejecución
+suma_prob <- numeric(length(ids))
+semillas_completadas <- integer()
+
+for (semilla in semillas_agosto) {
+
+  archivo <- file.path(
+    carpeta_experimento,
+    "probabilidades",
+    paste0(
+      "probabilidades_202108_seed_",
+      semilla,
+      ".csv"
+    )
+  )
+
+  if (!file.exists(archivo)) {
+    cat("Sin predicción guardada:", semilla, "\n")
+    next
+  }
+
+  tabla <- tryCatch(
+    fread(
+      archivo,
+      colClasses = c(numero_de_cliente = "character")
+    ),
+    error = function(e) {
+      cat(
+        "No se pudo leer la semilla", semilla,
+        ":", conditionMessage(e), "\n"
+      )
+      NULL
+    }
+  )
+
+  completa <- !is.null(tabla) &&
+    all(c(
+      "numero_de_cliente", "foto_mes", "prob"
+    ) %in% names(tabla)) &&
+    nrow(tabla) == length(ids) &&
+    !anyNA(tabla$numero_de_cliente) &&
+    !anyDuplicated(tabla$numero_de_cliente) &&
+    setequal(tabla$numero_de_cliente, ids) &&
+    !anyNA(tabla$foto_mes) &&
+    all(tabla$foto_mes == 202108L) &&
+    is.numeric(tabla$prob) &&
+    all(is.finite(tabla$prob)) &&
+    all(tabla$prob >= 0 & tabla$prob <= 1)
+
+  if (!completa) {
+
+    cat(
+      "Predicción incompleta o inválida; se omite:",
+      semilla, "\n"
+    )
+
+    rm(tabla)
+    next
+  }
+
+  # Alinear por cliente antes de sumar
+  suma_prob <- suma_prob +
+    tabla$prob[match(ids, tabla$numero_de_cliente)]
+
+  semillas_completadas <- c(
+    semillas_completadas,
+    semilla
+  )
+
+  cat("Incluida en el promedio:", semilla, "\n")
+  flush.console()
+
+  rm(tabla)
+}
+
+cantidad_completadas <- length(semillas_completadas)
+
+if (cantidad_completadas == 0L) {
+  stop("No hay predicciones completas para promediar.")
+}
+
+# [Anotación · líneas 3140–3198] Divide la suma por la cantidad de semillas incluidas, ordena por probabilidad
+#   descendente y guarda probabilidades_202108_promedio_semillas.csv; reescribe semillas_completadas.csv con las
+#   semillas que entraron en el promedio y libera los objetos de entrenamiento.
+# ============================================================
+# Calcular el promedio con las semillas realmente completadas
+# ============================================================
+
+tabla_promedio <- data.table(
+  numero_de_cliente = ids,
+  foto_mes = 202108L,
+  prob = suma_prob / cantidad_completadas
+)
+
+setorder(tabla_promedio, -prob, numero_de_cliente)
+
+guardar_csv_promedio <- function(tabla, archivo) {
+
+  temporal <- paste0(archivo, ".tmp")
+  fwrite(tabla, temporal, quote = FALSE)
+
+  if (!file.rename(temporal, archivo)) {
+    stop("No se pudo guardar: ", archivo)
+  }
+}
+
+# Actualizar el promedio que utilizará la celda de campañas
+guardar_csv_promedio(
+  tabla_promedio,
+  file.path(
+    carpeta_experimento,
+    "probabilidades",
+    "probabilidades_202108_promedio_semillas.csv"
+  )
+)
+
+# Guardar únicamente las semillas incluidas en este promedio
+# No modificar semillas_modelos.csv
+guardar_csv_promedio(
+  data.table(seed = semillas_completadas),
+  file.path(
+    carpeta_experimento,
+    "semillas_completadas.csv"
+  )
+)
+
+cat(
+  "\nPromedio actualizado con",
+  cantidad_completadas,
+  "semillas completas de",
+  N_SEMILLAS_AGOSTO,
+  "seleccionadas.\n"
+)
+
+print(semillas_completadas)
+
+# Liberar objetos grandes si siguen en memoria
+rm(list = intersect(
+  c("dtrain_final", "X_agosto"),
+  ls()
+))
+
+gc()
+
+# [Anotación · líneas 3200–3255] Celda de archivos de campaña: define CORTES_CAMPANIA = 10.000, 10.500,
+#   11.000, 11.500, 12.000 y 12.500, verifica que estén entre 8.000 y 15.000, lee semillas_completadas.csv y
+#   arma la lista de archivos de probabilidades (uno por semilla y el del promedio).
+#%% celda 54 [código]
+# ============================================================
+# 7. Creación CSV
+# ============================================================
+
+library(data.table)
+
+# Si reiniciaste la sesión, definir el nombre del experimento:
+# PARAM <- list(experimento = "HT4950-01")
+
+carpeta_experimento <- file.path(
+  "/home/ds/buckets/b1/exp",
+  PARAM$experimento,
+  PARAM$version_agosto
+)
+
+# Modificar aquí los cortes deseados
+CORTES_CAMPANIA <- c(10000L, 10500L, 11000L, 11500L, 12000L, 12500L)
+
+# Ejemplo con varios cortes:
+# CORTES_CAMPANIA <- c(8000L, 10000L, 12000L, 15000L)
+
+stopifnot(
+  length(CORTES_CAMPANIA) > 0L,
+  !anyNA(CORTES_CAMPANIA),
+  all(CORTES_CAMPANIA >= 8000L),
+  all(CORTES_CAMPANIA <= 15000L),
+  all(CORTES_CAMPANIA == as.integer(CORTES_CAMPANIA))
+)
+
+CORTES_CAMPANIA <- unique(CORTES_CAMPANIA)
+
+carpeta_prob <- file.path(carpeta_experimento, "probabilidades")
+carpeta_salida <- file.path(carpeta_experimento, "campania")
+
+dir.create(
+  carpeta_salida,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# Leer las semillas utilizadas en este experimento
+semillas <- fread(
+  file.path(carpeta_experimento, "semillas_completadas.csv")
+)$seed
+
+# Archivos individuales y promedio
+archivos <- file.path(
+  carpeta_prob,
+  c(
+    paste0("probabilidades_202108_seed_", semillas, ".csv"),
+    "probabilidades_202108_promedio_semillas.csv"
+  )
+)
+
+stopifnot(all(file.exists(archivos)))
+
+# [Anotación · líneas 3257–3303] Para cada archivo de probabilidades ordena por probabilidad descendente y,
+#   para cada corte, escribe en la carpeta campania un archivo Entrega_32_<etiqueta>_top_<corte>.csv con los
+#   numero_de_cliente de los primeros registros, uno por línea y sin encabezado.
+for (archivo in archivos) {
+
+  # IDs como texto para conservar el formato entero
+  tabla <- fread(
+    archivo,
+    colClasses = c(numero_de_cliente = "character")
+  )
+
+  stopifnot(
+    all(c("numero_de_cliente", "prob") %in% names(tabla)),
+    !anyNA(tabla$numero_de_cliente),
+    !anyDuplicated(tabla$numero_de_cliente),
+    all(grepl("^[0-9]+$", tabla$numero_de_cliente)),
+    all(is.finite(tabla$prob)),
+    nrow(tabla) >= max(CORTES_CAMPANIA)
+  )
+
+  setorder(tabla, -prob, numero_de_cliente)
+
+  etiqueta <- sub(
+    "^probabilidades_202108_", "",
+    tools::file_path_sans_ext(basename(archivo))
+  )
+
+  for (corte in CORTES_CAMPANIA) {
+
+    destino <- file.path(
+      carpeta_salida,
+      paste0(
+        "Entrega_32_", etiqueta,
+        "_top_", corte, ".csv"
+      )
+    )
+
+    # Solo IDs: un número por línea, sin encabezado
+    writeLines(
+      tabla$numero_de_cliente[seq_len(corte)],
+      con = destino,
+      useBytes = TRUE
+    )
+
+    cat(
+      "Guardado:", basename(destino),
+      "-", corte, "clientes\n"
+    )
+  }
+}
+
+# [Anotación · líneas 3305–3345] Celda de importancia de variables: fija el directorio de agosto, lee
+#   semillas_completadas.csv, crea la carpeta feature_importance y define guardar_fi (archivo temporal y
+#   renombrado).
+#%% celda 55 [código]
+# ============================================================
+# Feature importance por semilla y promedio
+# Carga modelos guardados: NO vuelve a entrenar
+# ============================================================
+
+library(data.table)
+library(lightgbm)
+
+carpeta_experimento <- file.path(
+  "/home/ds/buckets/b1/exp",
+  PARAM$experimento,
+  PARAM$version_agosto
+)
+
+setwd(carpeta_experimento)
+
+semillas_fi <- as.integer(
+  fread("semillas_completadas.csv")$seed
+)
+
+stopifnot(
+  length(semillas_fi) > 0L,
+  !anyNA(semillas_fi),
+  !anyDuplicated(semillas_fi),
+  length(campos_buenos) > 0L
+)
+
+dir.create("feature_importance", showWarnings = FALSE)
+
+# Guardado mediante archivo temporal
+guardar_fi <- function(tabla, archivo) {
+  temporal <- paste0(archivo, ".tmp")
+  fwrite(tabla, temporal)
+
+  if (!file.rename(temporal, archivo)) {
+    stop("No se pudo guardar: ", archivo)
+  }
+}
+
+suma_gain <- numeric(length(campos_buenos))
+
+# [Anotación · líneas 3347–3435] Para cada semilla recupera su archivo de importancia o carga el modelo
+#   guardado (sin volver a entrenar), calcula lgb.importance en porcentaje, completa con cero las variables sin
+#   splits, guarda feature_importance_seed_<semilla>.csv y acumula el Gain alineado por variable.
+for (i in seq_along(semillas_fi)) {
+
+  semilla <- semillas_fi[i]
+
+  cat(
+    "\nFeature importance", i, "de", length(semillas_fi),
+    "| seed:", semilla, "\n"
+  )
+  flush.console()
+
+  archivo_fi <- file.path(
+    "feature_importance",
+    paste0("feature_importance_seed_", semilla, ".csv")
+  )
+
+  if (file.exists(archivo_fi)) {
+
+    cat("Recuperando feature importance guardado...\n")
+    fi <- fread(archivo_fi)
+
+  } else {
+
+    archivo_modelo <- file.path(
+      "modelos",
+      paste0("modelo_", semilla, ".txt")
+    )
+
+    if (!file.exists(archivo_modelo)) {
+      stop("No se encontró el modelo: ", archivo_modelo)
+    }
+
+    cat("Cargando modelo y calculando importancia...\n")
+    flush.console()
+
+    modelo_fi <- lgb.load(archivo_modelo)
+
+    importancia <- lgb.importance(
+      modelo_fi,
+      percentage = TRUE
+    )
+
+    stopifnot(
+      all(importancia$Feature %in% campos_buenos)
+    )
+
+    # Conservar también las variables sin splits, con cero
+    fi <- merge(
+      data.table(Feature = campos_buenos),
+      importancia,
+      by = "Feature",
+      all.x = TRUE,
+      sort = FALSE
+    )
+
+    for (col in c("Gain", "Cover", "Frequency")) {
+
+      if (!col %in% names(fi)) {
+        fi[, (col) := 0]
+      }
+
+      set(
+        fi,
+        i = which(is.na(fi[[col]])),
+        j = col,
+        value = 0
+      )
+    }
+
+    setorder(fi, -Gain)
+    guardar_fi(fi, archivo_fi)
+
+    rm(modelo_fi, importancia)
+    invisible(gc())
+  }
+
+  stopifnot(
+    all(c("Feature", "Gain") %in% names(fi)),
+    !anyDuplicated(fi$Feature),
+    nrow(fi) == length(campos_buenos),
+    setequal(fi$Feature, campos_buenos),
+    all(is.finite(fi$Gain))
+  )
+
+  # Alinear las variables antes de acumular
+  suma_gain <- suma_gain +
+    fi$Gain[match(campos_buenos, fi$Feature)]
+
+  rm(fi)
+}
+
+# [Anotación · líneas 3437–3491] Promedia el Gain entre semillas, guarda feature_importance_promedio.csv,
+#   imprime las 20 primeras variables y dibuja un gráfico de barras horizontales con ellas.
+# ============================================================
+# Promedio del Gain normalizado entre semillas
+# ============================================================
+
+fi_promedio <- data.table(
+  Feature = campos_buenos,
+  Gain = suma_gain / length(semillas_fi)
+)
+
+setorder(fi_promedio, -Gain)
+
+guardar_fi(
+  fi_promedio,
+  file.path(
+    "feature_importance",
+    "feature_importance_promedio.csv"
+  )
+)
+
+print(head(fi_promedio, 20))
+
+# ============================================================
+# Gráfico de las 20 variables más importantes
+# ============================================================
+
+top20 <- head(fi_promedio, 20)
+
+if (nrow(top20) > 0L && any(top20$Gain > 0)) {
+
+  margen_anterior <- par("mar")
+  par(mar = c(5, 18, 4, 2))
+
+  barplot(
+    rev(top20$Gain),
+    names.arg = rev(top20$Feature),
+    horiz = TRUE,
+    las = 1,
+    cex.names = 0.7,
+    xlab = "Gain normalizado promedio",
+    main = "Importancia de variables"
+  )
+
+  par(mar = margen_anterior)
+}
+
+cat(
+  "\nFeature importance terminado para",
+  length(semillas_fi), "modelos.\n"
+)
+
+cat(
+  "Resultados guardados en:",
+  file.path(getwd(), "feature_importance"),
+  "\n"
+)
+```
+

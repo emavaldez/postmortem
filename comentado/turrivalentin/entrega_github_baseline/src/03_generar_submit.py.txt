@@ -1,0 +1,42 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–12] Carga trabajo/probabilidades_202108.npz y verifica con un assert que estén las
+#   claves m0 a m9; toma el vector de numero_de_cliente y su largo.
+"""Paso 03: promedio de los 10 modelos y archivo para el bot (segundos)."""
+import os
+
+import numpy as np
+
+import comun as cm
+
+pr = np.load(cm.PROBAS)
+faltan = [f'm{i}' for i in range(len(cm.JUEGOS)) if f'm{i}' not in pr]
+assert not faltan, f'faltan modelos del paso 02: {faltan}'
+ids = pr['numero_de_cliente']
+n = len(ids)
+
+# [Anotación · líneas 14–18] Calcula la media de las 10 probabilidades por cliente, ordena de mayor a menor
+#   con argsort estable (los empates conservan el orden de las filas) y toma los primeros N_ENVIOS = 11.000
+#   índices.
+# Los 10 modelos estiman lo mismo (P(BAJA+1 o BAJA+2)) con el mismo target: se promedian probabilidades.
+p = np.mean([pr[f'm{i}'] for i in range(len(cm.JUEGOS))], axis=0)
+# Orden estable: los empates se resuelven siempre igual y el archivo es reproducible.
+orden = np.argsort(-p, kind='stable')
+elegidos = orden[:cm.N_ENVIOS]
+
+# [Anotación · líneas 20–30] Crea salida/ si no existe. Escribe el archivo de envío en ASCII con un ID entero
+#   por línea y salto de línea '\n', sin encabezado. Escribe además prediccion_completa_202108.csv con
+#   encabezado 'numero_de_cliente,Predicted' y un 1 para los elegidos y un 0 para el resto. Imprime cuántos
+#   clientes se eligieron sobre el total.
+os.makedirs(cm.SALIDA, exist_ok=True)
+with open(cm.SUBMIT, 'w', encoding='ascii', newline='') as f:
+    for v in ids[elegidos]:
+        f.write(f'{int(v)}\n')
+pred = np.zeros(n, dtype=int)
+pred[elegidos] = 1
+with open(cm.PREDICCION, 'w', encoding='ascii', newline='') as f:
+    f.write('numero_de_cliente,Predicted\n')
+    for v, q in zip(ids, pred):
+        f.write(f'{int(v)},{int(q)}\n')
+print(f'{cm.N_ENVIOS:,} de {n:,} clientes -> {cm.SUBMIT}')

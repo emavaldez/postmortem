@@ -1,0 +1,20 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–14] Agrega la carpeta de la entrega al path, arma la ruta del dataset
+#   (data/competencia_01.csv, dos niveles arriba de la carpeta de la entrega) y ejecuta construir con salida en
+#   trabajo/historia.
+"""Construye las features de historia (h_*) para todas las variables y las guarda en ../trabajo/historia.
+
+Necesita data/competencia_01.csv en la raíz del repo (lo genera construccion_target.ipynb).
+Uso: python construir_historia.py
+"""
+import os
+import sys
+
+ENTREGA = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ENTREGA)
+from features_historia import construir
+
+DATOS = os.path.join(os.path.dirname(os.path.dirname(ENTREGA)), "data", "competencia_01.csv")
+construir(DATOS, os.path.join(ENTREGA, "trabajo", "historia"))

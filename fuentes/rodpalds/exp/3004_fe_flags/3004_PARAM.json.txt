@@ -1,0 +1,44 @@
+{
+  "experimento": 3004,
+  "nombre": "fe_flags",
+  "descripcion": "Receta del profesor (lags/deltas 1-2 sobre crudos, luego rank por mes con cero fijo) + proceso de muerte en su forma alternativa: un indicador dejo_<producto> por cada una de las 16 claves + las 6 de 03c, todas SIN rankear (conteos, 0/1 y cocientes no tienen inflacion).",
+  "dataset_entrada": "ds1001_base.parquet",
+  "dataset_salida": "ds3004_flags.parquet",
+  "orden": "lag_luego_rank",
+  "extras": "flags",
+  "rankear_extras": false,
+  "lags": [
+    1,
+    2
+  ],
+  "deltas": [
+    1,
+    2
+  ],
+  "claves": [
+    "ctrx_quarter",
+    "mpasivos_margen",
+    "mcaja_ahorro",
+    "mcuentas_saldo",
+    "ctarjeta_visa_transacciones",
+    "ctarjeta_master_transacciones",
+    "ctarjeta_debito_transacciones",
+    "mprestamos_personales",
+    "mpayroll",
+    "cmobile_app_trx",
+    "chomebanking_transacciones",
+    "mcomisiones",
+    "cdescubierto_preacordado",
+    "mcuenta_corriente",
+    "Visa_msaldototal",
+    "Master_msaldototal"
+  ],
+  "relativas_max3": [
+    "ctrx_quarter",
+    "mcaja_ahorro"
+  ],
+  "_config": "3004_fe_flags.json",
+  "_fecha_inicio": "2026-10-09 15:14:27",
+  "_script": "03d_fe_variantes.py",
+  "_git_commit": "sin_git"
+}

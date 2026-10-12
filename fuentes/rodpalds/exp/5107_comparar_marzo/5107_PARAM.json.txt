@@ -1,0 +1,76 @@
+{
+  "experimento": 5107,
+  "nombre": "comparar_marzo",
+  "descripcion": "¿Sirve sumar marzo al entrenamiento aunque no tenga lags? Misma receta completa (ds3003 con lag2) y mismos hiperparametros (p23 de 4104 via 4106; min_data_in_leaf x2 con dos meses), entrenando con abril solo contra marzo + abril. Mitad B de 202106 (x2), 30 semillas, bootstrap pareado. Es el analogo, en validacion, de entrenar el final con marzo a junio en lugar de abril a junio.",
+  "mitades": "4102_bo_fuera_de_tiempo/4102_mitades_junio.csv",
+  "referencia": "solo_abril",
+  "candidatos": {
+    "solo_abril": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4106_bo_receta_muerte/4106_eleccion.json"
+      },
+      "meses_train": [
+        202104
+      ]
+    },
+    "marzo_y_abril": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4106_bo_receta_muerte/4106_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ]
+    }
+  },
+  "mes_train": 202104,
+  "mes_test": 202106,
+  "clase": "clase_binaria2",
+  "n_semillas": 30,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    8000,
+    8500,
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000,
+    15500,
+    16000,
+    16500,
+    17000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "n_bootstrap": 1000,
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "clientes_agosto": 164647,
+  "_config": "5107_comparar_marzo.json",
+  "_fecha_inicio": "2026-10-09 20:04:10",
+  "_script": "11_comparar_pipelines.py",
+  "_git_commit": "sin_git"
+}

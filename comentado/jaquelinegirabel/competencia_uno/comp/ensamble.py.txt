@@ -1,0 +1,42 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–10] Docstring e imports: el mismo modelo se entrena con varias semillas y se promedian
+#   las probabilidades, tanto para medir en el mes de test como para la predicción final.
+"""Ensamble por semillas: entrena el mismo modelo con varias semillas y promedia las
+probabilidades. Reduce la variacion que da una sola semilla "con suerte" (o sin ella).
+
+Sirve tanto para evaluar (X_pred = mes de test) como para la prediccion final (X_pred = agosto).
+"""
+import lightgbm as lgb
+import numpy as np
+
+from .undersampling import corregir_probabilidad, dataset_muestra
+
+
+# [Anotación · líneas 12–34] predecir_promedio_semillas: si el archivo .npy existe lo carga. Si no, para cada
+#   semilla toma la muestra de submuestreo de esa semilla, entrena con lgb.train cambiando sólo 'seed', predice
+#   y corrige las probabilidades; promedia todas las predicciones y guarda el resultado en el .npy.
+def predecir_promedio_semillas(params, num_boost_round, train_lgb, X_pred, semillas, archivo=None, recalcular=False,
+                               y_train=None, undersampling=None):
+    """Promedio de las predicciones de un modelo entrenado con cada semilla.
+
+    undersampling (con y_train): cada semilla entrena con su propia muestra y sus
+    probabilidades se corrigen antes de promediar.
+
+    archivo (.npy, opcional): si existe se carga; si no, se guarda ahi el resultado.
+    """
+    if archivo is not None and archivo.exists() and not recalcular:
+        print('Predicciones cargadas desde', archivo)
+        return np.load(archivo)
+
+    predicciones = []
+    for seed in semillas:
+        datos = dataset_muestra(train_lgb, y_train, undersampling, seed)
+        model = lgb.train({**params, 'seed': seed}, datos, num_boost_round=num_boost_round)
+        predicciones.append(corregir_probabilidad(model.predict(X_pred), undersampling))
+    y_pred = np.mean(predicciones, axis=0)
+
+    if archivo is not None:
+        np.save(archivo, y_pred)
+    return y_pred

@@ -1,0 +1,9 @@
+Poner aqui el archivo de datos (no se sube a git por su tamano):
+
+    competencia_01_crudo.csv
+
+Descarga (la misma que usa la catedra):
+    https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv
+
+Ejemplo:
+    curl -L -o datos/competencia_01_crudo.csv https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv

@@ -1,0 +1,29 @@
+
+===== 037 a/b/c 2026-10-09 20:21 | train (654066, 866) (3985 BAJA+1) | valid 202107 (1103 BAJA+1) | 8 semillas | 855 columnas =====
+montos: 73 variables | factor de precios por mes (202103=1): 202103: 1.000, 202104: 1.000, 202105: 1.027, 202106: 1.141, 202107: 1.115
+canarios: gain máx 0.00719, p90 0.00572 | columnas > máx: 22 de 855 | > p90: 30  (2 min)
+[s=676057] BASE 603.4 | 037a_max -119.1 | 037a_p90 -119.5 | 037b_sin202103 -2.8 | 037c_deflactado -3.7 (4 min)
+[s=482687] BASE 609.1 | 037a_max -129.1 | 037a_p90 -131.4 | 037b_sin202103 +2.6 | 037c_deflactado -1.2 (6 min)
+[s=399221] BASE 614.1 | 037a_max -129.9 | 037a_p90 -134.6 | 037b_sin202103 -1.9 | 037c_deflactado -1.9 (8 min)
+[s=121109] BASE 604.6 | 037a_max -122.9 | 037a_p90 -118.2 | 037b_sin202103 +8.7 | 037c_deflactado +2.5 (10 min)
+[s=292131] BASE 605.4 | 037a_max -119.5 | 037a_p90 -121.3 | 037b_sin202103 -3.3 | 037c_deflactado -1.6 (13 min)
+[s=133559] BASE 607.8 | 037a_max -127.5 | 037a_p90 -123.1 | 037b_sin202103 +1.5 | 037c_deflactado +0.5 (15 min)
+[s=956184] BASE 616.3 | 037a_max -126.6 | 037a_p90 -125.3 | 037b_sin202103 +2.3 | 037c_deflactado -4.0 (17 min)
+[s=853814] BASE 593.3 | 037a_max -103.1 | 037a_p90 -106.0 | 037b_sin202103 +8.1 | 037c_deflactado -1.4 (19 min)
+
+Niveles (ganancia media en M ARS sobre BAJA+1):
+                        M     auc  n_cols
+variante                                 
+037a_max         484.5156  0.9226    22.0
+037a_p90         484.3094  0.9224    30.0
+037b_sin202103   608.6438  0.9443   855.0
+037c_deflactado  605.3781  0.9446   855.0
+BASE             606.7359  0.9447   855.0
+
+Contra BASE (pareado; BH con m=8 y q=0.10; mínimo +3M):
+       variante  n_cols   delta_M     ee pares+  delta_auc  p_unilateral  umbral_BH  pasa
+ 037b_sin202103     855    1.9078 1.6283    5/8    -0.0004        0.1398     0.0125 False
+037c_deflactado     855   -1.3578 0.7466    2/8    -0.0001        0.9441     0.0250 False
+       037a_max      22 -122.2203 3.0953    0/8    -0.0221        1.0000     0.0375 False
+       037a_p90      30 -122.4266 3.0915    0/8    -0.0224        1.0000     0.0500 False
+[037 a/b/c] terminado

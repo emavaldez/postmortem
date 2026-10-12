@@ -1,0 +1,363 @@
+#%% celda 1 [texto]
+### Competencia 1 - Entrega Final
+Junio (target fusionado BAJA+1+BAJA+2) para predecir Agosto. FE04b, trial 25, 20 semillas y corte en N = 12.000
+
+#%% celda 2 [texto]
+##### Librerías y Path Variables
+
+#%% celda 3 [código]
+# Configuración de recursos (parámetros de la máquina: 16 cores, 63.8GB RAM)      
+
+duckdb_threads = 12
+duckdb_memory_limit = '45GB'
+rf_n_jobs = 10
+lgb_threads = 10          # CAMBIO: se dejan los 10 threads con los que se corrió el submit final
+
+print(f"DuckDB: {duckdb_threads} threads, {duckdb_memory_limit} | RF: n_jobs={rf_n_jobs} | LGB: {lgb_threads} threads")
+
+#%% celda 4 [código]
+# Librerías
+
+import os, sys
+os.environ['PATH'] = os.path.join(sys.prefix, 'Library', 'bin') + os.pathsep + os.environ['PATH']
+import duckdb
+
+import pandas as pd
+import numpy as np
+import pickle
+
+import matplotlib.pyplot as plt
+
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+import plotly.express as px
+
+from sklearn.model_selection import StratifiedShuffleSplit
+
+import lightgbm as lgb
+
+import optuna
+from optuna.visualization import plot_optimization_history, plot_param_importances, plot_slice, plot_contour
+
+#%% celda 5 [código]
+# Paths Variables
+
+from pathlib import Path
+cwd = Path.cwd()
+if cwd.name == 'scripts':
+    RAIZ = cwd.parent
+elif cwd.name == '03_competencia_01':
+    RAIZ = cwd
+elif cwd.name == '02_prediccion_final':      # CAMBIO: la notebook final vive en esta carpeta del repo
+    RAIZ = cwd.parent
+else:
+    RAIZ = cwd / '03_competencia_01'
+
+sys.path.insert(0, str(RAIZ / 'scripts'))
+from semillas import SEMILLAS as semillas
+
+base_path = str(RAIZ) + '/'
+print(RAIZ, RAIZ.exists(), (RAIZ / 'scripts' / 'semillas.py').exists())
+
+dataset_path = base_path + 'data/'
+modelos_path = base_path + 'modelos/'
+db_path = base_path + 'data/databases/'
+dataset_file = 'competencia_01_fe03.parquet'
+
+#%% celda 6 [texto]
+##### Carga de Datos
+
+#%% celda 7 [código]
+# Función para cargar los datos de la competencia, filtrando por meses y columnas
+
+ruta_fe03 = dataset_path + dataset_file       # .../data/competencia_01_fe03.parquet
+ROTA = 'ccajas_depositos'
+ROTA_CONFIRMADA = True                        # resultado del chequeo de la otra notebook
+con = duckdb.connect()
+
+def cargar(archivo_cols, meses):
+    cols = Path(archivo_cols).read_text().split('\n')          # nombres de columnas, desde el .txt
+    select_cols = ', '.join(f'"{c}"' for c in cols)            # "col1", "col2", ... para el SELECT
+    lista_meses = ', '.join(str(m) for m in meses)             # 202103, 202104, ... para el WHERE
+
+    df = con.execute(f"""
+        select {select_cols} from read_parquet('{ruta_fe03}')
+        where foto_mes in ({lista_meses})
+    """).fetchdf()
+
+  # la variable rota: NaN solo en mayo
+    if ROTA_CONFIRMADA and ROTA in df.columns:
+        df.loc[df['foto_mes'] == 202105, ROTA] = np.nan
+
+    return df
+
+#%% celda 8 [código]
+# Cargar los datos de la competencia, filtrando por meses y columnas
+
+MESES = [202104, 202106, 202108]          # CAMBIO: abril (optimización), junio (entrena) y agosto (predice)
+
+OPCION = 'b'      # '' = sin históricas | 'b' = con delta_1
+
+archivos = {
+    'a': dataset_path  + 'fe04_a_sin_historicas.txt',
+    'b': dataset_path  + 'fe04_b_con_delta1.txt',
+}
+
+data = cargar(archivos[OPCION], MESES)
+
+data = data.sort_values(['foto_mes', 'numero_de_cliente'])      # CAMBIO: orden fijo de filas
+
+print(data.shape)
+print(data['foto_mes'].value_counts().sort_index())   # filas por mes
+
+#%% celda 9 [texto]
+##### Ganancia/Costo y Meses de Train/Test
+
+#%% celda 10 [código]
+# Ganancia y Costo y Selección de Meses para Entrenamiento y Test
+
+ganancia_acierto = 1_072_500
+costo_estimulo = 27_500
+
+mes_train = 202104    # Abril - mes de entrenamiento
+mes_test = 202106     # Junio - mes de testeo
+
+#%% celda 11 [texto]
+##### Clase Binaria BAJA+2 + X/Y Train/Test (para la Optimización)
+
+#%% celda 12 [código]
+data['clase_binaria_b2'] = np.where(data['clase_ternaria'] == 'BAJA+2', 1, 0)    # optimizo y mido con esta
+
+
+# Preparación de datos para la optimización
+cols_descartar = ['clase_ternaria', 'clase_binaria_b2', 'numero_de_cliente', 'foto_mes']
+
+train_data = data[data['foto_mes'] == mes_train]
+test_data  = data[data['foto_mes'] == mes_test]
+
+X_train = train_data.drop(columns=cols_descartar)
+y_train_binaria = train_data['clase_binaria_b2']
+
+X_test = test_data.drop(columns=cols_descartar)
+y_test_binaria = test_data['clase_binaria_b2']        # ← era 'clase_binaria'
+y_test_class = test_data['clase_ternaria']            # solo para medir; no entra en X
+
+train_data_lgb = lgb.Dataset(X_train, label=y_train_binaria)
+test_data_lgb  = lgb.Dataset(X_test, label=y_test_binaria, reference=train_data_lgb)
+
+#%% celda 13 [texto]
+##### Optimización de Hiperparámetros (Abril, Cross-Validation). Levanta el Study del .db
+
+#%% celda 14 [código]
+sss_opt = StratifiedShuffleSplit(n_splits=5, test_size=0.3, random_state=semillas[0])   # stratified shuffle split para la optimización bayesiana 
+                                                                                        # con 5 splits y 30% de testeo
+
+def objective(trial):
+
+    # bayesianos
+    num_leaves = trial.suggest_int('num_leaves', 8, 256)                                # numero de hojas del árbol
+    min_sum_hessian_in_leaf = trial.suggest_float('min_sum_hessian_in_leaf', 1e-3, 100, log=True)
+    learning_rate = trial.suggest_float('learning_rate', 0.005, 0.2, log=True)          # mas bajo, más iteraciones necesita
+    feature_fraction = trial.suggest_float('feature_fraction', 0.3, 0.7)                # columnas por árbol
+    feature_fraction_bynode = trial.suggest_float('feature_fraction_bynode', 0.1, 0.5)  # columnas por nodo (se multiplica con la anterior)
+    bagging_fraction = trial.suggest_float('bagging_fraction', 0.6, 1.0)                # submuestreo de filas por árbol
+    bagging_freq = trial.suggest_int('bagging_freq', 1, 10)                             # > 0 para que el bagging funcione
+
+    params = {
+        'objective': 'binary',
+        'metric': 'auc',
+        'boosting_type': 'gbdt',
+        'boost_from_average': True,
+        'feature_pre_filter': False,        
+      # fijos de la cátedra
+        'max_bin': 31,                       # número de bins para discretizar las variables continuas
+        'min_data_in_leaf': 0,               # el freno pasa a min_sum_hessian_in_leaf
+      # bayesianos
+        'num_leaves': num_leaves,
+        'min_sum_hessian_in_leaf': min_sum_hessian_in_leaf,
+        'learning_rate': learning_rate,
+        'feature_fraction': feature_fraction,
+        'feature_fraction_bynode': feature_fraction_bynode,
+        'bagging_fraction': bagging_fraction,
+        'bagging_freq': bagging_freq,
+        'seed': semillas[0],
+        'num_threads': lgb_threads,
+        'verbose': -1
+    }
+    num_boost_round = 3000                   # subido de 3000 porque el learning_rate mínimo es más bajo
+    cv_results = lgb.cv(
+        params,
+        train_data_lgb,
+        num_boost_round=num_boost_round,
+        callbacks=[lgb.early_stopping(stopping_rounds=min(int(50 + 5 / learning_rate), num_boost_round // 3), verbose=False)],  
+        folds=sss_opt.split(X_train, y_train_binaria),                    # usamos StratifiedShuffleSplit en vez del k-fold interno
+        seed=semillas[0]
+    )
+
+    max_auc = max(cv_results['valid auc-mean'])
+    best_iter = cv_results['valid auc-mean'].index(max_auc) + 1     # es el num_iterations
+
+    # Guardamos cual es la mejor iteración del modelo
+    trial.set_user_attr("best_iter", best_iter)
+
+    return max_auc
+
+storage_name = "sqlite:///" + db_path + "cpt2_optim_lgbm_Step1.db"
+study_name = "cpt2_step1_b2_lgbm_sss_3000_con_FE04-b"                            # se hizo con FE04b es decir con deltas además de intrames
+
+study = optuna.create_study(
+    direction="maximize",
+    study_name=study_name,
+    storage=storage_name,
+    load_if_exists=True,
+)
+
+print(len(study.trials))     # debe dar 0 si la base es nueva
+
+#%% celda 15 [texto]
+##### Completar la Optimización (si el .db ya tiene los 50 trials, no corre nada)
+
+#%% celda 16 [código]
+objetivo_total = 50                                        # número de trials que queremos correr en total
+faltan = objetivo_total - len(study.trials)
+print(f"Tengo {len(study.trials)}, corro {faltan} más")
+if faltan > 0:
+    study.optimize(objective, n_trials=faltan)
+
+#%% celda 17 [texto]
+##### Configuración del Trial 25 (Target Fusionado: BAJA+1 y BAJA+2)
+
+#%% celda 18 [código]
+# Target fusionado: BAJA+1 y BAJA+2 juntos (1) contra CONTINUA (0)
+data['clase_binaria_b12'] = np.where(data['clase_ternaria'].isin(['BAJA+1', 'BAJA+2']), 1, 0)
+
+# Se descartan el target, el id y el mes, para que no entren a X
+cols_a_descartar = ['clase_ternaria', 'clase_binaria_b2', 'clase_binaria_b12', 'numero_de_cliente', 'foto_mes']
+
+# Receta del trial 25: sus hiperparámetros y el número de árboles (best_iter) que guardó la optimización
+trial_25 = next(t for t in study.trials if t.number == 25)
+best_iter = trial_25.user_attrs['best_iter']
+params = {
+    'objective': 'binary',
+    'boosting_type': 'gbdt',
+    'first_metric_only': True,
+    'boost_from_average': True,
+    'feature_pre_filter': False,
+    'max_bin': 31,                                         # fijo de la cátedra
+    'min_data_in_leaf': 0,                                 # fijo de la cátedra: el freno es min_sum_hessian_in_leaf
+    **trial_25.params,                                     # los 7 hiperparámetros de la optimización
+    'seed': semillas[0],
+    'num_threads': lgb_threads,
+    'verbose': -1
+}
+
+print('best_iter =', best_iter, '(en la corrida original dio 1052)')
+print(trial_25.params)
+
+#%% celda 19 [texto]
+##### Entrenamiento Final: Junio para Predecir Agosto
+
+#%% celda 20 [código]
+# Entrenamiento final: junio (con etiquetas) para predecir agosto (sin etiquetas)
+mes_train_jun = 202106
+mes_pred_ago = 202108
+
+train_jun = data[data['foto_mes'] == mes_train_jun]
+pred_ago = data[data['foto_mes'] == mes_pred_ago]
+
+# IDs de los clientes a predecir, guardados ANTES del drop: son los que van al archivo del submit, en el mismo orden que las predicciones
+ids_pred_ago = pred_ago['numero_de_cliente'].values
+
+# El target es el fusionado (cols_a_descartar viene de la celda anterior)
+X_train_jun = train_jun.drop(columns=cols_a_descartar)
+y_train_jun = train_jun['clase_binaria_b12']
+X_pred_ago = pred_ago.drop(columns=cols_a_descartar)
+
+train_data_lgb_jun = lgb.Dataset(X_train_jun, label=y_train_jun)
+
+# Chequeos: 599 columnas, 164.647 clientes a predecir, y cuántos positivos hay en junio
+print(X_train_jun.shape, X_pred_ago.shape, len(ids_pred_ago))          # CAMBIO: sin la comparación con abril
+print(y_train_jun.value_counts())
+
+#%% celda 21 [texto]
+##### Agosto: 20 Semillas Nuevas con la Receta del Trial 25 (Target Fusionado), Entrenadas con Junio
+
+#%% celda 22 [código]
+# 20 semillas nuevas, distintas de las usadas en la validación (semillas[:20]); hacen falta al menos 40 semillas
+assert len(semillas) >= 40
+semillas_pred = semillas[20:40]
+
+carpeta_modelos_pred = modelos_path + 'cpt04_modelos_TrainJun_FE04b_opt/'
+os.makedirs(carpeta_modelos_pred, exist_ok=True)          # carpeta nueva: no se mezcla con los modelos de abril
+
+resultados_pred_b12 = {}                                  # probabilidades de agosto de cada modelo: (trial, semilla) -> probabilidades
+
+for seed in semillas_pred:
+    params_seed = {**params, 'seed': seed}                # receta del trial 25 (params y best_iter de la celda del fusionado)
+
+    # Entrena con junio (target fusionado), guarda el modelo y predice agosto
+    model_seed = lgb.train(params_seed, train_data_lgb_jun, num_boost_round=best_iter)
+    model_seed.save_model(carpeta_modelos_pred + f"cpt04_TrainJun-FE04b_PredAgo_modb12_t25_s{seed}.txt")
+    resultados_pred_b12[(25, seed)] = model_seed.predict(X_pred_ago)
+    print(f'semilla {seed} lista')
+
+# Guarda las probabilidades y los IDs, en el mismo orden (van juntos para armar los submits)
+with open(modelos_path + 'cpt04_TrainJun-FE04b_PredAgo_probb12_t25.pkl', 'wb') as f:
+    pickle.dump(resultados_pred_b12, f)
+np.save(modelos_path + 'cpt04_TrainJun-FE04b_PredAgo_ids_pred.npy', ids_pred_ago)
+
+print(len(resultados_pred_b12), 'modelos entrenados con junio para predecir agosto')
+
+#%% celda 23 [texto]
+##### Archivo Final: Semillerío con Corte N = 12.000
+
+#%% celda 24 [código]
+# Archivo final: semillerío (promedio de las 20 semillas de agosto) con corte en N
+
+nro_submit = '04'            # número de submit
+meses_sub = 'aja'            # abril-junio-agosto
+fe_sub = 'FE04bOpt'          # dataset + otra información (FE04bOpt = con deltas + optimización)
+
+N_final = 12000              # CAMBIO: corte final (~7,3% de los clientes de agosto), elegido con el público del bot
+
+pref_carpeta = f'submit{nro_submit}{meses_sub}{fe_sub}'      # da 'submit04ajaFE04bOpt'
+pref_archivo = f'Sbm{nro_submit}{meses_sub}{fe_sub}'         # da 'Sbm04ajaFE04bOpt'
+
+carpeta_subs = dataset_path + 'out/'                    # los submits van en data/out
+
+def escribir_ids(ruta, ids):
+  # IDs como enteros (nunca notación científica), uno por línea, sin encabezado
+    with open(ruta, 'w') as f:
+        f.write('\n'.join(str(int(c)) for c in ids))
+
+# Probabilidades de agosto de las 20 semillas, cliente por cliente, en el mismo orden que ids_pred_ago
+p_semillas = {seed: resultados_pred_b12[(25, seed)] for seed in semillas_pred}
+assert all(len(p) == len(ids_pred_ago) for p in p_semillas.values())
+
+# Semillerío: promedio de las 20 probabilidades, cliente por cliente
+p_prom = np.mean(list(p_semillas.values()), axis=0)
+
+# Un solo archivo: los N clientes con mayor probabilidad promedio
+carpeta_sem = carpeta_subs + f'{pref_carpeta}N{N_final}Sem/'
+os.makedirs(carpeta_sem, exist_ok=True)
+ruta_final = carpeta_sem + f'{pref_archivo}N{N_final}_sem.csv'
+idx = np.argsort(p_prom)[::-1][:N_final]
+escribir_ids(ruta_final, ids_pred_ago[idx])
+
+# Chequeos antes de mandar
+texto = open(ruta_final).read()
+ids = texto.split('\n')
+print(N_final, '| semillerío | N líneas:', len(ids) == N_final, '| sin e+:', 'e+' not in texto, '| IDs únicos:', len(set(ids)) == len(ids))
+
+#%% celda 25 [texto]
+##### Comparación con el Archivo Enviado al Bot
+
+#%% celda 26 [código]
+# Compara el archivo recién generado con el que se envió como entrega final (se guarda en submit_final/)
+archivo_enviado = dataset_path + 'out/Sbm04ajaFE04bOptN12000_sem_final.csv'     # el CSV que se subió al bot
+
+texto_enviado = open(archivo_enviado).read()
+ids_enviados = texto_enviado.split('\n')
+print('IDs enviados:', len(ids_enviados), '| IDs generados:', len(ids))
+print('IDs en común:', len(set(ids_enviados) & set(ids)))
+print('Archivos idénticos (mismo orden):', texto_enviado == texto)

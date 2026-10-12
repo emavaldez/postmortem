@@ -1,0 +1,63 @@
+{
+  "experimento": 5023,
+  "nombre": "prod_5015_sin_rotas",
+  "descripcion": "Opcion A: igual que 5015 (ds3003 con lag2, prueba 23, marzo-junio, min_data_in_leaf escalado x4) pero SIN Master/Visa_Finiciomora ni Master/Visa_fultimo_cierre (ni sus lags/deltas): columnas con valores anomalos (ceros inyectados) en 202105, 202106 y 202108. 30 semillas (minimo 20, corte 20:30). Regla fijada antes: se cambia la entrega solo si el publico >= 100,6 (5 puntos sobre 95,59).",
+  "modo": "produccion",
+  "dataset": "ds3003_rank_extra.parquet",
+  "variables": null,
+  "hiperparametros": {
+    "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+  },
+  "meses_train": [
+    202103,
+    202104,
+    202105,
+    202106
+  ],
+  "mes_prediccion": 202108,
+  "clase": "clase_binaria2",
+  "escalar_min_data_in_leaf": true,
+  "n_semillas": 30,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "usar_lag2": true,
+  "sobrescribir": true,
+  "excluir_prefijos": [
+    "Master_Finiciomora",
+    "Visa_Finiciomora",
+    "Master_fultimo_cierre",
+    "Visa_fultimo_cierre"
+  ],
+  "min_semillas": 20,
+  "hora_limite": "2026-10-11 20:30",
+  "_config": "5023_prod_5015_sin_rotas.json",
+  "_fecha_inicio": "2026-10-11 18:54:36",
+  "_script": "07_modelo_final.py",
+  "_git_commit": "sin_git"
+}

@@ -1,0 +1,287 @@
+#%% celda 1 [texto]
+# Grid fino de learning_rate x scale_pos_weight (359 vars: 358 + gen_1)
+
+La BO probó un rango amplio de 11 hiperparámetros y encontró un óptimo de AUC-CV que resultó PEOR en
+ganancia real (452.65M vs 463.98M de los hiperparámetros viejos, sobre el mismo pool) -- probablemente
+porque el learning_rate tan bajo que encontró (0.0132) necesita más de las 600 iteraciones fijas que usamos
+para medir ganancia real.
+
+Esta notebook hace un grid MUCHO más acotado, centrado en los valores viejos que ganan (learning_rate=0.02,
+scale_pos_weight=0.5), manteniendo el resto de los hiperparámetros del set viejo fijos. Va en 3 etapas para
+no gastar de más:
+
+1. Grid completo con 1 semilla (barato, para descartar rápido).
+2. Los mejores candidatos del grid, con screening de 3 semillas.
+3. El mejor candidato, confirmado con las 10 semillas completas -- y si su learning_rate es notablemente más
+   bajo que 0.02, probado también con num_iterations=1000 para descartar subentrenamiento.
+
+Referencia a superar: **463.98M** (hiperparámetros viejos, 359 vars con gen_1, 10 semillas).
+
+#%% celda 2 [texto]
+### Setup y carga de datos
+
+#%% celda 3 [código]
+rm(list = ls())
+gc()
+
+require("data.table")
+require("lightgbm")
+
+PARAM_carpeta_datasets <- "C:/Users/Laura/Documents/DMEyF/datasets/"
+PARAM_carpeta_exp <- "C:/Users/Laura/Documents/DMEyF/exp/"
+
+t0 <- Sys.time()
+dataset <- fread(paste0(PARAM_carpeta_datasets, "competencia_01_con_lags_fe_historico_rankeado.csv.gz"))
+cat("Dataset cargado:", nrow(dataset), "filas x", ncol(dataset), "columnas en",
+    round(as.numeric(Sys.time()-t0, units="secs"),1), "seg\n")
+
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+#%% celda 4 [texto]
+### Reconstruyo las compuestas y gen_1
+
+#%% celda 5 [código]
+agregar_si_existen <- function(dt, nombre_nueva, columnas, fun_combinacion) {
+  presentes <- columnas[columnas %in% colnames(dt)]
+  if (length(presentes) < 2) return(invisible(NULL))
+  dt[, (nombre_nueva) := fun_combinacion(.SD), .SDcols = presentes]
+}
+suma_filas <- function(sd) Reduce(`+`, sd)
+
+agregar_si_existen(dataset, "consumo_tarjetas_total", c("mtarjeta_visa_consumo", "mtarjeta_master_consumo"), suma_filas)
+agregar_si_existen(dataset, "consumototal_tarjetas", c("Visa_mconsumototal", "Master_mconsumototal"), suma_filas)
+agregar_si_existen(dataset, "saldo_tarjetas_total", c("Visa_msaldototal", "Master_msaldototal"), suma_filas)
+agregar_si_existen(dataset, "limite_tarjetas_total", c("Visa_mlimitecompra", "Master_mlimitecompra"), suma_filas)
+agregar_si_existen(dataset, "pagado_tarjetas_total", c("Visa_mpagado", "Master_mpagado"), suma_filas)
+agregar_si_existen(dataset, "pagominimo_tarjetas_total", c("Visa_mpagominimo", "Master_mpagominimo"), suma_filas)
+agregar_si_existen(dataset, "descuentos_tarjetas_total",
+                    c("mcajeros_propios_descuentos", "mtarjeta_visa_descuentos", "mtarjeta_master_descuentos"), suma_filas)
+
+if (all(c("consumototal_tarjetas", "limite_tarjetas_total") %in% colnames(dataset))) {
+  dataset[, utilizacion_tarjetas := ifelse(limite_tarjetas_total == 0, 0,
+                                            consumototal_tarjetas / limite_tarjetas_total)]
+}
+if (all(c("Visa_status", "Master_status") %in% colnames(dataset))) {
+  dataset[, tarjetas_activas_count := as.integer(Visa_status == 0) + as.integer(Master_status == 0)]
+}
+
+agregar_si_existen(dataset, "ingresos_payroll_total", c("mpayroll", "mpayroll2"), suma_filas)
+agregar_si_existen(dataset, "prestamos_sin_personales_total",
+                    c("mprestamos_prendarios", "mprestamos_hipotecarios"), suma_filas)
+agregar_si_existen(dataset, "inversiones_totales",
+                    c("minversion1_pesos", "minversion1_dolares", "minversion2"), suma_filas)
+agregar_si_existen(dataset, "plazo_fijo_total", c("mplazo_fijo_dolares", "mplazo_fijo_pesos"), suma_filas)
+
+if (all(c("mtransferencias_recibidas", "mtransferencias_emitidas") %in% colnames(dataset))) {
+  dataset[, transferencias_netas := mtransferencias_recibidas - mtransferencias_emitidas]
+}
+agregar_si_existen(dataset, "comisiones_totales_manual", c("mcomisiones_mantenimiento", "mcomisiones_otras"), suma_filas)
+
+dataset[, gen_1 := ctrx_quarter + cpayroll_trx_min3]
+
+cat("Compuestas y gen_1 reconstruidas\n")
+
+#%% celda 6 [texto]
+### Cargo la lista ganadora (358 vars) + gen_1 y armo train/future
+
+#%% celda 7 [código]
+campos_buenos <- fread(paste0(PARAM_carpeta_exp, "campos_canaritos_asesinos_2sd.txt"))$variable
+campos_buenos <- campos_buenos[campos_buenos %in% colnames(dataset)]
+campos_buenos <- c(campos_buenos, "gen_1")
+cat("Variables (incluye gen_1):", length(campos_buenos), "\n")
+
+dataset_train <- dataset[foto_mes %in% c(202103, 202104)]
+dfuture <- dataset[foto_mes == 202106]
+clase_ternaria_future <- dfuture[, clase_ternaria]
+
+matriz_train <- data.matrix(dataset_train[, campos_buenos, with = FALSE])
+matriz_future <- data.matrix(dfuture[, campos_buenos, with = FALSE])
+
+rm(dataset)
+gc(full = TRUE, verbose = FALSE)
+
+cat("train:", nrow(dataset_train), "filas | future:", nrow(dfuture), "filas\n")
+
+#%% celda 8 [texto]
+### Hiperparámetros base (los viejos ganadores) y grilla fina a explorar
+
+Todo queda fijo en los valores viejos salvo `learning_rate` y `scale_pos_weight`, que son los dos que vamos
+a barrer.
+
+#%% celda 9 [código]
+param_base <- list(
+  boosting = "gbdt",
+  objective = "binary",
+  metric = "auc",
+  first_metric_only = TRUE,
+  boost_from_average = TRUE,
+  feature_pre_filter = FALSE,
+  verbosity = -100,
+
+  feature_fraction = 0.1541961,
+  feature_fraction_bynode = 1,
+  min_data_in_leaf = 4000,
+  num_leaves = 1684,
+  max_depth = -1,
+  lambda_l1 = 1.520327,
+  lambda_l2 = 7.548036,
+  min_gain_to_split = 0.2158453,
+  max_delta_step = 0,
+  bagging_fraction = 0.8425105,
+  bagging_freq = 6,
+  min_sum_hessian_in_leaf = 0.001,
+  pos_bagging_fraction = 1,
+  neg_bagging_fraction = 1,
+  extra_trees = FALSE,
+  path_smooth = 0,
+  cat_l2 = 10,
+  cat_smooth = 10,
+  max_cat_to_onehot = 4,
+  top_rate = 0.2,
+  other_rate = 0.1,
+  use_missing = TRUE,
+  is_unbalance = FALSE,
+  num_iterations = 600,
+  early_stopping_rounds = 0,
+  max_bin = 31,
+  force_row_wise = TRUE
+)
+
+grilla_learning_rate <- c(0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05)
+grilla_scale_pos_weight <- c(0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.5)
+
+grid <- CJ(learning_rate = grilla_learning_rate, scale_pos_weight = grilla_scale_pos_weight)
+cat("Combinaciones en el grid:", nrow(grid), "\n")
+
+SEMILLA_UNICA <- 585581
+SEMILLAS_SCREENING <- c(585581, 249449, 655649)
+SEMILLAS_10 <- c(585581, 249449, 655649, 503039, 798191, 112909, 334667, 421303, 667021, 887923)
+CORTE_FIJO <- 12000
+
+#%% celda 10 [texto]
+### Función de evaluación (una semilla, para el barrido inicial del grid)
+
+#%% celda 11 [código]
+evaluar_una_semilla <- function(param_extra, semilla) {
+  param <- param_base
+  param$learning_rate <- param_extra$learning_rate
+  param$scale_pos_weight <- param_extra$scale_pos_weight
+  param$seed <- semilla
+
+  dtrain <- lgb.Dataset(data = matriz_train, label = dataset_train$clase01, free_raw_data = FALSE)
+  modelo <- lgb.train(data = dtrain, param = param, verbose = -1)
+  prediccion <- predict(modelo, matriz_future)
+
+  tbl <- data.table(prob = prediccion, clase_ternaria = clase_ternaria_future)
+  setorder(tbl, -prob)
+  tbl[, gan_individual := ifelse(clase_ternaria == "BAJA+2", 1072500, -27500)]
+  ganancia <- sum(tbl[1:CORTE_FIJO, gan_individual])
+
+  rm(dtrain, modelo)
+  gc(verbose = FALSE)
+  ganancia
+}
+
+#%% celda 12 [texto]
+### Etapa 1: barrido completo del grid con 1 sola semilla
+
+Es la etapa más barata -- sirve para descartar rápido zonas malas de la grilla. No confíes en el ganador de
+esta etapa solo (una sola semilla tiene mucho ruido), es solo para achicar el universo.
+
+#%% celda 13 [código]
+grid[, ganancia_1semilla := NA_real_]
+
+t0 <- Sys.time()
+for (i in 1:nrow(grid)) {
+  grid[i, ganancia_1semilla := evaluar_una_semilla(grid[i], SEMILLA_UNICA)]
+
+  if (i %% 5 == 0) {
+    elapsed <- round(as.numeric(Sys.time()-t0, units="mins"), 1)
+    cat(i, "/", nrow(grid), "--", elapsed, "min --",
+        "lr=", grid$learning_rate[i], "scr=", grid$scale_pos_weight[i],
+        "-> ganancia:", grid$ganancia_1semilla[i], "\n")
+  }
+}
+
+setorder(grid, -ganancia_1semilla)
+cat("\n=== Top 10 del grid (1 semilla) ===\n")
+print(head(grid, 10))
+
+#%% celda 14 [texto]
+### Etapa 2: los mejores 5 candidatos del grid, a screening de 3 semillas
+
+#%% celda 15 [código]
+top5 <- head(grid, 5)
+
+resultados_screening <- rbindlist(lapply(1:nrow(top5), function(i) {
+  cat("Candidato", i, "-- lr=", top5$learning_rate[i], "scr=", top5$scale_pos_weight[i], "\n")
+  ganancias <- sapply(SEMILLAS_SCREENING, function(s) evaluar_una_semilla(top5[i], s))
+  cat("  media (3 semillas):", mean(ganancias), "\n")
+  data.table(learning_rate = top5$learning_rate[i], scale_pos_weight = top5$scale_pos_weight[i],
+             media_screening = mean(ganancias))
+}))
+
+setorder(resultados_screening, -media_screening)
+cat("\n=== Ranking de candidatos (screening 3 semillas) ===\n")
+print(resultados_screening)
+
+#%% celda 16 [texto]
+### Etapa 3: el mejor candidato, confirmado con las 10 semillas completas
+
+Comparar contra la referencia actual: **463.98M** (hiperparámetros viejos originales, 359 vars, 10 semillas).
+
+#%% celda 17 [código]
+mejor <- resultados_screening[1]
+cat("Mejor candidato: learning_rate=", mejor$learning_rate, "scale_pos_weight=", mejor$scale_pos_weight, "\n\n")
+
+ganancias_10 <- sapply(SEMILLAS_10, function(s) {
+  g <- evaluar_una_semilla(mejor, s)
+  cat("    semilla", s, "-> ganancia", g, "\n")
+  g
+})
+
+cat("\nmedia (10 semillas):", mean(ganancias_10), "desvio:", sd(ganancias_10), "\n")
+cat("Diferencia vs referencia (463.98M):", mean(ganancias_10) - 463980000, "\n")
+
+#%% celda 18 [texto]
+### Etapa 4 (solo si el learning_rate ganador es bajo): probar con num_iterations=1000
+
+Si el mejor candidato tiene un learning_rate notablemente menor a 0.02, puede estar necesitando más de 600
+iteraciones para converger del todo -- lo probamos con 1000 para descartar que se esté quedando corto.
+
+#%% celda 19 [código]
+if (mejor$learning_rate < 0.018) {
+  cat("learning_rate bajo (", mejor$learning_rate, ") -- probando con num_iterations=1000\n\n")
+
+  evaluar_mas_iteraciones <- function(param_extra, semilla, n_iter) {
+    param <- param_base
+    param$learning_rate <- param_extra$learning_rate
+    param$scale_pos_weight <- param_extra$scale_pos_weight
+    param$num_iterations <- n_iter
+    param$seed <- semilla
+
+    dtrain <- lgb.Dataset(data = matriz_train, label = dataset_train$clase01, free_raw_data = FALSE)
+    modelo <- lgb.train(data = dtrain, param = param, verbose = -1)
+    prediccion <- predict(modelo, matriz_future)
+
+    tbl <- data.table(prob = prediccion, clase_ternaria = clase_ternaria_future)
+    setorder(tbl, -prob)
+    tbl[, gan_individual := ifelse(clase_ternaria == "BAJA+2", 1072500, -27500)]
+    ganancia <- sum(tbl[1:CORTE_FIJO, gan_individual])
+
+    rm(dtrain, modelo)
+    gc(verbose = FALSE)
+    ganancia
+  }
+
+  ganancias_1000 <- sapply(SEMILLAS_10, function(s) {
+    g <- evaluar_mas_iteraciones(mejor, s, 1000)
+    cat("    semilla", s, "-> ganancia", g, "\n")
+    g
+  })
+
+  cat("\nmedia (10 semillas, num_iterations=1000):", mean(ganancias_1000), "desvio:", sd(ganancias_1000), "\n")
+  cat("Diferencia vs num_iterations=600:", mean(ganancias_1000) - mean(ganancias_10), "\n")
+} else {
+  cat("learning_rate del ganador (", mejor$learning_rate, ") no es especialmente bajo -- no hace falta probar mas iteraciones\n")
+}

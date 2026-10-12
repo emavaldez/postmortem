@@ -1,0 +1,12 @@
+{
+  "hiperparametros": "z601",
+  "arboles": 250,
+  "min_data_in_leaf": 816,
+  "n_semillas": 50,
+  "mejor_envios": 14500,
+  "proporcion_envios": 0.0884,
+  "maximo_semillerio_M": 410.8,
+  "meseta_semillerio_M": 399.0,
+  "meseta_semilla_sola_M": 395.4,
+  "_minutos": 11.14
+}

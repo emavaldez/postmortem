@@ -1,0 +1,24 @@
+
+===== final 017 2026-10-08 09:03 | principal (654066, 498) | auxiliar (818414, 498) (BAJA+1: 5088) | score (164647, 498) | 30 semillas x 6 configs | k=11000 | lag2=True | M0 178 cols, M1 300 cols =====
+listo M0 top1 (30 semillas, 35 min)
+listo M0 top2 (30 semillas, 83 min)
+listo M0 top3 (30 semillas, 125 min)
+listo M1 top1 (30 semillas, 170 min)
+listo M1 top2 (30 semillas, 208 min)
+listo M1 top3 (30 semillas, 265 min)
+exp017_final_s30_k11000_lag2.csv
+solapamiento top-11000 con exp010_mc_h2_k11500: 97.7%
+solapamiento top-11000 con exp005_final_s30_k11500: 96.8%
+[final 017] terminado
+
+===== final 017 2026-10-08 14:21 | principal (654066, 498) | auxiliar (818414, 498) (BAJA+1: 5088) | score (164647, 498) | 30 semillas x 6 configs | k=11000 | lag2=True | M0 178 cols, M1 300 cols =====
+listo M0 top1 (30 semillas, 0 min)
+listo M0 top2 (30 semillas, 0 min)
+listo M0 top3 (30 semillas, 0 min)
+listo M1 top1 (30 semillas, 0 min)
+listo M1 top2 (30 semillas, 0 min)
+listo M1 top3 (30 semillas, 0 min)
+exp017_final_s30_k11000_lag2.csv ya existía: IDÉNTICO al regenerado (mismo conjunto y mismo orden)
+solapamiento top-11000 con exp010_mc_h2_k11500: 97.7%
+solapamiento top-11000 con exp005_final_s30_k11500: 96.8%
+[final 017] terminado

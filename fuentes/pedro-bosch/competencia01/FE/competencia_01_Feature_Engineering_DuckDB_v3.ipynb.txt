@@ -1,0 +1,953 @@
+#%% celda 1 [texto]
+AÑADIR EXPORT A PARQUET
+
+#%% celda 2 [texto]
+# Feature engineering v3: flags opcionales y DuckDB persistente
+
+Versión basada en `competencia_01_Feature_Engineering_DuckDB_v2.ipynb`, con salidas propias.
+`CREAR_FLAGS=False` omite todos los indicadores `*_es_nulo`, tanto en los
+bloques intermedios como en la tabla final y el CSV. `True` los habilita.
+Se mantienen las mismas fórmulas, ventanas y propagación de NULL de la v2.
+`n_campos_nulos` y los dos contadores de cobertura se conservan en ambos modos.
+Usar el kernel **DM_EyF_v1**. Sólo requiere DuckDB y la biblioteca estándar;
+se verifica con DuckDB 1.3.2 sin instalar ni actualizar paquetes.
+
+Para todos los predictores numéricos originales y de negocio (incluidos ratios):
+
+| Variable | Información utilizada para la foto t |
+|---|---|
+| `*_lag_1`, `*_lag_2` | Mes calendario exacto t−1 y t−2 |
+| `*_delta_1` | Valor actual − valor de t−1 |
+| `*_media_hist_prev`, `*_min_hist_prev`, `*_max_hist_prev` | Todas las observaciones anteriores del cliente |
+| `*_pendiente_hist_prev` | Regresión sobre todos los meses anteriores, con la distancia mensual real |
+
+Los acumulados excluyen el actual y requieren uno o más valores previos; la
+pendiente requiere dos. **Se mantiene la propagación estricta de faltantes:**
+si existe un NULL en el historial de un campo, sus acumulados son NULL. Un mes
+sin fila no es una observación; no se inventan filas ni se rellenan valores.
+La ampliación de la ventana evita exigir tres meses completos, pero no imputa
+los datos ausentes. SQL NULL se exporta como campo vacío en el CSV.
+
+Se excluyen claves, etiqueta y coordenada mensual interna (id, target y fechames). Los flags y contadores
+de cobertura no reciben históricos recursivos. Las variables `saldo_mean`,
+`ingresos` y `util_saldo`, por ser reglas de negocio, sí reciben históricos;
+su primer NULL puede dejar sus acumulados posteriores en NULL bajo esta política.
+Los códigos categóricos numéricos también se incluyen por pedido (revisar de cara  a competencia 1); evaluar su
+interpretación antes del modelado.
+
+## 1. Configuración
+
+Cada bloque se guarda en la base y se incorpora a la tabla final mediante una
+actualización de sus columnas, con COMMIT y CHECKPOINT. No se hace una unión de
+cientos de bloques ni un ordenamiento global del CSV. `memory_limit` limita el
+administrador de memoria de DuckDB, no toda la memoria del proceso.
+
+Fuentes: [memoria](https://duckdb.org/2024/07/09/memory-management),
+[ventanas](https://duckdb.org/docs/current/sql/functions/window_functions),
+[actualizaciones](https://duckdb.org/docs/current/sql/statements/update),
+[checkpoint](https://duckdb.org/docs/current/sql/statements/checkpoint).
+
+#%% celda 3 [código]
+from pathlib import Path
+import csv
+import hashlib
+import json
+import math
+import shutil
+import sys
+import time
+import duckdb
+
+# Encuentra el proyecto desde la carpeta FE o desde la raíz del proyecto.
+RAIZ = next((p for p in (Path.cwd(), *Path.cwd().parents)
+             if (p / 'Datasets' / 'competencia_01.csv').is_file()), None)
+if RAIZ is None:
+    raise FileNotFoundError('Ejecutar dentro del proyecto que contiene Datasets/competencia_01.csv')
+CARPETA_FE = RAIZ / 'Clases' / 'Clase 4' / 'FE'
+CSV_ORIGEN = RAIZ / 'Datasets' / 'competencia_01.csv'
+BASE = CARPETA_FE / 'competencia_01_fe_v3.duckdb'
+CSV_FINAL = CARPETA_FE / 'competencia_01_fe_v3.csv'
+TEMPORALES = CARPETA_FE / 'duckdb_tmp_v3'
+MEMORIA = '1GB'
+HILOS = 1
+MAX_TEMPORALES = '20GB'
+CREAR_FLAGS = False  # True agrega *_es_nulo; False no genera ninguno.
+REHACER = False  # True recalcula las tablas generadas por ESTA notebook.
+# Al cambiar CREAR_FLAGS en una base existente: REHACER=True y ejecutar todo.
+# Para conservar ambas variantes, cambiar también BASE y CSV_FINAL.
+if type(CREAR_FLAGS) is not bool:
+    raise TypeError('CREAR_FLAGS debe ser True o False (booleano).')
+
+CARPETA_FE.mkdir(parents=True, exist_ok=True)
+TEMPORALES.mkdir(exist_ok=True)
+
+def literal(valor):
+    return "'" + str(valor).replace("'", "''") + "'"
+
+def identificador(nombre):
+    return '"' + str(nombre).replace('"', '""') + '"'
+
+def sha256_archivo(ruta):
+    h = hashlib.sha256()
+    with ruta.open('rb') as archivo:
+        for bloque in iter(lambda: archivo.read(4 * 1024 * 1024), b''):
+            h.update(bloque)
+    return h.hexdigest()
+
+HUELLA_CSV = sha256_archivo(CSV_ORIGEN)
+if 'con' in globals():
+    con.close()
+con = duckdb.connect(str(BASE), config={
+    'memory_limit': MEMORIA,
+    'threads': str(HILOS),
+    'temp_directory': str(TEMPORALES),
+    'max_temp_directory_size': MAX_TEMPORALES,
+    'preserve_insertion_order': 'false',
+})
+print('Python:', sys.executable)
+print('DuckDB:', duckdb.__version__)
+print('Base:', BASE)
+print('Crear indicadores *_es_nulo:', CREAR_FLAGS)
+print('CSV SHA256:', HUELLA_CSV)
+print('Espacio libre (GiB):', round(shutil.disk_usage(CARPETA_FE).free / 2**30, 2))
+for fila in con.execute("""
+    SELECT name, value FROM duckdb_settings()
+    WHERE name IN ('memory_limit', 'threads', 'temp_directory',
+                   'max_temp_directory_size', 'preserve_insertion_order')
+    ORDER BY name
+""").fetchall():
+    print(fila)
+TABLA_FINAL = 'competencia_01_fe_v3'
+CAMPOS_POR_BLOQUE = 2
+EXPORTAR_CSV = True
+
+#%% celda 4 [texto]
+## 2. Etapas reanudables
+
+`_fe_etapas` guarda las firmas del CSV, SQL, dependencias y `CREAR_FLAGS`. Con `REHACER=False`
+se reutiliza lo ya terminado. Si cambia una fórmula o `CREAR_FLAGS`, usar otra BASE o activar
+`REHACER=True` y ejecutar desde el inicio. Las actualizaciones de cada bloque y
+su registro se confirman juntos: una interrupción no deja un bloque a medias.
+La tabla final sólo debe consumirse cuando exista la marca `v3_completa`.
+
+#%% celda 5 [código]
+MACROS_SQL = """
+CREATE OR REPLACE MACRO ratio_seguro(a, b) AS
+    CASE WHEN a IS NULL OR b IS NULL OR b = 0
+                   OR NOT isfinite(a::DOUBLE) OR NOT isfinite(b::DOUBLE)
+         THEN NULL
+         WHEN isfinite(a::DOUBLE / b::DOUBLE) THEN a::DOUBLE / b::DOUBLE
+         ELSE NULL END;
+CREATE OR REPLACE MACRO mayor_estricto(a, b) AS
+    CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE greatest(a, b) END;
+CREATE OR REPLACE MACRO menor_estricto(a, b) AS
+    CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE least(a, b) END;
+"""
+con.execute(MACROS_SQL)
+con.execute("""
+CREATE TABLE IF NOT EXISTS _fe_etapas (
+    etapa VARCHAR PRIMARY KEY, firma VARCHAR, tabla VARCHAR,
+    filas BIGINT, columnas BIGINT, segundos DOUBLE,
+    finalizado TIMESTAMP, sql VARCHAR
+)
+""")
+con.execute('CHECKPOINT')
+firmas = {}
+diccionario = []
+
+def registrar(nombre, etapa, expresion, descripcion, temporal='foto actual'):
+    diccionario.append({
+        'variable': nombre, 'etapa': etapa, 'expresion_sql': expresion,
+        'descripcion': descripcion, 'temporalidad': temporal,
+    })
+
+def firma_consulta(sql, dependencias=()):
+    contenido = json.dumps([{'version': 'v3', 'crear_flags': CREAR_FLAGS},
+                            HUELLA_CSV, duckdb.__version__, MACROS_SQL, sql,
+                            [firmas[d] for d in dependencias]], ensure_ascii=False)
+    return hashlib.sha256(contenido.encode('utf-8')).hexdigest()
+
+def existe_tabla(tabla):
+    return con.execute('SELECT count(*) FROM information_schema.tables '
+                       'WHERE table_schema = ? AND table_name = ?',
+                       ['main', tabla]).fetchone()[0] == 1
+
+def guardar_registro(etapa, firma, tabla, filas, columnas, segundos, sql):
+    con.execute('DELETE FROM _fe_etapas WHERE etapa = ?', [etapa])
+    con.execute('INSERT INTO _fe_etapas VALUES (?, ?, ?, ?, ?, ?, current_timestamp, ?)',
+                [etapa, firma, tabla, filas, columnas, segundos, sql])
+
+def materializar(tabla, sql, dependencias=(), filas_esperadas=None):
+    firma = firma_consulta(sql, dependencias)
+    previo = con.execute('SELECT firma, filas FROM _fe_etapas WHERE etapa = ?',
+                         [tabla]).fetchone()
+    if previo and previo[0] != firma and not REHACER:
+        raise RuntimeError(f'{tabla}: cambiaron los insumos/SQL o CREAR_FLAGS. Usar otra BASE o REHACER=True y ejecutar todo.')
+    if previo and previo[0] == firma and existe_tabla(tabla) and not REHACER:
+        n = con.execute(f'SELECT count(*) FROM {identificador(tabla)}').fetchone()[0]
+        if n != previo[1] or (filas_esperadas is not None and n != filas_esperadas):
+            raise RuntimeError(f'{tabla}: la tabla persistida fue modificada; reconstruir.')
+        firmas[tabla] = firma
+        print(f'Reutilizada {tabla}: {n:,} filas')
+        return n
+    inicio = time.perf_counter()
+    print(f'Creando {tabla}...', flush=True)
+    con.execute('BEGIN TRANSACTION')
+    try:
+        con.execute("DELETE FROM _fe_etapas WHERE etapa = 'v3_completa'")
+        con.execute(f'CREATE OR REPLACE TABLE {identificador(tabla)} AS {sql}')
+        n = con.execute(f'SELECT count(*) FROM {identificador(tabla)}').fetchone()[0]
+        if filas_esperadas is not None and n != filas_esperadas:
+            raise AssertionError(f'{tabla}: {n} filas, se esperaban {filas_esperadas}')
+        columnas = len(con.execute(f'DESCRIBE {identificador(tabla)}').fetchall())
+        guardar_registro(tabla, firma, tabla, n, columnas, time.perf_counter()-inicio, sql)
+        con.execute('COMMIT')
+    except BaseException:
+        con.execute('ROLLBACK')
+        raise
+    con.execute('CHECKPOINT')
+    firmas[tabla] = firma
+    print(f'Guardada {tabla}: {n:,} filas, {columnas} columnas, '
+          f'{time.perf_counter()-inicio:.1f} s; base {BASE.stat().st_size/2**20:.1f} MiB')
+    return n
+
+def esquema(tabla):
+    return [(r[0], r[1]) for r in con.execute(f'DESCRIBE {identificador(tabla)}').fetchall()]
+
+def incorporar_bloque(origen):
+    """Agrega/actualiza sólo las columnas del bloque; no reescribe las anteriores."""
+    campos = [(c, t) for c, t in esquema(origen) if c not in CLAVES]
+    asignaciones = ', '.join(f'{identificador(c)} = h.{identificador(c)}' for c, _ in campos)
+    sql = (f'UPDATE {identificador(TABLA_FINAL)} AS f SET {asignaciones} '
+           f'FROM {identificador(origen)} AS h '
+           'WHERE f.numero_de_cliente = h.numero_de_cliente AND f.foto_mes = h.foto_mes')
+    firma = firma_consulta(sql, [TABLA_FINAL, origen])
+    etapa = 'incorporar_' + origen
+    previo = con.execute('SELECT firma, filas FROM _fe_etapas WHERE etapa=?', [etapa]).fetchone()
+    actuales = dict(esquema(TABLA_FINAL))
+    if previo and previo[0] != firma and not REHACER:
+        raise RuntimeError(f'{etapa}: cambió la receta; reconstruir en orden.')
+    if previo and previo[0] == firma and not REHACER:
+        assert previo[1] == N_FILAS and all(actuales.get(c) == t for c, t in campos)
+        firmas[TABLA_FINAL] = firma
+        print('Reutilizado:', etapa, flush=True)
+        return
+    inicio = time.perf_counter()
+    con.execute('BEGIN')
+    try:
+        con.execute("DELETE FROM _fe_etapas WHERE etapa = 'v3_completa'")
+        for campo, tipo in campos:
+            if campo not in actuales:
+                con.execute(f'ALTER TABLE {identificador(TABLA_FINAL)} ADD COLUMN {identificador(campo)} {tipo}')
+            elif actuales[campo] != tipo:
+                raise TypeError(f'Tipo inesperado: {campo}')
+        actualizadas = con.execute(sql).fetchone()[0]
+        assert actualizadas == N_FILAS, (origen, actualizadas, N_FILAS)
+        guardar_registro(etapa, firma, TABLA_FINAL, actualizadas,
+                         len(actuales) + sum(c not in actuales for c, _ in campos),
+                         time.perf_counter()-inicio, sql)
+        con.execute('COMMIT')
+    except BaseException:
+        con.execute('ROLLBACK')
+        raise
+    con.execute('CHECKPOINT')
+    firmas[TABLA_FINAL] = firma
+    print(f'Incorporado {origen}: {len(campos)} columnas; {time.perf_counter()-inicio:.1f} s', flush=True)
+
+#%% celda 6 [texto]
+## 3. Importación y claves
+
+Lectura directa del CSV, sin pandas. Se validan identificadores, meses y una fila
+por cliente-mes. `_mes_indice` permite cruzar correctamente diciembre y enero.
+
+#%% celda 7 [código]
+with CSV_ORIGEN.open(encoding='utf-8-sig', newline='') as archivo:
+    columnas_originales = next(csv.reader(archivo))
+CLAVES = ['numero_de_cliente', 'foto_mes']
+OBJETIVO = 'clase_ternaria'
+PREDICTORES = [c for c in columnas_originales if c not in CLAVES + [OBJETIVO]]
+tipos = {c: ('VARCHAR' if c == OBJETIVO else
+             'DOUBLE' if c.startswith(('m', 'Master_m', 'Visa_m')) else 'BIGINT')
+         for c in columnas_originales}
+tipos_sql = '{' + ', '.join(f'{literal(c)}: {literal(t)}' for c, t in tipos.items()) + '}'
+sql_base = f"""
+SELECT *, (foto_mes // 100 * 12 + foto_mes % 100)::INTEGER AS _mes_indice
+FROM read_csv({literal(CSV_ORIGEN.as_posix())},
+    header=true, delim=',', types={tipos_sql},
+    nullstr=['', 'NA', 'NaN', 'nan', 'NAN', 'NULL', 'null'], parallel=false)
+"""
+N_FILAS = materializar('fe_00_base', sql_base)
+assert N_FILAS > 0, 'CSV sin filas'
+assert con.execute("""
+    SELECT count(*) FROM fe_00_base
+    WHERE numero_de_cliente IS NULL OR foto_mes IS NULL
+       OR foto_mes % 100 NOT BETWEEN 1 AND 12
+       OR foto_mes // 100 NOT BETWEEN 1900 AND 2200
+""").fetchone()[0] == 0, 'Claves o meses inválidos'
+assert con.execute("""
+    SELECT count(*) FROM (
+        SELECT numero_de_cliente, foto_mes FROM fe_00_base
+        GROUP BY numero_de_cliente, foto_mes HAVING count(*) > 1
+    )
+""").fetchone()[0] == 0, 'Hay duplicados cliente-mes: resolver antes del FE'
+MESES = con.execute('SELECT foto_mes, count(*) FROM fe_00_base '
+                    'GROUP BY foto_mes ORDER BY foto_mes').fetchall()
+print('Filas y meses:', MESES)
+print('Clientes:', con.execute('SELECT count(DISTINCT numero_de_cliente) FROM fe_00_base').fetchone()[0])
+
+#%% celda 8 [texto]
+## 4. Sumas y reglas de negocio de la foto actual
+
+Se conservan las reglas anteriores y se añaden las solicitadas. Todas las sumas
+son estrictas. Las listas de actividad pueden solapar operaciones y deben leerse
+como índices aditivos, no como conteos de operaciones únicas.
+
+Decisiones confirmadas:
+
+- `mtarjeta_visa_debitos_automaticos` se resuelve al nombre real **mttarjeta_visa_debitos_automaticos**.
+- `m_limite_compra` se define una sola vez, aunque fue pedido dos veces; equivale al `tc_limite_compra` existente.
+- Los adelantos van en **m_adelanto_pesos** y **m_adelanto_dolares**. No se genera una suma que mezcle monedas.
+- Se mantienen alias solicitados aunque coincidan con otros totales existentes; el diccionario deja visibles sus fórmulas.
+
+#%% celda 9 [código]
+SUMAS_NEGOCIO = {
+    'c_tarjetas_credito': ['ctarjeta_visa', 'ctarjeta_master'],
+    'c_prestamos': ['cprestamos_personales', 'cprestamos_prendarios', 'cprestamos_hipotecarios'],
+    'c_utilizacion_credito_master': ['ctarjeta_master_transacciones', 'ctarjeta_master_debitos_automaticos',
+        'ctarjeta_master_descuentos', 'Master_cconsumos', 'Master_cadelantosefectivo'],
+    'c_utilizacion_credito_visa': ['ctarjeta_visa_transacciones', 'ctarjeta_visa_debitos_automaticos',
+        'ctarjeta_visa_descuentos', 'Visa_cconsumos', 'Visa_cadelantosefectivo'],
+    'c_inversiones': ['cplazo_fijo', 'cinversion1', 'cinversion2'],
+    'c_seguros': ['cseguro_vida', 'cseguro_auto', 'cseguro_vivienda', 'cseguro_accidentes_personales'],
+    'c_payrroll': ['cpayroll_trx', 'cpayroll2_trx'],
+    'c_forex': ['cforex', 'cforex_buy', 'cforex_sell'],
+    'c_transferencias': ['ctransferencias_recibidas', 'ctransferencias_emitidas'],
+    'c_cheques_rechazados': ['ccheques_depositados_rechazados', 'ccheques_emitidos_rechazados'],
+    'c_utilizacion_sucursales': ['ccajas_transacciones', 'ccajas_consultas', 'ccajas_depositos',
+        'ccajas_extracciones', 'ccajas_otras', 'catm_trx', 'catm_trx_other', 'cextraccion_autoservicio'],
+    'c_online': ['cmobile_app_trx', 'chomebanking_transacciones'],
+    'delinquencia': ['Master_delinquency', 'Visa_delinquency'],
+    'c_utilizacion_debito': ['ctarjeta_debito', 'ctarjeta_debito_transacciones', 'ccuenta_debitos_automaticos'],
+    'c_utilizacion_tc': ['ctarjeta_visa_debitos_automaticos', 'ctarjeta_master_debitos_automaticos'],
+    'c_adelantos_efectivo': ['Master_cadelantosefectivo', 'Visa_cadelantosefectivo'],
+    'm_transferencias': ['mtransferencias_recibidas', 'mtransferencias_emitidas'],
+    'm_utilizacion_tc': ['mttarjeta_visa_debitos_automaticos', 'mttarjeta_master_debitos_automaticos'],
+    'm_prestamos': ['mprestamos_personales', 'mprestamos_prendarios', 'mprestamos_hipotecarios'],
+    'm_payroll': ['mpayroll', 'mpayroll2'],
+    'm_cheques_rechazados': ['mcheques_depositados_rechazados', 'mcheques_emitidos_rechazados'],
+    'm_inversiones_pesos': ['mplazo_fijo_pesos', 'minversion1_pesos'],
+    'm_inversiones_dolares': ['mplazo_fijo_dolares', 'minversion1_dolares'],
+    'tc_saldo_total': ['Master_msaldototal', 'Visa_msaldototal'],
+    'tc_saldo_pesos': ['Master_msaldopesos', 'Visa_msaldopesos'],
+    'tc_saldo_dolares': ['Master_msaldodolares', 'Visa_msaldodolares'],
+    'tc_limite_compra': ['Master_mlimitecompra', 'Visa_mlimitecompra'],
+    'tc_consumo_total': ['Master_mconsumototal', 'Visa_mconsumototal'],
+    'tc_pago_minimo': ['Master_mpagominimo', 'Visa_mpagominimo'],
+    'tc_adelantos_pesos': ['Master_madelantopesos', 'Visa_madelantopesos'],
+    'tc_adelantos_dolares': ['Master_madelantodolares', 'Visa_madelantodolares'],
+}
+SUMAS_NEGOCIO.update({
+    'm_consumo_dolares': ['Master_mconsumosdolares', 'Visa_mconsumosdolares'],
+    'm_limite_compra': ['Master_mlimitecompra', 'Visa_mlimitecompra'],
+    'm_credito_visa': ['mttarjeta_visa_debitos_automaticos', 'mtarjeta_visa_consumo', 'mtarjeta_visa_descuentos'],
+    'm_credito_master': ['mttarjeta_master_debitos_automaticos', 'mtarjeta_master_consumo', 'mtarjeta_master_descuentos'],
+    'm_adelanto_pesos': ['Visa_madelantopesos', 'Master_madelantopesos'],
+    'm_adelanto_dolares': ['Visa_madelantodolares', 'Master_madelantodolares'],
+})
+expresiones_negocio = {}
+for nombre, campos in SUMAS_NEGOCIO.items():
+    assert set(campos) <= set(PREDICTORES), f'Campos inválidos en {nombre}'
+    expresiones_negocio[nombre] = ' + '.join(identificador(c) for c in campos)
+expresiones_negocio.update({
+    'balance_net': 'mpasivos_margen - mactivos_margen',
+    'm_utilizacion_debito': 'mcuenta_debitos_automaticos',
+    'm_transferencias_neto': 'mtransferencias_recibidas - mtransferencias_emitidas',
+    'tc_fvencimiento_mayor': 'mayor_estricto(Master_Fvencimiento, Visa_Fvencimiento)',
+    'tc_fvencimiento_menor': 'menor_estricto(Master_Fvencimiento, Visa_Fvencimiento)',
+})
+for nombre, expr in expresiones_negocio.items():
+    registrar(nombre, 'fe_01_negocio', expr, 'Operación estricta: cualquier insumo NULL produce NULL.')
+sql_negocio = 'SELECT numero_de_cliente, foto_mes,\n' + ',\n'.join(
+    f'{expr} AS {identificador(nombre)}' for nombre, expr in expresiones_negocio.items()
+) + '\nFROM fe_00_base'
+materializar('fe_01_negocio', sql_negocio, ['fe_00_base'], N_FILAS)
+print('Variables de negocio:', len(expresiones_negocio))
+
+#%% celda 10 [texto]
+## 5. Ratios actuales
+
+Se conservan los nueve ratios anteriores y se agregan los ocho solicitados.
+Los `+1` se aplican exactamente donde se pidieron. Si aun así el denominador
+resulta cero, el ratio seguro produce NULL. `%_pago_minimo` conserva ese nombre
+y devuelve una **razón**, no un porcentaje multiplicado por 100.
+
+Para `share_usd`, por confirmación del usuario, se usan los campos existentes
+`Visa_mconsumosdolares + Master_mconsumosdolares` y el total
+`Visa_mconsumototal + Master_mconsumototal + 1`. No se convierte moneda: no debe
+interpretarse automáticamente como una participación monetaria homogénea.
+
+#%% celda 11 [código]
+RATIOS = {
+    'ratio_utilizacion_limite_tc': ('n.tc_saldo_total', 'n.tc_limite_compra'),
+    'ratio_consumo_limite_tc': ('n.tc_consumo_total', 'n.tc_limite_compra'),
+    'ratio_pago_minimo_saldo_tc': ('n.tc_pago_minimo', 'n.tc_saldo_total'),
+    'ratio_utilizacion_limite_visa': ('b.Visa_msaldototal', 'b.Visa_mlimitecompra'),
+    'ratio_utilizacion_limite_master': ('b.Master_msaldototal', 'b.Master_mlimitecompra'),
+    'ratio_saldo_payroll': ('b.mcuentas_saldo', 'n.m_payroll'),
+    'ratio_prestamos_payroll': ('n.m_prestamos', 'n.m_payroll'),
+    'ratio_rentabilidad_por_producto': ('b.mrentabilidad', 'b.cproductos'),
+    'ratio_participacion_online': ('n.c_online', '(n.c_online + n.c_utilizacion_sucursales)'),
+}
+RATIOS.update({
+    'fee_load': ('b.mcomisiones', '(b.mcomisiones + b.mrentabilidad + 1)'),
+    'fees_per_tx': ('b.mcomisiones', '(b.ctrx_quarter + 1)'),
+    'rent_per_tx': ('b.mrentabilidad', '(b.ctrx_quarter + 1)'),
+    'util_visa': ('b.Visa_msaldototal', '(b.Visa_mfinanciacion_limite + 1)'),
+    'util_master': ('b.Master_msaldototal', '(b.Master_mfinanciacion_limite + 1)'),
+    '%_pago_minimo': ('(b.Visa_mpagominimo + b.Master_mpagominimo)',
+                     '(b.Visa_mpagado + b.Master_mpagado + 1)'),
+    'cash_advance_share': ('(b.Visa_cadelantosefectivo + b.Master_cadelantosefectivo)',
+                           '(b.Visa_cconsumos + b.Master_cconsumos + 1)'),
+    'share_usd': ('n.m_consumo_dolares', '(n.tc_consumo_total + 1)'),
+})
+expresiones_ratios = {nombre: f'ratio_seguro({a}, {b})' for nombre, (a, b) in RATIOS.items()}
+for nombre, expr in expresiones_ratios.items():
+    registrar(nombre, 'fe_02_ratios', expr, 'Razón segura; NULL si falta un insumo o el denominador es cero.')
+sql_ratios = 'SELECT b.numero_de_cliente, b.foto_mes, ' + ', '.join(
+    f'{expr} AS {identificador(c)}' for c, expr in expresiones_ratios.items()
+) + ' FROM fe_00_base b JOIN fe_01_negocio n USING (numero_de_cliente, foto_mes)'
+materializar('fe_02_ratios', sql_ratios, ['fe_00_base', 'fe_01_negocio'], N_FILAS)
+
+#%% celda 12 [texto]
+## 6. Funciones temporales
+
+`RANGE ... 1 PRECEDING / 2 PRECEDING` busca meses exactos. La ventana acumulada
+usa `ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING` sobre claves únicas:
+incluye todas las observaciones anteriores y nunca el actual ni el futuro.
+El control `count(campo) = count(*)` impide que los agregados omitan NULL.
+
+`saldo_mean` y `ingresos` son, respectivamente, la media anterior de
+`mcuentas_saldo` y el máximo anterior de `mcaja_ahorro`, por cliente.
+`util_saldo = saldo_mean / (ingresos + 1)` usa esos dos valores históricos.
+
+#%% celda 13 [código]
+def expresiones_historicas(campos):
+    expresiones = {}
+    for campo in campos:
+        q = identificador(campo)
+        for k in (1, 2):
+            expresiones[f'{campo}_lag_{k}'] = f'max({q}) OVER v{k}'
+        for funcion, sufijo, minimo in [('avg', 'media', 1), ('min', 'min', 1),
+                                        ('max', 'max', 1), ('regr_slope', 'pendiente', 2)]:
+            args = f'{q}, _mes_indice' if funcion == 'regr_slope' else q
+            expresiones[f'{campo}_{sufijo}_hist_prev'] = (
+                f'CASE WHEN count(*) OVER historia >= {minimo} '
+                f'AND count({q}) OVER historia = count(*) OVER historia '
+                f'THEN {funcion}({args}) OVER historia END')
+    return expresiones
+
+def sql_historicos(origen, campos):
+    columnas = ', '.join(identificador(c) for c in campos)
+    calculos = ', '.join(f'{expr} AS {identificador(c)}'
+                         for c, expr in expresiones_historicas(campos).items())
+    deltas = ', '.join(f'{identificador(c)} - {identificador(c + "_lag_1")} '
+                       f'AS {identificador(c + "_delta_1")}' for c in campos)
+    return f"""
+    WITH historico AS (
+        SELECT numero_de_cliente, foto_mes, _mes_indice, {columnas}, {calculos}
+        FROM {identificador(origen)}
+        WINDOW v1 AS (PARTITION BY numero_de_cliente ORDER BY _mes_indice
+                      RANGE BETWEEN 1 PRECEDING AND 1 PRECEDING),
+               v2 AS (PARTITION BY numero_de_cliente ORDER BY _mes_indice
+                      RANGE BETWEEN 2 PRECEDING AND 2 PRECEDING),
+               historia AS (PARTITION BY numero_de_cliente ORDER BY _mes_indice
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+    )
+    SELECT * EXCLUDE (_mes_indice, {columnas}), {deltas} FROM historico
+    """
+
+def sql_negocio_temporal(origen):
+    return f"""
+    WITH anteriores AS (
+        SELECT numero_de_cliente, foto_mes,
+               CASE WHEN count(*) OVER historia >= 1
+                      AND count(mcuentas_saldo) OVER historia = count(*) OVER historia
+                    THEN avg(mcuentas_saldo) OVER historia END AS saldo_mean,
+               CASE WHEN count(*) OVER historia >= 1
+                      AND count(mcaja_ahorro) OVER historia = count(*) OVER historia
+                    THEN max(mcaja_ahorro) OVER historia END AS ingresos
+        FROM {identificador(origen)}
+        WINDOW historia AS (PARTITION BY numero_de_cliente ORDER BY _mes_indice
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+    )
+    SELECT *, ratio_seguro(saldo_mean, ingresos + 1) AS util_saldo FROM anteriores
+    """
+
+sql_temporal_negocio = sql_negocio_temporal('fe_00_base')
+materializar('fe_03_negocio_temporal', sql_temporal_negocio, ['fe_00_base'], N_FILAS)
+for campo, expr in {
+    'saldo_mean': 'media estricta de mcuentas_saldo en todas las observaciones previas del cliente',
+    'ingresos': 'máximo estricto de mcaja_ahorro en todas las observaciones previas del cliente',
+    'util_saldo': 'ratio_seguro(saldo_mean, ingresos + 1)',
+}.items():
+    registrar(campo, 'fe_03_negocio_temporal', expr, expr, 'sólo meses anteriores')
+
+#%% celda 14 [texto]
+## 7. Insumo unificado y selección de campos
+
+Se materializa una tabla que contiene las originales, reglas actuales, ratios y
+las tres reglas históricas. Sobre sus columnas numéricas se calcula una sola
+capa de siete históricos. Así también reciben ventanas las variables de negocio.
+Si `CREAR_FLAGS=True`, se calcula un indicador por variable, sin flags de
+otros flags. Con `False` se omite su SQL y su registro en el diccionario.
+
+#%% celda 15 [código]
+sql_insumo = """
+SELECT b.*, n.* EXCLUDE (numero_de_cliente, foto_mes),
+       r.* EXCLUDE (numero_de_cliente, foto_mes),
+       t.* EXCLUDE (numero_de_cliente, foto_mes)
+FROM fe_00_base b
+JOIN fe_01_negocio n USING (numero_de_cliente, foto_mes)
+JOIN fe_02_ratios r USING (numero_de_cliente, foto_mes)
+JOIN fe_03_negocio_temporal t USING (numero_de_cliente, foto_mes)
+"""
+materializar('fe_04_insumo', sql_insumo,
+             ['fe_00_base', 'fe_01_negocio', 'fe_02_ratios', 'fe_03_negocio_temporal'], N_FILAS)
+CAMPOS_HISTORICOS = [c for c, tipo in esquema('fe_04_insumo')
+                    if c not in CLAVES + [OBJETIVO, '_mes_indice']
+                    and tipo in {'BIGINT', 'DOUBLE', 'INTEGER', 'HUGEINT'}]
+assert set(CAMPOS_HISTORICOS) == set(PREDICTORES) | set(expresiones_negocio) | set(RATIOS) | {'saldo_mean', 'ingresos', 'util_saldo'}
+assert len(CAMPOS_HISTORICOS) == len(set(CAMPOS_HISTORICOS))
+print('Originales:', len(PREDICTORES))
+print('Reglas de negocio y ratios:', len(CAMPOS_HISTORICOS)-len(PREDICTORES))
+print('Campos con ventanas:', len(CAMPOS_HISTORICOS))
+print('Históricos a crear:', 7*len(CAMPOS_HISTORICOS))
+
+sql_cobertura = """
+SELECT numero_de_cliente, foto_mes,
+       row_number() OVER historia - 1 AS n_observaciones_previas,
+       _mes_indice - lag(_mes_indice) OVER historia AS meses_desde_ultima_observacion
+FROM fe_00_base
+WINDOW historia AS (PARTITION BY numero_de_cliente ORDER BY _mes_indice)
+"""
+materializar('fe_05_cobertura', sql_cobertura, ['fe_00_base'], N_FILAS)
+for c in ['n_observaciones_previas', 'meses_desde_ultima_observacion']:
+    registrar(c, 'fe_05_cobertura', sql_cobertura, 'Cobertura del pasado observado.', 'sólo pasado')
+
+def agregar_flags(sql, campos, etapa):
+    if not CREAR_FLAGS or not campos:
+        return sql
+    expresiones = []
+    for campo in campos:
+        nombre = campo + '_es_nulo'
+        expr = f'({identificador(campo)} IS NULL)::UTINYINT'
+        expresiones.append(f'{expr} AS {identificador(nombre)}')
+        registrar(nombre, etapa, expr, '1 si falta el valor; 0 si está presente. No imputa datos.',
+                  'disponibilidad de la variable en la foto actual')
+    return 'SELECT *, ' + ', '.join(expresiones) + ' FROM (' + sql + ') valores'
+
+expr_nulos = ' + '.join(f'({identificador(c)} IS NULL)::INTEGER' for c in PREDICTORES)
+registrar('n_campos_nulos', TABLA_FINAL, expr_nulos, 'Faltantes en los predictores originales; excluye etiqueta.')
+sql_inicio = ('SELECT i.* EXCLUDE (_mes_indice), c.* EXCLUDE (numero_de_cliente, foto_mes), '
+              + expr_nulos + ' AS n_campos_nulos FROM fe_04_insumo i '
+              'JOIN fe_05_cobertura c USING (numero_de_cliente, foto_mes)')
+CANDIDATOS_FLAGS = CAMPOS_HISTORICOS + ['n_observaciones_previas', 'meses_desde_ultima_observacion', 'n_campos_nulos']
+CAMPOS_FLAGS = CANDIDATOS_FLAGS.copy() if CREAR_FLAGS else []
+sql_inicio = agregar_flags(sql_inicio, CAMPOS_FLAGS, TABLA_FINAL)
+materializar(TABLA_FINAL, sql_inicio, ['fe_04_insumo', 'fe_05_cobertura'], N_FILAS)
+# La marca final se emite nuevamente sólo después de validar la receta completa.
+con.execute("DELETE FROM _fe_etapas WHERE etapa = 'v3_completa'")
+con.execute('CHECKPOINT')
+
+#%% celda 16 [texto]
+## 8. Pruebas de lógica temporal y faltantes
+
+Se prueban más de tres meses de historia, huecos de calendario, cambio de año,
+faltantes y alteraciones del futuro. Estas pruebas llaman las mismas funciones
+que generan los históricos y las reglas de negocio temporales.
+
+#%% celda 17 [código]
+comprobaciones = {}
+def comprobar(nombre, condicion):
+    if not condicion:
+        raise AssertionError(nombre)
+    comprobaciones[nombre] = True
+    print('OK:', nombre, flush=True)
+
+def iguales(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    return math.isclose(float(a), float(b), rel_tol=1e-8, abs_tol=1e-6)
+
+def filas_iguales(a, b):
+    return len(a) == len(b) and all(len(x) == len(y) and all(iguales(u, v) for u, v in zip(x, y))
+                                   for x, y in zip(a, b))
+
+comprobar('sumas y extremos propagan NULL', con.execute(
+    'SELECT 5 + NULL, mayor_estricto(5, NULL), menor_estricto(NULL, 5)').fetchone() == (None, None, None))
+comprobar('ratios: faltantes, cero y no finitos producen NULL', con.execute("""
+    SELECT ratio_seguro(NULL, 2), ratio_seguro(2, NULL), ratio_seguro(3, -1+1),
+           ratio_seguro('NaN'::DOUBLE, 2), ratio_seguro(4, 2)
+""").fetchone() == (None, None, None, None, 2.0))
+con.execute("""
+CREATE OR REPLACE TEMP TABLE prueba_historia AS
+SELECT *, x AS mcuentas_saldo, x + 1 AS mcaja_ahorro,
+       (foto_mes // 100 * 12 + foto_mes % 100)::INTEGER AS _mes_indice
+FROM (SELECT numero_de_cliente, foto_mes, x::DOUBLE AS x FROM (VALUES
+ (1, 202010, 0.0), (1, 202011, 10.0), (1, 202012, 20.0), (1, 202101, 30.0),
+ (1, 202102, 999.0), (1, 202103, NULL),
+ (2, 202011, 10.0), (2, 202012, NULL), (2, 202101, 30.0), (2, 202102, 40.0),
+ (3, 202011, 10.0), (3, 202101, 30.0), (3, 202102, 40.0),
+ (4, 202012, 0.0), (4, 202101, 5.0)
+) t(numero_de_cliente, foto_mes, x)) datos
+""")
+orden = ' ORDER BY numero_de_cliente, foto_mes'
+consulta_prueba = sql_historicos('prueba_historia', ['x'])
+cur = con.execute(consulta_prueba + orden)
+nombres_prueba = [c[0] for c in cur.description]
+filas_prueba = cur.fetchall()
+prueba = {(r[0], r[1]): dict(zip(nombres_prueba, r)) for r in filas_prueba}
+p = prueba[(1, 202102)]
+comprobar('acumulados usan más de tres meses, excluyen el actual y cruzan el año',
+          p['x_media_hist_prev'] == 15 and p['x_min_hist_prev'] == 0
+          and p['x_max_hist_prev'] == 30 and iguales(p['x_pendiente_hist_prev'], 10)
+          and p['x_delta_1'] == 969)
+comprobar('un valor previo permite media, min y max; pendiente requiere dos',
+          prueba[(1, 202011)]['x_media_hist_prev'] == 0
+          and prueba[(1, 202011)]['x_pendiente_hist_prev'] is None
+          and iguales(prueba[(1, 202012)]['x_pendiente_hist_prev'], 10))
+comprobar('un NULL anterior invalida todos los acumulados de ese campo',
+          all(prueba[(2, 202102)][f'x_{s}_hist_prev'] is None
+              for s in ['media', 'min', 'max', 'pendiente']))
+comprobar('huecos: lags calendario exactos, acumulados sobre filas existentes',
+          prueba[(3, 202101)]['x_lag_1'] is None
+          and prueba[(3, 202101)]['x_lag_2'] == 10
+          and prueba[(3, 202102)]['x_media_hist_prev'] == 20
+          and iguales(prueba[(3, 202102)]['x_pendiente_hist_prev'], 10))
+comprobar('actual NULL: delta NULL y media del pasado completo válida',
+          prueba[(1, 202103)]['x_delta_1'] is None
+          and iguales(prueba[(1, 202103)]['x_media_hist_prev'], (0+10+20+30+999)/5))
+comprobar('siete históricos por campo; no lag_3 ni variacion_1',
+          len(nombres_prueba) == 9 and 'x_lag_3' not in nombres_prueba
+          and 'x_variacion_1' not in nombres_prueba)
+negocio_prueba = con.execute(sql_negocio_temporal('prueba_historia') + orden).fetchall()
+negocio_febrero = next(r for r in negocio_prueba if r[:2] == (1, 202102))
+comprobar('saldo_mean, ingresos y util_saldo se calculan sólo con el pasado',
+          filas_iguales([negocio_febrero], [(1, 202102, 15, 31, 15/32)]))
+con.execute('CREATE OR REPLACE TEMP TABLE prueba_truncada AS '
+            'SELECT * FROM prueba_historia WHERE foto_mes <= 202101')
+pasado = [r for r in filas_prueba if r[1] <= 202101]
+negocio_pasado = [r for r in negocio_prueba if r[1] <= 202101]
+comprobar('agregar futuro no modifica históricos ni reglas temporales previas',
+          filas_iguales(pasado, con.execute(sql_historicos('prueba_truncada', ['x']) + orden).fetchall())
+          and filas_iguales(negocio_pasado, con.execute(sql_negocio_temporal('prueba_truncada') + orden).fetchall()))
+con.execute('UPDATE prueba_historia SET x=-123456789, mcuentas_saldo=-98765, mcaja_ahorro=88888 '
+            'WHERE foto_mes > 202101')
+comprobar('alterar futuro no modifica históricos ni reglas temporales previas',
+          filas_iguales(pasado, [r for r in con.execute(consulta_prueba + orden).fetchall() if r[1] <= 202101])
+          and filas_iguales(negocio_pasado, [r for r in con.execute(sql_negocio_temporal('prueba_historia') + orden).fetchall() if r[1] <= 202101]))
+for tabla in ['prueba_historia', 'prueba_truncada']:
+    con.execute(f'DROP TABLE {tabla}')
+
+#%% celda 18 [texto]
+## 9. Históricos por bloques persistentes
+
+Cada bloque procesa dos campos del insumo completo. Sus siete históricos se
+guardan en `fe_06_hist_NNN`; los flags sólo se agregan si `CREAR_FLAGS=True`.
+Luego se incorporan esas columnas a la tabla final mediante un único JOIN con
+ese bloque. Se confirma y se hace CHECKPOINT antes de continuar. Las columnas
+anteriores se conservan. Con `False`, ningún bloque crea columnas `*_es_nulo`.
+
+#%% celda 19 [código]
+TABLAS_HISTORICAS = []
+for inicio in range(0, len(CAMPOS_HISTORICOS), CAMPOS_POR_BLOQUE):
+    campos = CAMPOS_HISTORICOS[inicio:inicio+CAMPOS_POR_BLOQUE]
+    tabla = f'fe_06_hist_{inicio // CAMPOS_POR_BLOQUE + 1:03d}'
+    definiciones = expresiones_historicas(campos)
+    for c in campos:
+        definiciones[c + '_delta_1'] = f'{identificador(c)} - {identificador(c + "_lag_1")}'
+    for nombre, expr in definiciones.items():
+        registrar(nombre, tabla, expr, 'Ver definición del sufijo; propagación estricta de NULL.',
+                  'actual y t-1' if nombre.endswith('_delta_1') else 'sólo observaciones anteriores')
+    sql = agregar_flags(sql_historicos('fe_04_insumo', campos), list(definiciones), tabla)
+    materializar(tabla, sql, ['fe_04_insumo'], N_FILAS)
+    incorporar_bloque(tabla)
+    TABLAS_HISTORICAS.append(tabla)
+    if CREAR_FLAGS:
+        CAMPOS_FLAGS.extend(definiciones)
+    print(f'Avance: {min(inicio+CAMPOS_POR_BLOQUE, len(CAMPOS_HISTORICOS))}/{len(CAMPOS_HISTORICOS)} campos', flush=True)
+
+columnas_finales = [c for c, _ in esquema(TABLA_FINAL)]
+nuevas = [c for c in columnas_finales if c not in columnas_originales]
+print('Filas:', N_FILAS, '| Columnas:', len(columnas_finales), '| Nuevas:', len(nuevas))
+print('Históricos:', len(CAMPOS_HISTORICOS)*7, '| Flags:', len(CAMPOS_FLAGS))
+
+#%% celda 20 [texto]
+## 10. Validación completa y referencia independiente
+
+Se comprueban filas, claves, conservación de originales y etiqueta, cobertura del
+diccionario y cumplimiento de `CREAR_FLAGS`. Con `False`, se comprueba
+que ninguna tabla de la base contenga columnas `*_es_nulo`. Los controles de muchas columnas se
+dividen en grupos para no construir expresiones excesivamente grandes.
+
+Para una muestra determinista de 24 clientes se verifican todos los históricos
+contra cálculos independientes en Python. La pendiente usa coordenadas mensuales
+centradas; no supone tres meses ni distancias consecutivas. Las reglas nuevas se
+contrastan con sus insumos originales en esa misma muestra.
+
+#%% celda 21 [código]
+comprobar('tabla final conserva filas', con.execute(f'SELECT count(*) FROM {identificador(TABLA_FINAL)}').fetchone()[0] == N_FILAS)
+comprobar('claves únicas en tabla final', con.execute(f"""
+    SELECT count(*) FROM (SELECT numero_de_cliente, foto_mes FROM {identificador(TABLA_FINAL)}
+                         GROUP BY numero_de_cliente, foto_mes HAVING count(*) != 1)
+""").fetchone()[0] == 0)
+comprobar('todos los originales, negocios y ratios tienen siete históricos',
+          all(c + sufijo in columnas_finales for c in CAMPOS_HISTORICOS
+              for sufijo in ['_lag_1', '_lag_2', '_delta_1', '_media_hist_prev', '_min_hist_prev', '_max_hist_prev', '_pendiente_hist_prev']))
+comprobar('no existen lag_3 ni variacion_1',
+          not any(c.endswith(('_lag_3', '_variacion_1')) for c in columnas_finales))
+comprobar('no se usan claves, etiqueta ni flags como entradas históricas',
+          not (set(CLAVES + [OBJETIVO, '_mes_indice']) & set(CAMPOS_HISTORICOS))
+          and not any(c.endswith('_es_nulo') for c in CAMPOS_HISTORICOS))
+comprobar('diccionario cubre exactamente las columnas nuevas',
+          len(diccionario) == len(nuevas) and {r['variable'] for r in diccionario} == set(nuevas))
+flags_finales = {c for c in columnas_finales if c.endswith('_es_nulo')}
+if CREAR_FLAGS:
+    comprobar('flags cubren todas las variables originales y calculadas sin recursión',
+              len(CAMPOS_FLAGS) == len(set(CAMPOS_FLAGS))
+              and {c + '_es_nulo' for c in CAMPOS_FLAGS} == flags_finales
+              and set(CAMPOS_FLAGS) == set(columnas_finales) - set(CLAVES + [OBJETIVO]) - flags_finales)
+else:
+    comprobar('CREAR_FLAGS=False: ninguna tabla contiene indicadores _es_nulo',
+              not CAMPOS_FLAGS and not flags_finales
+              and con.execute("SELECT count(*) FROM information_schema.columns "
+                              "WHERE table_schema = 'main' AND right(column_name, 8) = '_es_nulo'").fetchone()[0] == 0)
+    comprobar('CREAR_FLAGS=False: diccionario sin indicadores _es_nulo',
+              not any(r['variable'].endswith('_es_nulo') for r in diccionario))
+columnas_sin_flags = len(CAMPOS_HISTORICOS)*8 + len(CLAVES) + 1 + 3
+comprobar('cantidad de columnas corresponde a históricos, auxiliares y flags elegidos',
+          len(columnas_finales) == columnas_sin_flags + len(CAMPOS_FLAGS))
+
+def huella_columnas(tabla, columnas):
+    # Dos agregados del hash y el conteo por mes; no requieren ordenar las filas.
+    expr = 'hash(' + ','.join(identificador(c) for c in columnas) + ')'
+    return con.execute(f'SELECT foto_mes, count(*), sum({expr}::HUGEINT), bit_xor({expr}) '
+                       f'FROM {identificador(tabla)} GROUP BY foto_mes ORDER BY foto_mes').fetchall()
+
+comprobar('originales y etiqueta conservados: huellas por mes',
+          huella_columnas('fe_00_base', columnas_originales) == huella_columnas(TABLA_FINAL, columnas_originales))
+if CREAR_FLAGS:
+    errores_flags = 0
+    for inicio in range(0, len(CAMPOS_FLAGS), 40):
+        condiciones = ' OR '.join(
+            f'{identificador(c + "_es_nulo")} IS DISTINCT FROM ({identificador(c)} IS NULL)::UTINYINT'
+            for c in CAMPOS_FLAGS[inicio:inicio+40])
+        errores_flags += con.execute(f'SELECT count(*) FROM {identificador(TABLA_FINAL)} WHERE {condiciones}').fetchone()[0]
+    comprobar('todos los flags coinciden con los NULL de sus variables', errores_flags == 0)
+no_finitos = 0
+for inicio in range(0, len(nuevas), 40):
+    condiciones = ' OR '.join(f'({identificador(c)} IS NOT NULL AND NOT isfinite({identificador(c)}::DOUBLE))'
+                              for c in nuevas[inicio:inicio+40])
+    no_finitos += con.execute(f'SELECT count(*) FROM {identificador(TABLA_FINAL)} WHERE {condiciones}').fetchone()[0]
+comprobar('nuevas sin infinito ni NaN flotante; faltantes representados como NULL', no_finitos == 0)
+
+ids = [r[0] for r in con.execute('SELECT DISTINCT numero_de_cliente FROM fe_00_base '
+                                'ORDER BY numero_de_cliente LIMIT 24').fetchall()]
+filtro = ','.join(str(int(c)) for c in ids)
+def muestra(tabla):
+    cur = con.execute(f'SELECT * FROM {identificador(tabla)} WHERE numero_de_cliente IN ({filtro}) '
+                      'ORDER BY numero_de_cliente, foto_mes')
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+insumos_muestra = muestra('fe_04_insumo')
+salidas_muestra = muestra(TABLA_FINAL)
+por_cliente = {}
+for fila in insumos_muestra:
+    por_cliente.setdefault(fila['numero_de_cliente'], []).append(fila)
+por_clave = {(r['numero_de_cliente'], r['foto_mes']): r for r in salidas_muestra}
+
+def suma_estricta(valores):
+    return None if any(v is None for v in valores) else sum(valores)
+
+def dividir(a, b):
+    if a is None or b is None or b == 0:
+        return None
+    valor = a/b
+    return valor if math.isfinite(valor) else None
+
+def acumulados_python(previos, campo):
+    valores = [r[campo] for r in previos]
+    if not valores or any(v is None for v in valores):
+        return dict(media=None, min=None, max=None, pendiente=None)
+    media = math.fsum(valores)/len(valores)
+    pendiente = None
+    if len(valores) >= 2:
+        xs = [r['_mes_indice'] for r in previos]
+        centro = math.fsum(xs)/len(xs)
+        pendiente = math.fsum((x-centro)*(y-media) for x, y in zip(xs, valores))/math.fsum((x-centro)**2 for x in xs)
+    return dict(media=media, min=min(valores), max=max(valores), pendiente=pendiente)
+
+total_comparaciones = 0
+for cliente, filas in por_cliente.items():
+    calendario = {r['_mes_indice']: r for r in filas}
+    for i, actual in enumerate(filas):
+        salida = por_clave[(cliente, actual['foto_mes'])]
+        anteriores = filas[:i]
+        for campo in CAMPOS_HISTORICOS:
+            lag1 = calendario.get(actual['_mes_indice']-1, {}).get(campo)
+            lag2 = calendario.get(actual['_mes_indice']-2, {}).get(campo)
+            delta = actual[campo]-lag1 if actual[campo] is not None and lag1 is not None else None
+            esperados = {campo+'_lag_1': lag1, campo+'_lag_2': lag2, campo+'_delta_1': delta}
+            esperados.update({campo+'_'+k+'_hist_prev': v for k, v in acumulados_python(anteriores, campo).items()})
+            for nombre, esperado in esperados.items():
+                assert iguales(salida[nombre], esperado), (cliente, actual['foto_mes'], nombre, salida[nombre], esperado)
+                total_comparaciones += 1
+        for nombre, campos in SUMAS_NEGOCIO.items():
+            assert iguales(actual[nombre], suma_estricta([actual[c] for c in campos])), nombre
+        media_saldo = acumulados_python(anteriores, 'mcuentas_saldo')['media']
+        max_caja = acumulados_python(anteriores, 'mcaja_ahorro')['max']
+        assert iguales(actual['saldo_mean'], media_saldo)
+        assert iguales(actual['ingresos'], max_caja)
+        assert iguales(actual['util_saldo'], dividir(media_saldo, max_caja+1 if max_caja is not None else None))
+        # Fórmulas adicionales contrastadas con sus componentes originales.
+        esperado_balance = (actual['mpasivos_margen'] - actual['mactivos_margen']
+                            if actual['mpasivos_margen'] is not None and actual['mactivos_margen'] is not None else None)
+        assert iguales(actual['balance_net'], esperado_balance)
+        esperados_ratios = {
+            'fee_load': (actual['mcomisiones'], suma_estricta([actual['mcomisiones'], actual['mrentabilidad'], 1])),
+            'fees_per_tx': (actual['mcomisiones'], suma_estricta([actual['ctrx_quarter'], 1])),
+            'rent_per_tx': (actual['mrentabilidad'], suma_estricta([actual['ctrx_quarter'], 1])),
+            'util_visa': (actual['Visa_msaldototal'], suma_estricta([actual['Visa_mfinanciacion_limite'], 1])),
+            'util_master': (actual['Master_msaldototal'], suma_estricta([actual['Master_mfinanciacion_limite'], 1])),
+            '%_pago_minimo': (suma_estricta([actual['Visa_mpagominimo'], actual['Master_mpagominimo']]),
+                              suma_estricta([actual['Visa_mpagado'], actual['Master_mpagado'], 1])),
+            'cash_advance_share': (suma_estricta([actual['Visa_cadelantosefectivo'], actual['Master_cadelantosefectivo']]),
+                                   suma_estricta([actual['Visa_cconsumos'], actual['Master_cconsumos'], 1])),
+            'share_usd': (suma_estricta([actual['Visa_mconsumosdolares'], actual['Master_mconsumosdolares']]),
+                          suma_estricta([actual['Visa_mconsumototal'], actual['Master_mconsumototal'], 1])),
+        }
+        for nombre, (a, b) in esperados_ratios.items():
+            assert iguales(actual[nombre], dividir(a, b)), nombre
+comprobar('todos los históricos contrastados con referencia independiente en 24 clientes', total_comparaciones > 0)
+comprobar('sumas y nuevas reglas de negocio contrastadas con insumos originales', True)
+print('Comparaciones históricas independientes:', total_comparaciones)
+
+campos_diccionario = ['variable', 'etapa', 'expresion_sql', 'descripcion', 'temporalidad']
+with (CARPETA_FE / 'competencia_01_fe_v3_diccionario.csv').open('w', encoding='utf-8-sig', newline='') as archivo:
+    escritor = csv.DictWriter(archivo, fieldnames=campos_diccionario)
+    escritor.writeheader()
+    escritor.writerows(diccionario)
+con.execute('CREATE OR REPLACE TABLE _fe_diccionario ('
+            'variable VARCHAR, etapa VARCHAR, expresion_sql VARCHAR, descripcion VARCHAR, temporalidad VARCHAR)')
+con.executemany('INSERT INTO _fe_diccionario VALUES (?, ?, ?, ?, ?)',
+                [[r[c] for c in campos_diccionario] for r in diccionario])
+con.execute('CHECKPOINT')
+
+#%% celda 22 [texto]
+## 11. CSV final y cierre de la base
+
+La exportación es directa, sin pandas y sin ordenar globalmente las filas. Se
+verifica el CSV completo con el esquema exacto y huellas por mes de todas las
+columnas. Luego se publica el `.csv` y se marca la tabla como completa.
+La base se cierra y se reabre para comprobar que las tablas persisten.
+
+#%% celda 23 [código]
+if EXPORTAR_CSV:
+    parcial = CSV_FINAL.with_suffix('.csv.partial')
+    inicio = time.perf_counter()
+    print('Exportando CSV...', flush=True)
+    con.execute(f"COPY {identificador(TABLA_FINAL)} TO {literal(parcial.as_posix())} (FORMAT CSV, HEADER true, NULL '')")
+    tipos_finales = '{' + ', '.join(f'{literal(c)}: {literal(t)}' for c, t in esquema(TABLA_FINAL)) + '}'
+    con.execute(f"CREATE OR REPLACE TEMP VIEW csv_verificacion AS SELECT * FROM read_csv("
+                f"{literal(parcial.as_posix())}, header=true, delim=',', types={tipos_finales}, nullstr='', parallel=false)")
+    print('Verificando CSV completo...', flush=True)
+    comprobar('CSV completo: conteos y huellas por mes coinciden con la base',
+              huella_columnas(TABLA_FINAL, columnas_finales) == huella_columnas('csv_verificacion', columnas_finales))
+    con.execute('DROP VIEW csv_verificacion')
+    parcial.replace(CSV_FINAL)
+    print('CSV verificado (s):', round(time.perf_counter()-inicio, 1))
+guardar_registro('v3_completa', firmas[TABLA_FINAL], TABLA_FINAL, N_FILAS, len(columnas_finales), 0,
+                 'Validaciones completas; consultar _fe_diccionario para las fórmulas.')
+con.execute('CHECKPOINT')
+con.close()
+con = duckdb.connect(str(BASE), read_only=True, config={'memory_limit': MEMORIA, 'threads': str(HILOS)})
+comprobar('base reabierta: filas, esquema y marca de finalización persisten',
+          con.execute(f'SELECT count(*) FROM {identificador(TABLA_FINAL)}').fetchone()[0] == N_FILAS
+          and len(esquema(TABLA_FINAL)) == len(columnas_finales)
+          and con.execute("SELECT count(*) FROM _fe_etapas WHERE etapa='v3_completa'").fetchone()[0] == 1)
+con.close()
+resumen = {
+    'version': 'v3', 'crear_flags': CREAR_FLAGS,
+    'duckdb_version': duckdb.__version__, 'python': sys.executable,
+    'fuente_sha256': HUELLA_CSV, 'filas': N_FILAS,
+    'originales': len(columnas_originales), 'campos_con_historicos': len(CAMPOS_HISTORICOS),
+    'columnas_historicas': len(CAMPOS_HISTORICOS)*7, 'flags': len(CAMPOS_FLAGS),
+    'columnas_finales': len(columnas_finales), 'nuevas': len(nuevas),
+    'comparaciones_historicas_independientes': total_comparaciones,
+    'configuracion': {'crear_flags': CREAR_FLAGS, 'memory_limit': MEMORIA, 'threads': HILOS, 'temp_directory': str(TEMPORALES),
+                      'max_temp_directory_size': MAX_TEMPORALES, 'preserve_insertion_order': False},
+    'base_bytes': BASE.stat().st_size,
+    'csv_bytes': CSV_FINAL.stat().st_size if EXPORTAR_CSV else None,
+    'validaciones': comprobaciones,
+}
+(CARPETA_FE / 'competencia_01_fe_v3_validacion.json').write_text(json.dumps(resumen, ensure_ascii=False, indent=2), encoding='utf-8')
+print(json.dumps({k:v for k,v in resumen.items() if k != 'validaciones'}, ensure_ascii=False, indent=2))
+print('Controles aprobados:', len(comprobaciones))
+
+#%% celda 24 [texto]
+## Consulta posterior
+
+La base y el CSV v3 tienen nombres propios. Para consultar desde esta carpeta:
+
+```python
+from pathlib import Path
+import duckdb
+con = duckdb.connect(str(Path.cwd() / 'competencia_01_fe_v3.duckdb'),
+                     read_only=True, config={'memory_limit': '1GB', 'threads': '1'})
+con.execute("SELECT numero_de_cliente, foto_mes, m_credito_visa, m_credito_visa_media_hist_prev FROM competencia_01_fe_v3 LIMIT 10").fetchall()
+con.close()
+```
+
+Las salidas nuevas usan el prefijo `competencia_01_fe_v3`. El diccionario cubre
+todas las variables calculadas. No es necesario ejecutar el FE para consultar
+la base terminada. Para reconstruir, ejecutar todas las celdas en orden; las
+firmas evitan mezclar recetas. Sólo consumir la tabla al finalizar las validaciones.
+
+La configuración entregada es `CREAR_FLAGS=False`. Para generar los indicadores,
+cambiarla a `True`, activar `REHACER=True` si se usa la misma base, y ejecutar todas
+las celdas en orden. Volver a `REHACER=False` después de completar la reconstrucción.
+Si se quieren conservar ambas variantes, elegir otras rutas para BASE y CSV_FINAL.
+
+Ver [validaciones](competencia_01_fe_v3_validacion.json),
+[recursos](competencia_01_fe_v3_recursos.json),
+[diccionario](competencia_01_fe_v3_diccionario.csv) y
+[guía de uso](LEEME_Feature_Engineering_v3.md).
+
+**Ejecución verificada con `CREAR_FLAGS=False`:** 983.061 filas, 1.718 columnas y **cero indicadores `*_es_nulo`**. Se mantienen 214 campos con 1.498 históricos. Pasaron los 26 controles, incluidas 215,712 comparaciones históricas independientes, la lectura del CSV completo y la reapertura de la base.
+
+Base: 7.29 GB. CSV: 7.43 GB (unidades decimales).
+
+#%% celda 25 [texto]
+PB: para consultar base y pasar a pandas:
+
+#%% celda 26 [código]
+# import duckdb
+
+# ruta_db = (
+#     r"C:\Users\pedro\OneDrive\Escritorio\MAESTRIA"
+#     r"\Especialización 2C 2026\DM_EyF_2026"
+#     r"\Clases\Clase 4\FE\competencia_01_fe_v3.duckdb"
+# )
+
+# consulta = consulta = """
+# SELECT *
+# FROM competencia_01_fe_v3
+# WHERE foto_mes NOT IN  (202107, 202108)
+# """
+
+# with duckdb.connect(ruta_db, read_only=True) as con:
+#     df = con.execute(consulta).fetchdf()
+
+# print(df.shape)
+# df.head()

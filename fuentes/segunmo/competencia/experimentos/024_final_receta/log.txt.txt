@@ -1,0 +1,11 @@
+
+===== 024 final receta 2026-10-08 23:22 | train (654066, 150) | 8 semillas =====
+semilla 852583 lista (5 min)
+semilla 771227 lista (10 min)
+semilla 676057 lista (14 min)
+semilla 482687 lista (19 min)
+semilla 399221 lista (24 min)
+semilla 121109 lista (29 min)
+semilla 292131 lista (33 min)
+semilla 133559 lista (38 min)
+[024 final receta] terminado

@@ -1,0 +1,11 @@
+
+===== final 010 2026-10-07 09:54 | train (654066, 348) (BAJA+1 3985, BAJA+2 4067) | score (164647, 348) | semillas [852583, 771227, 676057, 482687, 399221, 121109] =====
+listo M0 top1 (5 min)
+listo M0 top2 (12 min)
+listo M0 top3 (19 min)
+listo M1 top1 (25 min)
+listo M1 top2 (30 min)
+listo M1 top3 (38 min)
+exp010_mc_h2_k11500.csv
+solapamiento top-11500 con exp005_final_s30_k11500: 96.2%
+solapamiento top-11500 con exp008_lag2_ccajas_k11500: 95.3%

@@ -1,0 +1,340 @@
+#%% celda 1 [texto]
+# 1 · Bayesian Optimization
+
+**Antes:** tiene que estar corrido el notebook 0.
+
+**Qué hace:**
+* Entrena en **202103 + 202104** (todos los registros, **sin undersampling**) y mide en **202106**
+* Hiperparámetros fijos y de la BO: num_iterations (64 a 4096), num_leaves (16 a 2048), min_sum_hessian_in_leaf (1e-06 a 0.1).
+* **10 iteraciones** con la semilla **370003** (con 3 hiperparámetros, las 10 son al azar)
+* Guarda los **2 mejores sets** de hiperparámetros en `exp/mejores_hiperparametros.txt`
+  (se actualiza después de cada iteración, así el notebook 2 puede arrancar aunque esto se corte)
+
+**Si se corta:** volver a correr todo. Sigue desde la última iteración guardada en `exp/BO/BO_log.txt`.
+
+#%% celda 2 [texto]
+### Librerías
+
+#%% celda 3 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+# limpio la memoria
+rm(list=ls(all.names=TRUE))
+gc(full=TRUE, verbose=FALSE)
+
+# cargo las librerias (la primera vez se instalan y tarda varios minutos)
+options(repos= c(CRAN= "https://cloud.r-project.org"))
+options(width= 200)
+
+for (paquete in c("data.table", "R.utils", "fst", "lightgbm", "bbotk", "mlr3", "mlr3mbo", "mlr3learners", "DiceKriging")) {
+  if (!require(paquete, character.only= TRUE)) {
+    install.packages(paquete)
+    library(paquete, character.only= TRUE)
+  }
+}
+
+cat("Nucleos disponibles:", parallel::detectCores(), "\n")
+
+#%% celda 4 [texto]
+### Parámetros
+
+#%% celda 5 [código]
+PARAM <- list()
+
+PARAM$archivo_dataset <- "datos/dataset_preprocesado.fst"
+
+# Mi semilla
+PARAM$semilla <- 370003
+
+# training y testing de la BO
+PARAM$bo_train <- c(202103, 202104)
+PARAM$bo_test  <- c(202106)
+
+# cantidad de combinaciones que prueba la BO
+# (las primeras 4 x 3 = 12 serian al azar, asi que con 10 son todas al azar)
+PARAM$bo_iteraciones <- 10
+
+# cortes donde mido la ganancia en 202106 (solo informativo)
+PARAM$cortes <- seq(9000, 14000, by= 500)
+
+if (!file.exists(PARAM$archivo_dataset))
+  stop("No existe ", PARAM$archivo_dataset, ". Primero hay que correr el notebook 0")
+
+#%% celda 6 [código]
+# Hiperparametros FIJOS de LightGBM: los que pide el profesor (punto 1.7)
+# ⚠️ Este bloque tiene que ser IGUAL en los notebooks 1 y 2
+
+PARAM$lgbm$param_fijos <- list(
+  boosting=           "gbdt",
+  objective=          "binary",
+  metric=             "auc",
+  first_metric_only=  FALSE,
+  boost_from_average= TRUE,
+  feature_pre_filter= FALSE,
+  force_row_wise=     TRUE,
+  deterministic=      TRUE,
+  verbosity=          -100,
+
+  max_depth=          -1L,
+  min_gain_to_split=  0,
+  lambda_l1=          0,
+  lambda_l2=          0,
+  bagging_fraction=   1.0,       # sin bagging
+  is_unbalance=       FALSE,
+  scale_pos_weight=   1.0,
+  extra_trees=        FALSE,
+  use_missing=        TRUE,      # para que LightGBM entienda los NA
+
+  # ---- fijos ----
+  max_bin=                 31L,
+  min_data_in_leaf=        0L,
+  feature_fraction=        0.50,
+  feature_fraction_bynode= 0.20,
+  learning_rate=           0.005,
+
+  # ---- estos tres los elige la BO (aca solo hay un valor por defecto) ----
+  num_iterations=          1000L,
+  num_leaves=              64L,
+  min_sum_hessian_in_leaf= 0.001
+)
+
+#%% celda 7 [texto]
+Hiperparámetros de la BO (los que pide el profesor). Los rangos son los que veníamos usando,
+porque el profesor no los especifica:
+
+| Hiperparámetro | desde | hasta |
+|---|---|---|
+| `num_iterations` | 64 | 4096 |
+| `num_leaves` | 16 | 2048 |
+| `min_sum_hessian_in_leaf` | 0.000001 | 1.0 |
+
+#%% celda 8 [código]
+PARAM$bo_espacio <- ps(
+  num_iterations=          p_int(lower= 64L,   upper= 4096L),
+  num_leaves=              p_int(lower= 16L,   upper= 2048L),
+  min_sum_hessian_in_leaf= p_dbl(lower= 1e-06, upper= 0.1)
+)
+
+#%% celda 9 [texto]
+### Funciones
+
+#%% celda 10 [código]
+# escribe un mensaje con la hora
+avisar <- function(...) {
+  cat(format(Sys.time(), "%H:%M:%S"), " ", ..., "\n", sep= "")
+  flush.console()
+}
+
+# muestra el avance de LightGBM mientras entrena (cada 250 arboles)
+mostrar_avance <- function(env) {
+  if (env$iteration %% 250 == 0 || env$iteration == env$end_iteration) {
+    cat("      ", format(Sys.time(), "%H:%M:%S"),
+      "  arbol ", env$iteration, " de ", env$end_iteration, "\n", sep= "")
+    flush.console()
+  }
+}
+attr(mostrar_avance, "call") <- quote(mostrar_avance())
+attr(mostrar_avance, "name") <- "mostrar_avance"
+
+# lee del dataset preprocesado solo los meses pedidos
+# (el archivo esta ordenado por foto_mes, asi no se carga todo en memoria)
+leer_meses <- function(meses) {
+  foto_mes <- read_fst(PARAM$archivo_dataset, columns= "foto_mes")$foto_mes
+  filas <- which(foto_mes %in% meses)
+  dt <- read_fst(PARAM$archivo_dataset, from= min(filas), to= max(filas),
+    as.data.table= TRUE)
+  dt[foto_mes %in% meses]
+}
+
+# AUC (area bajo la curva ROC), calculado a partir de los rankings
+calcular_auc <- function(clase, prob) {
+  rango <- frank(prob)
+  n1 <- sum(clase == 1)
+  n0 <- sum(clase == 0)
+  (sum(rango[clase == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+# ganancia si le envio estimulo a los primeros N clientes (para cada N de cortes)
+calcular_ganancias <- function(prob, gan, cortes) {
+  acumulada <- cumsum(gan[order(-prob)])
+  acumulada[cortes]
+}
+
+#%% celda 11 [texto]
+## Datos de training (202103 + 202104) y testing (202106)
+
+#%% celda 12 [código]
+dir.create("exp/BO", showWarnings= FALSE, recursive= TRUE)
+
+dataset <- leer_meses(c(PARAM$bo_train, PARAM$bo_test))
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+# las variables del modelo (todas menos estas)
+campos_buenos <- setdiff(colnames(dataset), c("foto_mes", "clase_ternaria", "clase01"))
+cat("Variables del modelo:", length(campos_buenos), "\n")
+
+# training: TODOS los registros de 202103 y 202104, sin undersampling
+dtrain <- lgb.Dataset(
+  data=  data.matrix(dataset[foto_mes %in% PARAM$bo_train, campos_buenos, with= FALSE]),
+  label= dataset[foto_mes %in% PARAM$bo_train, clase01],
+  free_raw_data= TRUE
+)
+
+# testing: 202106, aca se miden el AUC y la ganancia
+mtest <- data.matrix(dataset[foto_mes %in% PARAM$bo_test, campos_buenos, with= FALSE])
+dtest <- dataset[foto_mes %in% PARAM$bo_test,
+  list(numero_de_cliente, clase01,
+       gan= ifelse(clase_ternaria == "BAJA+2", 1072500, -27500))]
+
+cat("Filas training:", nrow(dtrain), "  Filas testing:", nrow(mtest), "\n")
+
+rm(dataset)
+gc(full=TRUE, verbose=FALSE)
+
+#%% celda 13 [texto]
+## Configuración de la BO
+
+`Estimar_lightgbm` entrena un LightGBM con la combinación propuesta, lo mide en 202106,
+agrega una línea a `exp/BO/BO_log.txt` y actualiza `exp/mejores_hiperparametros.txt`.
+
+#%% celda 14 [código]
+archivo_log <- "exp/BO/BO_log.txt"
+giter <- 0
+
+# guarda los 2 mejores sets de hiperparametros (por AUC)
+guardar_mejores <- function() {
+  log_bo <- fread(archivo_log)
+  setorder(log_bo, -auc)
+  mejores <- log_bo[1:min(2, .N)]
+  mejores[, set := .I]
+  setcolorder(mejores, "set")
+  fwrite(mejores, "exp/mejores_hiperparametros.txt", sep= "\t")
+  invisible(mejores)
+}
+
+Estimar_lightgbm <- function(xs) {
+
+  giter <<- giter + 1
+  t0 <- Sys.time()
+
+  avisar("Iteracion ", giter, " de ", PARAM$bo_iteraciones)
+  avisar("   entrenando con: ",
+    paste(names(xs), "=", signif(unlist(xs), 4), collapse= ", "))
+
+  param_completo <- modifyList(PARAM$lgbm$param_fijos, xs)
+  param_completo$seed <- PARAM$semilla
+
+  modelo <- lgb.train(data= dtrain, param= param_completo,
+    callbacks= list(mostrar_avance))
+
+  avisar("   prediciendo 202106 y calculando AUC y ganancia")
+  prob <- predict(modelo, mtest)
+  ganancias <- calcular_ganancias(prob, dtest$gan, PARAM$cortes)
+
+  registro <- data.table(
+    iter=    giter,
+    semilla= PARAM$semilla,
+    as.data.table(xs),
+    auc=     calcular_auc(dtest$clase01, prob),
+    ganancia_max= max(ganancias),
+    envios_max=   PARAM$cortes[which.max(ganancias)],
+    minutos= round(as.numeric(
+      difftime(Sys.time(), t0, units= "mins")), 1)
+  )
+  fwrite(registro, archivo_log, sep= "\t", append= file.exists(archivo_log))
+  guardar_mejores()
+
+  avisar("   listo en ", registro$minutos, " min.",
+    "  AUC = ", round(registro$auc, 5),
+    "  ganancia = ", round(registro$ganancia_max / 1e6, 1), " millones",
+    ", corte = ", registro$envios_max)
+
+  set.seed(PARAM$semilla, kind= "L'Ecuyer-CMRG")
+  return(list(auc= registro$auc))
+}
+
+#%% celda 15 [código]
+set.seed(PARAM$semilla, kind= "L'Ecuyer-CMRG")
+
+objective <- ObjectiveRFun$new(
+  fun=      Estimar_lightgbm,
+  domain=   PARAM$bo_espacio,
+  codomain= ps(auc= p_dbl(tags= "maximize")),
+  id=       "BO_lightgbm"
+)
+
+instance <- OptimInstanceBatchSingleCrit$new(
+  objective=  objective,
+  terminator= trm("evals", n_evals= PARAM$bo_iteraciones)
+)
+
+# si la BO ya habia empezado, retomo desde lo que quedo en BO_log.txt
+bo_terminada <- FALSE
+if (file.exists(archivo_log)) {
+  log_anterior <- fread(archivo_log)
+
+  if (!all(PARAM$bo_espacio$ids() %in% names(log_anterior)))
+    stop("El BO_log.txt es de un espacio de busqueda distinto.",
+      " Borra la carpeta exp/BO y volve a correr")
+
+  giter <- max(log_anterior$iter)
+  bo_terminada <- nrow(log_anterior) >= PARAM$bo_iteraciones
+
+  instance$archive$add_evals(
+    xdt= log_anterior[, PARAM$bo_espacio$ids(), with= FALSE],
+    ydt= log_anterior[, list(auc)]
+  )
+  avisar("Retomo la BO: ya hay ", nrow(log_anterior), " iteraciones hechas")
+}
+
+surrogate <- srlrn(lrn("regr.km",
+  optim.method= "BFGS",
+  nugget.estim= TRUE,
+  control=      list(trace= FALSE)))
+
+# las primeras 4 x (cantidad de hiperparametros) son al azar, sin pasarse de las iteraciones
+cantidad_al_azar <- min(4 * length(PARAM$bo_espacio$ids()), PARAM$bo_iteraciones)
+
+optimizer <- opt("mbo",
+  loop_function= bayesopt_ego,
+  surrogate=     surrogate,
+  acq_function=  acqf("ei"),
+  acq_optimizer= acqo(
+    optimizer=  opt("random_search", batch_size= 1000),
+    terminator= trm("evals", n_evals= 1000)),
+  args= list(init_design_size= cantidad_al_azar)
+)
+
+#%% celda 16 [texto]
+## Corrida de la BO  ⏳
+
+Cada combinación muestra con qué hiperparámetros entrena, el avance cada 250 árboles,
+y al terminar su AUC y su ganancia en 202106.
+
+#%% celda 17 [código]
+if (bo_terminada) {
+  avisar("La BO ya estaba terminada")
+} else {
+  avisar("Arranca la BO. Las primeras ", cantidad_al_azar, " iteraciones son al azar")
+  optimizer$optimize(instance)
+  avisar("Termino la BO")
+}
+
+#%% celda 18 [texto]
+## Resultado
+
+Todas las iteraciones ordenadas por AUC, y los **2 mejores sets** que va a usar el notebook 2
+(guardados en `exp/mejores_hiperparametros.txt`).
+
+#%% celda 19 [código]
+tb_BO <- fread(archivo_log)
+setorder(tb_BO, -auc)
+tb_BO[, ganancia_millones := round(ganancia_max / 1e6, 1)]
+print(tb_BO[, list(iter, num_iterations, num_leaves, min_sum_hessian_in_leaf,
+  auc, ganancia_millones, envios_max, minutos)])
+
+cat("\nLos 2 mejores sets (exp/mejores_hiperparametros.txt):\n")
+guardar_mejores()
+
+#%% celda 20 [código]
+format(Sys.time(), "%a %b %d %X %Y")

@@ -1,0 +1,112 @@
+{
+  "experimento": 3006,
+  "nombre": "fe_muerte_ampliada",
+  "descripcion": "ds3003 (receta + 6 variables del proceso de muerte) + proceso de muerte ampliado: conteo sobre ~45 productos, conteos por grupo (tarjetas, canales, transaccional, ahorro, credito, sueldo, seguros), puntaje ponderado por log(lift) calculado con 202103-202104, y relativo al maximo de 3 meses para 8 variables mas. Todo rankeado por mes con cero fijo.",
+  "dataset_entrada": "ds1001_base.parquet",
+  "dataset_salida": "ds3006_muerte_ampliada.parquet",
+  "lags": [
+    1,
+    2
+  ],
+  "deltas": [
+    1,
+    2
+  ],
+  "claves_03c": [
+    "ctrx_quarter",
+    "mpasivos_margen",
+    "mcaja_ahorro",
+    "mcuentas_saldo",
+    "ctarjeta_visa_transacciones",
+    "ctarjeta_master_transacciones",
+    "ctarjeta_debito_transacciones",
+    "mprestamos_personales",
+    "mpayroll",
+    "cmobile_app_trx",
+    "chomebanking_transacciones",
+    "mcomisiones",
+    "cdescubierto_preacordado",
+    "mcuenta_corriente",
+    "Visa_msaldototal",
+    "Master_msaldototal"
+  ],
+  "relativas_max3_03c": [
+    "ctrx_quarter",
+    "mcaja_ahorro"
+  ],
+  "grupos": {
+    "tarjetas": [
+      "ctarjeta_visa",
+      "ctarjeta_master",
+      "ctarjeta_visa_transacciones",
+      "ctarjeta_master_transacciones",
+      "mtarjeta_visa_consumo",
+      "mtarjeta_master_consumo",
+      "Visa_msaldototal",
+      "Master_msaldototal",
+      "ctarjeta_debito_transacciones"
+    ],
+    "canales": [
+      "chomebanking_transacciones",
+      "cmobile_app_trx",
+      "thomebanking",
+      "tmobile_app",
+      "catm_trx",
+      "catm_trx_other",
+      "cextraccion_autoservicio",
+      "ccajas_transacciones"
+    ],
+    "transaccional": [
+      "ctrx_quarter",
+      "active_quarter",
+      "ctransferencias_recibidas",
+      "ctransferencias_emitidas",
+      "cpagomiscuentas",
+      "cpagodeservicios",
+      "ccuenta_debitos_automaticos",
+      "ctarjeta_visa_debitos_automaticos",
+      "mcomisiones",
+      "ccomisiones_otras"
+    ],
+    "ahorro": [
+      "mcaja_ahorro",
+      "mcuentas_saldo",
+      "mcaja_ahorro_dolares",
+      "mpasivos_margen",
+      "cplazo_fijo",
+      "cinversion1",
+      "cinversion2"
+    ],
+    "credito": [
+      "cprestamos_personales",
+      "mprestamos_personales",
+      "cdescubierto_preacordado"
+    ],
+    "sueldo": [
+      "mpayroll",
+      "cpayroll_trx"
+    ],
+    "seguros": [
+      "cseguro_vida",
+      "cseguro_vivienda",
+      "cseguro_accidentes_personales"
+    ]
+  },
+  "relativas_max3_extra": [
+    "mpayroll",
+    "mtarjeta_visa_consumo",
+    "mcuentas_saldo",
+    "ctarjeta_visa_transacciones",
+    "chomebanking_transacciones",
+    "cmobile_app_trx",
+    "mpasivos_margen",
+    "ctarjeta_debito_transacciones"
+  ],
+  "meses_lift": [
+    202103,
+    202104
+  ],
+  "_fecha_inicio": "2026-10-10 03:23:43",
+  "_script": "03e_fe_muerte_ampliada.py",
+  "_git_commit": "sin_git"
+}

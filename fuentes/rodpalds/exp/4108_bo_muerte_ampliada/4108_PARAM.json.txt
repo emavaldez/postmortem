@@ -1,0 +1,96 @@
+{
+  "experimento": 4108,
+  "nombre": "bo_muerte_ampliada",
+  "descripcion": "Bayesiana como 4107 (indicaciones del profesor: train 202103 + 202104, rangos num_leaves 8-2000, min_data_in_leaf 1-20000, feature_fraction 0.05-0.9, bagging_fraction 0.05-1, learning_rate 0.01-0.2, max_bin 31, 50 pruebas, confirmacion con 20 semillas en la mitad B) sobre ds3006 (proceso de muerte ampliado). Referencias: z601 y p23 de 4104.",
+  "reanudar": false,
+  "dataset": "ds3006_muerte_ampliada.parquet",
+  "variables": null,
+  "usar_lag2": true,
+  "mes_train": 202104,
+  "mes_test": 202106,
+  "clase": "clase_binaria2",
+  "semilla_mitades": 571369,
+  "n_trials": 50,
+  "n_startup_trials": 15,
+  "max_boost_round": 3000,
+  "espacio": {
+    "num_leaves": [
+      8,
+      2000,
+      "log"
+    ],
+    "min_data_in_leaf": [
+      1,
+      20000,
+      "log"
+    ],
+    "feature_fraction": [
+      0.05,
+      0.9,
+      "lineal"
+    ],
+    "bagging_fraction": [
+      0.05,
+      1.0,
+      "lineal"
+    ],
+    "learning_rate": [
+      0.01,
+      0.2,
+      "log"
+    ]
+  },
+  "lgbm_fijos": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "metric": "None",
+    "max_bin": 31,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "first_metric_only": true,
+    "deterministic": true,
+    "force_row_wise": true,
+    "verbose": -1
+  },
+  "semilla_sampler": 849571,
+  "referencias_extra": [
+    {
+      "nombre": "p23_4104",
+      "params": {
+        "learning_rate": 0.0678,
+        "num_leaves": 41,
+        "min_data_in_leaf": 10124,
+        "feature_fraction": 0.1798,
+        "bagging_fraction": 0.3124,
+        "lambda_l1": 0.001,
+        "lambda_l2": 0.001
+      },
+      "arboles": 580
+    }
+  ],
+  "top_confirmar": 5,
+  "semillas_confirmacion": 20,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "regla_minimo_semillas_ganadas": 14,
+  "meseta_mes_completo": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "meses_train": [
+    202103,
+    202104
+  ],
+  "mitades_desde": "4102_bo_fuera_de_tiempo/4102_mitades_junio.csv",
+  "_config": "4108_bo_muerte_ampliada.json",
+  "_fecha_inicio": "2026-10-10 06:06:57",
+  "_script": "08_bo_fuera_de_tiempo.py",
+  "_git_commit": "sin_git"
+}

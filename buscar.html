@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="es" data-raiz="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buscar en el código · Postmortem Primera Competencia DMEyF 2026</title>
+<meta name="description" content="Buscador en el código principal de todas las entregas.">
+<link rel="stylesheet" href="assets/estilo.css">
+<link rel="help" href="llms.txt" title="Guía para agentes">
+
+<script src="assets/app.js" defer></script>
+</head>
+<body>
+<header class="barra"><div class="barra-int"><a class="marca" href="index.html">Postmortem · Primera Competencia</a><nav aria-label="Secciones"><a href="index.html">Resumen</a><a href="index.html#entregas">Entregas</a><a href="comparar.html">Comparar</a><a href="fichas.html">Fichas</a><a href="tecnicas.html">Técnicas</a><a href="reproducibilidad.html">Reproducibilidad</a><a href="buscar.html" aria-current="page">Buscar en el código</a><a href="glosario.html">Glosario</a><a href="agentes.html">Para agentes</a></nav></div></header>
+<main>
+<h1>Buscar en el código</h1>
+<p class="bajada">Busca en el código principal de todas las entregas (el camino que produce la predicción). Sirve para ver cómo usó cada uno una función, una variable o un parámetro.</p>
+<div class="filtros"><input id="consulta" type="search" placeholder="por ejemplo: feature_fraction, ccajas_depositos, frank(" aria-label="Texto a buscar" style="flex:1 1 22rem"><label><input type="checkbox" id="exp-regular"> expresión regular</label><label><input type="checkbox" id="mayusculas"> distinguir mayúsculas</label></div>
+<p id="aviso-carga" class="aviso oculto">No se pudo cargar el índice. Esta página necesita abrirse desde un servidor web.</p>
+<noscript><p class="aviso">El buscador necesita JavaScript. El índice completo está en <a href="data/busqueda.json">data/busqueda.json</a>.</p></noscript>
+<p id="estado-busqueda" class="meta" aria-live="polite">Escribí al menos dos caracteres.</p><div id="resultados"></div>
+<footer class="pie">
+<p>Página armada el 2026-10-12 a partir de los repositorios públicos que cada alumno posteó como entrega de la Primera Competencia de DMEyF 2026 (UBA). Las descripciones y las anotaciones del código son lecturas automáticas hechas con asistencia de IA y revisadas por una segunda pasada automática; describen lo que el código hace, sin valorarlo, y pueden contener errores. El código y los textos de cada entrega pertenecen a sus autores y se muestran tal como estaban en el commit indicado en cada página.</p>
+<p>Para corregir una descripción o pedir que se retire una entrega: <a href="https://github.com/emavaldez/postmortem/issues">abrir un issue</a>. <a href="agentes.html">Versión para agentes</a> · <a href="llms.txt">llms.txt</a> · <a href="https://github.com/emavaldez/postmortem">repositorio de esta página</a>.</p>
+</footer>
+</main>
+</body>
+</html>

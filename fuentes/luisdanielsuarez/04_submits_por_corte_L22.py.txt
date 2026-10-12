@@ -1,0 +1,99 @@
+"""
+04_submits_por_corte_L22.py — arma VARIOS submits (uno por línea de corte), cada uno con un archivo por semilla.
+
+Para cada corte N y para cada una de las primeras --n_semillas semillas disponibles, escribe un .csv con los N clientes
+de mayor probabilidad SEGÚN ESE MODELO (no según el ensamble), como pide la cátedra: varios modelos que solo cambian la
+semilla, todos con el mismo corte; el bot devuelve la media y el desvío de las ganancias de esos archivos.
+Cada corte queda en su propia carpeta:
+
+    exp/<volumen>/submit_por_corte/c09000/L22_s878443_c09000_<fecha>.csv   (20 archivos por carpeta)
+    exp/<volumen>/submit_por_corte/c09500/...
+    exp/<volumen>/submit_por_corte/mensajes_submit.txt                     (el cuerpo del mensaje para cada carpeta)
+    exp/<volumen>/submit_por_corte/resumen.csv
+
+Formato (bot): .csv, SIN encabezado, un numero_de_cliente entero por línea, entre 8000 y 15000 registros.
+"Primeras semillas": las primeras en el orden fijo de semillas que tengan predicción guardada (VM de este volumen + --otros).
+
+Uso (desde ~/dmeyf):
+    python 04_submits_por_corte_L22.py --volumen L22 --otros L22b --desde 9000 --hasta 13000 --paso 500 --n_semillas 20 --zip
+"""
+import argparse
+import os
+import re
+import shutil
+import time
+
+import numpy as np
+import pandas as pd
+
+import comun_L22 as cm
+from comun_L22 import log
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--volumen", default=cm.VOLUMEN)
+    ap.add_argument("--otros", nargs="*", default=[])
+    ap.add_argument("--dir_base", default=os.path.expanduser("~/dmeyf"))
+    ap.add_argument("--desde", type=int, default=9000)
+    ap.add_argument("--hasta", type=int, default=13000)
+    ap.add_argument("--paso", type=int, default=500)
+    ap.add_argument("--n_semillas", type=int, default=20, help="archivos por submit (el bot admite hasta 20)")
+    ap.add_argument("--zip", action="store_true", help="además comprime todo en un .zip para descargarlo de la VM")
+    ap.add_argument("--prueba", action="store_true", help="SOLO para probar el código: no exige 8000-15000")
+    a = ap.parse_args()
+
+    cortes = list(range(a.desde, a.hasta + 1, a.paso))
+    if not a.prueba:
+        assert all(8000 <= c <= 15000 for c in cortes), "el bot acepta archivos con entre 8000 y 15000 registros"
+    assert 1 <= a.n_semillas <= 20, "el bot admite hasta 20 archivos por submit"
+
+    dir_exp = os.path.join(a.dir_base, "exp", a.volumen)
+    otros = [os.path.join(a.dir_base, "exp", v) for v in a.otros]
+    ids, disp = cm.predicciones_08_disponibles(dir_exp, cm.semillas_n(1000), otros)
+    log(f"  predicciones disponibles: {len(disp)} modelos ({sum(c == a.volumen for _, _, c in disp)} de {a.volumen}, "
+        f"{sum(c != a.volumen for _, _, c in disp)} de otras carpetas)")
+    if len(disp) < a.n_semillas:
+        raise SystemExit(f"Solo hay {len(disp)} modelos y se pidieron {a.n_semillas}. Esperar a que haya más, "
+                         f"o pedir menos con --n_semillas.")
+    usar = disp[:a.n_semillas]
+    log(f"  se usan las primeras {len(usar)} semillas: {[sd for sd, _, _ in usar]}")
+    P = {sd: np.load(ruta) for sd, ruta, _ in usar}
+    for sd, pr in P.items():
+        assert len(pr) == len(ids), f"semilla {sd}: la predicción no tiene los clientes de ids_08"
+
+    fecha = time.strftime("%Y%m%d%H%M")
+    raiz = os.path.join(dir_exp, "submit_por_corte")
+    assert not os.path.exists(raiz) or not os.listdir(raiz), \
+        f"{raiz} ya tiene contenido: moverlo o borrarlo antes (cada archivo debe tener un nombre distinto a todos los enviados)"
+    os.makedirs(raiz, exist_ok=True)
+    mensajes, filas = [], []
+    for c in cortes:
+        carpeta = os.path.join(raiz, f"c{c:05d}")
+        os.makedirs(carpeta)
+        for sd, _, vol in usar:
+            orden = np.argsort(-P[sd], kind="stable")[:c]
+            sel = ids[orden].astype("int64")
+            assert len(np.unique(sel)) == c
+            ruta = os.path.join(carpeta, f"{a.volumen}_s{sd}_c{c:05d}_{fecha}.csv")
+            pd.Series(sel, dtype="int64").to_csv(ruta, index=False, header=False)
+            with open(ruta) as fh:                                       # verificación leyendo el texto
+                lin = fh.read().split("\n")
+            assert lin[-1] == "" and len(lin) - 1 == c and all(re.fullmatch(r"[0-9]+", l) for l in lin[:-1]), ruta
+            filas.append(dict(corte=c, semilla=sd, carpeta_origen=vol, prob_minima_enviada=float(P[sd][orden[-1]])))
+        mensajes.append(f"c{c:05d}:  submit    {a.volumen}_{len(usar)}s_c{c:05d}_{fecha}")
+        log(f"  corte {c:,}: {len(usar)} archivos en {carpeta}")
+    with open(os.path.join(raiz, "mensajes_submit.txt"), "w") as fh:
+        fh.write("Cuerpo del mensaje a @competencia-uno para cada carpeta (adjuntar los archivos de esa carpeta):\n\n"
+                 + "\n".join(mensajes) + "\n")
+    pd.DataFrame(filas).to_csv(os.path.join(raiz, "resumen.csv"), index=False)
+    total = len(cortes) * len(usar)
+    log(f"  listo: {len(cortes)} carpetas, {total} archivos en {raiz}")
+    if a.zip:
+        z = shutil.make_archive(raiz, "zip", root_dir=dir_exp, base_dir="submit_por_corte")
+        log(f"  comprimido para descargar: {z} ({os.path.getsize(z) / 1e6:.1f} MB)")
+    print("\n" + open(os.path.join(raiz, "mensajes_submit.txt")).read())
+
+
+if __name__ == "__main__":
+    main()

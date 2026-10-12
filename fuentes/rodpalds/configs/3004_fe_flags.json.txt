@@ -1,0 +1,9 @@
+{
+  "experimento": 3004,
+  "nombre": "fe_flags",
+  "dataset_salida": "ds3004_flags.parquet",
+  "orden": "lag_luego_rank",
+  "extras": "flags",
+  "rankear_extras": false,
+  "descripcion": "Receta del profesor (lags/deltas 1-2 sobre crudos, luego rank por mes con cero fijo) + proceso de muerte en su forma alternativa: un indicador dejo_<producto> por cada una de las 16 claves + las 6 de 03c, todas SIN rankear (conteos, 0/1 y cocientes no tienen inflacion)."
+}

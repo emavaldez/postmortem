@@ -1,0 +1,12 @@
+ctrx_quarter
+r_trx_por_producto
+mpasivos_margen
+r_saldo_por_producto
+r_payroll_por_trx
+mrentabilidad_annual
+Master_Fvencimiento
+mcuentas_saldo
+cliente_edad
+mprestamos_personales
+Visa_fechaalta
+mcaja_ahorro

@@ -1,0 +1,33 @@
+
+===== 022 2026-10-08 20:08 | 4 semillas =====
+[A s=676057] base 231.1 | extra_trees +3.7 | path_smooth5 +1.0 | path_smooth20 +1.8 | min_gain0.5 +1.7 | extra+smooth5 +4.1 (5 min)
+[A s=482687] base 237.9 | extra_trees -0.1 | path_smooth5 +1.0 | path_smooth20 -0.3 | min_gain0.5 +2.5 | extra+smooth5 -3.8 (10 min)
+[A s=399221] base 239.0 | extra_trees -7.6 | path_smooth5 -0.7 | path_smooth20 -0.3 | min_gain0.5 -0.3 | extra+smooth5 -6.2 (15 min)
+[A s=121109] base 235.9 | extra_trees -4.4 | path_smooth5 -1.5 | path_smooth20 -1.0 | min_gain0.5 +0.4 | extra+smooth5 -3.4 (20 min)
+[B s=676057] base 406.7 | extra_trees -11.4 | path_smooth5 -1.1 | path_smooth20 -1.1 | min_gain0.5 -8.4 | extra+smooth5 -12.9 (26 min)
+[B s=482687] base 404.7 | extra_trees +2.3 | path_smooth5 +2.1 | path_smooth20 +3.2 | min_gain0.5 -0.1 | extra+smooth5 -6.2 (32 min)
+[B s=399221] base 405.5 | extra_trees -12.1 | path_smooth5 +1.5 | path_smooth20 -0.6 | min_gain0.5 -6.6 | extra+smooth5 -7.2 (37 min)
+[B s=121109] base 403.7 | extra_trees -12.9 | path_smooth5 -5.4 | path_smooth20 -3.7 | min_gain0.5 -10.9 | extra+smooth5 -17.7 (43 min)
+[Bh s=676057] base 392.7 | extra_trees -4.7 | path_smooth5 -1.0 | path_smooth20 +2.6 | min_gain0.5 -0.1 | extra+smooth5 -4.9 (48 min)
+[Bh s=482687] base 393.8 | extra_trees +2.9 | path_smooth5 +2.2 | path_smooth20 +1.8 | min_gain0.5 -0.6 | extra+smooth5 +0.3 (53 min)
+[Bh s=399221] base 393.4 | extra_trees -9.1 | path_smooth5 -2.9 | path_smooth20 -4.0 | min_gain0.5 -4.8 | extra+smooth5 -8.1 (58 min)
+[Bh s=121109] base 388.0 | extra_trees -8.2 | path_smooth5 +4.3 | path_smooth20 +4.5 | min_gain0.5 -2.8 | extra+smooth5 -12.8 (63 min)
+
+Niveles (M ARS):
+fold               A      B     Bh
+variante                          
+base           236.0  405.1  392.0
+extra+smooth5  233.6  394.1  385.6
+extra_trees    233.9  396.6  387.2
+min_gain0.5    237.0  398.6  389.9
+path_smooth20  236.1  404.6  393.2
+path_smooth5   235.9  404.4  392.6
+
+Diferencias pareadas vs base:
+     variante  A_delta  B_delta  Bh_delta  A_ee  B_ee  Bh_ee pares_positivos
+  extra_trees    -2.10    -8.53     -4.78  2.46  3.63   2.73            3/12
+ path_smooth5    -0.07    -0.72      0.65  0.62  1.69   1.60            6/12
+path_smooth20     0.07    -0.55      1.24  0.60  1.42   1.83            5/12
+  min_gain0.5     1.07    -6.50     -2.06  0.62  2.29   1.08            3/12
+extra+smooth5    -2.34   -11.00     -6.39  2.24  2.69   2.74            2/12
+[022] terminado

@@ -1,0 +1,801 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–23] Título del experimento 6018 (rankings con cero fijo). Fija BASE en ~/buckets/b1,
+#   crea las carpetas datasets y exp y descarga competencia_01_crudo.csv desde la URL del curso sólo si el
+#   archivo no existe o está vacío, con un timeout de 3.600 segundos.
+#%% celda 1 [texto]
+# Primera Competencia (notebook nombre: exp 6018 ahora hago rankings con cero fijo 
+
+#%% celda 2 [texto]
+## 1. Carpetas y dataset (bucket de Google Cloud)
+
+#%% celda 3 [código]
+BASE <- path.expand("~/buckets/b1")   # bucket de Google Cloud (persistente)
+
+dir.create(file.path(BASE, "datasets"), recursive= TRUE, showWarnings= FALSE)
+dir.create(file.path(BASE, "exp"),      recursive= TRUE, showWarnings= FALSE)
+
+# URL del dataset 2026
+archivo_origen  <- "https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv"
+archivo_destino <- file.path(BASE, "datasets", "competencia_01_crudo.csv")
+
+options(timeout= 3600)   # el archivo es grande; por defecto R corta a los 60 segundos
+
+if (!file.exists(archivo_destino) || file.size(archivo_destino) == 0)
+  download.file(archivo_origen, archivo_destino, mode= "wb")
+
+cat("Carpeta de trabajo:", BASE, "\n")
+cat("Dataset:", round(file.size(archivo_destino) / 1e6), "MB\n")
+
+# [Anotación · líneas 25–75] Arma clase_ternaria: convierte foto_mes en un número de período consecutivo,
+#   calcula por cliente los dos períodos siguientes (leads 1 y 2) y asigna CONTINUA a los períodos anteriores al
+#   anteúltimo, BAJA+1 cuando el cliente no aparece en el período siguiente y BAJA+2 cuando aparece en el
+#   siguiente y no en el subsiguiente. Graba competencia_01.csv.gz y muestra la cantidad de filas por foto_mes y
+#   clase.
+#%% celda 4 [texto]
+## 2. Generacion de la clase_ternaria]
+
+#%% celda 5 [código]
+require( "data.table" )
+
+# leo el dataset
+dataset <- fread(file.path(BASE, "datasets", "competencia_01_crudo.csv") )
+
+# calculo el periodo0 consecutivo
+dsimple <- dataset[, list(
+    "pos" = .I,
+    numero_de_cliente,
+    periodo0 = as.integer(foto_mes/100)*12 +  foto_mes%%100 ) ]
+
+# ordeno
+setorder( dsimple, numero_de_cliente, periodo0 )
+
+# calculo topes
+periodo_ultimo <- dsimple[, max(periodo0) ]
+periodo_anteultimo <- periodo_ultimo - 1
+
+# calculo los leads de orden 1 y 2
+dsimple[, c("periodo1", "periodo2") :=
+    shift(periodo0, n=1:2, fill=NA, type="lead"),  numero_de_cliente ]
+
+# assign most common class values = "CONTINUA"
+dsimple[ periodo0 < periodo_anteultimo, clase_ternaria := "CONTINUA" ]
+
+# calculo BAJA+1
+dsimple[ periodo0 < periodo_ultimo &
+    ( is.na(periodo1) | periodo0 + 1 < periodo1 ),
+    clase_ternaria := "BAJA+1" ]
+
+# calculo BAJA+2
+dsimple[ periodo0 < periodo_anteultimo & (periodo0+1 == periodo1 )
+    & ( is.na(periodo2) | periodo0 + 2 < periodo2 ),
+    clase_ternaria := "BAJA+2" ]
+
+# pego el resultado en el dataset original y grabo
+setorder( dsimple, pos )
+dataset[, clase_ternaria := dsimple$clase_ternaria ]
+
+fwrite( dataset,
+    file =  file.path(BASE, "datasets", "competencia_01.csv.gz"),
+    sep = ","
+)
+
+#%% celda 6 [código]
+setorder( dataset, foto_mes, clase_ternaria, numero_de_cliente)
+dataset[, .N, list(foto_mes, clase_ternaria)]
+
+# [Anotación · líneas 77–117] Registra la hora, borra todos los objetos de memoria salvo BASE y carga
+#   data.table, parallel, R.utils, primes, utils, rlist, yaml, lightgbm, DiceKriging y mlrMBO, instalando los
+#   que falten.
+#%% celda 7 [texto]
+## 3. Inicio y parámetros
+
+#%% celda 8 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+# limpio la memoria
+rm(list= setdiff(ls(all.names=TRUE), "BASE")) # remove all objects, salvo BASE
+gc(full=TRUE, verbose=FALSE) # garbage collection
+
+#%% celda 9 [texto]
+Carga de librerias. Esta parte lleva varios minutos la primera vez en Google Colab
+
+#%% celda 10 [código]
+# cargo las librerias que necesito
+require("data.table")
+require("parallel")
+
+if(!require("R.utils")) install.packages("R.utils")
+require("R.utils")
+
+if( !require("primes") ) install.packages("primes")
+require("primes")
+
+if( !require("utils") ) install.packages("utils")
+require("utils")
+
+if( !require("rlist") ) install.packages("rlist")
+require("rlist")
+
+if( !require("yaml")) install.packages("yaml")
+require("yaml")
+
+if( !require("lightgbm") ) install.packages("lightgbm")
+require("lightgbm")
+
+if( !require("DiceKriging") ) install.packages("DiceKriging")
+require("DiceKriging")
+
+if( !require("mlrMBO") ) install.packages("mlrMBO")
+require("mlrMBO")
+
+# [Anotación · líneas 119–173] Define PARAM: experimento 6018, semilla primigenia 992720 y una lista de 10
+#   semillas. Meses: train 202103–202105, eval_mes 202106, train_final 202103–202106 y future 202108. Cortes de
+#   evaluación de 8.000 a 15.000 de a 250, undersampling 0.25 para la búsqueda bayesiana y para los modelos
+#   finales y PARAM$fe$lag2 en FALSE.
+#%% celda 11 [texto]
+### 3.1 Definicion de Parametros
+aqui debe cargar SU semilla primigenia
+<br>**recuerde cambiar el numero de experimento en cada corrida nueva**
+
+#%% celda 12 [código]
+PARAM <- list()
+PARAM$experimento <- 6018   # el 6016 con ranking con cero fijo
+
+PARAM$semillaprimigenia <- 992720
+
+# semillas para los modelos finales: un archivo de Zulip por semilla (maximo 20 por submit)
+PARAM$semillas <- c(
+  864203, 451997, 909131, 582314, 737281,
+  128945, 675432, 390217, 842691, 519804
+)
+
+#%% celda 13 [texto]
+**Meses.** Ajustar según la tabla de la sección 2. Dataset 2026: meses 202103 a 202108, futuro 202108:
+- `eval_mes` = último mes con BAJA+2 conocido (202106) → donde se mide la ganancia local y la BO.
+- `train` = meses anteriores a `eval_mes` → entrenamiento para BO y evaluación local.
+- `train_final` = `train` + `eval_mes` → entrenamiento de los modelos que predicen el futuro.
+- `future` = mes a predecir y entregar.
+
+202107 **no** se usa para entrenar: todavía no se sabe quién de ese mes es BAJA+2.
+
+#%% celda 14 [código]
+# -------------------------------------------
+# Períodos de entrenamiento, evaluación y futuro
+# -------------------------------------------
+PARAM$train       <- c(202103, 202104, 202105)   # el dataset 2026 arranca en 202103
+PARAM$eval_mes    <- c(202106)
+PARAM$train_final <- c(PARAM$train, PARAM$eval_mes)
+PARAM$future      <- c(202108)
+
+# cortes (cantidad de envíos) que se evaluan localmente
+PARAM$cortes_eval <- seq(8000, 15000, by= 250)
+
+# cortes para los archivos de Zulip
+# NULL = se eligen solos alrededor del mejor corte de la evaluación local
+PARAM$envios_zulip <- NULL
+
+#%% celda 15 [código]
+# un undersampling de 0.1  toma solo el 10% de los CONTINUA
+# undersampling de 1.0  implica tomar TODOS los datos
+# undersampling: Bayesian Optimization
+PARAM$trainingstrategy$undersampling <- 0.25
+
+# undersampling: evaluacion local y modelos finales
+#  1.0 = todos los datos (necesita 16 GB de RAM o mas)
+#  0.25 = version liviana para una compu con 8 GB
+PARAM$trainingstrategy$undersampling_final <- 0.25
+
+# lags y deltas de orden 2: FALSE para ahorrar memoria (8 GB)
+PARAM$fe$lag2 <- FALSE
+
+# [Anotación · líneas 175–236] Lista de parámetros fijos de LightGBM (gbdt, objective binary, metric auc,
+#   max_bin 31, max_depth -1, lambda_l1 y lambda_l2 en 0, bagging_fraction 1.0) con valores iniciales para los
+#   cinco hiperparámetros que después se reemplazan. Define también los rangos de la búsqueda bayesiana, 30
+#   iteraciones y 2 semillas por iteración; en este notebook no se llama a mbo y de este bloque sólo param_fijos
+#   se usa más adelante (línea 593).
+#%% celda 16 [código]
+# Parametros LightGBM
+
+# parametros fijos del LightGBM que se pisaran con la parte variable de la BO
+PARAM$lgbm$param_fijos <-  list(
+  boosting= "gbdt", # puede ir  dart  , ni pruebe random_forest
+  objective= "binary",
+  metric= "auc",
+  first_metric_only= FALSE,
+  boost_from_average= TRUE,
+  feature_pre_filter= FALSE,
+  force_row_wise= TRUE, # para reducir warnings
+  verbosity= -100,
+
+  seed= PARAM$semillaprimigenia,
+
+  max_depth= -1L, # -1 significa no limitar,  por ahora lo dejo fijo
+  min_gain_to_split= 0, # min_gain_to_split >= 0
+  min_sum_hessian_in_leaf= 0.001, #  min_sum_hessian_in_leaf >= 0.0
+  lambda_l1= 0.0, # lambda_l1 >= 0.0
+  lambda_l2= 0.0, # lambda_l2 >= 0.0
+  max_bin= 31L, # lo debo dejar fijo, no participa de la BO
+
+  bagging_fraction= 1.0, # 0.0 < bagging_fraction <= 1.0
+  pos_bagging_fraction= 1.0, # 0.0 < pos_bagging_fraction <= 1.0
+  neg_bagging_fraction= 1.0, # 0.0 < neg_bagging_fraction <= 1.0
+  is_unbalance= FALSE, #
+  scale_pos_weight= 1.0, # scale_pos_weight > 0.0
+
+  drop_rate= 0.1, # 0.0 < neg_bagging_fraction <= 1.0
+  max_drop= 50, # <=0 means no limit
+  skip_drop= 0.5, # 0.0 <= skip_drop <= 1.0
+
+  extra_trees= FALSE,
+
+  num_iterations= 1000,
+  learning_rate= 0.02,
+  feature_fraction= 0.5,
+  num_leaves= 150,
+  min_data_in_leaf= 500
+)
+
+#%% celda 17 [texto]
+Hiperparámetros que participan de la Bayesian Optimization
+<br> si es un numero entero debe ir  makeIntegerParam
+<br> si es un numero real (con decimales) debe ir  makeNumericParam
+
+#%% celda 18 [código]
+# Aqui se cargan los bordes de los hiperparametros de la BO
+PARAM$hypeparametertuning$hs <- makeParamSet(
+  makeIntegerParam("num_iterations", lower= 300L, upper= 2000L),
+  makeNumericParam("learning_rate", lower= 0.01, upper= 0.1),
+  makeNumericParam("feature_fraction", lower= 0.1, upper= 1.0),
+  makeIntegerParam("num_leaves", lower= 20L, upper= 1024L),
+  makeIntegerParam("min_data_in_leaf", lower= 20L, upper= 3000L)
+)
+
+#%% celda 19 [código]
+PARAM$hyperparametertuning$iteraciones <- 30 # iteraciones bayesianas
+
+# cuantas semillas usa CADA iteracion de la BO (1 o 2; mas semillas = mucho mas lento)
+PARAM$hyperparametertuning$cant_semillas <- 2
+
+# [Anotación · líneas 238–256] ganancia_acumulada ordena por probabilidad descendente y acumula +780.000 por
+#   cada BAJA+2 y −20.000 por cada fila que no lo es. escribir_zulip escribe los numero_de_cliente uno por
+#   línea, sin encabezado y sin notación científica.
+#%% celda 20 [texto]
+### 3.2 Funciones auxiliares
+
+#%% celda 21 [código]
+# ganancia acumulada: ordeno de mayor a menor probabilidad
+#  y voy sumando +780000 por cada BAJA+2 y -20000 por cada uno que no lo es
+# el elemento N del resultado es la ganancia de enviar estimulo a los N primeros
+
+ganancia_acumulada <- function( pprob, pes_baja2 ) {
+  cumsum( ifelse( pes_baja2[ order(-pprob) ], 780000, -20000 ) )
+}
+
+#%% celda 22 [código]
+# escribe un archivo para Zulip: solo numero_de_cliente, sin encabezado,
+#  sin notacion cientifica (cuidado con 48000000 y 31100000)
+
+escribir_zulip <- function( pids, parchivo ) {
+  writeLines( format( pids, scientific= FALSE, trim= TRUE ), parchivo )
+}
+
+# [Anotación · líneas 258–287] Crea exp/HT6018 y la fija como carpeta de trabajo. Lee competencia_01.csv.gz,
+#   imprime filas y cantidad de BAJA+2 por mes y detiene la ejecución si falta algún mes de train_final, si
+#   falta el mes futuro o si eval_mes no tiene BAJA+2.
+#%% celda 23 [texto]
+## 4. Preprocesamiento
+
+#%% celda 24 [código]
+# carpeta de trabajo
+
+setwd(file.path(BASE, "exp"))
+experimento_folder <- paste0("HT", PARAM$experimento)
+dir.create(experimento_folder, showWarnings=FALSE)
+setwd(file.path(BASE, "exp", experimento_folder))
+
+if( file.exists("bayesiana.RDATA") )
+  cat("ATENCION: ya existe bayesiana.RDATA en esta carpeta, la BO se va a retomar.\n",
+      "Si es una corrida nueva, cambie PARAM$experimento\n")
+
+#%% celda 25 [código]
+# lectura del dataset
+dataset <- fread(file.path(BASE, "datasets", "competencia_01.csv.gz"), stringsAsFactors= TRUE)
+
+#%% celda 26 [código]
+# controlo que los meses de PARAM tengan sentido
+meses <- dataset[, list( N= .N, baja2= sum(clase_ternaria == "BAJA+2", na.rm= TRUE)), foto_mes]
+print( meses )
+
+stopifnot( all( PARAM$train_final %in% meses$foto_mes ) )
+stopifnot( PARAM$future %in% meses$foto_mes )
+stopifnot( meses[ foto_mes == PARAM$eval_mes, baja2 ] > 0 )   # eval_mes debe tener BAJA+2
+
+if( PARAM$future != max(meses$foto_mes) )
+  cat( "ATENCION: PARAM$future no es el ultimo mes del dataset\n" )
+
+# [Anotación · líneas 289–316] Variables de aguinaldo: mes_aguinaldo (1 en junio y diciembre), payroll_ratio
+#   (mpayroll sobre el promedio de mpayroll de las dos filas anteriores del cliente), cobra_aguinaldo (mes de
+#   aguinaldo y cociente entre 1.3 y 2.0) y mpayroll_sin_sac (mpayroll / 1.5 cuando cobra_aguinaldo es 1).
+#   Imprime cuántos clientes quedan marcados por mes.
+#%% celda 27 [texto]
+### 4.1 Aguinaldo 
+
+#%% celda 28 [código]
+setorder(dataset, numero_de_cliente, foto_mes)
+
+# 1. mes en que se paga aguinaldo (junio y diciembre)
+dataset[, mes_aguinaldo := as.integer(foto_mes %% 100 %in% c(6, 12))]
+
+# 2. payroll promedio de los 2 meses anteriores (solo pasado)
+dataset[, payroll_prev := (shift(mpayroll, 1) + shift(mpayroll, 2)) / 2, by= numero_de_cliente]
+
+# 3. cuanto salto el sueldo contra el pasado
+dataset[, payroll_ratio := fifelse(payroll_prev > 0, mpayroll / payroll_prev, NA_real_)]
+
+# 4. cobra aguinaldo: mes de aguinaldo y el sueldo sube entre 30% y 100%
+#    (mismo criterio que el notebook de polars)
+dataset[, cobra_aguinaldo := as.integer(
+  mes_aguinaldo == 1 & !is.na(payroll_ratio) & payroll_ratio >= 1.3 & payroll_ratio <= 2.0
+)]
+
+# 5. payroll sin aguinaldo: el SAC es medio sueldo, entonces divido por 1.5
+dataset[, mpayroll_sin_sac := fifelse(cobra_aguinaldo == 1, mpayroll / 1.5, mpayroll)]
+
+dataset[, payroll_prev := NULL]
+
+# control: cuantos clientes cobran aguinaldo por mes
+dataset[, list(cobran= sum(cobra_aguinaldo), clientes= .N), foto_mes]
+
+# [Anotación · líneas 318–351] Para todas las columnas numéricas salvo numero_de_cliente, foto_mes y
+#   clase_ternaria calcula el valor de la fila anterior del cliente (_lag1) y la diferencia con ese valor
+#   (_delta1). Las ramas de orden 2 de este bloque no se ejecutan porque PARAM$fe$lag2 es FALSE.
+#%% celda 29 [texto]
+### 4.2 Feature engineering
+
+#%% celda 30 [código]
+# 1. Ordenar por cliente y mes
+setorder(dataset, numero_de_cliente, foto_mes)
+
+# 2. Columnas a transformar: excluyo identificadores, mes y clase
+cols_excluir <- c("numero_de_cliente", "foto_mes", "clase_ternaria")
+cols_features <- setdiff(names(dataset), cols_excluir)
+
+# 3. Solo las columnas numericas
+cols_features <- cols_features[sapply(dataset[, ..cols_features], is.numeric)]
+cat("Cantidad de columnas numericas para lag/delta:", length(cols_features), "\n")
+
+# 4. Lags de orden 1 (y 2 si PARAM$fe$lag2 es TRUE)
+cols_lag1 <- paste0(cols_features, "_lag1")
+dataset[, (cols_lag1) := shift(.SD, n= 1, type= "lag"), by= numero_de_cliente, .SDcols= cols_features]
+
+if (PARAM$fe$lag2) {
+  cols_lag2 <- paste0(cols_features, "_lag2")
+  dataset[, (cols_lag2) := shift(.SD, n= 2, type= "lag"), by= numero_de_cliente, .SDcols= cols_features]
+}
+
+# 5. Delta-lags
+for (i in seq_along(cols_features)) {
+  col <- cols_features[i]
+  set(dataset, j= paste0(col, "_delta1"), value= dataset[[col]] - dataset[[cols_lag1[i]]])
+  if (PARAM$fe$lag2)
+    set(dataset, j= paste0(col, "_delta2"), value= dataset[[col]] - dataset[[cols_lag2[i]]])
+}
+
+cat("Lags y deltas generados. Columnas totales:", ncol(dataset), "\n")
+gc(full= TRUE, verbose= FALSE)
+
+# [Anotación · líneas 353–448] Lista de 78 variables escrita en el código (vars_orden2). Verifica que existan
+#   y calcula para cada una el valor de dos filas atrás del cliente (_lag2) y la diferencia con ese valor
+#   (_delta2): 156 columnas nuevas.
+#%% celda 31 [texto]
+### 4.3 Lag 2 y delta 2 **solo** para las 78 variables que no me generan un problema en agosto
+
+#%% celda 32 [código]
+vars_orden2 <- c(
+  "minversion2",
+  "ccallcenter_transacciones",
+  "thomebanking",
+  "ctrx_quarter",
+  "tcallcenter",
+  "Master_msaldototal",
+  "cseguro_vida",
+  "Visa_msaldototal",
+  "cprestamos_personales",
+  "Visa_msaldopesos",
+  "chomebanking_transacciones",
+  "cinversion1",
+  "mcheques_emitidos",
+  "mcheques_depositados",
+  "cseguro_auto",
+  "cseguro_vivienda",
+  "ccheques_emitidos",
+  "Master_mpagado",
+  "Visa_mpagado",
+  "ccuenta_debitos_automaticos",
+  "ccheques_depositados",
+  "matm",
+  "Master_mpagospesos",
+  "mcuenta_corriente",
+  "ctransferencias_recibidas",
+  "mtransferencias_recibidas",
+  "mcaja_ahorro",
+  "mcaja_ahorro_adicional",
+  "mextraccion_autoservicio",
+  "catm_trx",
+  "Visa_mpagospesos",
+  "internet",
+  "mrentabilidad_annual",
+  "mcomisiones",
+  "mautoservicio",
+  "cinversion2",
+  "cseguro_accidentes_personales",
+  "mcuenta_debitos_automaticos",
+  "mcomisiones_otras",
+  "mtransferencias_emitidas",
+  "mprestamos_prendarios",
+  "mcajeros_propios_descuentos",
+  "ccomisiones_mantenimiento",
+  "ctransferencias_emitidas",
+  "cextraccion_autoservicio",
+  "cmobile_app_trx",
+  "Master_mpagominimo",
+  "Visa_mpagosdolares",
+  "mactivos_margen",
+  "cdescubierto_preacordado",
+  "ctarjeta_debito_transacciones",
+  "ccajeros_propios_descuentos",
+  "Master_mpagosdolares",
+  "Visa_mpagominimo",
+  "cprestamos_hipotecarios",
+  "mttarjeta_visa_debitos_automaticos",
+  "mcomisiones_mantenimiento",
+  "ccomisiones_otras",
+  "cforex",
+  "cforex_sell",
+  "mforex_sell",
+  "ccajas_transacciones",
+  "ccajas_extracciones",
+  "matm_other",
+  "mrentabilidad",
+  "mpasivos_margen",
+  "mprestamos_personales",
+  "mprestamos_hipotecarios",
+  "mpagomiscuentas",
+  "ctarjeta_master_descuentos",
+  "catm_trx_other",
+  "tmobile_app",
+  "mcaja_ahorro_dolares",
+  "ctarjeta_debito",
+  "cprestamos_prendarios",
+  "cpagomiscuentas",
+  "ccajas_consultas",
+  "ccajas_otras"
+)
+
+faltan <- setdiff(vars_orden2, names(dataset))
+if (length(faltan) > 0) stop("No existen en el dataset: ", paste(faltan, collapse= ", "))
+
+setorder(dataset, numero_de_cliente, foto_mes)
+cols_l2 <- paste0(vars_orden2, "_lag2")
+dataset[, (cols_l2) := shift(.SD, n= 2, type= "lag"), by= numero_de_cliente, .SDcols= vars_orden2]
+for (i in seq_along(vars_orden2))
+  set(dataset, j= paste0(vars_orden2[i], "_delta2"), value= dataset[[vars_orden2[i]]] - dataset[[cols_l2[i]]])
+
+cat("Orden 2 para", length(vars_orden2), "variables (", 2 * length(vars_orden2), "columnas nuevas). Columnas totales:", ncol(dataset), "\n")
+gc(full= TRUE, verbose= FALSE)
+
+# [Anotación · líneas 450–546] Lista de 62 variables de monto (vars_rank) y función rank_cero_fijo: deja el 0
+#   en 0, asigna a cada positivo su rango entre los positivos dividido por la cantidad de positivos (intervalo
+#   (0,1]), a cada negativo el rango de su valor absoluto entre los negativos con signo menos (intervalo [-1,0))
+#   y mantiene los NA. Se aplica dentro de cada foto_mes y genera las columnas rk_*. Imprime por mes el mínimo y
+#   el máximo de rk_mcuentas_saldo, el porcentaje de ceros de rk_mprestamos_personales y las medianas de
+#   mpayroll y rk_mpayroll.
+#%% celda 33 [texto]
+### 4.5 Rankings con cero fijo dentro de cada mes (lo único que cambia contra el 6016)
+Para cada variable de monto, `rk_<variable>`, calculado **dentro de cada mes**:
+- 0 → **0**
+- positivos → su lugar **entre los positivos**, de 0 a 1 (el más alto = 1)
+- negativos → su lugar **entre los negativos**, de 0 a −1 (el más negativo = −1)
+- vacío → vacío
+
+#%% celda 34 [código]
+vars_rank <- c(
+  "Visa_mconsumosdolares",
+  "mtarjeta_master_consumo",
+  "Master_mconsumosdolares",
+  "Visa_mconsumospesos",
+  "Visa_mconsumototal",
+  "Master_mconsumospesos",
+  "Master_mconsumototal",
+  "mpayroll",
+  "Visa_msaldodolares",
+  "minversion1_pesos",
+  "Master_msaldodolares",
+  "mtarjeta_visa_consumo",
+  "mcuentas_saldo",
+  "minversion2",
+  "Visa_mlimitecompra",
+  "Visa_mfinanciacion_limite",
+  "Master_msaldototal",
+  "Master_msaldopesos",
+  "Visa_msaldototal",
+  "mpagodeservicios",
+  "mplazo_fijo_dolares",
+  "mttarjeta_master_debitos_automaticos",
+  "Visa_msaldopesos",
+  "mtarjeta_visa_descuentos",
+  "mtarjeta_master_descuentos",
+  "mcheques_emitidos",
+  "mcheques_depositados",
+  "Master_mpagado",
+  "Visa_mpagado",
+  "matm",
+  "Master_mpagospesos",
+  "mcuenta_corriente",
+  "mtransferencias_recibidas",
+  "mcaja_ahorro",
+  "mcaja_ahorro_adicional",
+  "mextraccion_autoservicio",
+  "Visa_mpagospesos",
+  "mrentabilidad_annual",
+  "mcomisiones",
+  "mautoservicio",
+  "mcuenta_debitos_automaticos",
+  "mcomisiones_otras",
+  "mtransferencias_emitidas",
+  "mprestamos_prendarios",
+  "mcajeros_propios_descuentos",
+  "Master_mpagominimo",
+  "Visa_mpagosdolares",
+  "mactivos_margen",
+  "Master_mpagosdolares",
+  "Visa_mpagominimo",
+  "mttarjeta_visa_debitos_automaticos",
+  "mcomisiones_mantenimiento",
+  "mforex_sell",
+  "matm_other",
+  "mrentabilidad",
+  "mpasivos_margen",
+  "mprestamos_personales",
+  "mprestamos_hipotecarios",
+  "mpagomiscuentas",
+  "mcaja_ahorro_dolares",
+  "Master_mfinanciacion_limite",
+  "Master_mlimitecompra"
+)
+faltan <- setdiff(vars_rank, names(dataset))
+if (length(faltan) > 0) stop("No existen: ", paste(faltan, collapse= ", "))
+
+rank_cero_fijo <- function(x) {
+  r <- rep(NA_real_, length(x))
+  r[!is.na(x) & x == 0] <- 0
+  pos <- which(!is.na(x) & x > 0)
+  neg <- which(!is.na(x) & x < 0)
+  if (length(pos) > 0) r[pos] <-  frank(x[pos],  ties.method= "max") / length(pos)   # (0, 1]
+  if (length(neg) > 0) r[neg] <- -frank(-x[neg], ties.method= "max") / length(neg)   # [-1, 0)
+  r
+}
+cols_rk <- paste0("rk_", vars_rank)
+dataset[, (cols_rk) := lapply(.SD, rank_cero_fijo), by= foto_mes, .SDcols= vars_rank]
+
+# control extra: el cero queda en cero, positivos en (0,1], negativos en [-1,0)
+print(dataset[, list(min_rk_saldo= min(rk_mcuentas_saldo, na.rm= TRUE), max_rk_saldo= max(rk_mcuentas_saldo, na.rm= TRUE),
+                     pct_rk_prestamo_cero= round(100 * mean(rk_mprestamos_personales == 0, na.rm= TRUE), 1)), by= foto_mes][order(foto_mes)])
+cat("Rankings agregados:", length(cols_rk), "| columnas totales:", ncol(dataset), "\n")
+
+# control: el sueldo en pesos sube de mes a mes (inflacion + aguinaldo); el ranking no
+print(dataset[mpayroll > 0, list(mediana_mpayroll= round(median(mpayroll)),
+                                 mediana_rk_mpayroll= round(median(rk_mpayroll), 3)), by= foto_mes][order(foto_mes)])
+gc(full= TRUE, verbose= FALSE)
+
+# [Anotación · líneas 548–580] Bloque de máximo, mínimo y promedio contra el mes anterior, que no se ejecuta
+#   porque PARAM$fe$minmaxmean es FALSE. Después crea clase01 (1 para BAJA+1 y BAJA+2) y define campos_buenos
+#   como todas las columnas salvo clase_ternaria, clase01, azar y training; numero_de_cliente y foto_mes quedan
+#   dentro de esa lista.
+#%% celda 35 [texto]
+### 4.4 (Opcional) máximo, mínimo y promedio contra el mes anterior
+Tomado de los notebooks 4955/7001. **Usa mucha RAM** (agrega 3 columnas por variable):
+activarlo solo si Colab tiene memoria suficiente.
+
+#%% celda 36 [código]
+PARAM$fe$minmaxmean <- FALSE
+
+if( PARAM$fe$minmaxmean ) {
+  for (i in seq_along(cols_features)) {
+    col <- cols_features[i]
+    actual   <- dataset[[col]]
+    anterior <- dataset[[cols_lag1[i]]]
+    set(dataset, j= paste0(col, "_max"),  value= pmax(actual, anterior))
+    set(dataset, j= paste0(col, "_min"),  value= pmin(actual, anterior))
+    set(dataset, j= paste0(col, "_mean"), value= (actual + anterior) / 2)
+  }
+  cat("max/min/mean generados. Columnas totales:", ncol(dataset), "\n")
+  gc(full= TRUE, verbose= FALSE)
+}
+
+#%% celda 37 [código]
+# paso la clase a binaria que tome valores {0,1}  enteros
+#  BAJA+1 y BAJA+2  son  1,   CONTINUA es 0
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+2","BAJA+1"), 1L, 0L)]
+
+# los campos que se van a utilizar
+campos_buenos <- setdiff(
+  colnames(dataset),
+  c("clase_ternaria", "clase01", "azar", "training")
+)
+
+length(campos_buenos)
+
+# [Anotación · líneas 582–601] Lee exp/HT6005/BO_log.txt (detiene la ejecución si no existe), lo ordena por y
+#   descendente y toma de la primera fila los cinco hiperparámetros, que reemplazan a los de param_fijos.
+#   min_data_in_leaf se multiplica por undersampling_final/undersampling (0.25/0.25) y se redondea.
+#%% celda 38 [texto]
+## 5. Hiperparámetros: los del 6005 (no se repite la Bayesian Optimization)
+
+#%% celda 39 [código]
+archivo_bo <- file.path(BASE, "exp", "HT6005", "BO_log.txt")
+if (!file.exists(archivo_bo)) stop("No encuentro ", archivo_bo, " : falta el resultado de la Bayesian Optimization del 6005.")
+
+tb_bo <- fread(archivo_bo)
+setorder(tb_bo, -y)
+cols_hp <- c("num_iterations", "learning_rate", "feature_fraction", "num_leaves", "min_data_in_leaf")
+
+param_bag <- modifyList(PARAM$lgbm$param_fijos, as.list(tb_bo[1, ..cols_hp]))
+param_bag$num_iterations   <- as.integer(param_bag$num_iterations)
+param_bag$num_leaves       <- as.integer(param_bag$num_leaves)
+param_bag$min_data_in_leaf <- as.integer(round(param_bag$min_data_in_leaf *
+  PARAM$trainingstrategy$undersampling_final / PARAM$trainingstrategy$undersampling))
+
+options(scipen= 999)
+cat("Hiperparametros del 6005 (ganancia en la BO:", format(tb_bo[1, y], big.mark= ","), ")\n")
+print(tb_bo[1, ..cols_hp])
+
+# [Anotación · líneas 603–618] Arma las 20 semillas: las 10 de PARAM$semillas más las primeras 10 de
+#   sample(100000:999999, 30) tras set.seed(992720) que no estén en esa lista. dtrain_bolsa(meses, semilla) fija
+#   la semilla (Mersenne-Twister), sortea un número uniforme por fila y arma el lgb.Dataset con las filas de los
+#   meses pedidos que tienen clase01 = 1 o que sortearon 0.25 o menos.
+# 20 semillas para el bagging: las 10 de siempre + 10 nuevas (siempre las mismas)
+PARAM$bagging$cant_bolsas <- 20
+set.seed(PARAM$semillaprimigenia)
+PARAM$bagging$semillas <- c(PARAM$semillas,
+                            setdiff(sample(100000:999999, 30), PARAM$semillas)[1:(PARAM$bagging$cant_bolsas - length(PARAM$semillas))])
+cat("\nSemillas del bagging:", PARAM$bagging$semillas, "\n")
+
+# datos de entrenamiento de UNA bolsa: todas las bajas + un 25% de los CONTINUA elegido con su propia semilla
+dtrain_bolsa <- function(meses, semilla) {
+  set.seed(semilla, kind= "Mersenne-Twister")   # mismo generador siempre, aunque se retome la corrida
+  azar_b <- runif(nrow(dataset))
+  filtro <- dataset$foto_mes %in% meses &
+            (azar_b <= PARAM$trainingstrategy$undersampling_final | dataset$clase01 == 1L)
+  lgb.Dataset(data= data.matrix(dataset[filtro, campos_buenos, with= FALSE]),
+              label= dataset[filtro, clase01])
+}
+
+# [Anotación · líneas 620–672] Prueba en junio: para cada semilla entrena con 202103–202105 y predice 202106
+#   completo, guardando cada columna en bagging_pred_junio.csv (saltea las que ya existen). Guarda la
+#   importancia de variables del último modelo en impo_junio.txt e imprime las 25 primeras y los rk_* entre las
+#   60 primeras. Calcula la ganancia del promedio de las 20 probabilidades para 9.000 a 13.000 envíos de a 500
+#   y, si existen los archivos de exp/HT6006 y exp/HT6016, agrega sus columnas y las diferencias; escribe
+#   comparacion_junio_vs_6006.txt.
+#%% celda 40 [texto]
+## 6. Prueba en junio: 6016 vs 6006
+Entrena los 20 modelos con marzo–mayo y mide la ganancia en junio (promediando sus probabilidades). La tabla pone al lado la curva del **6006 (bagging 20)**.
+<br>Se guarda en `bagging_pred_junio.csv` a medida que avanza.
+
+#%% celda 41 [código]
+X_jun     <- data.matrix(dataset[foto_mes %in% PARAM$eval_mes, campos_buenos, with= FALSE])
+baja2_jun <- dataset[foto_mes %in% PARAM$eval_mes, clase_ternaria %in% "BAJA+2"]
+
+archivo_jun <- "bagging_pred_junio.csv"
+pred_jun <- if (file.exists(archivo_jun)) fread(archivo_jun) else data.table(fila= seq_len(nrow(X_jun)))
+
+for (s in PARAM$bagging$semillas) {
+  col <- paste0("bolsa_", s)
+  if (col %in% names(pred_jun)) { cat("Saltando (ya existe):", col, "\n"); next }
+  d <- dtrain_bolsa(PARAM$train, s)
+  m <- lgb.train(data= d, param= modifyList(param_bag, list(seed= s)))
+  pred_jun[, (col) := predict(m, X_jun)]
+  fwrite(pred_jun, archivo_jun)
+  cat(format(Sys.time(), "%X"), "junio, bolsa", s, "lista\n")
+  rm(d); gc(full= TRUE, verbose= FALSE)
+}
+
+if (exists("m")) {
+  impo <- as.data.table(lgb.importance(m)); impo[, puesto := .I]
+  fwrite(impo, "impo_junio.txt", sep= "\t")
+  cat("\nLas 25 variables mas importantes:\n"); print(head(impo[, list(puesto, Feature, Gain= round(Gain, 4))], 25))
+  cat("\nRankings (rk_) entre las 60 mas importantes:\n")
+  print(impo[puesto <= 60 & grepl("^rk_", Feature), list(puesto, Feature, Gain= round(Gain, 4))])
+  cat("Rankings en el top 60:", impo[puesto <= 60 & grepl("^rk_", Feature), .N], "de 60 (en el 6016 fueron 14)\n")
+}
+
+# ---------- comparacion contra el 6006 ----------
+cortes     <- seq(9000, 13000, by= 500)
+cols_bolsa <- paste0("bolsa_", PARAM$bagging$semillas)
+comparacion <- data.table(envios= cortes,
+                          e6018_bagging_20= round(ganancia_acumulada(rowMeans(pred_jun[, ..cols_bolsa]), baja2_jun)[cortes] / 1e6, 1))
+archivo_6006 <- file.path(BASE, "exp", "HT6006", "bagging_comparacion_junio.txt")
+if (file.exists(archivo_6006)) {
+  c6006 <- fread(archivo_6006)[, list(envios, e6006_bagging_20= bagging_20_modelos)]
+  comparacion <- merge(c6006, comparacion, by= "envios")
+  comparacion[, diferencia := e6018_bagging_20 - e6006_bagging_20]
+}
+archivo_6016 <- file.path(BASE, "exp", "HT6016", "comparacion_junio_vs_6006.txt")
+if (file.exists(archivo_6016)) {
+  comparacion <- merge(comparacion, fread(archivo_6016)[, list(envios, e6016_bagging_20)], by= "envios")
+  comparacion[, dif_vs_6016 := e6018_bagging_20 - e6016_bagging_20]
+}
+fwrite(comparacion, "comparacion_junio_vs_6006.txt", sep= "\t")
+cat("\nGanancia en JUNIO (millones):\n"); print(comparacion)
+if ("diferencia" %in% names(comparacion))
+  cat("\nMejor 6006:", max(comparacion$e6006_bagging_20), "M  |  Mejor 6018:", max(comparacion$e6018_bagging_20), "M",
+      "\n(diferencias de 1-2 M pueden ser ruido; 4-5 M o mas, probablemente real)\n")
+
+# [Anotación · líneas 674–700] Modelos para 202108: para cada una de las 20 semillas entrena con 202103–202106
+#   (cada modelo con su 25% de CONTINUA) y agrega la predicción como columna pred_bolsa_<semilla> a
+#   predicciones_futuro.csv, que se reescribe en cada vuelta y se retoma si ya existe. Este archivo es el que
+#   después lee el notebook 6019.
+#%% celda 42 [texto]
+## 7. Modelos para agosto (20 bolsas) y archivos para el bot
+Entrena con marzo–junio, cada modelo con su propio 25% de los CONTINUA. Tarda ~40–60 minutos.
+<br>Las predicciones se guardan en `predicciones_futuro.csv` a medida que avanza (si se corta, saltea lo ya hecho).
+
+#%% celda 43 [código]
+dfuture  <- dataset[foto_mes %in% PARAM$future]
+X_future <- data.matrix(dfuture[, campos_buenos, with= FALSE])
+
+archivo_pred <- "predicciones_futuro.csv"
+if (file.exists(archivo_pred)) {
+  tb_pred <- fread(archivo_pred)
+  stopifnot(identical(tb_pred$numero_de_cliente, dfuture$numero_de_cliente))
+} else {
+  tb_pred <- dfuture[, list(numero_de_cliente)]
+}
+
+for (s in PARAM$bagging$semillas) {
+  col <- paste0("pred_bolsa_", s)
+  if (col %in% names(tb_pred)) { cat("Saltando (ya existe):", col, "\n"); next }
+  d <- dtrain_bolsa(PARAM$train_final, s)
+  m <- lgb.train(data= d, param= modifyList(param_bag, list(seed= s)))
+  tb_pred[, (col) := predict(m, X_future)]
+  fwrite(tb_pred, archivo_pred)
+  cat(format(Sys.time(), "%X"), "agosto, bagging, semilla", s, "guardada\n")
+  rm(d); gc(full= TRUE, verbose= FALSE)
+}
+
+# [Anotación · líneas 702–722] Promedia las columnas pred_bolsa_*, ordena los clientes por probabilidad
+#   descendente y escribe zulip/FINAL_e6018_N<N>.csv para N de 9.500 a 12.000 de a 250, comprobando cantidad de
+#   líneas, sólo dígitos, sin repetidos y clientes de 202108. Guarda PARAM en PARAM.yml.
+#%% celda 44 [código]
+# ---------- archivos FINAL: promedio de las probabilidades de los 20 modelos ----------
+options(scipen= 999)
+dir.create("zulip", showWarnings= FALSE)
+
+cols_pred <- grep("^pred_bolsa_", names(tb_pred), value= TRUE)
+cat("Modelos promediados:", length(cols_pred), "\n")
+prob <- rowMeans(tb_pred[, ..cols_pred])
+ids  <- tb_pred$numero_de_cliente[order(-prob)]
+
+for (N in seq(9500, 12000, by= 250)) {
+  archivo <- sprintf("zulip/FINAL_e6018_N%05d.csv", N)
+  escribir_zulip(ids[1:N], archivo)
+  lineas <- readLines(archivo)
+  ok <- length(lineas) == N && all(grepl("^[0-9]+$", lineas)) && !anyDuplicated(lineas) &&
+        all(as.numeric(lineas) %in% dfuture$numero_de_cliente)
+  cat(archivo, ":", length(lineas), "lineas,", ifelse(ok, "OK", "ERROR"), "\n")
+}
+
+write_yaml(PARAM, file= "PARAM.yml")
+format(Sys.time(), "%a %b %d %X %Y")
+
+# [Anotación · líneas 724–730] Celda de texto con la lista de qué subir al bot: la columna dif_vs_6016 de la
+#   tabla de junio y FINAL_e6018_N11000.csv.
+#%% celda 45 [texto]
+## 8. Qué subir al bot (siempre `submit <nombre>` en la primera línea)
+Los archivos están en `exp/HT6018/zulip/`.
+1. Tabla de junio: columna `dif_vs_6016` (mismos hiperparámetros y semillas → comparación justa).
+2. `FINAL_e6018_N11000.csv` → comparar con el **6016: 111,65** (ruido del público ±4).
+3. **Último envío: el elegido, solo.**
+4. Al terminar: apagar la máquina.

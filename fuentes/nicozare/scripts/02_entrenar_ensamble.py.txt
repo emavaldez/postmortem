@@ -1,0 +1,131 @@
+"""Entrena el ensamble de modelos LightGBM.
+
+Por cada semilla se entrenan 3 submodelos (variando la semilla interna, que
+cambia el submuestreo de filas y de columnas de cada árbol) y se promedian
+sus probabilidades — reduce la varianza de un único modelo.
+
+Dos corridas:
+  1. Control de calidad: entrena sin el mes más reciente con clase conocida
+     (se lo reserva como holdout) y mide la ganancia real ahí. Con esa
+     medición se elige, dentro de RANGO_CORTE, la cantidad de clientes a
+     estimular que da la mayor ganancia.
+  2. Modelo de entrega: entrena con TODOS los meses de clase conocida y
+     guarda un modelo por semilla y submodelo en modelos/.
+
+En las dos corridas, la clase a predecir es "se da de baja dentro de los
+próximos dos meses" (BAJA+1 o BAJA+2), y se submuestrea la clase mayoritaria
+(clientes que continúan) al 50% en cada submodelo — todos los positivos se
+conservan. Al entrenar con menos filas de la clase mayoritaria,
+`min_data_in_leaf` se divide por esa misma proporción.
+"""
+from __future__ import annotations
+
+import json
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+from comun import detectar_meses, submuestrear_continuas
+from config import (
+    COSTO_ESTIMULO,
+    DATASET_FE_CSV_PATH,
+    GANANCIA_ACIERTO,
+    MODELS_DIR,
+    OUTPUT_DIR,
+    PASO_BARRIDO_CORTE,
+    RANGO_CORTE,
+    SEMILLA_INTERNA_PASO,
+    SEMILLAS,
+    SUBMODELOS_POR_SEMILLA,
+    SUBMUESTREO_CONTINUA,
+)
+
+COLUMNAS_NO_FEATURE = ["numero_de_cliente", "foto_mes", "clase_ternaria", "clase_binaria"]
+
+
+def cargar_hiperparametros() -> tuple[dict, int]:
+    datos = json.loads((MODELS_DIR / "mejores_hiperparametros.json").read_text(encoding="utf-8"))
+    return datos["hiperparametros"], datos["num_boost_round"]
+
+
+HIPERPARAMETROS, NUM_BOOST_ROUND = cargar_hiperparametros()
+
+
+def armar_params(seed: int) -> dict:
+    hiper = {**HIPERPARAMETROS, "min_data_in_leaf": round(HIPERPARAMETROS["min_data_in_leaf"] / SUBMUESTREO_CONTINUA)}
+    return {
+        "objective": "binary", "boosting_type": "gbdt", "first_metric_only": False,
+        "boost_from_average": True, "feature_pre_filter": False, "max_bin": 31,
+        "seed": seed, "verbose": -1, **hiper,
+    }
+
+
+def entrenar_submodelo(df: pd.DataFrame, feats: list[str], seed: int, k: int) -> lgb.Booster:
+    seed_interna = seed + k * SEMILLA_INTERNA_PASO
+    muestra = submuestrear_continuas(df, seed_interna, SUBMUESTREO_CONTINUA)
+    dataset = lgb.Dataset(muestra[feats], label=muestra["clase_binaria"])
+    return lgb.train(armar_params(seed_interna), dataset, num_boost_round=NUM_BOOST_ROUND)
+
+
+def predecir_ensamble(modelos: list[lgb.Booster], X: pd.DataFrame) -> np.ndarray:
+    return np.mean([m.predict(X) for m in modelos], axis=0)
+
+
+def ganancia_en_corte(y_pred: np.ndarray, clase: np.ndarray, corte: int) -> float:
+    g = np.where(clase == "BAJA+2", GANANCIA_ACIERTO, -COSTO_ESTIMULO)
+    orden = np.argsort(y_pred)[::-1][:corte]
+    return float(g[orden].sum())
+
+
+def elegir_corte_optimo(preds_por_semilla: dict[int, np.ndarray], clase: np.ndarray) -> int:
+    cortes = list(range(RANGO_CORTE[0], RANGO_CORTE[1] + 1, PASO_BARRIDO_CORTE))
+    filas = [
+        {"corte": c, "ganancia_promedio": np.mean([ganancia_en_corte(preds_por_semilla[s], clase, c) for s in SEMILLAS])}
+        for c in cortes
+    ]
+    df = pd.DataFrame(filas)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(OUTPUT_DIR / "ganancia_por_corte.csv", index=False)
+    mejor = df.loc[df["ganancia_promedio"].idxmax()]
+    corte = int(mejor["corte"])
+    print(f"Corte óptimo dentro de {RANGO_CORTE}: {corte:,} (ganancia promedio ${mejor['ganancia_promedio']:,.0f})", flush=True)
+    (MODELS_DIR / "corte_optimo.txt").write_text(str(corte), encoding="utf-8")
+    return corte
+
+
+def main() -> None:
+    data = pd.read_csv(DATASET_FE_CSV_PATH, low_memory=False)
+    data["clase_binaria"] = np.where(data["clase_ternaria"].isin(["BAJA+1", "BAJA+2"]), 1, 0)
+    feats = [c for c in data.columns if c not in COLUMNAS_NO_FEATURE]
+    print(f"{len(feats)} features", flush=True)
+
+    meses_entrenamiento, mes_holdout, _ = detectar_meses(sorted(data["foto_mes"].unique()))
+    meses_fit_holdout = [m for m in meses_entrenamiento if m != mes_holdout]
+
+    print(f"\n--- Control de calidad: entrena con {meses_fit_holdout}, mide en {mes_holdout} ---", flush=True)
+    train = data[data["foto_mes"].isin(meses_fit_holdout)]
+    valid = data[data["foto_mes"] == mes_holdout]
+    clase_valid = valid["clase_ternaria"].to_numpy()
+
+    preds_por_semilla = {}
+    for seed in SEMILLAS:
+        modelos = [entrenar_submodelo(train, feats, seed, k) for k in range(SUBMODELOS_POR_SEMILLA)]
+        preds_por_semilla[seed] = predecir_ensamble(modelos, valid[feats])
+        print(f"  semilla {seed} entrenada", flush=True)
+    elegir_corte_optimo(preds_por_semilla, clase_valid)
+
+    print(f"\n--- Modelo de entrega: entrena con {meses_entrenamiento} ---", flush=True)
+    train_final = data[data["foto_mes"].isin(meses_entrenamiento)]
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    (MODELS_DIR / "features.txt").write_text("\n".join(feats), encoding="utf-8")
+    for seed in SEMILLAS:
+        for k in range(SUBMODELOS_POR_SEMILLA):
+            modelo = entrenar_submodelo(train_final, feats, seed, k)
+            destino = MODELS_DIR / f"lgb_seed_{seed}_k{k}.txt"
+            modelo.save_model(str(destino))
+        print(f"  semilla {seed}: {SUBMODELOS_POR_SEMILLA} submodelos guardados", flush=True)
+
+
+if __name__ == "__main__":
+    main()

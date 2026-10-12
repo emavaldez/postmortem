@@ -1,0 +1,349 @@
+#%% celda 1 [texto]
+<a href="https://colab.research.google.com/github/tobiartinian/Econom-a-y-Finanzas/blob/main/EDA.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+
+#%% celda 2 [código]
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import duckdb
+%pip install jupysql
+%pip install duckdb-engine
+%load_ext sql
+%config SqlMagic.autopandas = True
+%config SqlMagic.feedback = False
+%config SqlMagic.displaycon = False
+%sql duckdb://
+
+#%% celda 3 [código]
+dataset_path = "/content/drive/MyDrive/Economía y finanzas/"
+dataset_file = "competencia_01.csv"
+
+#%% celda 4 [texto]
+##EDA
+
+#%% celda 5 [código]
+%%sql
+create or replace table competencia_01 as
+select
+    *
+from read_csv_auto("{{dataset_path + dataset_file}}")
+
+#%% celda 6 [código]
+%%sql
+select DISTINCT(foto_mes)
+from competencia_01
+order by foto_mes ASC
+# tenemos info desde marzo 21 a agosto 21
+
+#%% celda 7 [código]
+%%sql
+SELECT
+AVG(active_quarter) AS tasa_activacion,
+foto_mes
+FROM competencia_01
+GROUP BY foto_mes
+
+#%% celda 8 [código]
+%%sql
+SELECT
+clase_ternaria,
+AVG(active_quarter) as tasa_activacion
+FROM competencia_01
+GROUP BY clase_Ternaria
+ORDER BY tasa_activacion DESC
+
+#%% celda 9 [código]
+%%sql
+SELECT
+    clase_ternaria,
+    COUNT(*) AS cantidad_vip,
+    PRINTF('%.2f%%', COUNT(*) * 100.0 / SUM(COUNT(*)) OVER()) AS porcentaje_vip
+FROM competencia_01
+WHERE cliente_vip = 1
+GROUP BY clase_ternaria
+ORDER BY cantidad_vip DESC;
+
+#%% celda 10 [código]
+%%sql
+SELECT
+  PRINTF('%.2f%%',AVG(internet)*100) as tasa_internet
+FROM competencia_01
+
+#%% celda 11 [código]
+%%sql
+SELECT
+  clase_ternaria,
+  PRINTF('%.2f%%',AVG(internet)*100) as tasa_internet
+FROM competencia_01
+GROUP BY clase_ternaria
+
+#%% celda 12 [código]
+%%sql
+SELECT
+AVG(cliente_edad) as avg_edad,
+MAX(cliente_edad) as max_edad,
+MIN(cliente_edad) as min_edad,
+PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cliente_edad) AS mediana_edad
+FROM competencia_01
+
+#%% celda 13 [código]
+%%sql
+WITH base AS (
+    SELECT
+        numero_de_cliente,
+        clase_ternaria,
+        CASE
+            WHEN cliente_edad < 30 THEN '1. Menor a 30'
+            WHEN cliente_edad < 40 THEN '2. 30 a 39'
+            WHEN cliente_edad < 50 THEN '3. 40 a 49'
+            WHEN cliente_edad < 60 THEN '4. 50 a 59'
+            ELSE '5. 60 o más'
+        END AS rango_edad
+    FROM competencia_01
+)
+SELECT
+    rango_edad,
+    clase_ternaria,
+    -- Porcentaje sobre el TOTAL GLOBAL de la tabla
+    ROUND(100.0 * COUNT(DISTINCT numero_de_cliente) / SUM(COUNT(DISTINCT numero_de_cliente)) OVER(), 2) AS pct_sobre_total_global,
+    ROUND(100.0 * COUNT(DISTINCT numero_de_cliente) / SUM(COUNT(DISTINCT numero_de_cliente)) OVER(PARTITION BY rango_edad), 2) AS pct_sobre_total_rango,
+FROM base
+GROUP BY rango_edad, clase_ternaria
+ORDER BY rango_edad, clase_ternaria;
+
+#%% celda 14 [código]
+%%sql
+SELECT
+mactivos_margen
+FROM competencia_01
+
+#%% celda 15 [código]
+df = pd.read_csv(f'{dataset_path + dataset_file}')
+X = df.loc[df["foto_mes"]==202103]
+y = X["clase_ternaria"]
+X = X.drop(columns=["clase_ternaria"])
+
+#%% celda 16 [código]
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.datasets import make_classification
+
+clf = RandomForestClassifier(max_depth=2, random_state=0)
+clf.fit(X, y)
+
+#%% celda 17 [texto]
+### Top 30 Most Important Features
+
+Let's extract the top 30 features based on their importance scores from the Random Forest model.
+
+#%% celda 18 [código]
+importances = clf.feature_importances_
+
+feature_importances_df = pd.DataFrame({
+    'feature': X.columns,
+    'importance': importances
+}).sort_values('importance', ascending=False)
+
+top_30_features = feature_importances_df.head(30)
+
+print("Top 30 Most Important Features:")
+display(top_30_features)
+
+#%% celda 19 [texto]
+Now, let's visualize these top 30 features to continue analysing the main features of the dataset.
+
+#%% celda 20 [código]
+plt.figure(figsize=(10, 8))
+sns.barplot(x='importance', y='feature', data=top_30_features, palette='viridis')
+plt.title('Top 30 Feature Importances')
+plt.xlabel('Importance')
+plt.ylabel('Feature')
+plt.tight_layout()
+plt.show()
+
+#%% celda 21 [código]
+%%sql
+
+WITH base_clases_ternarias AS (
+  SELECT id
+  FROM competencia_01
+  WHERE clase_ternaria = 'BAJA+2'
+)
+
+SELECT
+clase_ternaria,
+AVG(mpasivos_margen)
+FROM base_clases_ternarias
+GROUP BY clase_ternaria
+
+#%% celda 22 [código]
+%%sql
+
+WITH base_id_baja2 AS (
+  SELECT numero_de_cliente
+  FROM competencia_01
+  WHERE clase_ternaria = 'BAJA+2'
+)
+SELECT
+c.clase_ternaria,
+AVG(c.mpasivos_margen),
+COUNT(DISTINCT b.numero_de_cliente)
+FROM competencia_01 c
+INNER JOIN base_id_baja2 b
+ON c.numero_de_cliente = b.numero_de_cliente
+GROUP BY c.clase_ternaria
+
+#%% celda 23 [código]
+%%sql
+WITH base_id_baja2 AS (
+  -- 1. Obtenemos los clientes únicos que fueron BAJA+2
+  SELECT DISTINCT numero_de_cliente
+  FROM competencia_01
+  WHERE clase_ternaria = 'BAJA+2'
+)
+SELECT
+  c.foto_mes,
+  c.clase_ternaria,
+  AVG(c.mpasivos_margen) AS promedio_mpasivos_margen,
+  COUNT(DISTINCT c.numero_de_cliente) AS cantidad_clientes
+FROM competencia_01 c
+INNER JOIN base_id_baja2 b
+  ON c.numero_de_cliente = b.numero_de_cliente
+GROUP BY
+  c.foto_mes,
+  c.clase_ternaria
+ORDER BY
+  c.foto_mes ASC;
+
+#%% celda 24 [código]
+%%sql
+
+WITH ids_baja2 AS (
+  -- 1. Identificamos todos los clientes que AL MENOS UNA VEZ fueron BAJA+2
+  SELECT DISTINCT numero_de_cliente
+  FROM competencia_01
+  WHERE clase_ternaria = 'BAJA+2'
+),
+clientes_clasificados AS (
+  -- 2. Clasificamos a todos los clientes según su comportamiento histórico
+  SELECT
+    c.foto_mes,
+    c.numero_de_cliente,
+    c.clase_ternaria,
+    c.mpasivos_margen,
+    CASE
+      WHEN b.numero_de_cliente IS NOT NULL THEN 'Eventual BAJA'
+      ELSE 'Siempre CONTINUA'
+    END AS cohorte_cliente
+  FROM competencia_01 c
+  LEFT JOIN ids_baja2 b
+    ON c.numero_de_cliente = b.numero_de_cliente
+)
+-- 3. Agrupamos por mes y por cohorte para comparar métricas
+SELECT
+  clase_ternaria,
+  cohorte_cliente,
+  AVG(mpasivos_margen) AS promedio_mpasivos_margen,
+  COUNT(DISTINCT numero_de_cliente) AS total_clientes
+FROM clientes_clasificados
+GROUP BY
+   clase_ternaria,
+  cohorte_cliente
+ORDER BY
+  cohorte_cliente;
+
+#%% celda 25 [código]
+%%sql df <<
+
+WITH ids_baja2 AS (
+  SELECT DISTINCT numero_de_cliente
+  FROM competencia_01
+  WHERE clase_ternaria = 'BAJA+2'
+),
+clientes_clasificados AS (
+  SELECT
+    c.foto_mes,
+    c.numero_de_cliente,
+    c.clase_ternaria,
+    c.mpasivos_margen,
+    CASE
+      WHEN b.numero_de_cliente IS NOT NULL THEN 'Eventual BAJA'
+      ELSE 'Siempre CONTINUA'
+    END AS cohorte_cliente
+  FROM competencia_01 c
+  LEFT JOIN ids_baja2 b
+    ON c.numero_de_cliente = b.numero_de_cliente
+)
+SELECT
+  clase_ternaria,
+  cohorte_cliente,
+  AVG(mpasivos_margen) AS promedio_mpasivos_margen,
+  COUNT(DISTINCT numero_de_cliente) AS total_clientes
+FROM clientes_clasificados
+GROUP BY
+  clase_ternaria,
+  cohorte_cliente
+ORDER BY
+  cohorte_cliente;
+
+#%% celda 26 [código]
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 1. Filtramos solo los datos de la cohorte 'Eventual BAJA'
+df_eventual = df[df['cohorte_cliente'] == 'Eventual BAJA']
+
+# 2. Obtenemos el valor promedio de la cohorte 'Siempre CONTINUA'
+avg_siempre_continua = df[df['cohorte_cliente'] == 'Siempre CONTINUA'][
+    'promedio_mpasivos_margen'
+].values[0]
+
+# 3. Configuramos la figura
+plt.figure(figsize=(10, 6))
+
+# Dibujamos las barras para Eventual BAJA
+bars = sns.barplot(
+    data=df_eventual,
+    x='clase_ternaria',
+    y='promedio_mpasivos_margen',
+    palette='Blues_d',
+)
+
+# 4. Agregamos la línea horizontal de referencia
+plt.axhline(
+    y=avg_siempre_continua,
+    color='red',
+    linestyle='--',
+    linewidth=2,
+    label=f'Promedio "Siempre CONTINUA" (${avg_siempre_continua:,.2f})',
+)
+
+# 5. Agregamos etiquetas con los montos encima de cada barra
+for bar in bars.patches:
+    height = bar.get_height()
+    if height > 0:
+        plt.annotate(
+            f'${height:,.2f}',
+            (bar.get_x() + bar.get_width() / 2.0, height),
+            ha='center',
+            va='bottom',
+            xytext=(0, 5),
+            textcoords='offset points',
+            fontsize=10,
+            fontweight='bold',
+        )
+
+# Formato visual
+plt.title(
+    'Promedio Margen Pasivos: Eventual BAJA por Clase Ternaria vs. Siempre CONTINUA',
+    fontsize=12,
+    fontweight='bold',
+    pad=15,
+)
+plt.xlabel('Clase Ternaria', fontsize=11)
+plt.ylabel('Promedio Margen Pasivos ($)', fontsize=11)
+plt.legend(loc='upper right')
+plt.grid(axis='y', linestyle=':', alpha=0.6)
+plt.tight_layout()
+
+plt.show()

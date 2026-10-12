@@ -1,0 +1,403 @@
+#%% celda 1 [texto]
+# Primera competencia DMEyF 2026 — Notebook final reproducible
+**Modelo entregado: A'plus + B, 100 semillas de cada uno, ensamble por promedio de rankings, corte 10.600.**
+Resultado en el Public del bot: **119,3775 M** (archivo `Aprimaplus_B100_corte10600.csv`).
+
+## Qué hace (de punta a punta)
+1. Lee `competencia_01.csv` (ya trae `clase_ternaria`) y corrige un cero roto (`ccajas_depositos` en 202105 → NA).
+2. Calcula para cada cliente los **rezagos de 1 y 2 meses** (`_lag1`, `_lag2`) y las **diferencias con el valor actual** (`_delta1`, `_delta2`) de todas las variables numéricas.
+3. **Modelo A'plus** (576 variables): variables seleccionadas con canaritos + variables históricas (promedio, máximo, mínimo, razones y tendencia de 3 meses) + variables compuestas + `gen_1`. Se transforman con el *ranking cero fijo* (ver más abajo).
+4. **Modelo B** (todas las variables originales + lags + deltas, rankeadas igual; sin `foto_mes` ni `numero_de_cliente`).
+5. Entrena **LightGBM con 100 semillas para A'plus y 100 para B** sobre 202103–202106 y predice 202108.
+6. Promedia los rankings (percentiles) de las semillas de cada modelo, promedia A'plus y B, y se queda con los **10.600 clientes** de mayor puntaje.
+
+## Requisitos
+- R 4.5 con los paquetes `data.table` y `lightgbm`. RAM: unos 20 GB.
+- `competencia_01.csv` (carpeta de datasets del curso).
+- `variables_A_Aprimaplus.txt` en la misma carpeta que esta notebook: la lista **ordenada** de las 576 variables de A'plus (575 seleccionadas + `gen_1`). El orden importa: LightGBM elige las columnas de cada árbol según su posición.
+- Tiempo medido en una máquina de 20 GB de RAM: ~70 min de preparación (carga, rezagos, ranking y matrices) + ~2 min por semilla de A'plus + ~4 min por semilla de B. Con 100 semillas, **unas 11 h en total**. Es **reanudable**: si se corta, volver a correrla; las semillas ya hechas se saltean (la preparación se repite).
+- Para una prueba rápida, poner `N_SEMILLAS <- 10` en la celda de configuración (~2 h). Da un resultado parecido pero **no idéntico** al de 100 semillas.
+- Para **verificar el pipeline completo en ~1 h 20 min**, poner `N_SEMILLAS <- 1` y correr hasta el final: la sección 11 compara el ranking de esa semilla con el que ya teníamos guardado. En la corrida de verificación (semilla 585581) los rankings de A'plus y de B resultaron **idénticos** a los originales (Spearman 1).
+
+## Decisiones que conviene conocer (transparencia)
+| Tema | Qué se hizo |
+|---|---|
+| Ranking cero fijo | Variante **propia** (no la fórmula de la cátedra, que no vimos con detalle): por mes y por variable, los valores distintos de cero (negativos y positivos juntos) se ordenan y se escalan de 1 a 100; el cero queda fijo en 0 y los NA siguen NA |
+| Selección de variables | Se hizo con canaritos usando etiquetas hasta 202106. Por eso la validación en 202106 sale **optimista** para el modelo A; la decisión final se apoyó en el Public del bot y no solo en esa validación |
+| Salsa Mágica | No se usa (no se excluyen `cprestamos_personales` ni `mprestamos_personales`) |
+| `foto_mes` | Se excluye de B: con 202108 como mes a predecir sería un valor nunca visto en el entrenamiento |
+| Hiperparámetros | Fijos y los mismos en las 100 semillas (los del ensamble que dio 472,23 M en validación); no se reoptimizan acá |
+| Corte | 10.600 clientes, elegido mirando la curva ganancia–corte del Public (la ganancia cambia poco entre ~10.500 y ~10.750) |
+
+**Reproducibilidad:** las semillas están fijas, pero LightGBM con varios hilos puede dar diferencias de redondeo según la versión y la máquina. Al final, la notebook compara contra el archivo entregado (si está disponible) e informa cuántos clientes coinciden.
+
+#%% celda 2 [texto]
+### 1. Configuración
+
+#%% celda 3 [código]
+rm(list = ls())
+gc()
+
+require("data.table")
+require("lightgbm")
+options(scipen = 999)
+
+# ---- RUTAS: cambiar solo estas dos lineas ----
+PARAM_carpeta_datasets <- "C:/Users/Laura/Documents/DMEyF/datasets/"      # contiene competencia_01.csv
+PARAM_carpeta_salida   <- "C:/Users/Laura/Documents/DMEyF/exp/final_reproducible/"   # aca se escribe todo
+archivo_variables_A    <- "variables_A_Aprimaplus.txt"                    # en la misma carpeta que esta notebook
+
+dir.create(PARAM_carpeta_salida, showWarnings = FALSE, recursive = TRUE)
+if (!file.exists(archivo_variables_A)) stop("Falta ", archivo_variables_A, " (debe estar junto a esta notebook; ver Requisitos)")
+
+# ---- Periodos ----
+MESES_TRAIN <- c(202103, 202104, 202105, 202106)
+MES_FUTURE  <- 202108
+
+# ---- Correccion de ceros rotos (cero -> NA en el/los mes(es) indicados) ----
+CORRECCIONES <- list(ccajas_depositos = c(202105))
+
+# ---- Salida ----
+CORTE_FINAL <- 10600
+N_SEMILLAS  <- 100        # 100 = entrega final; 10 = prueba rapida (no identica); 1 = verificacion del pipeline
+
+# ---- Semillas: 10 originales + 20 nuevas + 70 primos a partir de 100272 ----
+SEMILLAS_10 <- c(585581, 249449, 655649, 503039, 798191, 112909, 334667, 421303, 667021, 887923)
+SEMILLAS_NUEVAS <- c(100003, 100019, 100043, 100049, 100057, 100069, 100103, 100109, 100129, 100151, 100153, 100169, 100183, 100189, 100193, 100207, 100213, 100237, 100267, 100271)
+es_primo <- function(n) n > 1 && all(n %% 2:floor(sqrt(n)) != 0)
+cand <- 100272:101500; cand <- cand[sapply(cand, es_primo)]
+SEM100 <- c(SEMILLAS_10, SEMILLAS_NUEVAS, cand[1:70])
+stopifnot(length(unique(SEM100)) == 100)
+SEMILLAS <- SEM100[1:N_SEMILLAS]
+
+# ---- Hiperparametros (iguales para todas las semillas) ----
+param_A <- list(
+  boosting = "gbdt", objective = "binary", metric = "auc",
+  first_metric_only = TRUE, boost_from_average = TRUE, feature_pre_filter = FALSE, verbosity = -100,
+  learning_rate = 0.02, feature_fraction = 0.1541961, feature_fraction_bynode = 1,
+  min_data_in_leaf = 4000, num_leaves = 1684, max_depth = -1,
+  lambda_l1 = 1.520327, lambda_l2 = 7.548036, min_gain_to_split = 0.2158453, max_delta_step = 0,
+  bagging_fraction = 0.8425105, bagging_freq = 6, min_sum_hessian_in_leaf = 0.001,
+  pos_bagging_fraction = 1, neg_bagging_fraction = 1, extra_trees = FALSE, path_smooth = 0,
+  cat_l2 = 10, cat_smooth = 10, max_cat_to_onehot = 4, top_rate = 0.2, other_rate = 0.1,
+  use_missing = TRUE, is_unbalance = FALSE, num_iterations = 600, early_stopping_rounds = 0,
+  max_bin = 31, scale_pos_weight = 0.5, force_row_wise = TRUE
+)
+param_B <- list(
+  boosting = "gbdt", objective = "binary", metric = "auc",
+  first_metric_only = FALSE, boost_from_average = TRUE, feature_pre_filter = FALSE,
+  force_row_wise = TRUE, verbosity = -100,
+  max_depth = -1, max_bin = 31,
+  min_sum_hessian_in_leaf = 0.001,
+  pos_bagging_fraction = 1, neg_bagging_fraction = 1, is_unbalance = FALSE,
+  drop_rate = 0.1, max_drop = 50, skip_drop = 0.5, extra_trees = FALSE,
+  num_iterations = 600, learning_rate = 0.02, feature_fraction = 0.1541961,
+  num_leaves = 1684, min_data_in_leaf = 1000, scale_pos_weight = 0.5,
+  min_gain_to_split = 0.2158453, lambda_l1 = 1.520327, lambda_l2 = 7.548036,
+  bagging_fraction = 0.8425105, bagging_freq = 6
+)
+
+cat("Train:", paste(MESES_TRAIN, collapse = "+"), "| future:", MES_FUTURE, "| semillas:", N_SEMILLAS, "| corte:", CORTE_FINAL, "\n")
+cat("lightgbm", as.character(packageVersion("lightgbm")), "| data.table", as.character(packageVersion("data.table")), "|", R.version.string, "\n")
+
+#%% celda 4 [texto]
+### 2. Carga de `competencia_01.csv` y chequeos
+
+#%% celda 5 [código]
+t0 <- Sys.time()
+dataset <- fread(paste0(PARAM_carpeta_datasets, "competencia_01.csv"), stringsAsFactors = TRUE)
+cat("Cargado:", nrow(dataset), "filas x", ncol(dataset), "columnas en", round(as.numeric(Sys.time() - t0, units = "secs"), 1), "seg\n")
+
+if (!("clase_ternaria" %in% colnames(dataset))) stop("No se encontro clase_ternaria")
+cat("\nFilas por mes y clase_ternaria:\n")
+print(dcast(dataset[, .N, by = .(foto_mes, clase_ternaria)], foto_mes ~ clase_ternaria, value.var = "N"))
+
+if (!(MES_FUTURE %in% dataset$foto_mes)) stop("No esta el mes future en el dataset: ", MES_FUTURE)
+if (dataset[foto_mes %in% MESES_TRAIN & is.na(clase_ternaria), .N] > 0) stop("Hay filas de train sin clase_ternaria (NA)")
+setorder(dataset, numero_de_cliente, foto_mes)
+
+#%% celda 6 [texto]
+### 3. Corrección del cero roto (`ccajas_depositos`, 202105: cero → NA)
+
+#%% celda 7 [código]
+for (v in names(CORRECCIONES)) {
+  meses <- CORRECCIONES[[v]]
+  n <- dataset[foto_mes %in% meses & get(v) == 0, .N]
+  dataset[foto_mes %in% meses & get(v) == 0, (v) := NA_real_]
+  cat(v, "-- meses", paste(meses, collapse = ","), "-- ceros pasados a NA:", n, "\n")
+}
+
+#%% celda 8 [texto]
+### 4. Rezagos y diferencias de 1 y 2 meses
+`_lag1` = valor de hace 1 mes; `_lag2` = valor de hace 2 meses; `_delta1` = actual − lag1; `_delta2` = actual − lag2. Se calculan sobre los valores originales, por cliente, **antes** de rankear.
+
+#%% celda 9 [código]
+campos_no_procesar <- c("numero_de_cliente", "foto_mes", "clase_ternaria")
+campos_lag <- setdiff(colnames(dataset), campos_no_procesar)
+campos_lag <- campos_lag[sapply(dataset[, ..campos_lag], is.numeric)]
+cat("Lags/deltas para", length(campos_lag), "variables\n")
+
+t0 <- Sys.time()
+dataset[, (paste0(campos_lag, "_lag1")) := shift(.SD, n = 1, fill = NA, type = "lag"), by = numero_de_cliente, .SDcols = campos_lag]
+dataset[, (paste0(campos_lag, "_lag2")) := shift(.SD, n = 2, fill = NA, type = "lag"), by = numero_de_cliente, .SDcols = campos_lag]
+for (campo in campos_lag) {
+  dataset[, paste0(campo, "_delta1") := get(campo) - get(paste0(campo, "_lag1"))]
+  dataset[, paste0(campo, "_delta2") := get(campo) - get(paste0(campo, "_lag2"))]
+}
+cat("Listo en", round(as.numeric(Sys.time() - t0, units = "secs"), 1), "seg |", nrow(dataset), "filas x", ncol(dataset), "columnas\n")
+
+# con los rezagos ya calculados, se conservan solo los meses que se usan (el ranking es por mes: no cambia)
+MESES_USAR <- c(MESES_TRAIN, MES_FUTURE)
+dataset <- dataset[foto_mes %in% MESES_USAR]
+gc()
+cat("Filas que quedan (", paste(MESES_USAR, collapse = ","), "):", nrow(dataset), "\n")
+
+#%% celda 10 [texto]
+### 5. Ranking cero fijo
+Por mes y por variable: los valores distintos de cero (negativos y positivos juntos) se ordenan y se llevan a una escala de 1 a 100; el cero queda en 0 y los NA siguen siendo NA.
+
+#%% celda 11 [código]
+rankear_cero_fijo <- function(x) {
+  out <- rep(0, length(x))
+  idx_nz <- which(x != 0 & !is.na(x))
+  n <- length(idx_nz)
+  if (n == 1) {
+    out[idx_nz] <- 100
+  } else if (n > 1) {
+    r <- frank(x[idx_nz], ties.method = "average")
+    out[idx_nz] <- 1 + 99 * (r - 1) / (n - 1)
+  }
+  out[is.na(x)] <- NA_real_
+  out
+}
+
+rankear_dataset <- function(dt) {
+  campos_no_rankear <- c("numero_de_cliente", "foto_mes", "clase_ternaria")
+  campos_rankear <- setdiff(colnames(dt), campos_no_rankear)
+  campos_rankear <- campos_rankear[sapply(dt[, ..campos_rankear], is.numeric)]
+  for (campo in campos_rankear) {
+    # las columnas enteras no pueden guardar percentiles con decimales: se pasan a numeric antes de rankear
+    if (is.integer(dt[[campo]])) set(dt, j = campo, value = as.numeric(dt[[campo]]))
+    dt[, (campo) := rankear_cero_fijo(get(campo)), by = foto_mes]
+  }
+  invisible(dt)
+}
+
+#%% celda 12 [texto]
+### 6. Modelo A'plus: variables históricas, ranking, compuestas y `gen_1`
+Solo se calculan y rankean las columnas que el modelo usa (el ranking es independiente por columna, así que el resultado es idéntico al de rankear todo; solo ahorra tiempo y memoria).
+
+#%% celda 13 [código]
+t0 <- Sys.time()
+
+variables_A_archivo <- trimws(readLines(archivo_variables_A)); variables_A_archivo <- variables_A_archivo[variables_A_archivo != ""]
+stopifnot(tail(variables_A_archivo, 1) == "gen_1", !anyDuplicated(variables_A_archivo))
+campos_A_archivo <- setdiff(variables_A_archivo, "gen_1")   # las 575 seleccionadas, en su orden
+
+insumos_compuestas <- c("mtarjeta_visa_consumo", "mtarjeta_master_consumo", "Visa_mconsumototal", "Master_mconsumototal",
+  "Visa_msaldototal", "Master_msaldototal", "Visa_mlimitecompra", "Master_mlimitecompra", "Visa_mpagado", "Master_mpagado",
+  "Visa_mpagominimo", "Master_mpagominimo", "mcajeros_propios_descuentos", "mtarjeta_visa_descuentos",
+  "mtarjeta_master_descuentos", "Visa_status", "Master_status", "mpayroll", "mpayroll2", "mprestamos_prendarios",
+  "mprestamos_hipotecarios", "minversion1_pesos", "minversion1_dolares", "minversion2", "mplazo_fijo_dolares",
+  "mplazo_fijo_pesos", "mtransferencias_recibidas", "mtransferencias_emitidas", "mcomisiones_mantenimiento",
+  "mcomisiones_otras")
+patron_ruidoso <- "Master_fultimo_cierre|Visa_fultimo_cierre|Visa_mpagado"   # estas variables se sacan del modelo A
+necesarias <- unique(c(campos_A_archivo, insumos_compuestas, "ctrx_quarter", "cpayroll_trx_min3"))
+necesarias <- necesarias[!grepl(patron_ruidoso, necesarias)]
+sufijos_fe <- c("_avg3", "_max3", "_min3", "_ratio_avg", "_ratio_max", "_tendencia")
+
+claves <- c("numero_de_cliente", "foto_mes", "clase_ternaria")
+dataset_A <- dataset[, unique(c(claves, intersect(necesarias, colnames(dataset)))), with = FALSE]
+
+# --- variables historicas (promedio, maximo, minimo, razones y tendencia de 3 meses) ---
+todas <- colnames(dataset)
+bases <- sub("_lag1$", "", grep("_lag1$", todas, value = TRUE))
+bases <- bases[bases %in% todas & paste0(bases, "_lag2") %in% todas]
+bases <- bases[!grepl(patron_ruidoso, bases)]
+bases_fe <- bases[vapply(bases, function(b) any(paste0(b, sufijos_fe) %in% necesarias), logical(1))]
+for (b in bases_fe) {
+  a  <- dataset[[b]]
+  l1 <- dataset[[paste0(b, "_lag1")]]
+  l2 <- dataset[[paste0(b, "_lag2")]]
+  avg3 <- rowMeans(cbind(a, l1, l2), na.rm = TRUE)
+  avg3[is.nan(avg3)] <- NA_real_
+  max3 <- pmax(a, l1, l2, na.rm = TRUE)
+  min3 <- pmin(a, l1, l2, na.rm = TRUE)
+  derivadas <- list(
+    avg3 = avg3, max3 = max3, min3 = min3,
+    ratio_avg = ifelse(!is.na(avg3) & avg3 != 0, a / avg3, NA_real_),
+    ratio_max = ifelse(!is.na(max3) & max3 != 0, a / max3, NA_real_),
+    tendencia = ifelse(!is.na(l2), (a - l2) / 2, ifelse(!is.na(l1), a - l1, NA_real_))
+  )
+  for (s in names(derivadas)) {
+    nom <- paste0(b, "_", s)
+    if (nom %in% necesarias) dataset_A[, (nom) := derivadas[[s]]]
+  }
+}
+cat("Variables historicas:", length(bases_fe), "variables base de", length(bases), "\n")
+
+# --- ranking cero fijo ---
+rankear_dataset(dataset_A)
+gc()
+
+# --- variables compuestas y gen_1 (se calculan sobre valores ya rankeados) ---
+agregar_si_existen <- function(dt, nombre_nueva, columnas, fun_combinacion) {
+  presentes <- columnas[columnas %in% colnames(dt)]
+  if (length(presentes) < 2) return(invisible(NULL))
+  dt[, (nombre_nueva) := fun_combinacion(.SD), .SDcols = presentes]
+}
+suma_filas <- function(sd) Reduce(`+`, sd)
+
+agregar_si_existen(dataset_A, "consumo_tarjetas_total", c("mtarjeta_visa_consumo", "mtarjeta_master_consumo"), suma_filas)
+agregar_si_existen(dataset_A, "consumototal_tarjetas", c("Visa_mconsumototal", "Master_mconsumototal"), suma_filas)
+agregar_si_existen(dataset_A, "saldo_tarjetas_total", c("Visa_msaldototal", "Master_msaldototal"), suma_filas)
+agregar_si_existen(dataset_A, "limite_tarjetas_total", c("Visa_mlimitecompra", "Master_mlimitecompra"), suma_filas)
+agregar_si_existen(dataset_A, "pagado_tarjetas_total", c("Visa_mpagado", "Master_mpagado"), suma_filas)
+agregar_si_existen(dataset_A, "pagominimo_tarjetas_total", c("Visa_mpagominimo", "Master_mpagominimo"), suma_filas)
+agregar_si_existen(dataset_A, "descuentos_tarjetas_total",
+                   c("mcajeros_propios_descuentos", "mtarjeta_visa_descuentos", "mtarjeta_master_descuentos"), suma_filas)
+if (all(c("consumototal_tarjetas", "limite_tarjetas_total") %in% colnames(dataset_A))) {
+  dataset_A[, utilizacion_tarjetas := ifelse(limite_tarjetas_total == 0, 0, consumototal_tarjetas / limite_tarjetas_total)]
+}
+if (all(c("Visa_status", "Master_status") %in% colnames(dataset_A))) {
+  dataset_A[, tarjetas_activas_count := as.integer(Visa_status == 0) + as.integer(Master_status == 0)]
+}
+agregar_si_existen(dataset_A, "ingresos_payroll_total", c("mpayroll", "mpayroll2"), suma_filas)
+agregar_si_existen(dataset_A, "prestamos_sin_personales_total", c("mprestamos_prendarios", "mprestamos_hipotecarios"), suma_filas)
+agregar_si_existen(dataset_A, "inversiones_totales", c("minversion1_pesos", "minversion1_dolares", "minversion2"), suma_filas)
+agregar_si_existen(dataset_A, "plazo_fijo_total", c("mplazo_fijo_dolares", "mplazo_fijo_pesos"), suma_filas)
+if (all(c("mtransferencias_recibidas", "mtransferencias_emitidas") %in% colnames(dataset_A))) {
+  dataset_A[, transferencias_netas := mtransferencias_recibidas - mtransferencias_emitidas]
+}
+agregar_si_existen(dataset_A, "comisiones_totales_manual", c("mcomisiones_mantenimiento", "mcomisiones_otras"), suma_filas)
+dataset_A[, gen_1 := ctrx_quarter + cpayroll_trx_min3]
+dataset_A[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+campos_A <- campos_A_archivo[campos_A_archivo %in% colnames(dataset_A)]
+campos_A <- c(campos_A, "gen_1")
+cat("Variables modelo A'plus:", length(campos_A), "\n")
+if (!identical(campos_A, variables_A_archivo)) stop("Las variables de A'plus calculadas no coinciden (ni en cantidad ni en orden) con ", archivo_variables_A)
+
+# --- matrices (future ordenado por cliente) ---
+dataset_A_train <- dataset_A[foto_mes %in% MESES_TRAIN]
+dfuture_A       <- dataset_A[foto_mes == MES_FUTURE]
+setkey(dfuture_A, numero_de_cliente)
+matriz_A_train  <- data.matrix(dataset_A_train[, campos_A, with = FALSE])
+matriz_A_future <- data.matrix(dfuture_A[, campos_A, with = FALSE])
+y_train    <- dataset_A_train$clase01
+ids_future <- dfuture_A$numero_de_cliente
+cat("train:", nrow(dataset_A_train), "filas |", sum(y_train), "positivos (BAJA+1 y BAJA+2) | future:", length(ids_future), "clientes\n")
+rm(dataset_A, dataset_A_train, dfuture_A); gc(full = TRUE, verbose = FALSE)
+cat("Modelo A'plus: matrices listas en", round(as.numeric(Sys.time() - t0, units = "secs"), 1), "seg\n")
+
+#%% celda 14 [texto]
+### 7. Modelo B: todas las variables, rankeadas (sin `foto_mes` ni `numero_de_cliente`)
+
+#%% celda 15 [código]
+t0 <- Sys.time()
+dataset_B <- dataset
+rm(dataset)
+rankear_dataset(dataset_B)
+dataset_B[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+gc()
+
+campos_B <- setdiff(colnames(dataset_B), c("clase_ternaria", "clase01", "numero_de_cliente", "foto_mes"))
+cat("Variables modelo B:", length(campos_B), "\n")
+
+idx_train  <- which(dataset_B$foto_mes %in% MESES_TRAIN)
+idx_future <- which(dataset_B$foto_mes == MES_FUTURE)
+idx_future <- idx_future[order(dataset_B$numero_de_cliente[idx_future])]   # mismo orden que en A'plus
+stopifnot(identical(dataset_B$numero_de_cliente[idx_future], ids_future))
+stopifnot(identical(dataset_B$clase01[idx_train], y_train))
+
+matriz_B_train  <- data.matrix(dataset_B[idx_train,  campos_B, with = FALSE])
+matriz_B_future <- data.matrix(dataset_B[idx_future, campos_B, with = FALSE])
+rm(dataset_B, idx_train, idx_future); gc(full = TRUE, verbose = FALSE)
+cat("Modelo B: matrices listas en", round(as.numeric(Sys.time() - t0, units = "secs"), 1), "seg\n")
+
+#%% celda 16 [texto]
+### 8. Entrenamiento: una corrida de LightGBM por semilla y por modelo (reanudable)
+Cada semilla guarda el ranking de sus predicciones (`frank(prob) / n`) en un archivo `.rds`; si ya existe, se saltea.
+
+#%% celda 17 [código]
+carpeta_rank <- paste0(PARAM_carpeta_salida, "rankings/"); dir.create(carpeta_rank, showWarnings = FALSE, recursive = TRUE)
+ruta_rank <- function(modelo, s) paste0(carpeta_rank, "rank_", modelo, "_s", s, ".rds")
+
+entrenar_modelo <- function(modelo, param, m_train, m_future) {
+  for (SEM in SEMILLAS) {
+    archivo <- ruta_rank(modelo, SEM)
+    if (file.exists(archivo)) { cat("[", modelo, "semilla", SEM, "] ya hecha, se saltea\n"); next }
+    t0 <- Sys.time()
+    p <- param; p$seed <- SEM
+    set.seed(SEM, "L'Ecuyer-CMRG")
+    m <- lgb.train(data = lgb.Dataset(data = m_train, label = y_train, free_raw_data = FALSE), param = p, verbose = -1)
+    prob <- predict(m, m_future)
+    rm(m); gc(full = TRUE, verbose = FALSE)
+    saveRDS(frank(prob) / length(prob), archivo)
+    cat("[", modelo, "semilla", SEM, "] lista en", round(as.numeric(Sys.time() - t0, units = "mins"), 1), "min |", format(Sys.time()), "\n")
+  }
+}
+
+entrenar_modelo("Aplus", param_A, matriz_A_train, matriz_A_future)
+entrenar_modelo("B",     param_B, matriz_B_train, matriz_B_future)
+cat("\nA'plus:", sum(file.exists(sapply(SEMILLAS, function(s) ruta_rank("Aplus", s)))), "de", length(SEMILLAS), "semillas |",
+    "B:", sum(file.exists(sapply(SEMILLAS, function(s) ruta_rank("B", s)))), "de", length(SEMILLAS), "semillas\n")
+
+#%% celda 18 [texto]
+### 9. Ensamble y archivo para el bot
+Ranking promedio de las semillas de cada modelo; luego promedio de A'plus y B; se toman los `CORTE_FINAL` clientes con mayor ranking.
+
+#%% celda 19 [código]
+rA <- rowMeans(sapply(SEMILLAS, function(s) readRDS(ruta_rank("Aplus", s))))
+rB <- rowMeans(sapply(SEMILLAS, function(s) readRDS(ruta_rank("B", s))))
+stopifnot(length(rA) == length(ids_future), length(rB) == length(ids_future))
+cat("Spearman A'plus vs B:", round(cor(rA, rB, method = "spearman"), 4), "\n")
+
+rank_final <- (rA + rB) / 2
+orden <- ids_future[order(-rank_final)]
+top <- orden[1:CORTE_FINAL]
+
+archivo_final <- paste0(PARAM_carpeta_salida, "Aprimaplus_B", N_SEMILLAS, "_corte", CORTE_FINAL, ".csv")
+fwrite(data.table(id = as.integer(top)), archivo_final, col.names = FALSE)
+fwrite(data.table(numero_de_cliente = as.integer(ids_future), rank_Aplus = rA, rank_B = rB, rank_final = rank_final),
+       paste0(PARAM_carpeta_salida, "scores_Aprimaplus_B", N_SEMILLAS, "_202108.csv"))
+
+# chequeo de formato (sin encabezado, solo enteros, sin repetidos, cantidad exacta)
+lineas <- readLines(archivo_final)
+stopifnot(all(grepl("^[0-9]+$", lineas)), length(lineas) == CORTE_FINAL, !anyDuplicated(lineas))
+cat("Archivo para el bot:", archivo_final, "| filas:", length(lineas), "| formato ok\n")
+cat("Primeras lineas:", paste(head(lineas, 5), collapse = ", "), "\n")
+
+#%% celda 20 [texto]
+### 10. Comparación con el archivo entregado (opcional)
+Si se dispone del archivo que obtuvo 119,3775 en el Public, se informa cuántos clientes coinciden. Con 100 semillas y la misma versión de LightGBM debería coincidir completo o casi.
+
+#%% celda 21 [código]
+archivo_entregado <- "C:/Users/Laura/Documents/DMEyF/exp/submit_Aprimaplus/cortes/Aprimaplus_B100_corte10600.csv"   # ajustar o ignorar
+if (N_SEMILLAS == 100 && file.exists(archivo_entregado)) {
+  ref <- fread(archivo_entregado, header = FALSE)$V1
+  cat("Coinciden con el archivo entregado:", length(intersect(ref, top)), "de", CORTE_FINAL,
+      "| mismo orden:", identical(as.integer(ref), as.integer(top)), "\n")
+} else {
+  cat("Sin comparacion (N_SEMILLAS != 100 o no se encontro el archivo entregado)\n")
+}
+cat("\nResultado en el Public del bot para el archivo entregado: 119,3775 M\n")
+sessionInfo()
+
+#%% celda 22 [texto]
+### 11. Verificación rápida de una semilla (opcional)
+Compara el ranking de la primera semilla con el que se guardó cuando se armó la entrega original (si esos archivos están disponibles). Si el pipeline es el mismo, la correlación debe ser 1 (o casi).
+
+#%% celda 23 [código]
+exp_original <- "C:/Users/Laura/Documents/DMEyF/exp/"      # ajustar o ignorar
+s1 <- SEMILLAS[1]
+for (par in list(list("Aplus", paste0(exp_original, "submit_Aprimaplus/rankApp_s", s1, ".rds")),
+                 list("B",     paste0(exp_original, "submit_control_soloB/rank_s", s1, ".rds")))) {
+  if (file.exists(par[[2]]) && file.exists(ruta_rank(par[[1]], s1))) {
+    nuevo <- readRDS(ruta_rank(par[[1]], s1)); viejo <- readRDS(par[[2]])
+    cat(par[[1]], "semilla", s1, "| Spearman con el ranking original:", round(cor(nuevo, viejo, method = "spearman"), 6),
+        "| identicos:", isTRUE(all.equal(nuevo, viejo)), "\n")
+  } else {
+    cat(par[[1]], ": sin comparacion (no se encontro el ranking original)\n")
+  }
+}

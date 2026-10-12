@@ -1,0 +1,47 @@
+
+===== B1 multiclase 2026-10-07 09:27 | r=0.099 rondas=688 | semillas [676057, 482687, 399221, 121109, 292131] =====
+[A] train (162900, 150): CONTINUA 160922, BAJA+1 1018, BAJA+2 960 -> valid 202105
+[A s=676057] BIN_005 226.3 | BIN_misma 210.7 | MC_p2 225.8 | MC_h2 231.1 | BIN+MC 218.5 (2 min)
+[A s=482687] BIN_005 232.9 | BIN_misma 218.3 | MC_p2 232.2 | MC_h2 237.9 | BIN+MC 227.2 (3 min)
+[A s=399221] BIN_005 226.7 | BIN_misma 220.3 | MC_p2 234.0 | MC_h2 239.0 | BIN+MC 230.3 (5 min)
+[A s=121109] BIN_005 230.4 | BIN_misma 208.6 | MC_p2 230.2 | MC_h2 235.9 | BIN+MC 222.2 (7 min)
+[A s=292131] BIN_005 233.1 | BIN_misma 219.2 | MC_p2 237.3 | MC_h2 243.2 | BIN+MC 228.8 (8 min)
+[B] train (326184, 150): CONTINUA 322110, BAJA+1 1975, BAJA+2 2099 -> valid 202106
+[B s=676057] BIN_005 395.3 | BIN_misma 386.8 | MC_p2 401.9 | MC_h2 406.7 | BIN+MC 397.1 (10 min)
+[B s=482687] BIN_005 393.4 | BIN_misma 383.4 | MC_p2 398.2 | MC_h2 404.7 | BIN+MC 393.4 (12 min)
+[B s=399221] BIN_005 391.5 | BIN_misma 379.6 | MC_p2 402.1 | MC_h2 405.5 | BIN+MC 393.8 (13 min)
+[B s=121109] BIN_005 390.2 | BIN_misma 376.5 | MC_p2 399.4 | MC_h2 403.7 | BIN+MC 389.9 (15 min)
+[B s=292131] BIN_005 406.2 | BIN_misma 381.4 | MC_p2 404.2 | MC_h2 408.5 | BIN+MC 396.7 (17 min)
+[Bh] train (163284, 150): CONTINUA 161188, BAJA+1 957, BAJA+2 1139 -> valid 202106
+[Bh s=676057] BIN_005 389.5 | BIN_misma 371.4 | MC_p2 386.2 | MC_h2 392.7 | BIN+MC 382.2 (18 min)
+[Bh s=482687] BIN_005 386.5 | BIN_misma 371.7 | MC_p2 387.1 | MC_h2 393.8 | BIN+MC 382.8 (20 min)
+[Bh s=399221] BIN_005 378.3 | BIN_misma 365.3 | MC_p2 387.9 | MC_h2 393.4 | BIN+MC 378.8 (21 min)
+[Bh s=121109] BIN_005 378.7 | BIN_misma 361.9 | MC_p2 382.7 | MC_h2 388.0 | BIN+MC 375.5 (23 min)
+[Bh s=292131] BIN_005 389.0 | BIN_misma 367.7 | MC_p2 388.6 | MC_h2 395.6 | BIN+MC 381.1 (25 min)
+
+Niveles (M ARS):
+fold           A      B     Bh
+modelo                        
+BIN+MC     225.4  394.2  380.1
+BIN_005    229.9  395.3  384.4
+BIN_misma  215.4  381.5  367.6
+MC_h2      237.4  405.8  392.7
+MC_p2      231.9  401.2  386.5
+
+AUC:
+fold            A       B      Bh
+modelo                           
+BIN+MC     0.8899  0.9015  0.8982
+BIN_005    0.8905  0.9018  0.8979
+BIN_misma  0.8870  0.8992  0.8955
+MC_h2      0.8930  0.9035  0.9006
+MC_p2      0.8915  0.9025  0.8996
+
+Diferencias pareadas:
+        comparacion  A_delta  A_ee  B_delta  B_ee  Bh_delta  Bh_ee
+BIN_misma - BIN_005   -14.49  2.46   -13.78  2.88    -16.80   1.43
+  MC_p2 - BIN_misma    16.50  1.50    19.63  1.90     18.89   1.57
+  MC_h2 - BIN_misma    22.03  1.62    24.28  1.53     25.11   1.43
+ BIN+MC - BIN_misma     9.98  0.98    12.65  1.05     12.51   0.62
+    MC_p2 - BIN_005     2.01  1.61     5.86  2.19      2.09   2.21
+[B1] terminado

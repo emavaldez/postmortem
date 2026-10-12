@@ -1,0 +1,53 @@
+{
+  "experimento": 5011,
+  "nombre": "prod_rank_bo4105",
+  "descripcion": "Produccion receta del profesor SIN lag2 con la eleccion de la BO ampliada 4105, 50 semillas. Train 202104-202106 -> 202108.",
+  "modo": "produccion",
+  "dataset": "ds3002_rank_total.parquet",
+  "variables": null,
+  "hiperparametros": {
+    "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+  },
+  "meses_train": [
+    202104,
+    202105,
+    202106
+  ],
+  "mes_prediccion": 202108,
+  "clase": "clase_binaria2",
+  "escalar_min_data_in_leaf": true,
+  "n_semillas": 50,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "usar_lag2": false,
+  "_config": "5011_prod_rank_bo4105.json",
+  "_fecha_inicio": "2026-10-09 03:49:03",
+  "_script": "07_modelo_final.py",
+  "_git_commit": "sin_git"
+}

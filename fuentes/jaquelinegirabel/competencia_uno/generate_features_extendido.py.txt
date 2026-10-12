@@ -1,0 +1,588 @@
+"""Genera competencia_01_extendido.parquet a partir de competencia_01.csv (el dataset crudo).
+
+Es un solo archivo, sin otras dependencias del proyecto: alcanza con tener competencia_01.csv.
+Pasos:
+1. Calcula las 40 variables de competencia_01_final con el mismo codigo de
+   generate_features_final.py (copiado tal cual en generar_final_csv, mas abajo).
+2. Agrega las variables de historia e inflacion de abajo.
+El resultado es identico al competencia_01_extendido.parquet que se armaba leyendo competencia_01_final.
+
+Grupos nuevos (ver FEATURES.md):
+- <var>_rank    (inflacion) rank dentro del mes de las variables de plata, con "cero fijo":
+                positivos -> (0, 1], negativos -> [-1, 0), cero -> 0, vacio -> vacio.
+                Un saldo en el percentil 80 de marzo y uno en el percentil 80 de agosto valen
+                lo mismo aunque en pesos el de agosto sea mas grande por inflacion.
+- <var>_lag1, <var>_lag2      valor del mismo cliente 1 y 2 meses calendario antes
+                              (vacio si no estaba ese mes o si el mes no existe en el dataset).
+- <var>_delta1, <var>_delta2  valor actual menos lag1 / lag2.
+Lags y deltas se calculan para las 152 variables originales.
+
+No se agrega lag3: el dataset empieza en 202103, asi que lag3 recien existe desde 202106 y
+estaria vacio en todos los meses de train.
+
+Uso (por defecto lee y escribe en la carpeta del script):
+    python generate_features_extendido.py
+    python generate_features_extendido.py --entrada otra/competencia_01.csv --salida otra/competencia_01_extendido.parquet
+    python generate_features_extendido.py --guardar-final    # ademas deja competencia_01_final.csv
+
+Necesita: pandas, numpy, pyarrow y duckdb (Python 3.10 o mas nuevo).
+"""
+import argparse
+import bisect
+import csv
+import tempfile
+import time
+from collections import defaultdict
+from pathlib import Path
+
+try:
+    import duckdb
+except ImportError:
+    raise SystemExit('Falta duckdb (lo usa ctrx_quarter_slope_3). Instalarlo con: pip install duckdb')
+import numpy as np
+import pandas as pd
+
+AQUI = Path(__file__).resolve().parent
+ENTRADA = AQUI / 'competencia_01.csv'
+SALIDA = AQUI / 'competencia_01_extendido.parquet'
+CLAVES = ['numero_de_cliente', 'foto_mes']
+
+
+def sumar_meses(mes, n):
+    """sumar_meses(202105, -2) -> 202103. Funciona cruzando anios."""
+    anio, m = divmod(mes, 100)
+    total = anio * 12 + (m - 1) + n
+    return (total // 12) * 100 + total % 12 + 1
+
+
+# ---------------------------------------------------------------------------------------------
+# 1. Las 40 variables de competencia_01_final (codigo de generate_features_final.py, sin cambios)
+# ---------------------------------------------------------------------------------------------
+def generar_final_csv(input_file, output_file):
+    """Codigo de generate_features_final.py sin cambios: lee input_file (competencia_01.csv)
+    y escribe output_file con las 195 columnas de competencia_01_final."""
+    input_file, output_file = str(input_file), str(output_file)
+    input_file_sql = input_file.replace("'", "''")
+
+    start_time = time.time()
+    print("Iniciando procesamiento de competencia_01.csv (version final)...")
+
+
+    # 1. Leer encabezados
+    with open(input_file, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+
+    idx = {h: i for i, h in enumerate(headers)}
+
+    num_cli_idx = idx["numero_de_cliente"]
+    foto_mes_idx = idx["foto_mes"]
+    payroll_trx_idx = idx["cpayroll_trx"]
+    saldo_idx = idx["mcuentas_saldo"]
+    ctrx_idx = idx["ctrx_quarter"]
+    thb_idx = idx["thomebanking"]
+    mob_idx = idx["cmobile_app_trx"]
+    visa_lim_idx = idx["Visa_mlimitecompra"]
+    visa_saldo_idx = idx["Visa_msaldototal"]
+    visa_pmin_idx = idx["Visa_mpagominimo"]
+    visa_cons_idx = idx["Visa_mconsumototal"]
+    visa_pagado_idx = idx["Visa_mpagado"]
+    cprod_idx = idx["cproductos"]
+    master_cons_idx = idx["Master_mconsumototal"]
+    master_lim_idx = idx["Master_mlimitecompra"]
+    master_saldo_idx = idx["Master_msaldototal"]
+    mpayroll_idx = idx["mpayroll"]
+    visa_delinq_idx = idx["Visa_delinquency"]
+    master_delinq_idx = idx["Master_delinquency"]
+    cplazo_fijo_idx = idx["cplazo_fijo"]
+    cseguro_vida_idx = idx["cseguro_vida"]
+    cseguro_auto_idx = idx["cseguro_auto"]
+    cseguro_vivienda_idx = idx["cseguro_vivienda"]
+    cseguro_accidentes_idx = idx["cseguro_accidentes_personales"]
+    ccuenta_deb_auto_idx = idx["ccuenta_debitos_automaticos"]
+
+    # Columnas heredadas de generate_features.py (con 3 formulas corregidas, ver README/MD)
+    new_headers_v1 = [
+        "tiene_payroll",
+        "saldo_vacio",
+        "activo_digital",
+        "ratio_uso_limite_visa",
+        "flag_pago_minimo",
+        "rango_productos_ord",
+        "ctrx_quarter_lag1",
+        "mcuentas_saldo_lag1",
+        "cpayroll_trx_lag1",
+        "Visa_mconsumototal_lag1",
+        "delta_ctrx_quarter",
+        "delta_mcuentas_saldo",
+        "ratio_saldo",
+        "flag_perdio_sueldo",
+        "flag_apago_tarjeta",
+        "rank_saldo_mes",
+        "ratio_consumo_vs_limite_master",
+        "delta_mpayroll",
+        "total_deuda",
+        "ratio_pagado_vs_deuda_visa",
+    ]
+
+    # Columnas nuevas de esta ronda
+    new_headers_v2 = [
+        "flag_mora_visa",
+        "flag_mora_master",
+        "flag_mora",
+        "flag_nueva_mora",
+        "flag_paga_solo_minimo",
+        "racha_baja_ctrx_quarter",
+        "racha_baja_saldo",
+        "delta_cproductos",
+        "delta_ccuenta_debitos_automaticos",
+        "cseguros_total",
+        "flag_cancelo_seguro",
+        "flag_cerro_plazo_fijo",
+        "flag_dejo_digital",
+        "ratio_uso_limite_master",
+        "ratio_consumo_vs_limite_visa",
+        "rank_mpayroll_mes",
+        "rank_visa_consumo_mes",
+        "delta_rank_saldo_mes",
+        "flag_gap_mes",
+    ]
+
+    # Tendencia (regr_slope de DuckDB), agregada a partir de z402_Feature_Engineering_en_SQL.ipynb
+    new_headers_v3 = [
+        "ctrx_quarter_slope_3",
+    ]
+
+    all_headers = headers + new_headers_v1 + new_headers_v2 + new_headers_v3
+    new_idx = {h: len(headers) + i for i, h in enumerate(new_headers_v1 + new_headers_v2)}
+
+
+    def parse_float(v):
+        if not v or v in ("NA", "<NA>", "NaN", "null"):
+            return 0.0
+        try:
+            return float(v)
+        except ValueError:
+            return 0.0
+
+
+    def fm_to_int(fm):
+        fm = int(fm)
+        return (fm // 100) * 12 + (fm % 100)
+
+
+    def fmt_num(v):
+        return f"{v:.0f}" if float(v).is_integer() else f"{v}"
+
+
+    def safe_ratio(curr, prev, floor=1000.0):
+        """Cambio relativo acotado: (curr - prev) / max(|prev|, floor).
+        Evita el problema de ratio_saldo original (curr/prev con epsilon fijo),
+        que producia signos incorrectos cuando el saldo cruza cero."""
+        denom = max(abs(prev), floor)
+        return (curr - prev) / denom
+
+
+    # 2. Leer registros organizados por cliente
+    print("Cargando y ordenando historia de clientes...")
+    client_records = defaultdict(list)
+    with open(input_file, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        for row in reader:
+            client_records[row[num_cli_idx]].append(row)
+
+    print(f"Total clientes unicos: {len(client_records)} cargados en {time.time() - start_time:.2f}s")
+
+    # 3. Procesar variables estaticas y temporales
+    month_saldos = defaultdict(list)
+    month_payrolls = defaultdict(list)
+    month_visacons = defaultdict(list)
+    processed_rows = []
+
+    for cli, rows in client_records.items():
+        rows.sort(key=lambda r: int(r[foto_mes_idx]))
+        prev = None
+        racha_ctrx = 0
+        racha_saldo = 0
+
+        for r in rows:
+            fm = r[foto_mes_idx]
+            fm_num = fm_to_int(fm)
+            payroll = parse_float(r[payroll_trx_idx])
+            saldo = parse_float(r[saldo_idx])
+            ctrx = parse_float(r[ctrx_idx])
+            thb = parse_float(r[thb_idx])
+            mob = parse_float(r[mob_idx])
+            visa_lim = parse_float(r[visa_lim_idx])
+            visa_saldo = parse_float(r[visa_saldo_idx])
+            visa_pmin = parse_float(r[visa_pmin_idx])
+            visa_cons = parse_float(r[visa_cons_idx])
+            visa_pagado = parse_float(r[visa_pagado_idx])
+            cprod = parse_float(r[cprod_idx])
+            master_cons = parse_float(r[master_cons_idx])
+            master_lim = parse_float(r[master_lim_idx])
+            master_saldo = parse_float(r[master_saldo_idx])
+            mpayroll_val = parse_float(r[mpayroll_idx])
+            visa_delinq = parse_float(r[visa_delinq_idx])
+            master_delinq = parse_float(r[master_delinq_idx])
+            cplazo_fijo = parse_float(r[cplazo_fijo_idx])
+            ccuenta_deb_auto = parse_float(r[ccuenta_deb_auto_idx])
+            cseguros_total = (
+                parse_float(r[cseguro_vida_idx])
+                + parse_float(r[cseguro_auto_idx])
+                + parse_float(r[cseguro_vivienda_idx])
+                + parse_float(r[cseguro_accidentes_idx])
+            )
+
+            # --- Variables estaticas (no requieren historia) ---
+            tiene_payroll = 1 if payroll > 0 else 0
+            saldo_vacio = 1 if saldo < 1000 else 0
+            activo_digital = 1 if (thb == 1 or mob > 0) else 0
+            # FIX bug #3: antes devolvia 0.0 si no tenia limite (confundia "sin tarjeta" con "0% de uso").
+            # Ahora, igual que las demas ratios nuevas, queda en blanco (NaN) si no aplica.
+            ratio_limite = round(visa_saldo / visa_lim, 4) if visa_lim > 0 else ""
+            flag_pmin = 1 if visa_pmin > 0 else 0
+
+            # FIX bug #2: bins recalculados sobre el histograma real de cproductos (rango 3-17,
+            # con ~92% de los clientes entre 6 y 10). Los bins originales (<=2,<=5,<=10,>10)
+            # dejaban el 92% de los casos en un unico valor.
+            if cprod <= 5:
+                rango_prod_ord = 0
+            elif cprod <= 7:
+                rango_prod_ord = 1
+            elif cprod <= 9:
+                rango_prod_ord = 2
+            else:
+                rango_prod_ord = 3
+
+            ratio_master = round(master_cons / master_lim, 4) if master_lim > 0 else ""
+            total_deuda = round(visa_saldo + master_saldo, 2)
+            ratio_pagado_visa = round(visa_pagado / visa_saldo, 4) if visa_saldo > 0 else ""
+
+            # --- Familia mora / estres crediticio (nueva, familia 4 del SKILL.md) ---
+            flag_mora_visa = 1 if visa_delinq == 1 else 0
+            flag_mora_master = 1 if master_delinq == 1 else 0
+            flag_mora = 1 if (flag_mora_visa or flag_mora_master) else 0
+
+            # Indicador real de "paga solo el minimo" (distinto de flag_pago_minimo,
+            # que solo indica que existe un minimo calculado, es decir que hay deuda).
+            flag_paga_solo_minimo = 1 if (
+                visa_saldo > 0 and visa_pmin > 0 and visa_pagado <= visa_pmin * 1.15
+            ) else 0
+
+            month_saldos[fm].append(saldo)
+            month_payrolls[fm].append(mpayroll_val)
+            month_visacons[fm].append(visa_cons)
+
+            # --- Variables temporales: requieren mes anterior CONSECUTIVO ---
+            gap_flag = 0
+            valid_prev = False
+            if prev is not None:
+                gap = fm_num - prev["fm_num"]
+                if gap == 1:
+                    valid_prev = True
+                else:
+                    # FIX bug #4: antes se calculaba el lag/delta igual, aunque hubiera
+                    # meses faltantes entre observaciones del mismo cliente.
+                    gap_flag = 1
+
+            if not valid_prev:
+                ctrx_lag = ""
+                saldo_lag = ""
+                payroll_lag = ""
+                visa_cons_lag = ""
+                delta_ctrx = ""
+                delta_saldo = ""
+                ratio_saldo = ""
+                flag_perdio_sueldo = 0
+                flag_apago_tarjeta = 0
+                delta_mpayroll = ""
+                delta_cproductos = ""
+                delta_ccuenta_deb = ""
+                flag_cancelo_seguro = 0
+                flag_cerro_plazo_fijo = 0
+                flag_dejo_digital = 0
+                flag_nueva_mora = 0
+                racha_ctrx = 0
+                racha_saldo = 0
+            else:
+                p = prev
+                ctrx_lag = fmt_num(p["ctrx"])
+                saldo_lag = f"{p['saldo']:.2f}"
+                payroll_lag = fmt_num(p["payroll"])
+                visa_cons_lag = f"{p['visa_cons']:.2f}"
+                delta_ctrx = f"{ctrx - p['ctrx']:.2f}"
+                delta_saldo = f"{saldo - p['saldo']:.2f}"
+                # FIX bug #1: formula anterior (saldo+1000)/(prev_saldo+1000) daba ratios
+                # negativos sin sentido en ~10% de las filas cuando el saldo cruza cero.
+                ratio_saldo = f"{safe_ratio(saldo, p['saldo']):.4f}"
+                flag_perdio_sueldo = 1 if (p["payroll"] > 0 and payroll == 0) else 0
+                flag_apago_tarjeta = 1 if (p["visa_cons"] > 0 and visa_cons == 0) else 0
+                delta_mpayroll = f"{mpayroll_val - p['mpayroll']:.2f}"
+                delta_cproductos = f"{cprod - p['cprod']:.2f}"
+                delta_ccuenta_deb = f"{ccuenta_deb_auto - p['ccuenta_deb_auto']:.2f}"
+                flag_cancelo_seguro = 1 if cseguros_total < p["cseguros_total"] else 0
+                flag_cerro_plazo_fijo = 1 if (p["cplazo_fijo"] > 0 and cplazo_fijo == 0) else 0
+                flag_dejo_digital = 1 if (p["activo_digital"] == 1 and activo_digital == 0) else 0
+                flag_nueva_mora = 1 if (p["flag_mora"] == 0 and flag_mora == 1) else 0
+                racha_ctrx = racha_ctrx + 1 if (ctrx - p["ctrx"]) < 0 else 0
+                racha_saldo = racha_saldo + 1 if (saldo - p["saldo"]) < 0 else 0
+
+            prev = {
+                "fm_num": fm_num,
+                "ctrx": ctrx,
+                "saldo": saldo,
+                "payroll": payroll,
+                "visa_cons": visa_cons,
+                "mpayroll": mpayroll_val,
+                "cprod": cprod,
+                "ccuenta_deb_auto": ccuenta_deb_auto,
+                "cseguros_total": cseguros_total,
+                "cplazo_fijo": cplazo_fijo,
+                "activo_digital": activo_digital,
+                "flag_mora": flag_mora,
+            }
+
+            new_row = r + [
+                tiene_payroll,
+                saldo_vacio,
+                activo_digital,
+                ratio_limite,
+                flag_pmin,
+                rango_prod_ord,
+                ctrx_lag,
+                saldo_lag,
+                payroll_lag,
+                visa_cons_lag,
+                delta_ctrx,
+                delta_saldo,
+                ratio_saldo,
+                flag_perdio_sueldo,
+                flag_apago_tarjeta,
+                saldo,  # placeholder -> rank_saldo_mes (pase 2)
+                ratio_master,
+                delta_mpayroll,
+                total_deuda,
+                ratio_pagado_visa,
+                flag_mora_visa,
+                flag_mora_master,
+                flag_mora,
+                flag_nueva_mora,
+                flag_paga_solo_minimo,
+                racha_ctrx,
+                racha_saldo,
+                delta_cproductos,
+                delta_ccuenta_deb,
+                cseguros_total,
+                flag_cancelo_seguro,
+                flag_cerro_plazo_fijo,
+                flag_dejo_digital,
+                round(master_saldo / master_lim, 4) if master_lim > 0 else "",
+                round(visa_cons / visa_lim, 4) if visa_lim > 0 else "",
+                mpayroll_val,  # placeholder -> rank_mpayroll_mes (pase 2)
+                visa_cons,  # placeholder -> rank_visa_consumo_mes (pase 2)
+                "",  # placeholder -> delta_rank_saldo_mes (pase 3)
+                gap_flag,
+            ]
+            processed_rows.append(new_row)
+
+    # 4. Calcular percentiles mensuales (anti-inflacion: saldo, payroll y consumo Visa)
+    print("Calculando percentiles mensuales (saldo, payroll, consumo Visa)...")
+    saldo_sorted = {fm: sorted(v) for fm, v in month_saldos.items()}
+    payroll_sorted = {fm: sorted(v) for fm, v in month_payrolls.items()}
+    visacons_sorted = {fm: sorted(v) for fm, v in month_visacons.items()}
+
+    rank_saldo_pos = new_idx["rank_saldo_mes"]
+    rank_payroll_pos = new_idx["rank_mpayroll_mes"]
+    rank_visacons_pos = new_idx["rank_visa_consumo_mes"]
+
+    for row in processed_rows:
+        fm = row[foto_mes_idx]
+
+        s_list = saldo_sorted[fm]
+        s = row[rank_saldo_pos]
+        row[rank_saldo_pos] = f"{bisect.bisect_right(s_list, s) / len(s_list):.4f}"
+
+        p_list = payroll_sorted[fm]
+        p = row[rank_payroll_pos]
+        row[rank_payroll_pos] = f"{bisect.bisect_right(p_list, p) / len(p_list):.4f}"
+
+        v_list = visacons_sorted[fm]
+        v = row[rank_visacons_pos]
+        row[rank_visacons_pos] = f"{bisect.bisect_right(v_list, v) / len(v_list):.4f}"
+
+    # 5. delta_rank_saldo_mes: requiere rank_saldo_mes ya calculado para el mes anterior.
+    # processed_rows mantiene los bloques por cliente contiguos y ordenados por foto_mes,
+    # asi que basta un recorrido secuencial detectando cambio de cliente o salto de mes.
+    print("Calculando delta_rank_saldo_mes...")
+    delta_rank_pos = new_idx["delta_rank_saldo_mes"]
+    prev_cli = None
+    prev_fm_num = None
+    prev_rank = None
+    for row in processed_rows:
+        cli = row[num_cli_idx]
+        fm_num = fm_to_int(row[foto_mes_idx])
+        rank_val = float(row[rank_saldo_pos])
+        if prev_cli == cli and (fm_num - prev_fm_num) == 1:
+            row[delta_rank_pos] = f"{rank_val - prev_rank:.4f}"
+        else:
+            row[delta_rank_pos] = ""
+        prev_cli, prev_fm_num, prev_rank = cli, fm_num, rank_val
+
+    # 6. ctrx_quarter_slope_3: pendiente de regresion (tendencia) de ctrx_quarter en una ventana
+    # movil de hasta 4 meses (actual + 3 anteriores). Usa DuckDB (regr_slope), igual que en
+    # z402_Feature_Engineering_en_SQL.ipynb, en vez de re-implementar la formula de OLS a mano.
+    # x = cliente_antiguedad (no foto_mes ni un contador de filas): al ser la antiguedad real del
+    # cliente, un salto de mes faltante se refleja como un salto de 2 en vez de 1, y regr_slope
+    # normaliza por la distancia real en x, por lo que el resultado sigue siendo "cambio por mes"
+    # incluso para los pocos clientes con historia discontinua (ver flag_gap_mes).
+    print("Calculando ctrx_quarter_slope_3 con DuckDB (regr_slope)...")
+    con = duckdb.connect()
+    slope_rows = con.execute(
+        f"""
+        select
+            numero_de_cliente,
+            foto_mes,
+            regr_slope(ctrx_quarter, cliente_antiguedad) over (
+                partition by numero_de_cliente
+                order by foto_mes
+                rows between 3 preceding and current row
+            ) as ctrx_quarter_slope_3
+        from read_csv_auto('{input_file_sql}')
+        """
+    ).fetchall()
+    con.close()
+
+
+    def is_valid_number(x):
+        return x is not None and not (isinstance(x, float) and x != x)
+
+
+    slope_map = {
+        (str(cli), str(fm)): slope
+        for cli, fm, slope in slope_rows
+        if is_valid_number(slope)
+    }
+
+    for row in processed_rows:
+        slope = slope_map.get((row[num_cli_idx], row[foto_mes_idx]))
+        row.append(f"{slope:.4f}" if slope is not None else "")
+
+    # 7. Escribir archivo final
+    print(f"Escribiendo {len(processed_rows)} filas en {output_file}...")
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(all_headers)
+        writer.writerows(processed_rows)
+
+    print(f"Dataset generado exitosamente en {output_file} en {time.time() - start_time:.2f} segundos!")
+
+
+def generar_final(entrada, guardar_en=None):
+    """DataFrame con las 195 columnas de competencia_01_final, leido igual que competencia_01_final.csv."""
+    entrada = Path(entrada).resolve()
+    if not entrada.exists():
+        raise SystemExit(f'No existe {entrada}')
+    if guardar_en is not None:
+        generar_final_csv(entrada, guardar_en)
+        return pd.read_csv(guardar_en)
+    with tempfile.TemporaryDirectory() as carpeta:
+        archivo = Path(carpeta) / 'competencia_01_final.csv'
+        generar_final_csv(entrada, archivo)
+        return pd.read_csv(archivo)
+
+
+def variables_originales(columnas, entrada=ENTRADA):
+    originales = pd.read_csv(entrada, nrows=1).columns
+    return [c for c in originales if c not in CLAVES + ['clase_ternaria'] and c in columnas]
+
+
+# ---------------------------------------------------------------------------------------------
+# 2. Variables de historia e inflacion
+# ---------------------------------------------------------------------------------------------
+def es_plata(nombre):
+    return nombre.startswith(('m', 'Visa_m', 'Master_m'))
+
+
+def rank_cero_fijo(x, mes):
+    """Rank percentil dentro de cada mes, separando positivos y negativos y dejando el 0 fijo."""
+    rank_pos = x.where(x > 0).groupby(mes).rank(pct=True)
+    rank_neg = -(-x).where(x < 0).groupby(mes).rank(pct=True)
+    r = rank_pos.fillna(rank_neg)
+    r[x == 0] = 0.0
+    return r.astype('float32')
+
+
+def iguales(a, b):
+    a, b = np.asarray(a, dtype='float64'), np.asarray(b, dtype='float64')
+    return np.allclose(a, b, equal_nan=True, rtol=1e-6, atol=1e-6)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--entrada', type=Path, default=ENTRADA, help='dataset crudo (competencia_01.csv)')
+    parser.add_argument('--salida', type=Path, default=SALIDA, help='parquet a generar')
+    parser.add_argument('--guardar-final', action='store_true',
+                        help='ademas guardar competencia_01_final.csv al lado de la entrada')
+    args = parser.parse_args()
+
+    inicio = time.time()
+    print(f'Generando las variables de competencia_01_final desde {args.entrada.name}...')
+    guardar_en = Path(args.entrada).resolve().parent / 'competencia_01_final.csv' if args.guardar_final else None
+    data = generar_final(args.entrada, guardar_en)
+    print(f'  listo en {time.time() - inicio:.0f} s')
+    variables = variables_originales(data.columns, args.entrada)
+    plata = [v for v in variables if es_plata(v)]
+    print(f'{data.shape[1]} columnas de entrada | {len(variables)} variables originales | {len(plata)} de plata')
+
+    nuevas = {}
+
+    print('Ranks dentro del mes (inflacion)...')
+    for v in plata:
+        nuevas[f'{v}_rank'] = rank_cero_fijo(data[v], data['foto_mes'])
+
+    for k in (1, 2):
+        print(f'Lag {k} y delta {k}...')
+        previo = data[CLAVES + variables].copy()
+        previo['foto_mes'] = previo['foto_mes'].map(lambda m: sumar_meses(m, k))  # el valor de M aparece en M + k
+        lag = data[CLAVES].merge(previo, on=CLAVES, how='left')  # how='left' respeta el orden de data
+        for v in variables:
+            nuevas[f'{v}_lag{k}'] = lag[v].to_numpy(dtype='float32')
+            nuevas[f'{v}_delta{k}'] = (data[v].to_numpy(dtype='float64') - lag[v].to_numpy(dtype='float64')).astype('float32')
+
+    # Lags/deltas que ya existian en competencia_01_final con otro nombre (o el mismo): no duplicar.
+    # Si ya existe una columna con el mismo nombre se conserva la de final (para que final quede
+    # identico dentro de extendido). Ej.: Visa_mconsumototal_lag1 de final pone 0 donde el mes
+    # anterior estaba vacio; la calculada aca lo deja vacio.
+    ya_existentes = {f'{v}_delta1': f'delta_{v}' for v in variables}
+    ya_existentes.update({f'{v}_lag1': f'{v}_lag1' for v in variables})
+    descartadas, conservadas_de_final = [], []
+    for nueva, existente in ya_existentes.items():
+        if existente in data.columns and nueva in nuevas:
+            if iguales(nuevas[nueva], data[existente]):
+                del nuevas[nueva]
+                descartadas.append(nueva)
+            elif nueva == existente:
+                del nuevas[nueva]
+                conservadas_de_final.append(nueva)
+    print(f'Descartadas por repetir una columna existente: {descartadas}')
+    print(f'Mismo nombre que una de final con otros valores (se conserva la de final): {conservadas_de_final}')
+
+    extendido = pd.concat([data, pd.DataFrame(nuevas, index=data.index)], axis=1)
+    print(f'Escribiendo {extendido.shape[0]} filas x {extendido.shape[1]} columnas en {args.salida}...')
+    extendido.to_parquet(args.salida, index=False)
+
+    grupos = {
+        'rank (inflacion)': sum(c.endswith('_rank') for c in nuevas),
+        'lag1': sum(c.endswith('_lag1') for c in nuevas),
+        'lag2': sum(c.endswith('_lag2') for c in nuevas),
+        'delta1': sum(c.endswith('_delta1') for c in nuevas),
+        'delta2': sum(c.endswith('_delta2') for c in nuevas),
+    }
+    print(f'Nuevas: {len(nuevas)} {grupos} | total columnas: {extendido.shape[1]}')
+    print(f'Listo en {time.time() - inicio:.0f} s')
+
+
+if __name__ == '__main__':
+    main()

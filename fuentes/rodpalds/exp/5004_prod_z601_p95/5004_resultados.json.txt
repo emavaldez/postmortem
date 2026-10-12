@@ -1,0 +1,14 @@
+{
+  "hiperparametros": "z601",
+  "arboles": 250,
+  "min_data_in_leaf": 2448,
+  "n_semillas": 50,
+  "archivos_kaggle": 15,
+  "filas": 164647,
+  "prob_p50_p90_p99": [
+    0.0019,
+    0.0214,
+    0.2301
+  ],
+  "_minutos": 11.42
+}

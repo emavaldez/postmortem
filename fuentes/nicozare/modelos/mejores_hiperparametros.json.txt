@@ -1,0 +1,11 @@
+{
+  "hiperparametros": {
+    "num_leaves": 41,
+    "learning_rate": 0.009612969771176738,
+    "min_data_in_leaf": 380,
+    "feature_fraction": 0.2555233272095875,
+    "bagging_fraction": 0.5476858144042315
+  },
+  "num_boost_round": 690,
+  "ganancia_cv": 1193298333.3333335
+}

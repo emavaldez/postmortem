@@ -1,0 +1,91 @@
+{
+  "version": "c1m1femasiva03_s2_familias_v1",
+  "parent_run": "c1m1femasiva03/S1",
+  "reference": "F0_M1_RAW",
+  "target_train": "baja2_vs_rest",
+  "dataset_sha256": "59231e670a1342ad6f689ad7edc7ece047fc9f7115c6d7845e6c72fa3bbd95bb",
+  "folds": {
+    "mayo": {"train": [202103], "eval": 202105},
+    "junio": {"train": [202103, 202104], "eval": 202106}
+  },
+  "seeds": [17, 101, 202, 303, 404],
+  "rounds": 300,
+  "cuts": [10500, 11000, 11500],
+  "arms": {
+    "S2_HIST_CORE": {
+      "blocks": ["historia_numerica", "transiciones_numericas", "recencia", "categoricas", "historia_relaciones"],
+      "min_history": "ge1",
+      "folds": ["junio"],
+      "role": "historia"
+    },
+    "S2_RANK_ACTUAL": {
+      "blocks": ["ranks"],
+      "min_history": "eq0",
+      "folds": ["mayo", "junio"],
+      "role": "representacion"
+    },
+    "S2_RANK_CAMBIO": {
+      "blocks": ["ranks"],
+      "min_history": "ge1",
+      "folds": ["junio"],
+      "role": "historia"
+    },
+    "S2_PRODUCTOS_SALDO": {
+      "blocks": ["stocks_productos_deuda", "funciones"],
+      "min_history": "eq0",
+      "folds": ["mayo", "junio"],
+      "role": "representacion"
+    },
+    "S2_TARJETAS_RATIOS": {
+      "blocks": ["tarjetas", "ratios"],
+      "min_history": "eq0",
+      "folds": ["mayo", "junio"],
+      "role": "representacion"
+    },
+    "S2_OBSERVABILIDAD": {
+      "blocks": ["disponibilidad", "cobertura_panel"],
+      "min_history": "all",
+      "folds": ["junio"],
+      "role": "mixto"
+    },
+    "S2_INTERACCIONES": {
+      "blocks": ["interacciones"],
+      "min_history": "all",
+      "folds": ["mayo", "junio"],
+      "role": "secundario"
+    },
+    "C1_HIST_MAS_RANK": {
+      "components": ["S2_HIST_CORE", "S2_RANK_ACTUAL"],
+      "folds": ["junio"],
+      "role": "complementariedad"
+    },
+    "C2_HIST_MAS_PRODUCTOS": {
+      "components": ["S2_HIST_CORE", "S2_PRODUCTOS_SALDO"],
+      "folds": ["junio"],
+      "role": "complementariedad"
+    },
+    "C3_HIST_MAS_TARJETAS": {
+      "components": ["S2_HIST_CORE", "S2_TARJETAS_RATIOS"],
+      "folds": ["junio"],
+      "role": "complementariedad"
+    },
+    "C4_HIST_MAS_INTERACCIONES": {
+      "components": ["S2_HIST_CORE", "S2_INTERACCIONES"],
+      "folds": ["junio"],
+      "role": "complementariedad_secundaria"
+    }
+  },
+  "decision": {
+    "exploratory": true,
+    "primary_fold": "junio",
+    "family_shortlist_if": "delta_banda_medio > 0 AND delta_11000_medio > 0 AND wins >= 3/5",
+    "mayo_use": "diagnostico para familias no historicas; no rescata ni confirma historia",
+    "importance_use": "solo prioriza features dentro de una familia; no prueba aporte incremental"
+  },
+  "notes": [
+    "No se prueba una interacción aislada como representación de toda la familia.",
+    "Interacciones son rama secundaria; no se espera que expliquen el mayor salto.",
+    "No tuning, no 25/30 seeds, no agosto, no submits.",
+    "Se reutiliza el banco FE ya construido en S1."
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "tasa_general_baja2": 0.00622,
+  "variables_con_lift_na_o_cero_mayor_2": 56,
+  "_minutos": 0.04
+}

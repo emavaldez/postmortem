@@ -1,0 +1,26 @@
+{
+  "experimento": 5106,
+  "nombre": "lag2_entrenando_mayo",
+  "descripcion": "Unica forma de medir lag2 con los datos disponibles: entrenar con 202105 (su lag2 es marzo) y medir en la mitad B de 202106 (a 1 mes, no a 2). Misma receta 3003 sin y con lag2/delta2. Solo sirve para comparar las dos entre si, no para comparar con otros experimentos.",
+  "referencia": "muerte_conteo_sin_lag2",
+  "n_semillas": 30,
+  "mes_train": 202105,
+  "candidatos": {
+    "muerte_conteo_sin_lag2": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": false,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    },
+    "muerte_conteo_con_lag2": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    }
+  }
+}

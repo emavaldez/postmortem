@@ -1,0 +1,19 @@
+{
+  "experimento": 6008,
+  "nombre": "zulip_final_ensamble_5202",
+  "descripcion": "Archivos finales del ensamble 5202 (5005 + 5011): 11.500 a 13.000 envios. El candidato es 12.000.",
+  "modo": "final",
+  "fuente": "5202_ensamble_5005_5011",
+  "envios": [
+    11500,
+    12000,
+    12500,
+    13000
+  ],
+  "max_archivos": 20,
+  "clientes_esperados": 164647,
+  "_config": "6008_zulip_final_ensamble_5202.json",
+  "_fecha_inicio": "2026-10-09 10:41:59",
+  "_script": "10_entrega_zulip.py",
+  "_git_commit": "sin_git"
+}

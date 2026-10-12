@@ -1,0 +1,138 @@
+#%% celda 1 [texto]
+# Submits 16 y 17 - ¿Juntar BAJA+1 + BAJA+2 es mejor de verdad?
+
+Comparamos **distribuciones** en el bot (varios archivos por submit → media ± desvío), con 5 semillas NUEVAS.
+- **Modelos:** los 10 trials de `0_exploracion/z005_top10_final.csv`, train 202103-202106, predice 202108.
+- **Dos versiones:** `juntar` (target BAJA+1 + BAJA+2) y `solo` (target BAJA+2). 2 × 10 trials × 5 semillas = 100 modelos (~4 h).
+- Por cada semilla se promedian sus 10 trials → 1 archivo top 12.000.
+  - **Submit 16:** `16_juntar_s<semilla>_12000.csv` (5 archivos).
+  - **Submit 17:** `17_solo_s<semilla>_12000.csv` (5 archivos).
+- Cada predicción se guarda en `probs_16-17/` (si se corta, al volver a correr sigue desde ahí).
+
+Ojo: un submit de varios archivos NO vale como entrega final.
+
+#%% celda 2 [código]
+# --- 1. Librerías y parámetros ---
+import os
+import time
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+SEMILLAS    = [270131, 417293, 583117, 692347, 851071]   # nuevas, elegidas por Keila
+MESES_FINAL = [202103, 202104, 202105, 202106]
+MES_PRED    = 202108
+N_ENVIO     = 12_000
+# Versión → (número de submit, clases que cuentan como 1)
+VERSIONES = {"juntar": (16, ["BAJA+1", "BAJA+2"]),
+             "solo":   (17, ["BAJA+2"])}
+CARPETA = "probs_16-17"
+os.makedirs(CARPETA, exist_ok=True)
+
+params_fijos = {
+    "objective": "binary", "learning_rate": 0.005, "min_data_in_leaf": 0,
+    "feature_fraction": 0.5, "feature_fraction_bynode": 0.2, "max_bin": 31, "verbose": -1,
+}
+elegidos = pd.read_csv("../0_exploracion/z005_top10_final.csv", sep=";", decimal=",",
+                       encoding="utf-8-sig", index_col="trial")
+elegidos
+
+#%% celda 3 [código]
+# --- 2. Cargar datos y lags/deltas de orden 1 y 2 (igual que los submits 12 y 15) ---
+df = pd.read_parquet("../competencia_01.parquet")
+
+no_usar = ["foto_mes", "clase_ternaria"]
+cols = [c for c in df.columns if c not in no_usar and c != "numero_de_cliente"]
+
+df = df.sort_values(["numero_de_cliente", "foto_mes"]).reset_index(drop=True)
+grupo = df.groupby("numero_de_cliente")[cols]
+nuevas = []
+for k in [1, 2]:
+    lag = grupo.shift(k).astype("float32")
+    delta = (df[cols] - lag).astype("float32")
+    lag.columns   = [f"{c}_lag{k}" for c in cols]
+    delta.columns = [f"{c}_delta{k}" for c in cols]
+    nuevas += [lag, delta]
+df = pd.concat([df] + nuevas, axis=1)
+del nuevas, lag, delta, grupo
+
+variables = [c for c in df.columns if c not in no_usar]   # incluye numero_de_cliente
+final  = df[df["foto_mes"].isin(MESES_FINAL)]
+futuro = df[df["foto_mes"] == MES_PRED][["numero_de_cliente"]].copy()
+X_futuro = df.loc[futuro.index, variables]
+print("Variables:", len(variables))
+
+#%% celda 4 [código]
+# --- 3. Entrenar: 2 versiones × 10 trials × 5 semillas (retoma si se cortó) ---
+inicio_total = time.time()
+for version, (num, clases) in VERSIONES.items():
+    # El target cambia según la versión; las variables son las mismas
+    etiqueta = final["clase_ternaria"].isin(clases).astype(int)
+    datos = lgb.Dataset(final[variables], label=etiqueta, free_raw_data=False)
+    print(f"== {version}: positivos en train = {etiqueta.sum()}", flush=True)
+    for trial, r in elegidos.iterrows():
+        p = {**params_fijos, "num_leaves": int(r["params_num_leaves"]),
+             "min_sum_hessian_in_leaf": float(r["params_min_sum_hessian_in_leaf"])}
+        for semilla in SEMILLAS:
+            archivo = f"{CARPETA}/{version}_t{trial}_s{semilla}.npy"
+            if os.path.exists(archivo):      # ya estaba hecho: lo salteamos
+                continue
+            inicio = time.time()
+            modelo = lgb.train({**p, "seed": semilla}, datos, num_boost_round=int(r["user_attrs_best_iter"]))
+            np.save(archivo, modelo.predict(X_futuro))
+            print(f"{version} trial {trial}, semilla {semilla}: {(time.time() - inicio) / 60:.1f} min", flush=True)
+    del datos
+print(f"Total: {(time.time() - inicio_total) / 60:.0f} min")
+
+#%% celda 5 [código]
+# --- 4. Un archivo por semilla (promedio de sus 10 trials), top 12.000 ---
+tops = {}   # para comparar después cuánto se parecen
+for version, (num, clases) in VERSIONES.items():
+    for semilla in SEMILLAS:
+        probs = [np.load(f"{CARPETA}/{version}_t{t}_s{semilla}.npy") for t in elegidos.index]
+        f = futuro.copy()
+        f["prob"] = np.mean(probs, axis=0)
+        top = f.nlargest(N_ENVIO, "prob")["numero_de_cliente"].astype("int64")
+        tops[(version, semilla)] = set(top)
+        archivo = f"{num}_{version}_s{semilla}_{N_ENVIO}.csv"
+        top.to_csv(archivo, index=False, header=False)
+        with open(archivo) as fh:
+            contenido = fh.read()
+        print(archivo, "| filas:", len(contenido.splitlines()), "| ¿e+?", "e+" in contenido)
+
+#%% celda 6 [código]
+# --- 5. ¿Cuánto se parecen los archivos? (% de clientes en común en el top 12.000) ---
+# Dentro de cada versión (entre semillas) y entre versiones (misma semilla)
+for version in VERSIONES:
+    pares = [len(tops[(version, a)] & tops[(version, b)]) / N_ENVIO * 100
+             for i, a in enumerate(SEMILLAS) for b in SEMILLAS[i + 1:]]
+    print(f"{version}: coincidencia entre semillas {min(pares):.1f}% a {max(pares):.1f}%")
+entre = [len(tops[("juntar", s)] & tops[("solo", s)]) / N_ENVIO * 100 for s in SEMILLAS]
+print(f"juntar vs solo (misma semilla): {min(entre):.1f}% a {max(entre):.1f}%")
+
+#%% celda 7 [código]
+# --- 6. Anotar en resultados_experimentos.csv ---
+ruta_res = "../0_exploracion/resultados_experimentos.csv"
+res = pd.read_csv(ruta_res, sep=";", decimal=",", encoding="utf-8-sig")
+for version, (num, clases) in VERSIONES.items():
+    desc = f"{num}_Dist{version}_{N_ENVIO}"
+    res = res[~res["descripcion"].str.startswith(desc)]
+    res = pd.concat([res, pd.DataFrame([{
+        "fecha": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "descripcion": f"{desc}: 5 archivos (1 por semilla, promedio de 10 trials z005), target {' + '.join(clases)}, lags 1 y 2 (submit distribución)",
+        "meses_train": str(MESES_FINAL), "mes_valid": MES_PRED, "semilla": str(SEMILLAS),
+        "params": str(params_fijos) + " | trials " + str(list(elegidos.index)), "n_enviados": N_ENVIO}])], ignore_index=True)
+res["n_enviados"] = res["n_enviados"].astype("Int64")
+res.to_csv(ruta_res, sep=";", decimal=",", index=False, encoding="utf-8-sig")
+res.tail(2)
+
+#%% celda 8 [texto]
+## Resultados del bot (08/10)
+| Submit | Archivos | Media ± desvío (público) |
+|---|---|---|
+| 16 juntar (BAJA+1 + BAJA+2) | 5 | **101,45 ± 0,53** |
+| 17 solo BAJA+2 | 5 | 95,63 ± 1,09 |
+
+**Conclusión:** juntar gana por +5,8 M con semillas nuevas (diferencia ≫ desvío). Repite lo del 15 (101,92) vs 12 (94,82)
+y lo de validación (junio z009, mayo z019). **Se adopta juntar.** Entre semillas los archivos coinciden 98%:
+promediando 10 trials, la semilla casi no importa.

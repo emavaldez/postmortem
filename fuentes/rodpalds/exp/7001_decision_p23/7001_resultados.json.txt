@@ -1,0 +1,7 @@
+{
+  "min_data_variante": "md20248",
+  "min_data_2meses": 20248,
+  "arboles": 580,
+  "meseta_B_M": 443.1,
+  "_minutos": 0.0
+}

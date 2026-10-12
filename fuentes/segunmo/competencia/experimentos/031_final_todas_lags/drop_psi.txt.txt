@@ -1,0 +1,8 @@
+ccajas_depositos_d2 2.083
+mpayroll_d2 1.000
+cpayroll_trx_d2 0.455
+Visa_mlimitecompra_d2   0.332
+Master_mfinanciacion_limite_d2  0.290
+mpayroll_lag2   0.226
+Visa_mfinanciacion_limite_d2    0.217
+cpayroll_trx_lag2   0.205

@@ -1,0 +1,112 @@
+#%% celda 1 [texto]
+# Modelo con lags - 5 semillas + ensamble
+
+LightGBM solo BAJA+2 con variables originales + lags y deltas de orden 1 y 2.
+Entrena con 202103-202106 y predice 202108.
+
+- **Un CSV por semilla** → subirlos todos juntos en un submit: el bot da media y desvío.
+- **Un CSV de ensamble** (probabilidades promediadas) → submit de un solo archivo (formato de la entrega final).
+
+**Submits 1 y 2** (bot: `LagsSemillas01` con los 5 archivos por semilla, `LagsEnsamble01` con el ensamble). Archivos renombrados a `1_lags_s..._11500.csv` y `2_lags_ensamble5_11500.csv`.
+
+#%% celda 2 [código]
+# --- 1. Librerías y parámetros ---
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+MESES_FINAL = [202103, 202104, 202105, 202106]
+MES_PRED    = 202108
+TOP_N       = 11_500   # máximo de la curva promedio en validación (z003)
+SEMILLAS    = [501419, 623353, 786349, 834569, 946331]
+
+params = {
+    "objective": "binary",
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "min_data_in_leaf": 100,
+    "feature_fraction": 0.8,
+    "verbose": -1,
+}
+
+#%% celda 3 [código]
+# --- 2. Cargar datos y armar el target binario ---
+df = pd.read_parquet("../competencia_01.parquet")
+df["clase_binaria"] = (df["clase_ternaria"] == "BAJA+2").astype(int)
+
+no_usar = ["foto_mes", "clase_ternaria", "clase_binaria"]
+originales = [c for c in df.columns if c not in no_usar]
+cols = [c for c in originales if c != "numero_de_cliente"]   # a estas les calculamos historia
+
+#%% celda 4 [código]
+# --- 3. Lags y deltas de orden 1 y 2 (igual que z003) ---
+df = df.sort_values(["numero_de_cliente", "foto_mes"]).reset_index(drop=True)
+grupo = df.groupby("numero_de_cliente")[cols]
+
+nuevas = []
+for k in [1, 2]:
+    lag = grupo.shift(k).astype("float32")          # valor de k meses antes
+    delta = (df[cols] - lag).astype("float32")      # cuánto cambió
+    lag.columns   = [f"{c}_lag{k}" for c in cols]
+    delta.columns = [f"{c}_delta{k}" for c in cols]
+    nuevas += [lag, delta]
+
+df = pd.concat([df] + nuevas, axis=1)
+del nuevas, lag, delta, grupo
+
+variables = [c for c in df.columns if c not in no_usar]
+print("Variables:", len(variables))
+
+#%% celda 5 [código]
+# --- 4. Entrenar con cada semilla y guardar un CSV por semilla ---
+final  = df[df["foto_mes"].isin(MESES_FINAL)]
+futuro = df[df["foto_mes"] == MES_PRED][["numero_de_cliente"]].copy()
+datos_final = lgb.Dataset(final[variables], label=final["clase_binaria"], free_raw_data=False)
+
+def guardar_top(prob, archivo):
+    # Top N de mayor probabilidad; int64 evita la notación científica
+    ids = (futuro.assign(prob=prob).sort_values("prob", ascending=False)
+                 .head(TOP_N)["numero_de_cliente"].astype("int64"))
+    ids.to_csv(archivo, index=False, header=False)   # sin encabezado, una columna
+    with open(archivo) as f:
+        contenido = f.read()
+    print(archivo, "| filas:", len(contenido.splitlines()), "| ¿e+?", "e+" in contenido)
+
+for semilla in SEMILLAS:
+    modelo = lgb.train({**params, "seed": semilla}, datos_final, num_boost_round=300)
+    futuro[f"prob_{semilla}"] = modelo.predict(df.loc[futuro.index, variables])
+    guardar_top(futuro[f"prob_{semilla}"], f"lags_s{semilla}_{TOP_N}.csv")
+
+#%% celda 6 [código]
+# --- 5. Ensamble: promedio de probabilidades por cliente ---
+columnas_prob = [f"prob_{s}" for s in SEMILLAS]
+futuro["prob_ensamble"] = futuro[columnas_prob].mean(axis=1)
+guardar_top(futuro["prob_ensamble"], f"lags_ensamble{len(SEMILLAS)}_{TOP_N}.csv")
+
+# ¿Cuánto coinciden las semillas? (clientes del top N compartidos con el ensamble)
+top_ens = set(futuro.nlargest(TOP_N, "prob_ensamble").index)
+for c in columnas_prob:
+    print(c, "coincide con el ensamble en", round(len(top_ens & set(futuro.nlargest(TOP_N, c).index)) / TOP_N * 100, 1), "%")
+
+#%% celda 7 [código]
+# --- 6. Anotar en resultados_experimentos.csv ---
+ruta_res = "../0_exploracion/resultados_experimentos.csv"
+res = pd.read_csv(ruta_res, sep=";", decimal=",", encoding="utf-8-sig")
+
+for desc, sem in [(f"lags orden 1 y 2, {len(SEMILLAS)} semillas por separado, top {TOP_N} (submit)", str(SEMILLAS)),
+                  (f"lags orden 1 y 2, ensamble {len(SEMILLAS)} semillas, top {TOP_N} (submit)", str(SEMILLAS))]:
+    nueva = {
+        "fecha": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "descripcion": desc,
+        "meses_train": str(MESES_FINAL),
+        "mes_valid": MES_PRED,          # no hay validación: es el mes que se predice
+        "semilla": sem,
+        "params": str(params),
+        "n_enviados": TOP_N,
+        "ganancia_publica_M": None,     # completar con la respuesta del bot
+    }
+    res = pd.concat([res, pd.DataFrame([nueva])], ignore_index=True)
+
+res["n_enviados"] = res["n_enviados"].astype("Int64")
+res.to_csv(ruta_res, sep=";", decimal=",", index=False, encoding="utf-8-sig")
+res.tail(2)

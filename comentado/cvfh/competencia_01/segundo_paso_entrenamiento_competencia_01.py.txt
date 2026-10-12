@@ -1,0 +1,764 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–13] Importa pandas, numpy, Path, lightgbm, os y re.
+# ENTRENAMIENTO Y PREDICCIONES FINALES 
+#  
+# ============================================================
+# LIBRERÍAS
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import lightgbm as lgb
+
+import os
+import re
+
+# [Anotación · líneas 15–37] Fija la semilla 42 en numpy y sortea 50 enteros distintos entre 0 y 999.999 como
+#   lista de semillas. Define 16 semillas para el entrenamiento final (las primeras 16 de la lista) y 10.500
+#   clientes a enviar, y verifica que la cantidad de semillas esté entre 1 y 50. Define el identificador de
+#   corrida modelo_final y las carpetas data/ y resultados/ dentro del directorio de trabajo; crea resultados/
+#   si no existe.
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+# DEFINICIONES
+semilla = 42
+np.random.seed(semilla)
+semillas = np.random.choice(1000000, size=50, replace=False).tolist()
+
+# PENDIENTE: confirmar ambos valores antes de la entrega.
+# Actualmente se utilizan las primeras 16 semillas generadas con np.random.seed(42).
+N_SEMILLAS_FINAL = 16 # TO DO: confirmar si quedan 16 o se completan las 20
+N_ENVIOS_FINAL = 10500  # TODO: confirmar el número definitivo de clientes
+if not isinstance(N_SEMILLAS_FINAL, int) or not 1 <= N_SEMILLAS_FINAL <= len(semillas):
+    raise ValueError(f"N_SEMILLAS_FINAL debe estar entre 1 y {len(semillas)}")
+semillas_envio = semillas[:N_SEMILLAS_FINAL]
+
+# Parámetros de guardado/carga
+RUN_ID = "modelo_final"
+base_path = Path.cwd()
+dataset_path = str(base_path / "data") + "/"
+resultados_path = str(base_path / "resultados") + "/"
+os.makedirs(resultados_path, exist_ok=True)
+
+# [Anotación · líneas 39–50] Lee data/competencia_01_fev4.parquet y crea dos columnas binarias:
+#   clase_binaria12 (1 si clase_ternaria es BAJA+1 o BAJA+2) y clase_binaria2 (1 sólo si es BAJA+2).
+# ============================================================
+# CARGA Y PROCESAMIENTO DE DATA
+# ============================================================
+
+# CARGA DATA
+dataset_file = 'competencia_01_fev4.parquet'  
+data = pd.read_parquet(dataset_path + dataset_file)
+
+# PROCESAMIENTO DE DATA
+# Creo target binario
+data['clase_binaria12'] = np.where(data['clase_ternaria'].isin(['BAJA+1', 'BAJA+2']), 1, 0)  # continua vs resto
+data['clase_binaria2'] = np.where(data['clase_ternaria'].isin(['BAJA+2']), 1, 0)  # baja+2 vs resto
+
+# [Anotación · líneas 52–74] Toma las columnas numéricas cuyo nombre empieza con m minúscula (los nombres que
+#   empiezan con Master_ o Visa_ no cumplen esa condición). Para cada una, dentro de cada foto_mes, calcula un
+#   divisor: el máximo del mes, o el máximo valor absoluto del mes si hay algún valor negativo; divide la
+#   columna por ese divisor y deja el valor original si el divisor es 0 o no existe. Con modo = sustituir, la
+#   columna escalada (float32) reemplaza a la original y se renombra con el sufijo _norm0. Imprime cuántas
+#   columnas procesa y el total de columnas.
+# Rankings con cero fijo y normalización
+modo = "sustituir"  # "sustituir" o "anadir"
+m_cols = [c for c in data.columns if c.startswith("m")
+          and pd.api.types.is_numeric_dtype(data[c])]
+ 
+for col in m_cols:
+    valores = data[col]
+    max_abs_mes = valores.abs().groupby(data["foto_mes"]).transform("max")
+    min_mes = valores.groupby(data["foto_mes"]).transform("min")
+    max_mes = valores.groupby(data["foto_mes"]).transform("max")
+    divisor = max_abs_mes.where(min_mes < 0, max_mes)
+    divisor = divisor.replace(0, np.nan)
+    escalada = valores.div(divisor).where(divisor.notna(), valores)
+    nombre = f"{col}_norm0"
+    if modo == "sustituir":
+        data[col] = escalada.astype("float32")
+    else:
+        data[nombre] = escalada.astype("float32")
+if modo == "sustituir":
+    data.rename(columns={c: f"{c}_norm0" for c in m_cols}, inplace=True)
+
+print(f"Variables originales procesadas: {len(m_cols)}")
+print(f"Modo: {modo} | Columnas finales: {data.shape[1]}")
+
+# [Anotación · líneas 76–118] Define las cinco columnas fijas (cliente, mes y las tres clases) y arma tres
+#   tablas. Marca como históricas las columnas cuyo nombre contiene lag o delta, sin distinguir mayúsculas; el
+#   nombre flag_sin_tc_sin_acuerdos_sin_prestamos contiene lag, por lo que esa columna del mes entra en la lista
+#   y no en data_current. data_hist1 lleva las columnas con lag1 o delta1; data_hist2, las de lag2 o delta2;
+#   data_current, todas las que no están en la lista de históricas. Imprime las dimensiones de cada tabla.
+# Separación entre sub-modelos/sub-datasets
+cols_fijas = [
+    "numero_de_cliente",
+    "foto_mes",
+    "clase_ternaria",
+    "clase_binaria12",
+    "clase_binaria2"
+]
+
+# Identificar TODAS las variables históricas
+mask_hist = data.columns.str.contains(
+    r"(lag|delta)",
+    case=False,
+    regex=True
+)
+cols_hist_todas = data.columns[mask_hist].tolist()
+
+# HIST1: quedarse solamente con lag1 y delta1
+cols_hist1 = [
+    c for c in cols_hist_todas
+    if __import__("re").search(r"(lag|delta)1(?!\d)", c, flags=__import__("re").IGNORECASE)
+]
+data_hist1 = data[cols_fijas + cols_hist1].copy()
+
+# HIST2: quedarse solamente con lag2 y delta2
+cols_hist2 = [
+    c for c in cols_hist_todas
+    if __import__("re").search(r"(lag|delta)2(?!\d)", c, flags=__import__("re").IGNORECASE)
+]
+data_hist2 = data[cols_fijas + cols_hist2].copy()
+
+# CURRENT: eliminar TODAS las variables históricas
+cols_current = [
+    c for c in data.columns
+    if c not in cols_hist_todas
+    and c not in cols_fijas 
+]
+data_current = data[cols_fijas + cols_current].copy()
+
+print("Original :", data.shape)
+print("HIST 1   :", data_hist1.shape)
+print("HIST 2   :", data_hist2.shape)
+print("CURRENT  :", data_current.shape)
+
+# [Anotación · líneas 120–132] Quita de las tres tablas las columnas cuyo nombre contiene
+#   prestamos_personales, sin distinguir mayúsculas; el comentario lo atribuye a una sugerencia de la cátedra.
+#   El filtro actúa sobre el nombre: deuda_prestamos_total y ratio_liquidez_vs_deuda, que el notebook calcula
+#   con mprestamos_personales, tienen otro nombre y no se quitan.
+# borro prestamos personales x sugerencia de la cátedra
+data_hist1 = data_hist1.loc[
+    :,
+    ~data_hist1.columns.str.contains("prestamos_personales", case=False)
+].copy()
+data_hist2 = data_hist2.loc[
+    :,
+    ~data_hist2.columns.str.contains("prestamos_personales", case=False)
+].copy()
+data_current = data_current.loc[
+    :,
+    ~data_current.columns.str.contains("prestamos_personales", case=False)
+].copy()
+
+# [Anotación · líneas 134–153] Define los meses de cada modelo para la etapa de validación: current entrena
+#   con 202103, 202104 y 202105; hist1 con 202104 y 202105; hist2 con 202105; los tres se prueban en 202106. Los
+#   comentarios indican que se dejan fuera los meses en que las variables históricas son todas NaN. Arma la
+#   lista de columnas que no entran como variables: las tres clases, foto_mes y numero_de_cliente.
+# Separo train/test
+mes_train_current = [202103, 202104, 202105]
+mes_test_current = 202106
+train_data_current = data_current[data_current['foto_mes'].isin(mes_train_current)]
+test_data_current = data_current[data_current['foto_mes'] == mes_test_current]
+
+mes_train_hist1 = [202104, 202105] # NO Incluimos marzo porque son puros NANS
+mes_test_hist1 = 202106
+train_data_hist1 = data_hist1[data_hist1['foto_mes'].isin(mes_train_hist1)]
+test_data_hist1 = data_hist1[data_hist1['foto_mes'] == mes_test_hist1]
+
+mes_train_hist2 = [202105] # NO Incluimos ni marzo ni abril porque son puros NANS
+mes_test_hist2 = 202106
+train_data_hist2 = data_hist2[data_hist2['foto_mes'].isin(mes_train_hist2)]
+test_data_hist2 = data_hist2[data_hist2['foto_mes'] == mes_test_hist2]
+
+# Tiro cols 
+cols_target = ['clase_ternaria', 'clase_binaria12', 'clase_binaria2']
+cols_inutiles = ['foto_mes', 'numero_de_cliente']
+cols_a_drop = cols_target + cols_inutiles
+
+# [Anotación · líneas 155–197] Para cada una de las tres tablas de entrenamiento conserva todas las filas cuya
+#   clase_ternaria no es CONTINUA y una muestra al azar del 20% de las CONTINUA (random_state = 42). Separa
+#   variables y etiqueta (clase_binaria12), arma el lgb.Dataset y prepara las variables de 202106. La etiqueta
+#   con que se evalúa 202106 vale 1 sólo para BAJA+2.
+# Undersampling + separación X e y + lgb data
+
+# current
+df_bajas_current = train_data_current[train_data_current["clase_ternaria"] != "CONTINUA"]
+df_continua_current = train_data_current[train_data_current["clase_ternaria"] == "CONTINUA"].sample(
+    frac=0.20, random_state=semilla)
+train_under_current = pd.concat([df_bajas_current, df_continua_current])
+
+X_train_current = train_under_current.drop(cols_a_drop, axis=1)
+y_train_current = train_under_current['clase_binaria12']
+ 
+X_test_current = test_data_current.drop(cols_a_drop, axis=1)
+y_test_true_current = np.where(test_data_current['clase_ternaria'] == "BAJA+2", 1, 0) # deberia ser idem de arriba # dejo igual para legibilidad
+
+
+train_data_lgb_current = lgb.Dataset(X_train_current, label= y_train_current)
+
+# hist 1
+
+df_bajas_hist1 = train_data_hist1[train_data_hist1["clase_ternaria"] != "CONTINUA"]
+df_continua_hist1 = train_data_hist1[train_data_hist1["clase_ternaria"] == "CONTINUA"].sample(
+    frac=0.20, random_state=semilla)
+train_under_hist1 = pd.concat([df_bajas_hist1, df_continua_hist1])
+
+X_train_hist1 = train_under_hist1.drop(cols_a_drop, axis=1)
+y_train_hist1 = train_under_hist1['clase_binaria12']
+
+X_test_hist1 = test_data_hist1.drop(cols_a_drop, axis=1)
+
+train_data_lgb_hist1 = lgb.Dataset(X_train_hist1, label= y_train_hist1)
+
+# hist 2
+df_bajas_hist2 = train_data_hist2[train_data_hist2["clase_ternaria"] != "CONTINUA"]
+df_continua_hist2 = train_data_hist2[train_data_hist2["clase_ternaria"] == "CONTINUA"].sample(
+    frac=0.20, random_state=semilla)
+train_under_hist2 = pd.concat([df_bajas_hist2, df_continua_hist2])
+
+X_train_hist2 = train_under_hist2.drop(cols_a_drop, axis=1)
+y_train_hist2 = train_under_hist2['clase_binaria12']
+ 
+X_test_hist2 = test_data_hist2.drop(cols_a_drop, axis=1)
+
+train_data_lgb_hist2 = lgb.Dataset(X_train_hist2, label= y_train_hist2)
+
+# [Anotación · líneas 199–215] Define los valores de negocio: ganancia nominal 2.200.000, efectividad 0,5 y
+#   costo por estímulo 27.500; la ganancia por acierto es 2.200.000 × 0,5 − 27.500. La función
+#   ganancia_por_envios ordena las predicciones de mayor a menor, toma las primeras cant_envios y suma la
+#   ganancia por acierto en los positivos y −27.500 en los demás.
+# Funcion de ganancia / elementos de negocio
+
+ganancia_nominal = 2_200_000
+efectividad = 0.5
+costo_estimulo = 27_500 
+ganancia_acierto = ganancia_nominal * efectividad - costo_estimulo 
+
+def ganancia_por_envios(y_pred, y_true, cant_envios): # para optimizar alpha abajo
+    orden = np.argsort(y_pred)[::-1]
+    y_ordenado = np.asarray(y_true)[orden]
+    enviados = y_ordenado[:cant_envios]
+    ganancia = np.where(
+        enviados == 1,
+        ganancia_acierto,
+        -costo_estimulo
+    )
+    return ganancia.sum()
+
+# [Anotación · líneas 217–243] Arma los parámetros de LightGBM: objective binary, boosting gbdt, max_bin 31,
+#   boost_from_average True, feature_pre_filter False, seed igual a la primera semilla de la lista, num_leaves
+#   18, learning_rate 0,00625238, min_data_in_leaf 1748, feature_fraction 0,939774, bagging_fraction 0,376689 y
+#   bagging_freq 1. Al unir los diccionarios la métrica queda en auc. Fija 4928 iteraciones.
+# PARAMETROS OPTIMIZADOS
+
+FIXED_PARAMS = {
+        'objective': 'binary',
+        'metric': 'custom',
+        'boosting_type': 'gbdt',  
+        'first_metric_only': True,  
+        'boost_from_average': True, 
+        'feature_pre_filter': False,  
+        'max_bin': 31,  
+        'seed': semillas[0],
+        'verbose': -1
+}
+OPT_PARAMS = {'num_leaves': 18,
+ 'learning_rate': 0.00625238,
+ 'min_data_in_leaf': 1748,
+ 'feature_fraction': 0.939774,
+ 'bagging_fraction': 0.376689,
+ 'bagging_freq': 1}
+
+PARAMS = {
+    **FIXED_PARAMS,
+    **OPT_PARAMS,
+    "metric": "auc",
+}
+
+NUM_ROUNDS = 4928 
+
+# [Anotación · líneas 245–271] Entrena los tres modelos de validación (current, hist1, hist2) con los mismos
+#   parámetros y 4928 iteraciones, sin conjunto de validación ni parada temprana, y predice 202106 con cada uno.
+# ENTRENAMIENTO SOBRE CONJUNTO DE ENTRENAMIENTO
+
+# CURRENT 
+model_current = lgb.train(
+    PARAMS,
+    train_data_lgb_current,
+    num_boost_round=NUM_ROUNDS
+)
+
+y_pred_current = model_current.predict(X_test_current)
+
+# HIST 1 
+model_hist1 = lgb.train(
+    PARAMS,
+    train_data_lgb_hist1,
+    num_boost_round=NUM_ROUNDS
+)
+y_pred_hist1 = model_hist1.predict(X_test_hist1)
+
+# HIST 2
+model_hist2 = lgb.train(
+    PARAMS,
+    train_data_lgb_hist2,
+    num_boost_round=NUM_ROUNDS
+)
+
+y_pred_hist2 = model_hist2.predict(X_test_hist2)
+
+
+# [Anotación · líneas 274–336] Recorre una grilla de pesos de 0 a 1 con paso 0,05 para current e hist1; el
+#   peso de hist2 es lo que falta para sumar 1, y se saltean las combinaciones en que queda fuera del rango de 0
+#   a 1. Para cada combinación calcula dos scores sobre 202106: el promedio ponderado de las probabilidades y el
+#   promedio ponderado de los rankings percentiles de cada modelo. Para cada score y cada cantidad de envíos de
+#   8.000 a 15.000 de a 1.000 calcula la ganancia contra BAJA+2 y guarda el resultado en una tabla.
+# OPTIMIZACION DE ENSAMBLE Y PUNTOS DE CORTE
+# ==========================================
+# OPTIMIZAR ENSEMBLE - JUNIO
+# ==========================================
+
+pesos = np.arange(0, 1.01, 0.05)
+cant_envios = range(8000, 15001, 1000)
+resultados_ensemble = []
+
+# Rankings de cada modelo
+rank_current = pd.Series(y_pred_current).rank(pct=True).values
+rank_hist1 = pd.Series(y_pred_hist1).rank(pct=True).values
+rank_hist2 = pd.Series(y_pred_hist2).rank(pct=True).values
+for w_current in pesos:
+    for w_hist1 in pesos:
+        w_hist2 = 1 - w_current - w_hist1
+        # solo combinaciones válidas
+        if w_hist2 < -1e-10 or w_hist2 > 1 + 1e-10:
+            continue
+        # --------------------------
+        # Ensemble de probabilidades
+        # --------------------------
+        score_proba = (
+            w_current * y_pred_current
+            + w_hist1 * y_pred_hist1
+            + w_hist2 * y_pred_hist2
+        )
+        # --------------------------
+        # Ensemble de rankings
+        # --------------------------
+        score_rank = (
+            w_current * rank_current
+            + w_hist1 * rank_hist1
+            + w_hist2 * rank_hist2
+        )
+        for n in cant_envios:
+            ganancia_proba = ganancia_por_envios(
+                score_proba,
+                y_test_true_current,
+                n
+            )
+            resultados_ensemble.append({
+                "tipo": "probas",
+                "w_current": w_current,
+                "w_hist1": w_hist1,
+                "w_hist2": w_hist2,
+                "cant_envios": n,
+                "ganancia": ganancia_proba
+            })
+            ganancia_rank = ganancia_por_envios(
+                score_rank,
+                y_test_true_current,
+                n
+            )
+            resultados_ensemble.append({
+                "tipo": "rankings",
+                "w_current": w_current,
+                "w_hist1": w_hist1,
+                "w_hist2": w_hist2,
+                "cant_envios": n,
+                "ganancia": ganancia_rank
+            })
+df_ensemble = pd.DataFrame(resultados_ensemble)
+
+# [Anotación · líneas 338–366] Elige, para cada tipo de ensamble (probabilidades y rankings), la fila de mayor
+#   ganancia, la imprime y guarda sus tres pesos. La cantidad de envíos de esa fila se imprime y no se usa más
+#   adelante en el script.
+# ==========================================
+# MEJOR ENSEMBLE
+# ==========================================
+
+mejor_proba = df_ensemble[
+    df_ensemble["tipo"] == "probas"
+].loc[
+    lambda x: x["ganancia"].idxmax()
+]
+mejor_rank = df_ensemble[
+    df_ensemble["tipo"] == "rankings"
+].loc[
+    lambda x: x["ganancia"].idxmax()
+]
+print("MEJOR ENSEMBLE PROBAS")
+print(mejor_proba)
+print("\nMEJOR ENSEMBLE RANKINGS")
+print(mejor_rank)
+
+# ==========================================
+# Pesos del mejor ensemble de 3 modelos
+# ==========================================
+
+w_current_proba = mejor_proba["w_current"]
+w_hist1_proba = mejor_proba["w_hist1"]
+w_hist2_proba = mejor_proba["w_hist2"]
+w_current_rank = mejor_rank["w_current"]
+w_hist1_rank = mejor_rank["w_hist1"]
+w_hist2_rank = mejor_rank["w_hist2"]
+
+
+# [Anotación · líneas 369–402] Prepara los datos del entrenamiento final, sin submuestreo y con la etiqueta
+#   clase_binaria12: current con 202103 a 202106, hist1 con 202104 a 202106 e hist2 con 202105 y 202106. Para
+#   cada tabla separa las variables de 202108 y los numero_de_cliente de ese mes.
+# ==========================================
+# Entrenamiento completo y creación de archivos para la entrega
+# ==========================================
+
+# ==========================================
+# Data para entrega   
+# ==========================================
+# CURRENT
+
+train_data_marzo_junio_current = data_current[data_current['foto_mes'].isin([202103, 202104, 202105, 202106])]
+test_data_agosto_current = data_current[data_current['foto_mes'] == 202108]
+X_train_marzo_junio_current = train_data_marzo_junio_current.drop(cols_a_drop, axis=1)
+y_train_marzo_junio_current = train_data_marzo_junio_current['clase_binaria12']
+train_data_lgb_current_final = lgb.Dataset(X_train_marzo_junio_current, label=y_train_marzo_junio_current)
+X_agosto_current = test_data_agosto_current.drop(cols_a_drop, axis=1)
+numero_cliente_agosto_current = test_data_agosto_current["numero_de_cliente"]
+
+# HIST 1
+train_data_abril_junio_hist1 = data_hist1[data_hist1['foto_mes'].isin([202104, 202105, 202106])]
+test_data_agosto_hist1 = data_hist1[data_hist1['foto_mes'] == 202108]
+X_train_abril_junio_hist1 = train_data_abril_junio_hist1.drop(cols_a_drop, axis=1)
+y_train_abril_junio_hist1 = train_data_abril_junio_hist1['clase_binaria12']
+train_data_lgb_hist_final1 = lgb.Dataset(X_train_abril_junio_hist1, label=y_train_abril_junio_hist1)
+X_agosto_hist1 = test_data_agosto_hist1.drop(cols_a_drop, axis=1)
+numero_cliente_agosto_hist1 = test_data_agosto_hist1["numero_de_cliente"]
+
+# HIST 2
+train_data_mayo_junio_hist2 = data_hist2[data_hist2['foto_mes'].isin([202105, 202106])]
+test_data_agosto_hist2 = data_hist2[data_hist2['foto_mes'] == 202108]
+X_train_mayo_junio_hist2 = train_data_mayo_junio_hist2.drop(cols_a_drop, axis=1)
+y_train_mayo_junio_hist2 = train_data_mayo_junio_hist2['clase_binaria12']
+train_data_lgb_hist_final2 = lgb.Dataset(X_train_mayo_junio_hist2, label=y_train_mayo_junio_hist2)
+X_agosto_hist2 = test_data_agosto_hist2.drop(cols_a_drop, axis=1)
+numero_cliente_agosto_hist2 = test_data_agosto_hist2["numero_de_cliente"]
+
+# [Anotación · líneas 404–417] Verifica con assert que los clientes de 202108 están en el mismo orden en las
+#   tres tablas e imprime cuántos son.
+# ============================================================
+# CHEQUEO: LOS CLIENTES DE AGOSTO COINCIDEN
+# ============================================================
+assert np.array_equal(
+    numero_cliente_agosto_current.values,
+    numero_cliente_agosto_hist1.values
+), "ERROR: CURRENT y HIST1 no tienen los mismos clientes en el mismo orden."
+assert np.array_equal(
+    numero_cliente_agosto_current.values,
+    numero_cliente_agosto_hist2.values
+), "ERROR: CURRENT y HIST2 no tienen los mismos clientes en el mismo orden."
+print(
+    f"Clientes agosto: {len(numero_cliente_agosto_current)}"
+)
+
+
+# [Anotación · líneas 420–429] Copia los parámetros de cada modelo de validación y toma su cantidad de
+#   iteraciones con current_iteration(), para usarlos en el entrenamiento final.
+# Los envíos se guardan en resultados/ (sin subcarpetas).
+# ============================================================
+# PARAMETROS
+# ============================================================
+base_params_current = model_current.params.copy()
+model_best_iter_current = model_current.current_iteration()
+base_params_hist1 = model_hist1.params.copy()
+model_best_iter_hist1 = model_hist1.current_iteration()
+base_params_hist2 = model_hist2.params.copy()
+model_best_iter_hist2 = model_hist2.current_iteration()
+
+# [Anotación · líneas 431–460] Lee, si existe, el archivo modelo_final_semillas_completadas.txt de
+#   resultados/. Recorre las 16 semillas: si una figura como completada y sus cinco Parquet existen, la saltea;
+#   si falta alguno, la vuelve a ejecutar. Para cada semilla copia los parámetros de los tres modelos y
+#   reemplaza seed por la semilla en curso.
+# ============================================================
+# LOOP DE SEMILLAS
+# ============================================================
+# Control de avance: una semilla completa no se repite.
+# Se guardan rankings Parquet por semilla; los CSV se generan solo al final. 
+checkpoint_path = os.path.join(resultados_path, f"{RUN_ID}_semillas_completadas.txt")
+semillas_completadas = set()
+
+if os.path.exists(checkpoint_path):
+    with open(checkpoint_path, "r", encoding="utf-8") as f:
+        semillas_completadas = {int(x.strip()) for x in f if x.strip()}
+for seed in semillas_envio:
+    if seed in semillas_completadas:
+        archivos_semilla = [
+            Path(resultados_path) / f"{RUN_ID}_{tipo}_seed_{seed}.parquet"
+            for tipo in ("current", "hist1", "hist2", "ensemble_proba", "ensemble_rank")
+        ]
+        if all(ruta.exists() for ruta in archivos_semilla):
+            print(f"Semilla {seed}: ya completada, se omite")
+            continue
+        print(f"Semilla {seed}: checkpoint incompleto, se vuelve a ejecutar")
+
+    print(f"\n========== SEMILLA {seed} ==========")
+
+    params_current = base_params_current.copy()
+    params_current["seed"] = seed
+    params_hist1 = base_params_hist1.copy()
+    params_hist1["seed"] = seed
+    params_hist2 = base_params_hist2.copy()
+    params_hist2["seed"] = seed
+
+# [Anotación · líneas 462–493] Con la semilla en curso entrena los tres modelos sobre los datos finales y
+#   predice 202108 con cada uno.
+    # --------------------------------------------------------
+    # CURRENT
+    # --------------------------------------------------------
+
+    modelo_current = lgb.train(
+        params_current,
+        train_data_lgb_current_final,
+        num_boost_round=model_best_iter_current
+    )
+    proba_current = modelo_current.predict(X_agosto_current)
+    
+    # --------------------------------------------------------
+    # HIST 1
+    # --------------------------------------------------------
+    
+    modelo_hist1 = lgb.train(
+        params_hist1,
+        train_data_lgb_hist_final1,
+        num_boost_round=model_best_iter_hist1
+    )
+    proba_hist1 = modelo_hist1.predict(X_agosto_hist1)
+    
+    # --------------------------------------------------------
+    # HIST 2
+    # --------------------------------------------------------
+    
+    modelo_hist2 = lgb.train(
+        params_hist2,
+        train_data_lgb_hist_final2,
+        num_boost_round=model_best_iter_hist2
+    )
+    proba_hist2 = modelo_hist2.predict(X_agosto_hist2)
+    
+# [Anotación · líneas 495–528] Combina los tres modelos de dos maneras: promedio ponderado de las
+#   probabilidades con los pesos elegidos para probabilidades, y promedio ponderado de los rankings percentiles
+#   de cada modelo con los pesos elegidos para rankings.
+    # --------------------------------------------------------
+    # ENSEMBLE PROBABILIDADES
+    # --------------------------------------------------------
+    
+    score_ensemble_proba = (
+        w_current_proba * proba_current
+        + w_hist1_proba * proba_hist1
+        + w_hist2_proba * proba_hist2
+    )
+    
+    # --------------------------------------------------------
+    # ENSEMBLE RANKINGS
+    # --------------------------------------------------------
+    
+    rank_current = (
+        pd.Series(proba_current)
+        .rank(pct=True)
+        .values
+    )
+    rank_hist1 = (
+        pd.Series(proba_hist1)
+        .rank(pct=True)
+        .values
+    )
+    rank_hist2 = (
+        pd.Series(proba_hist2)
+        .rank(pct=True)
+        .values
+    )
+    score_ensemble_rank = (
+        w_current_rank * rank_current
+        + w_hist1_rank * rank_hist1
+        + w_hist2_rank * rank_hist2
+    )
+    
+# [Anotación · líneas 530–568] Arma cinco tablas con numero_de_cliente y su valor, ordenadas de mayor a menor:
+#   la probabilidad de cada uno de los tres modelos y el score de cada uno de los dos ensambles.
+    # ========================================================
+    # RANKINGS
+    # ========================================================
+    
+    ranking_current = pd.DataFrame({
+        "numero_de_cliente": numero_cliente_agosto_current.values,
+        "proba": proba_current
+    }).sort_values(
+        "proba",
+        ascending=False
+    )
+    ranking_hist1 = pd.DataFrame({
+        "numero_de_cliente": numero_cliente_agosto_hist1.values,
+        "proba": proba_hist1
+    }).sort_values(
+        "proba",
+        ascending=False
+    )
+    ranking_hist2 = pd.DataFrame({
+        "numero_de_cliente": numero_cliente_agosto_hist2.values,
+        "proba": proba_hist2
+    }).sort_values(
+        "proba",
+        ascending=False
+    )
+    ranking_proba = pd.DataFrame({
+        "numero_de_cliente": numero_cliente_agosto_current.values,
+        "score": score_ensemble_proba
+    }).sort_values(
+        "score",
+        ascending=False
+    )
+    ranking_rank = pd.DataFrame({
+        "numero_de_cliente": numero_cliente_agosto_current.values,
+        "score": score_ensemble_rank
+    }).sort_values(
+        "score",
+        ascending=False
+    )
+# [Anotación · líneas 569–616] Guarda las cinco tablas en resultados/ como Parquet, con el identificador de
+#   corrida, el tipo y la semilla en el nombre. Después agrega la semilla al archivo de semillas completadas y
+#   fuerza la escritura a disco.
+    # ========================================================
+    # GUARDAR RANKINGS
+    # ========================================================
+    
+    ranking_current.to_parquet(
+        os.path.join(
+            resultados_path,
+            f"{RUN_ID}_current_seed_{seed}.parquet"
+        ),
+        index=False
+    )
+    ranking_hist1.to_parquet(
+        os.path.join(
+            resultados_path,
+            f"{RUN_ID}_hist1_seed_{seed}.parquet"
+        ),
+        index=False
+    )
+    ranking_hist2.to_parquet(
+        os.path.join(
+            resultados_path,
+            f"{RUN_ID}_hist2_seed_{seed}.parquet"
+        ),
+        index=False
+    )
+    ranking_proba.to_parquet(
+        os.path.join(
+            resultados_path,
+            f"{RUN_ID}_ensemble_proba_seed_{seed}.parquet"
+        ),
+        index=False
+    )
+    ranking_rank.to_parquet(
+        os.path.join(
+            resultados_path,
+            f"{RUN_ID}_ensemble_rank_seed_{seed}.parquet"
+        ),
+        index=False
+    )
+    
+    # No se generan CSV individuales: los rankings Parquet se combinan al final.
+
+    # Registrar solamente después de guardar todos los resultados de la semilla.
+    with open(checkpoint_path, "a", encoding="utf-8") as f:
+        f.write(f"{seed}\n")
+        f.flush()
+        os.fsync(f.fileno())
+    print("OK")
+
+
+# [Anotación · líneas 619–653] Define ejecutar_ensemble_semillas. Valida que N_ENVIOS_FINAL sea un entero
+#   positivo. Para cada método (proba y rank) lee el Parquet del ensamble de cada una de las 16 semillas; si
+#   falta alguno, le faltan columnas o tiene clientes duplicados, lanza un error. Convierte el score de cada
+#   semilla en ranking percentil.
+# ============================================================
+# ENSAMBLE MULTISEMILLA FINAL
+# ============================================================
+# Los archivos por semilla se generan arriba y se recuperan por su nombre exacto.
+# La combinación es el promedio de los rankings percentiles por semilla,
+# siguiendo el criterio del bloque de ensamble multisemilla original.
+
+def ejecutar_ensemble_semillas():
+    if N_ENVIOS_FINAL is None:
+        print("PENDIENTE: definir N_ENVIOS_FINAL; no se generan CSVs finales.")
+        return
+    if not isinstance(N_ENVIOS_FINAL, int) or isinstance(N_ENVIOS_FINAL, bool) or N_ENVIOS_FINAL <= 0:
+        raise ValueError("N_ENVIOS_FINAL debe ser un entero positivo")
+
+    for metodo in ("proba", "rank"):
+        partes = []
+        for seed in semillas_envio:
+            ruta = Path(resultados_path) / (
+                f"{RUN_ID}_ensemble_{metodo}_seed_{seed}.parquet"
+            )
+            if not ruta.exists():
+                raise FileNotFoundError(
+                    f"Falta la predicción de la semilla {seed}: {ruta}. "
+                    "No se generará un ensamble con menos semillas que las configuradas."
+                )
+            df = pd.read_parquet(ruta)
+            if not {"numero_de_cliente", "score"}.issubset(df.columns):
+                raise ValueError(f"Faltan columnas en {ruta}")
+            if df["numero_de_cliente"].duplicated().any():
+                raise ValueError(f"Clientes duplicados en {ruta}")
+            partes.append(
+                df[["numero_de_cliente"]].assign(
+                    **{f"s{seed}": df["score"].rank(pct=True)}
+                )
+            )
+
+# [Anotación · líneas 655–682] Une las 16 tablas por numero_de_cliente (unión interna uno a uno) y verifica
+#   que todas tengan los mismos clientes. Promedia los 16 rankings percentiles, ordena por ese promedio de mayor
+#   a menor y, en los empates, por numero_de_cliente ascendente. Escribe los primeros 10.500 numero_de_cliente
+#   en un CSV sin encabezado ni índice, cuyo nombre lleva el método, la cantidad de envíos y la cantidad de
+#   semillas. La última línea llama a la función.
+        combinado = partes[0]
+        for parte in partes[1:]:
+            combinado = combinado.merge(
+                parte, on="numero_de_cliente", how="inner", validate="one_to_one"
+            )
+        if len(combinado) != len(partes[0]) or any(
+            len(combinado) != len(parte) for parte in partes
+        ):
+            raise ValueError("Las semillas no contienen exactamente los mismos clientes")
+
+        columnas_semillas = [f"s{seed}" for seed in semillas_envio]
+        combinado["score"] = combinado[columnas_semillas].mean(axis=1)
+        ranking = combinado.sort_values(
+            ["score", "numero_de_cliente"], ascending=[False, True]
+        )
+        if N_ENVIOS_FINAL > len(ranking):
+            raise ValueError("N_ENVIOS_FINAL excede la cantidad de clientes")
+
+        salida = Path(resultados_path) / (
+            f"multisemilla_ensemble_{metodo}_{N_ENVIOS_FINAL}_nsemillas_{len(partes)}.csv"
+        )
+        ranking["numero_de_cliente"].head(N_ENVIOS_FINAL).astype("int64").to_csv(
+            salida, index=False, header=False
+        )
+        print("Generado:", salida)
+
+
+ejecutar_ensemble_semillas()

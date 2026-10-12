@@ -1,0 +1,83 @@
+#%% celda 1 [texto]
+# Modelo base - submit
+
+LightGBM solo BAJA+2. Entrena con 202103-202106, predice 202108 y guarda el top N para el bot.
+
+**Submit 0** (bot: `base_0`). El archivo se guardó como `modelo_base_todos_meses_10000.csv` y se renombró a `0_modelo_base_todos_meses_10000.csv`.
+
+#%% celda 2 [código]
+# --- 1. Librerías y parámetros ---
+import os
+import pandas as pd
+import lightgbm as lgb
+
+MESES_FINAL = [202103, 202104, 202105, 202106]
+MES_PRED    = 202108
+TOP_N       = 10_000   # cantidad de clientes a estimular
+SEMILLA     = 501419
+
+#%% celda 3 [código]
+# --- 2. Cargar datos y armar el target binario ---
+df = pd.read_parquet("../competencia_01.parquet")
+
+# 1 si es BAJA+2, 0 en cualquier otro caso
+df["clase_binaria"] = (df["clase_ternaria"] == "BAJA+2").astype(int)
+
+# Columnas que NO son variables: el mes y el target
+no_usar = ["foto_mes", "clase_ternaria", "clase_binaria"]
+variables = [c for c in df.columns if c not in no_usar]
+
+#%% celda 4 [código]
+# --- 3. Entrenar con todos los meses que tienen target ---
+params = {
+    "objective": "binary",       # devuelve probabilidad de BAJA+2
+    "learning_rate": 0.05,       # cuánto aporta cada árbol
+    "num_leaves": 31,            # hojas máximas por árbol
+    "min_data_in_leaf": 100,     # mínimo de clientes por hoja
+    "feature_fraction": 0.8,     # cada árbol usa el 80% de las variables
+    "seed": SEMILLA,
+    "verbose": -1,
+}
+
+final = df[df["foto_mes"].isin(MESES_FINAL)]
+datos_final = lgb.Dataset(final[variables], label=final["clase_binaria"])
+modelo_final = lgb.train(params, datos_final, num_boost_round=300)
+print("Entrenado con", final.shape[0], "filas | BAJA+2:", final["clase_binaria"].sum())
+
+#%% celda 5 [código]
+# --- 4. Predecir 202108 y guardar el archivo para el bot ---
+futuro = df[df["foto_mes"] == MES_PRED].copy()
+futuro["prob"] = modelo_final.predict(futuro[variables])
+
+# Top N de mayor probabilidad; int64 evita la notación científica (4.8e+07)
+ids = (futuro.sort_values("prob", ascending=False)
+             .head(TOP_N)["numero_de_cliente"].astype("int64"))
+
+archivo = f"modelo_base_todos_meses_{TOP_N}.csv"
+ids.to_csv(archivo, index=False, header=False)   # sin encabezado, una sola columna
+
+# Verificación: cantidad de filas y que no haya "e+"
+with open(archivo) as f:
+    contenido = f.read()
+print("Archivo:", archivo)
+print("Filas:", len(contenido.splitlines()), "| ¿Notación científica?", "e+" in contenido)
+
+#%% celda 6 [código]
+# --- 5. Anotar el submit en resultados_experimentos.csv ---
+ruta_res = "../0_exploracion/resultados_experimentos.csv"
+res = pd.read_csv(ruta_res, sep=";", decimal=",", encoding="utf-8-sig")
+
+nueva = {
+    "fecha": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+    "descripcion": f"modelo_base todos los meses, top {TOP_N} (submit)",
+    "meses_train": str(MESES_FINAL),
+    "mes_valid": MES_PRED,          # no hay validación: es el mes que se predice
+    "semilla": SEMILLA,
+    "params": str(params),
+    "n_enviados": TOP_N,
+    "ganancia_publica_M": None,     # completar con la respuesta del bot
+}
+res = pd.concat([res, pd.DataFrame([nueva])], ignore_index=True)
+res["n_enviados"] = res["n_enviados"].astype("Int64")
+res.to_csv(ruta_res, sep=";", decimal=",", index=False, encoding="utf-8-sig")
+res.tail(3)

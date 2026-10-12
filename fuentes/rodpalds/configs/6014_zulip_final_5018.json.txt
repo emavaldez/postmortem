@@ -1,0 +1,16 @@
+{
+  "experimento": 6014,
+  "nombre": "zulip_final_5018",
+  "sobrescribir": true,
+  "modo": "final",
+  "fuente": "5018_prod_final",
+  "envios": [
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500
+  ],
+  "descripcion": "Archivos para el bot del modelo final 5018: 11.000 a 13.500 envios."
+}

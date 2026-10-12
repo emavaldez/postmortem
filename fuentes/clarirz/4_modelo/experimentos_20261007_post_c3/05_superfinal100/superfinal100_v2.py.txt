@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import gc
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+
+def _gcs(cmd, check=True, **kw):
+    """Respaldo opcional a Cloud Storage. Se omite cuando el bucket es el placeholder de publicacion."""
+    if any("REEMPLAZAR_CON_BUCKET_PROPIO" in str(a) or "BUCKET_PRIVADO_NO_PUBLICADO" in str(a) for a in cmd):
+        return None
+    return subprocess.run(cmd, check=check, **kw)
+
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import super_common as C
+import run_superfinal100 as V1
+
+RUN = "c1superfinal100v2"
+REMOTE = "gs://REEMPLAZAR_CON_BUCKET_PROPIO/corridas/" + RUN
+PLAN = json.loads((HERE / "plan_superfinal100_v2.json").read_text(encoding="utf-8"))
+GIB = 1024**3
+MIN_TOTAL_GIB = 56.0
+RESERVE_GIB = 8.0
+SCREEN_SEEDS = [17, 101, 202]
+REP_CONFIRM_SEEDS = [303, 404, 505, 606, 707]
+RECENCY_SEEDS = [808, 909, 1001, 1102, 1203]
+TUNE_CONFIRM_SEEDS = [1304, 1405, 1506, 1607, 1708]
+
+
+def require(ok: bool, msg: str) -> None:
+    if not ok:
+        raise RuntimeError(msg)
+
+
+def meminfo_gib() -> tuple[float, float]:
+    values = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        key, rest = line.split(":", 1)
+        values[key] = float(rest.strip().split()[0]) / 1024 / 1024
+    return values["MemTotal"], values["MemAvailable"]
+
+
+def configure_runtime() -> None:
+    C.RUN = RUN
+    C.REMOTE = REMOTE
+    V1.RUN = RUN
+    V1.REMOTE = REMOTE
+    V1.plan_doc = lambda: PLAN
+    V1.train_seeds = train_seeds_per_seed
+
+
+def dataset_for_seed(x, y, weights, features, params: dict, seed: int):
+    import lightgbm as lgb
+
+    seed_params = dict(params)
+    seed_params["seed"] = int(seed)
+    weight_arg = None if weights is None or bool(np.all(weights == 1.0)) else weights
+    ds = lgb.Dataset(
+        x,
+        label=y,
+        weight=weight_arg,
+        feature_name=features,
+        free_raw_data=False,
+        params={
+            "max_bin": int(seed_params.get("max_bin", 255)),
+            "seed": int(seed),
+        },
+    )
+    return ds, seed_params
+
+
+def train_seeds_per_seed(
+    data: dict,
+    features: list[str],
+    params: dict,
+    rounds: int,
+    seeds: list[int],
+    weights_by_month: dict[int, float],
+    out_dir: Path,
+    identity: str,
+    label: str,
+    save_models: bool = False,
+    backup_prefix: str | None = None,
+    reuse_scores: dict[int, np.ndarray] | None = None,
+) -> dict[int, np.ndarray]:
+    import lightgbm as lgb
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    reuse_scores = reuse_scores or {}
+    keep, weights = C.policy_weights(data["train_months"], weights_by_month)
+    x_train = (
+        data["x_train"]
+        if bool(np.all(keep))
+        else data["x_train"].loc[keep].reset_index(drop=True)
+    )
+    y_train = data["y_train"][keep]
+    x_eval = data["x_eval"]
+    ids = data["ids"]
+    y_eval = data["y_eval"]
+
+    result: dict[int, np.ndarray] = {}
+    for index, seed in enumerate(seeds, 1):
+        cp = out_dir / f"seed_{seed}.npz"
+        model_path = out_dir / f"modelo_{seed}.txt"
+        existing = C.score_checkpoint(cp, identity, label, seed, ids, y_eval)
+        if existing is not None:
+            if save_models:
+                require(model_path.is_file(), f"Checkpoint sin modelo seed={seed}")
+                with np.load(cp, allow_pickle=False) as z:
+                    require(
+                        str(z["model_sha256"].item()) == C.digest(model_path),
+                        f"Hash modelo/checkpoint seed={seed}",
+                    )
+            result[seed] = existing
+            print(f"REUSAR {label} {index}/{len(seeds)} seed={seed}", flush=True)
+            continue
+
+        if seed in reuse_scores:
+            scores = np.asarray(reuse_scores[seed], dtype=np.float64)
+            require(scores.shape == ids.shape and np.isfinite(scores).all(), "Reuse inválido")
+            with cp.with_suffix(".tmp").open("wb") as fh:
+                np.savez_compressed(
+                    fh,
+                    identity=np.array(identity), label=np.array(label),
+                    seed=np.array(seed), ids=ids, y=y_eval, scores=scores,
+                    reused=np.array(True), model_sha256=np.array(""),
+                )
+            cp.with_suffix(".tmp").replace(cp)
+            result[seed] = scores
+            print(f"COPIAR SCORE {label} {index}/{len(seeds)} seed={seed}", flush=True)
+            continue
+
+        print(
+            f"ENTRENAR {label} {index}/{len(seeds)} seed={seed}; "
+            f"features={len(features)}; rounds={rounds}; dataset_per_seed=SI",
+            flush=True,
+        )
+        ds, seed_params = dataset_for_seed(
+            x_train, y_train, weights, features, params, seed
+        )
+        model = lgb.train(seed_params, ds, num_boost_round=int(rounds))
+        scores = np.asarray(model.predict(x_eval, num_threads=C.THREADS), dtype=np.float64)
+        require(scores.shape == ids.shape and np.isfinite(scores).all(), "Scores inválidos")
+        require(((scores >= 0) & (scores <= 1)).all(), "Scores fuera de rango")
+
+        model_sha = ""
+        if save_models:
+            tmp_model = model_path.with_suffix(".tmp")
+            model.save_model(str(tmp_model))
+            tmp_model.replace(model_path)
+            model_sha = C.digest(model_path)
+        with cp.with_suffix(".tmp").open("wb") as fh:
+            np.savez_compressed(
+                fh,
+                identity=np.array(identity), label=np.array(label),
+                seed=np.array(seed), ids=ids, y=y_eval, scores=scores,
+                reused=np.array(False), model_sha256=np.array(model_sha),
+            )
+        cp.with_suffix(".tmp").replace(cp)
+        if backup_prefix:
+            files = [str(cp)] + ([str(model_path)] if save_models else [])
+            _gcs(["gcloud", "storage", "cp", *files, backup_prefix + "/"], check=True)
+        result[seed] = scores
+        del model, ds
+        gc.collect()
+    return result
+
+
+def exact_s3_canary(ctx: dict) -> dict:
+    root = ctx["paths"]["out"] / "canary_s3_exact"
+    result_path = root / "RESULT.json"
+    if result_path.is_file():
+        result = C.load_json(result_path)
+        require(result.get("status") == "passed" and result.get("max_abs") == 0.0,
+                "Canary previo inválido")
+        return result
+
+    root.mkdir(parents=True, exist_ok=True)
+    features = list(ctx["schema"])
+    data = C.load_fold(ctx, features, C.TRAIN_EVAL, C.EVAL_MONTH, ctx["paths"]["bank_orig"])
+    identity = C.fingerprint({"run": RUN, "stage": "canary", "plan": PLAN, "seed": 17})
+    scores = train_seeds_per_seed(
+        data, features, C.base_params(ctx["paths"]), 300, [17],
+        {202103: 1.0, 202104: 1.0}, root / "scores", identity, "C3_S3_CANARY",
+    )[17]
+    with np.load(ctx["paths"]["s3"] / "C3_HIST_MAS_TARJETAS/seed_17.npz",
+                 allow_pickle=False) as z:
+        expected_ids = np.asarray(z["ids"], dtype=np.int64)
+        expected_y = np.asarray(z["y"], dtype=np.int8)
+        expected = np.asarray(z["scores"], dtype=np.float64)
+    require(np.array_equal(data["ids"], expected_ids), "Canary IDs")
+    require(np.array_equal(data["y_eval"], expected_y), "Canary y")
+    max_abs = float(np.max(np.abs(scores - expected)))
+    exact = bool(np.array_equal(scores, expected))
+    require(exact and max_abs == 0.0, f"CANARY S3 FALLÓ: max_abs={max_abs}")
+    result = {
+        "status": "passed", "identity": identity, "seed": 17,
+        "max_abs": max_abs, "exact_array_equal": exact,
+        "candidate_sha256": hashlib.sha256(scores.tobytes()).hexdigest(),
+        "s3_sha256": hashlib.sha256(expected.tobytes()).hexdigest(),
+    }
+    C.write_json(result_path, result)
+    _gcs(["gcloud", "storage", "cp", str(result_path), REMOTE + "/CANARY_S3.json"], check=True)
+    print("CANARY_S3_EXACT_OK", flush=True)
+    return result
+
+
+def stage2_v2(ctx: dict, s0: dict, s1: dict) -> dict:
+    out = V1.stage_path(ctx, 2, "recency")
+    result_path = out / "RESULT.json"
+    if result_path.is_file():
+        return C.load_json(result_path)
+    features = C.load_json(Path(s1["winner_features_file"]))["features"]
+    data = C.load_fold(ctx, features, C.TRAIN_EVAL, C.EVAL_MONTH, Path(s0["eval_bank"]))
+    params = C.base_params(ctx["paths"])
+    identity = C.fingerprint({
+        "run": RUN, "stage": 2, "plan": PLAN, "stage1": s1["identity"],
+        "features": C.fingerprint(features), "seeds": RECENCY_SEEDS,
+    })
+    scores_by = {}
+    meta = {}
+    control_curves = None
+    for policy, weights in V1.RECENCY.items():
+        pid = C.fingerprint({"parent": identity, "policy": policy, "weights": weights})
+        scores = train_seeds_per_seed(
+            data, features, params, 300, RECENCY_SEEDS, weights,
+            out / policy, pid, policy,
+        )
+        choice, curves, ensemble = C.summarize_scores(data["ids"], data["y_eval"], scores, RECENCY_SEEDS)
+        scores_by[policy] = {k: v.copy() for k, v in scores.items()}
+        meta[policy] = {"identity": pid, "choice": choice}
+        if policy == "EXPANDING":
+            control_curves = curves
+        del scores, curves, ensemble
+        gc.collect()
+    require(control_curves is not None, "Falta EXPANDING")
+    rows = []
+    promoted = []
+    control_scores = scores_by["EXPANDING"]
+    for policy in V1.RECENCY:
+        choice = meta[policy]["choice"]
+        if policy == "EXPANDING":
+            paired = {"mean": 0.0, "median": 0.0, "sd": 0.0,
+                      "positive_fraction": 0.0, "wins": 0, "ties": 5, "losses": 0}
+            control_same = choice["ganancia_robusta"]
+            passed = True
+        else:
+            _, curves, _ = C.summarize_scores(data["ids"], data["y_eval"], scores_by[policy], RECENCY_SEEDS)
+            paired = C.paired_at_plateau(curves, control_curves, RECENCY_SEEDS, choice["meseta_n"])
+            control_same = V1.control_gain_at_ns(
+                data["ids"], data["y_eval"], control_scores, RECENCY_SEEDS, choice["meseta_n"]
+            )
+            passed = bool(choice["ganancia_robusta"] > control_same and paired["mean"] > 0
+                          and paired["median"] > 0 and paired["wins"] >= 3)
+            if passed:
+                promoted.append(policy)
+        rows.append({
+            "policy": policy, "passed": passed,
+            "control_gain_same_plateau": float(control_same),
+            "delta_ensemble_same_plateau": float(choice["ganancia_robusta"] - control_same),
+            **{k: v for k, v in choice.items() if k != "meseta_gain"},
+            **{f"paired_{k}": v for k, v in paired.items() if k != "deltas"},
+        })
+    frame = pd.DataFrame(rows)
+    frame.to_csv(out / "comparison.csv", index=False)
+    winner = (
+        frame[frame.policy.isin(promoted)]
+        .sort_values(["ganancia_robusta", "delta_ensemble_same_plateau"], ascending=[False, False])
+        .iloc[0].policy if promoted else "EXPANDING"
+    )
+    result = {
+        "status": "completed", "identity": identity, "winner_policy": winner,
+        "representation": s1["winner"], "quality_arm": s0["quality_arm"],
+        "winner_features_file": s1["winner_features_file"], "promoted": promoted,
+        "seeds": RECENCY_SEEDS, "fresh_vs_stage1": True,
+    }
+    C.write_json(result_path, result)
+    _gcs(["gcloud", "storage", "cp", str(result_path), str(out / "comparison.csv"), REMOTE + "/"], check=True)
+    print("STAGE2_V2_COMPLETO. Policy:", winner, flush=True)
+    return result
+
+
+def stage4_strict(ctx: dict, s0: dict, s1: dict, s2: dict, s3: dict) -> dict:
+    result = V1.stage4(ctx, s0, s1, s2, s3)
+    paired = result["paired"]
+    strict = bool(
+        result["candidate_choice"]["ganancia_robusta"] > result["control_gain_at_candidate_plateau"]
+        and paired["mean"] > 0 and paired["median"] > 0 and paired["wins"] >= 14
+    )
+    result["legacy_promote_12_of_20"] = bool(result.get("promote_to_august"))
+    result["promotion_rule_v2"] = {
+        "paired_mean_gt": 0, "paired_median_gt": 0, "wins_min": 14,
+        "ensemble_robust_gain_gt_c3": True,
+    }
+    result["promote_to_august"] = strict
+    C.write_json(ctx["paths"]["out"] / "stage4_confirm20/RESULT.json", result)
+    print(f"STAGE4_V2_PROMOTE={strict}; wins={paired['wins']}/20", flush=True)
+    return result
+
+
+def stage5_per_seed(ctx: dict, s0: dict, s1: dict, s2: dict, s3: dict, s4: dict) -> dict:
+    import lightgbm as lgb
+
+    out = V1.stage_path(ctx, 5, "final")
+    result_path = out / "RESULT.json"
+    if result_path.is_file():
+        return C.load_json(result_path)
+    if not s4["promote_to_august"]:
+        result = {"status": "stopped_no_promotion", "stage4_identity": s4["identity"], "no_submit": True}
+        C.write_json(result_path, result)
+        _gcs(["gcloud", "storage", "cp", str(result_path), REMOTE + "/stage5_RESULT.json"], check=True)
+        print("STAGE5 NO EJECUTADO: no promovió bajo regla v2.", flush=True)
+        return result
+
+    total_gib, available_gib = meminfo_gib()
+    require(total_gib >= MIN_TOTAL_GIB, f"VM insuficiente: MemTotal={total_gib:.1f}GiB < {MIN_TOTAL_GIB}")
+    features = C.load_json(Path(s1["winner_features_file"]))["features"]
+    n_train = sum(C.EXPECTED_ROWS[m] for m in C.FINAL_TRAIN)
+    n_score = C.EXPECTED_ROWS[C.SCORE_MONTH]
+    estimated_gib = ((2 * n_train + n_score) * len(features) * 8) / GIB + RESERVE_GIB
+    require(available_gib >= estimated_gib,
+            f"RAM disponible insuficiente: {available_gib:.1f}GiB < estimado {estimated_gib:.1f}GiB")
+    print(f"RAM_GUARD_OK total={total_gib:.1f} available={available_gib:.1f} estimated={estimated_gib:.1f}", flush=True)
+
+    bank = V1.prepare_final_bank(ctx, s0, features)
+    C.add_fe_path(ctx["paths"])
+    from cargar_bloques import cargar_bloques
+    derived = C.split_derived(features, ctx)
+    train_df, _ = cargar_bloques(bank, meses=C.FINAL_TRAIN, incluir_raw=True, features=derived)
+    labels = pd.read_parquet(ctx["paths"]["bank_orig"] / "etiquetas.parquet")
+    train_labels = labels[labels.foto_mes.isin(C.FINAL_TRAIN)].reset_index(drop=True)
+    require(train_df[["numero_de_cliente", "foto_mes"]].equals(
+        train_labels[["numero_de_cliente", "foto_mes"]]), "Final train desalineado")
+    x_train = train_df[features]
+    y_train = train_labels.clase_ternaria.eq("BAJA+2").to_numpy(np.int8)
+    months = train_df.foto_mes.to_numpy(np.int64)
+    keep, weights = C.policy_weights(months, V1.FINAL_RECENCY[s2["winner_policy"]])
+    x_fit = x_train if bool(np.all(keep)) else x_train.loc[keep].reset_index(drop=True)
+    y_fit = y_train[keep]
+
+    score_df, _ = cargar_bloques(bank, meses=[C.SCORE_MONTH], incluir_raw=True, features=derived)
+    ids = score_df.numero_de_cliente.to_numpy(np.int64)
+    require(len(ids) == C.EXPECTED_ROWS[C.SCORE_MONTH] and len(np.unique(ids)) == len(ids), "IDs agosto")
+    x_score = score_df[features]
+    identity = C.fingerprint({
+        "run": RUN, "stage": 5, "plan": PLAN, "stage4": s4["identity"],
+        "data_sha": C.digest(Path(s0["dataset"])),
+        "bank_manifest_sha": C.digest(bank / "manifest.json"),
+        "features": C.fingerprint(features), "params": s3["params"],
+        "rounds": s3["rounds"], "policy": s2["winner_policy"],
+        "n": s4["n_final"], "dataset_per_seed": True,
+    })
+    model_dir = out / "models"
+    model_dir.mkdir(exist_ok=True)
+    all_scores = []
+    for index, seed in enumerate(C.SEEDS20, 1):
+        cp = model_dir / f"seed_{seed}.npz"
+        model_path = model_dir / f"modelo_{seed}.txt"
+        if cp.is_file() and model_path.is_file():
+            with np.load(cp, allow_pickle=False) as z:
+                require(str(z["identity"].item()) == identity and int(z["seed"].item()) == seed,
+                        f"Checkpoint final incompatible seed={seed}")
+                require(np.array_equal(z["ids"], ids), f"IDs final seed={seed}")
+                require(str(z["model_sha256"].item()) == C.digest(model_path), f"Hash final seed={seed}")
+                scores = np.asarray(z["scores"], dtype=np.float64).copy()
+            print(f"REUSAR FINAL V2 {index}/20 seed={seed}", flush=True)
+        else:
+            require(not cp.exists() and not model_path.exists(), f"Par final parcial seed={seed}")
+            _, available_now = meminfo_gib()
+            require(available_now >= RESERVE_GIB, f"RAM < reserva antes seed={seed}")
+            print(f"ENTRENAR FINAL V2 {index}/20 seed={seed}", flush=True)
+            ds, seed_params = dataset_for_seed(x_fit, y_fit, weights, features, s3["params"], seed)
+            started = time.monotonic()
+            def progress(env):
+                it = env.iteration + 1
+                if it == 1 or it % 25 == 0 or it == s3["rounds"]:
+                    print(f"seed={seed} BOOST {it}/{s3['rounds']}; t={time.monotonic()-started:.1f}s", flush=True)
+            model = lgb.train(seed_params, ds, num_boost_round=int(s3["rounds"]), callbacks=[progress])
+            scores = np.asarray(model.predict(x_score, num_threads=C.THREADS), dtype=np.float64)
+            require(scores.shape == ids.shape and np.isfinite(scores).all(), "Scores final inválidos")
+            tmp_model = model_path.with_suffix(".tmp")
+            model.save_model(str(tmp_model))
+            tmp_model.replace(model_path)
+            with cp.with_suffix(".tmp").open("wb") as fh:
+                np.savez_compressed(fh, identity=np.array(identity), seed=np.array(seed),
+                                    ids=ids, scores=scores,
+                                    model_sha256=np.array(C.digest(model_path)))
+            cp.with_suffix(".tmp").replace(cp)
+            _gcs(["gcloud", "storage", "cp", str(cp), str(model_path),
+                            REMOTE + "/stage5_models/"], check=True)
+            del model, ds
+            gc.collect()
+        all_scores.append(scores)
+
+    ensemble = np.vstack(all_scores).mean(axis=0, dtype=np.float64)
+    n_final = int(s4["n_final"])
+    delivery = out / "delivery"
+    delivery.mkdir(exist_ok=True)
+    prefix = "C1SF2" + identity[:12].upper()
+    csv_path = delivery / f"{prefix}ENS{n_final}.csv"
+    info = C.export_csv(csv_path, ids, ensemble, n_final)
+    manifest = {
+        "status": "ready_not_submitted", "run": RUN, "identity": identity,
+        "n": n_final, "file": info, "submit_message": f"submit {prefix}ENS{n_final}",
+        "representation": s1["winner"], "quality_arm": s0["quality_arm"],
+        "recency": s2["winner_policy"], "params": s3["params"],
+        "rounds": s3["rounds"], "stage4_identity": s4["identity"],
+        "execution": "dataframe_64GiB_dataset_per_seed",
+    }
+    C.write_json(delivery / "MANIFEST.json", manifest)
+    (delivery / "mensaje_zulip.txt").write_text(manifest["submit_message"] + "\n", encoding="utf-8")
+    C.write_json(out / "LISTO.json", manifest)
+    _gcs(["gcloud", "storage", "cp", str(csv_path), str(delivery / "MANIFEST.json"),
+                    str(delivery / "mensaje_zulip.txt"), str(out / "LISTO.json"),
+                    REMOTE + "/final/"], check=True)
+    result = {"status": "ready_not_submitted", "identity": identity, "n": n_final,
+              "csv": str(csv_path), "sha256": info["sha256"],
+              "submit_message": manifest["submit_message"]}
+    C.write_json(result_path, result)
+    _gcs(["gcloud", "storage", "cp", str(result_path), REMOTE + "/stage5_RESULT.json"], check=True)
+    print("SUPERFINAL100_V2_LISTO. NO ENVIADO.", flush=True)
+    print(manifest["submit_message"], flush=True)
+    return result
+
+
+def run_all(ctx: dict) -> dict:
+    exact_s3_canary(ctx)
+    s0 = V1.stage0(ctx)
+    V1.SEEDS3 = SCREEN_SEEDS
+    V1.SEEDS5 = REP_CONFIRM_SEEDS
+    s1 = V1.stage1(ctx, s0)
+    s2 = stage2_v2(ctx, s0, s1)
+    V1.SEEDS5 = TUNE_CONFIRM_SEEDS
+    s3 = V1.stage3(ctx, s0, s1, s2)
+    V1.SEEDS20 = list(C.SEEDS20)
+    s4 = stage4_strict(ctx, s0, s1, s2, s3)
+    s5 = stage5_per_seed(ctx, s0, s1, s2, s3, s4)
+    return {"stage0": s0, "stage1": s1, "stage2": s2,
+            "stage3": s3, "stage4": s4, "stage5": s5}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SUPERFINAL100 v2 corregido")
+    parser.add_argument("--home", type=Path, default=Path.home())
+    parser.add_argument("--all", action="store_true")
+    args = parser.parse_args()
+    require(args.all, "Usar --all")
+    configure_runtime()
+    total_gib, _ = meminfo_gib()
+    require(total_gib >= MIN_TOTAL_GIB,
+            f"VM de al menos {MIN_TOTAL_GIB:.0f} GiB requerida; MemTotal={total_gib:.1f} GiB")
+    ctx = C.preflight_base(args.home.resolve())
+    require(PLAN["run"] == RUN and PLAN["stop_after_this_experiment"] is True,
+            "Plan v2 inesperado")
+    ctx["paths"]["out"].mkdir(parents=True, exist_ok=True)
+    import fcntl
+    lock = (ctx["paths"]["out"] / ".lock").open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit("SUPERFINAL100 v2 ya tiene otro proceso activo")
+    result = run_all(ctx)
+    print(json.dumps({
+        "stage4_promote": result["stage4"].get("promote_to_august"),
+        "stage4_wins": result["stage4"].get("paired", {}).get("wins"),
+        "stage5_status": result["stage5"].get("status"),
+        "stage5_submit": result["stage5"].get("submit_message"),
+    }, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

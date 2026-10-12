@@ -1,0 +1,162 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–48] CAMPOS_SERIE_CURADO: 36 campos (26 originales de transacciones, saldos, márgenes,
+#   comisiones, payroll, tarjetas, préstamos y transferencias, y 10 derivados de la familia intra-fila) sobre
+#   los que se calculan lags, deltas, ventanas y tendencia.
+"""Listas de campos "curados" y resolución de `campos_serie` / `rankings.campos`."""
+
+import logging
+import re
+
+log = logging.getLogger("competencia_1.fe")
+
+# Variables con mayor AUC / importancia según el EDA (docs/Hallazgos EDA Zulip.txt)
+# más derivadas de la familia 1 (fe_sql.py, CAMPOS_SERIE_CURADO).
+CAMPOS_SERIE_CURADO = [
+    "ctrx_quarter",
+    "chomebanking_transacciones",
+    "cmobile_app_trx",
+    "ccajas_transacciones",
+    "catm_trx",
+    "ctarjeta_debito_transacciones",
+    "ccallcenter_transacciones",
+    "mcuentas_saldo",
+    "mcaja_ahorro",
+    "mcuenta_corriente",
+    "mpasivos_margen",
+    "mactivos_margen",
+    "mrentabilidad",
+    "mcomisiones",
+    "mcomisiones_mantenimiento",
+    "cpayroll_trx",
+    "mpayroll",
+    "cproductos",
+    "mautoservicio",
+    "matm",
+    "mtarjeta_visa_consumo",
+    "mtarjeta_master_consumo",
+    "mprestamos_personales",
+    "mtransferencias_recibidas",
+    "mtransferencias_emitidas",
+    "cdescubierto_preacordado",
+    # derivadas de la familia 1
+    "tc_msaldototal",
+    "tc_mconsumototal",
+    "tc_mlimitecompra",
+    "tc_mpagado",
+    "r_tc_uso_limite",
+    "c_trx_digitales",
+    "c_trx_presenciales",
+    "r_engagement_digital",
+    "m_activos_totales",
+    "c_productos_contratados",
+]
+
+# [Anotación · líneas 50–70] CAMPOS_RANK_CURADO: 19 campos para el ranking dentro del mes (rentabilidad,
+#   comisiones, márgenes, saldos, payroll, préstamos, consumos de tarjeta, transacciones, productos, antigüedad
+#   y edad).
+CAMPOS_RANK_CURADO = [
+    "mrentabilidad",
+    "mrentabilidad_annual",
+    "mcomisiones",
+    "mactivos_margen",
+    "mpasivos_margen",
+    "mcuentas_saldo",
+    "mcaja_ahorro",
+    "mcuenta_corriente",
+    "mpayroll",
+    "mprestamos_personales",
+    "mtarjeta_visa_consumo",
+    "mtarjeta_master_consumo",
+    "tc_msaldototal",
+    "tc_mlimitecompra",
+    "ctrx_quarter",
+    "cproductos",
+    "cliente_antiguedad",
+    "cliente_edad",
+    "chomebanking_transacciones",
+]
+
+# [Anotación · líneas 72–90] NO_SERIE: claves, clase y columnas auxiliares del panel que nunca entran a series
+#   ni rankings; TIPOS_NUM: prefijos de los tipos numéricos de DuckDB.
+# Nunca entran a series ni rankings: claves, target y columnas auxiliares del panel.
+NO_SERIE = {
+    "pk_cliente",
+    "pk_mes",
+    "mes_0",
+    "numero_de_cliente",
+    "foto_mes",
+    "clase_ternaria",
+}
+TIPOS_NUM = (
+    "BIGINT",
+    "INTEGER",
+    "DOUBLE",
+    "FLOAT",
+    "DECIMAL",
+    "HUGEINT",
+    "SMALLINT",
+    "TINYINT",
+)
+
+
+# [Anotación · líneas 93–130] `resolver_campos`: una lista explícita (error si un nombre no existe), `curado`
+#   (la lista curada menos las inexistentes y las excluidas, que se informan en el log) o `todos` (todas las
+#   numéricas salvo claves y excluidas).
+def resolver_campos(
+    spec: str | list[str],
+    curado: list[str],
+    esquema: dict[str, str],
+    excluidos: set[str],
+    etiqueta: str,
+) -> list[str]:
+    """Resuelve una especificación de campos contra el esquema de `base`.
+
+    - "curado": la lista curada, salvo columnas inexistentes (familia apagada) o excluidas.
+    - "todos": todas las numéricas, salvo claves y excluidas (p. ej. drop_drift).
+    - lista explícita: se respeta tal cual; un nombre inexistente es error.
+    """
+    if isinstance(spec, list):
+        faltan = [c for c in spec if c not in esquema]
+        if faltan:
+            raise ValueError(f"{etiqueta}: campos inexistentes: {faltan}")
+        return list(spec)
+    if spec == "curado":
+        usables = [c for c in curado if c in esquema and c not in excluidos]
+        omitidos = [c for c in curado if c not in usables]
+        if omitidos:
+            log.info(
+                "%s curado: se omiten %d campos no disponibles/excluidos: %s",
+                etiqueta,
+                len(omitidos),
+                omitidos,
+            )
+        return usables
+    if spec == "todos":
+        return [
+            c
+            for c, t in esquema.items()
+            if c not in NO_SERIE
+            and c not in excluidos
+            and t.upper().startswith(TIPOS_NUM)
+        ]
+    raise ValueError(f"{etiqueta}: valor inválido {spec!r} (curado | todos | lista)")
+
+
+# [Anotación · líneas 133–146] `campos_monto`: columnas numéricas cuyo nombre empieza con m, Master_m, Visa_m
+#   o tc_m (seguido de letra minúscula o guion bajo), salvo claves y excluidas.
+# Montos nominales en pesos: originales m*, de las tarjetas (Master_m*, Visa_m*), consolidados
+# de TC (tc_m*) y agregados de la familia 1 (m_*). Los ratios (r_*) ya son adimensionales.
+_PATRON_MONTO = re.compile(r"^((Master|Visa|tc)_)?m[a-z_]")
+
+
+def campos_monto(esquema: dict[str, str], excluidos: set[str]) -> list[str]:
+    return [
+        c
+        for c, t in esquema.items()
+        if _PATRON_MONTO.match(c)
+        and c not in NO_SERIE
+        and c not in excluidos
+        and t.upper().startswith(TIPOS_NUM)
+    ]

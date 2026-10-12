@@ -1,0 +1,30 @@
+{
+  "minutos_total": 2.7,
+  "ranking": [
+    {
+      "dataset": "base",
+      "ganancia_media_M": 392.4,
+      "desvio_M": 10.2,
+      "corte_optimo": 13500
+    },
+    {
+      "dataset": "crudo",
+      "ganancia_media_M": 390.2,
+      "desvio_M": 1.8,
+      "corte_optimo": 14500
+    },
+    {
+      "dataset": "mediana",
+      "ganancia_media_M": 379.9,
+      "desvio_M": 5.7,
+      "corte_optimo": 15000
+    },
+    {
+      "dataset": "rank",
+      "ganancia_media_M": 374.9,
+      "desvio_M": 6.5,
+      "corte_optimo": 14000
+    }
+  ],
+  "_minutos": 2.75
+}

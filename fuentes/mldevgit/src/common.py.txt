@@ -1,0 +1,338 @@
+"""Protocolo final congelado. Todas las salidas se crean exclusivamente."""
+import argparse, gc, hashlib, json, platform, tempfile, time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+BASE = Path(__file__).resolve().parents[1]
+OUTPUT = BASE / 'output'
+INPUT = BASE / 'data' / 'competencia_01.csv'
+SEEDS = [290497,100003,200003,300007,400009]
+PESOS = {202104:.75,202105:1.0,202106:1.0}
+EXPECTED_CSV = '00534f4c23bb87c5e0962ee615a0f81740cf1e2f3e64232c7af5bc83aae697a0'
+SUBMISSION_NAME = 'submit_z636_c25_full762_n12000.csv'
+EXPECTED_INPUT = '53fd6265cfa565224fa4370e1fabe72d343a5c76540eb769758686a194bb5dfd'
+HASH_FULL457 = "c3578882fcf1adf79df9c20c472864719672522fa2ee9283d4a9b1c0fe080c12"
+HASH_FULL762 = '1e9747955f214a8ddcb405af0e3a71d4a516f1818bf829c0d6c14ca0f934e8f6'
+PARQUET457 = 'competencia_01_historico_lag1.parquet'
+PARQUET762 = 'competencia_01_historico_lag2_full762.parquet'
+
+CLAVES = ["numero_de_cliente", "foto_mes"]
+
+TARGET = "clase_ternaria"
+
+FILAS = 983061
+
+ESPERADOS = {
+    202104: {"filas": 163284, "CONTINUA": 161188, "BAJA+1": 957, "BAJA+2": 1139},
+    202105: {"filas": 163768, "CONTINUA": 161759, "BAJA+1": 1139, "BAJA+2": 870},
+    202106: {"filas": 164114, "CONTINUA": 162145, "BAJA+1": 871, "BAJA+2": 1098},
+}
+
+def exigir(condicion, mensaje):
+    if not condicion:
+        raise ValueError(mensaje)
+
+def sha256_archivo(ruta):
+    digest = hashlib.sha256()
+    with ruta.open("rb") as archivo:
+        for bloque in iter(lambda: archivo.read(8 * 1024 * 1024), b""):
+            digest.update(bloque)
+    return digest.hexdigest()
+
+def mes_anterior(meses):
+    return np.where(meses % 100 == 1, (meses // 100 - 1) * 100 + 12, meses - 1)
+
+def meses_atras(meses, lag):
+    meses = np.asarray(meses, dtype=np.int64)
+    exigir(lag in (1, 2), 'Sólo se permiten lag1 y lag2 congelados')
+    exigir(((meses % 100 >= 1) & (meses % 100 <= 12) & (meses // 100 >= 1)).all(),
+           'Mes calendario inválido')
+    serial = (meses // 100) * 12 + (meses % 100 - 1) - lag
+    return (serial // 12) * 100 + serial % 12 + 1
+
+def nombres_features(features):
+    full457 = features + [f'{f}_lag1' for f in features] + [f'{f}_delta_lag1' for f in features] + ['lag1_disponible']
+    full762 = full457 + [f'{f}_lag2' for f in features] + [f'{f}_delta_lag2' for f in features] + ['lag2_disponible']
+    for names, size, expected in [(full457, 457, HASH_FULL457), (full762, 762, HASH_FULL762)]:
+        exigir(len(names) == len(set(names)) == size, 'Cantidad/nombres de features inválidos')
+        exigir(hashlib.sha256('\n'.join(names).encode()).hexdigest() == expected, 'Hash de features incorrecto')
+    return full457, full762
+
+def auditar_fuente(base, features, full457):
+    exigir(len(base) == FILAS, f"Filas incorrectas: {len(base)} != {FILAS}")
+    exigir(len(base.columns) == 155, "La fuente no tiene 155 columnas")
+    exigir(len(features) == 152, f"Features originales: {len(features)} != 152")
+    exigir(len(full457) == 457 and len(set(full457)) == 457, "FULL457 no tiene 457 nombres únicos")
+    digest = hashlib.sha256("\n".join(full457).encode("utf-8")).hexdigest()
+    exigir(digest == HASH_FULL457, f"Hash FULL457 incorrecto: {digest}")
+    exigir(not base[CLAVES].isna().any().any(), "Claves nulas en la fuente")
+    exigir(not base.duplicated(CLAVES).any(), "Claves cliente/mes duplicadas")
+    meses = pd.to_numeric(base.foto_mes, errors="raise")
+    exigir(not ((meses % 1 != 0) | (meses // 100 < 1) | (~(meses % 100).between(1, 12))).any(),
+           "foto_mes no contiene meses calendario YYYYMM válidos")
+    for feature in features:
+        exigir(pd.api.types.is_numeric_dtype(base[feature]), f"Feature no numérica: {feature}")
+    for mes, esperado in ESPERADOS.items():
+        datos = base.loc[base.foto_mes.eq(mes)]
+        exigir(len(datos) == esperado["filas"], f"Filas incorrectas en {mes}")
+        exigir(not datos[TARGET].isna().any(), f"Target nulo en {mes}")
+        observado = datos[TARGET].value_counts().to_dict()
+        requerido = {k: v for k, v in esperado.items() if k != "filas"}
+        exigir(observado == requerido, f"Target incorrecto en {mes}: {observado} != {requerido}")
+    agosto = base.loc[base.foto_mes.eq(202108)]
+    exigir(len(agosto) == 164647, "Filas incorrectas en 202108")
+    exigir(agosto.numero_de_cliente.is_unique, "IDs no únicos en 202108")
+    exigir(mes_anterior(np.array([202105, 202106, 202201])).tolist() == [202104, 202105, 202112],
+           "Error en aritmética de mes calendario anterior")
+    return digest
+
+def predecesores(base, lag=1):
+    izquierda = base[CLAVES].copy()
+    meses = base.foto_mes.to_numpy(dtype='int64')
+    izquierda["foto_mes"] = mes_anterior(meses) if lag == 1 else meses_atras(meses, lag)
+    izquierda["_fila_actual"] = np.arange(len(base), dtype="int64")
+    derecha = base[CLAVES].copy()
+    derecha["_fila_lag"] = np.arange(len(base), dtype="int64")
+    unidos = izquierda.merge(derecha, on=CLAVES, how="left", sort=False, validate="one_to_one")
+    return unidos.set_index("_fila_actual")["_fila_lag"].reindex(base.index)
+
+def generar_lote(base, features, full457, anterior, inicio, fin):
+    actuales = base.iloc[inicio:fin]
+    indices = anterior.iloc[inicio:fin]
+    # reindex inserta NaN cuando no existe predecesor; no busca meses más antiguos.
+    # float64 permite NaN y garantiza el mismo esquema de lag/delta entre lotes.
+    lag = base[features].reindex(indices.fillna(-1).astype("int64").to_numpy())
+    lag.index = actuales.index
+    lag = lag.astype("float64")
+    delta = actuales[features] - lag
+    salida = pd.concat([
+        actuales[CLAVES + features],
+        lag.rename(columns={f: f"{f}_lag1" for f in features}),
+        delta.rename(columns={f: f"{f}_delta_lag1" for f in features}),
+        indices.notna().astype("int8").rename("lag1_disponible"), actuales[[TARGET]],
+    ], axis=1)
+    exigir(salida.columns.tolist() == CLAVES + full457 + [TARGET], "Orden de columnas incorrecto en lote")
+    return salida
+
+def generar_lote_full762(base, features, full457, full762, anterior, anterior2, inicio, fin):
+    # El prefijo FULL457 usa la implementación ya auditada sin cambios.
+    prefijo = generar_lote(base, features, full457, anterior, inicio, fin)
+    actuales = base.iloc[inicio:fin]
+    indices = anterior2.iloc[inicio:fin]
+    lag2 = base[features].reindex(indices.fillna(-1).astype('int64').to_numpy())
+    lag2.index = actuales.index
+    lag2 = lag2.astype('float64')
+    delta2 = actuales[features] - lag2
+    salida = pd.concat([
+        prefijo.drop(columns=[TARGET]),
+        lag2.rename(columns={f: f'{f}_lag2' for f in features}),
+        delta2.rename(columns={f: f'{f}_delta_lag2' for f in features}),
+        indices.notna().astype('int8').rename('lag2_disponible'), actuales[[TARGET]],
+    ], axis=1)
+    exigir(salida.columns.tolist() == CLAVES + full762 + [TARGET], 'Orden FULL762 incorrecto')
+    return salida
+
+def verificar_full762(ruta, base, features, full457, full762, anterior, anterior2, lote):
+    archivo = pq.ParquetFile(ruta)
+    exigir(archivo.metadata.num_rows == FILAS and archivo.schema_arrow.names == CLAVES + full762 + [TARGET],
+           'Filas/schema FULL762 incorrectos')
+    exigir(hashlib.sha256('\n'.join(archivo.schema_arrow.names[2:-1]).encode()).hexdigest() == HASH_FULL762,
+           'Hash FULL762 incorrecto al releer')
+    posicion = 0
+    for bloque in archivo.iter_batches(batch_size=lote):
+        releido = bloque.to_pandas().reset_index(drop=True)
+        fin = posicion + len(releido)
+        esperado = generar_lote_full762(base, features, full457, full762, anterior, anterior2, posicion, fin).reset_index(drop=True)
+        pd.testing.assert_frame_equal(releido, esperado, check_dtype=False, check_exact=True)
+        posicion = fin
+    exigir(posicion == FILAS, 'Relectura FULL762 incompleta')
+    print('FULL762: relectura exacta de claves, target, features y NaN PASS', flush=True)
+
+def verificar_parquet(ruta, base, features, full457, anterior, lote):
+    archivo = pq.ParquetFile(ruta)
+    exigir(archivo.metadata.num_rows == FILAS, "Filas incorrectas en parquet")
+    columnas = archivo.schema_arrow.names
+    exigir(columnas == CLAVES + full457 + [TARGET], "Columnas/orden incorrectos en parquet")
+    hash_releido = hashlib.sha256("\n".join(columnas[2:-1]).encode("utf-8")).hexdigest()
+    exigir(hash_releido == HASH_FULL457, "Hash FULL457 incorrecto al releer")
+    posicion = 0
+    # Relectura completa sin cargar a la vez los 460 campos de todo el parquet.
+    for bloque in archivo.iter_batches(batch_size=lote):
+        releido = bloque.to_pandas().reset_index(drop=True)
+        fin = posicion + len(releido)
+        original = base.iloc[posicion:fin][CLAVES + [TARGET]].reset_index(drop=True)
+        pd.testing.assert_frame_equal(releido[CLAVES + [TARGET]], original, check_dtype=False)
+        esperado = generar_lote(base, features, full457, anterior, posicion, fin).reset_index(drop=True)
+        pd.testing.assert_frame_equal(releido, esperado, check_dtype=False, check_exact=True)
+        posicion = fin
+        print(f"Relectura validada: {posicion}/{FILAS}", flush=True)
+    exigir(posicion == FILAS, "Relectura incompleta")
+    print(f"Parquet releído: {posicion} filas; {len(columnas)} columnas; hash FULL457={hash_releido}")
+    print("Preservación exacta de numero_de_cliente/foto_mes/clase_ternaria y valores FULL457: PASS")
+COMUNES = dict(
+    n_estimators=1200, learning_rate=0.02, num_leaves=750, max_depth=-1,
+    min_child_samples=5000, max_bin=31, colsample_bytree=0.5,
+    subsample=1.0, reg_alpha=0.0, reg_lambda=0.0, n_jobs=-1, verbosity=-1,
+)
+
+MULTICLASS = dict(objective="multiclass", num_class=3, **COMUNES)
+PARAMETROS=dict(loss_function='MultiClass',iterations=1000,learning_rate=.03,depth=6,
+    l2_leaf_reg=3.0,grow_policy='SymmetricTree',boosting_type='Plain',bootstrap_type='Bayesian',
+    bagging_temperature=1.0,random_strength=1.0,rsm=1.0,border_count=254,nan_mode='Min',
+    thread_count=8,task_type='CPU',allow_writing_files=False,verbose=False,use_best_model=False)
+
+def orden(prob,ids):
+    exigir(np.isfinite(prob).all(),'Score no finito')
+    return np.lexsort((ids,-prob))
+
+def normalizar(prob,ids):
+    ranks=np.empty(len(ids),dtype=np.int64)
+    ranks[orden(prob,ids)]=np.arange(1,len(ids)+1)
+    return (len(ids)-ranks)/(len(ids)-1)
+
+def args(description):
+    p=argparse.ArgumentParser(description=description)
+    p.add_argument('--output-dir',type=Path,default=OUTPUT)
+    return p
+
+def save_json(path,data):
+    with path.open('x',encoding='utf-8') as f: json.dump(data,f,indent=2,ensure_ascii=False,allow_nan=False)
+
+def save_parquet(path,frame):
+    with path.open('xb') as f: frame.to_parquet(f,index=False,engine='pyarrow')
+
+def ranking(ids,score,extras):
+    t=pd.DataFrame(dict(numero_de_cliente=ids,score=score,**extras)).iloc[orden(score,ids)].reset_index(drop=True)
+    t.insert(0,'rank',np.arange(1,len(ids)+1))
+    return t
+
+def load_training(output,sort_catboost=False):
+    path=output/PARQUET457
+    meta=pq.ParquetFile(path)
+    features=meta.schema_arrow.names[2:-1]
+    exigir(meta.metadata.num_rows==FILAS and len(features)==457 and hashlib.sha256('\n'.join(features).encode()).hexdigest()==HASH_FULL457,'Parquet/FULL457 inválido')
+    train=pd.read_parquet(path,columns=CLAVES+features+[TARGET],filters=[('foto_mes','in',list(PESOS))],engine='pyarrow').reset_index(drop=True)
+    # Proyección August explícitamente SIN target.
+    august=pd.read_parquet(path,columns=['numero_de_cliente']+features,filters=[('foto_mes','==',202108)],engine='pyarrow').reset_index(drop=True)
+    if sort_catboost:
+        train=train.sort_values(CLAVES,kind='stable').reset_index(drop=True)
+    exigir(len(train)==491166 and not train.duplicated(CLAVES).any(),'Train inválido')
+    for mes,expected in ESPERADOS.items():
+        q=train.loc[train.foto_mes.eq(mes)]
+        exigir(len(q)==expected['filas'] and q[TARGET].value_counts().to_dict()=={k:v for k,v in expected.items() if k!='filas'},'Conteos train inválidos')
+    weights=train.foto_mes.map(PESOS).to_numpy()
+    exigir(weights.sum()==450345.0,'Pesos inválidos')
+    ids=august.numero_de_cliente.to_numpy()
+    exigir(len(ids)==164647 and len(np.unique(ids))==164647 and pd.api.types.is_integer_dtype(ids.dtype),'August IDs inválidos')
+    return train[features],train[TARGET],weights,august[features],ids
+
+def load_lightgbm_matrices(output, temporary):
+    path = output/PARQUET762
+    meta = pq.ParquetFile(path)
+    features = meta.schema_arrow.names[2:-1]
+    exigir(meta.metadata.num_rows == FILAS and len(features) == 762
+           and hashlib.sha256('\n'.join(features).encode()).hexdigest() == HASH_FULL762,
+           'Parquet/FULL762 inválido')
+    keys = pd.read_parquet(path, columns=CLAVES+[TARGET], filters=[('foto_mes','in',list(PESOS))])
+    keys = keys.sort_values(CLAVES, kind='stable').reset_index(drop=True)
+    exigir(len(keys) == 491166 and not keys.duplicated(CLAVES).any() and not keys[CLAVES+[TARGET]].isna().any().any(), 'Train inválido')
+    for mes, expected in ESPERADOS.items():
+        q = keys.loc[keys.foto_mes.eq(mes)]
+        exigir(len(q) == expected['filas'] and q[TARGET].value_counts().to_dict()
+               == {k:v for k,v in expected.items() if k!='filas'}, 'Conteos train inválidos')
+    weights = keys.foto_mes.map(PESOS).to_numpy()
+    exigir(weights.sum() == 450345., 'Pesos inválidos')
+    # Sólo IDs en August; su target nunca entra en las matrices o labels.
+    august = pd.read_parquet(path, columns=['numero_de_cliente'], filters=[('foto_mes','==',202108)])
+    august = august.sort_values('numero_de_cliente', kind='stable').reset_index(drop=True)
+    ids = august.numero_de_cliente.to_numpy()
+    exigir(len(ids) == 164647 and len(np.unique(ids)) == 164647 and pd.api.types.is_integer_dtype(ids.dtype), 'August IDs inválidos')
+    index_train = pd.MultiIndex.from_frame(keys[CLAVES])
+    index_august = pd.Index(ids)
+    matrices = []
+    dataset = ds.dataset(path, format='parquet')
+    for name, index, filter_ in [
+        ('train',index_train,ds.field('foto_mes').isin(list(PESOS))),
+        ('august',index_august,ds.field('foto_mes')==202108),
+    ]:
+        matrix = np.memmap(temporary/name, mode='w+', dtype=np.float64, shape=(len(index),762), order='C')
+        seen = np.zeros(len(index), dtype=bool)
+        scanner = dataset.scanner(columns=CLAVES+features, filter=filter_, batch_size=5000,
+                                  batch_readahead=1,fragment_readahead=1,use_threads=False)
+        for batch in scanner.to_batches():
+            frame = batch.to_pandas()
+            wanted = pd.MultiIndex.from_frame(frame[CLAVES]) if name=='train' else frame.numero_de_cliente
+            positions = index.get_indexer(wanted)
+            exigir((positions>=0).all() and not seen[positions].any(), 'Universo de matriz incorrecto')
+            matrix[positions] = frame[features].to_numpy(dtype=np.float64)
+            seen[positions] = True
+        exigir(seen.all(), 'Matriz incompleta')
+        matrix.flush()
+        matrices.append(matrix)
+    return matrices[0], keys[TARGET].to_numpy(), weights, matrices[1], ids, features
+
+def train_lightgbm_full762(output):
+    import lightgbm
+    destination = output/'lightgbm'
+    exigir(not destination.exists(), 'Salida LightGBM existente')
+    destination.mkdir()
+    probabilities, records = [], []
+    with tempfile.TemporaryDirectory(dir=destination, prefix='_temporary_') as directory:
+        temporary = Path(directory).resolve()
+        exigir(temporary.is_relative_to(destination.resolve()), 'Directorio temporal inseguro')
+        x,y,w,a,ids,features = load_lightgbm_matrices(output,temporary)
+        try:
+            for seed in SEEDS:
+                print(f'INICIO LightGBM FULL762 seed={seed}',flush=True)
+                start = time.perf_counter()
+                model = lightgbm.LGBMClassifier(**MULTICLASS,random_state=seed)
+                model.fit(x,y,sample_weight=w,feature_name=features)
+                exigir(model.n_estimators_==1200 and model.n_features_in_==762, 'Fit incompleto')
+                classes = list(model.classes_)
+                prob = model.predict_proba(a)[:,classes.index('BAJA+2')]
+                exigir(len(prob)==len(ids) and np.isfinite(prob).all() and ((prob>=0)&(prob<=1)).all(), 'Probabilidades inválidas')
+                probabilities.append(prob)
+                save_parquet(destination/f'scores_seed_{seed}.parquet',pd.DataFrame(dict(numero_de_cliente=ids,prob_BAJA2=prob)))
+                records.append(dict(seed=seed,classes=classes,iterations=model.n_estimators_,seconds=time.perf_counter()-start))
+                print(records[-1],flush=True)
+                del model
+                gc.collect()
+        finally:
+            x._mmap.close()
+            a._mmap.close()
+    score = np.mean(np.stack(probabilities),axis=0)
+    save_parquet(destination/'ranking_ensemble.parquet',ranking(ids,score,dict(u=normalizar(score,ids),**{f'p_seed_{s}':p for s,p in zip(SEEDS,probabilities)})))
+    save_json(destination/'auditoria.json',dict(fits=5,seeds=SEEDS,parameters=MULTICLASS,features=762,
+              feature_hash=HASH_FULL762,weights=PESOS,row_order='numero_de_cliente ASC, foto_mes ASC',
+              matrix_dtype='float64',target_August_used=False,target_July_used=False,records=records))
+
+def train_family(output,family):
+    exigir(family in ('lightgbm','catboost'), 'Familia desconocida')
+    if family == 'lightgbm':
+        return train_lightgbm_full762(output)
+    destination=output/family
+    exigir(not destination.exists(),f'Salida existente: {destination}')
+    x,y,w,a,ids=load_training(output,sort_catboost=family=='catboost')
+    from catboost import CatBoostClassifier
+    constructor=lambda seed:CatBoostClassifier(**PARAMETROS,random_seed=seed)
+    destination.mkdir()
+    probabilities=[]
+    records=[]
+    for seed in SEEDS:
+        print(f'INICIO {family} seed={seed}',flush=True)
+        start=time.perf_counter(); model=constructor(seed)
+        model.fit(x,y,sample_weight=w)
+        classes=list(model.classes_)
+        prob=model.predict_proba(a)[:,classes.index('BAJA+2')]
+        exigir(len(prob)==len(ids) and np.isfinite(prob).all() and ((prob>=0)&(prob<=1)).all(),'Probabilidades inválidas')
+        probabilities.append(prob)
+        save_parquet(destination/f'scores_seed_{seed}.parquet',pd.DataFrame(dict(numero_de_cliente=ids,prob_BAJA2=prob)))
+        records.append(dict(seed=seed,classes=classes,seconds=time.perf_counter()-start))
+        print(records[-1],flush=True); del model; gc.collect()
+    score=np.mean(np.stack(probabilities),axis=0)
+    save_parquet(destination/'ranking_ensemble.parquet',ranking(ids,score,dict(u=normalizar(score,ids),**{f'p_seed_{s}':p for s,p in zip(SEEDS,probabilities)})))
+    save_json(destination/'auditoria.json',dict(fits=5,seeds=SEEDS,parameters=PARAMETROS,features=457,
+              feature_hash=HASH_FULL457,weights=PESOS,row_order='numero_de_cliente ASC, foto_mes ASC',
+              target_August_used=False,target_July_used=False,records=records))

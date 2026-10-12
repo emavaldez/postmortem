@@ -1,0 +1,1461 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–10] Celda de texto. Presenta el modelo E012: entrena sólo con 202106 completo y
+#   predice 202108, con variables crudas e historia de hasta cuatro meses sin imputación; la BO parte junio en
+#   80/20 estratificado por las tres clases y elige por AUC. Enumera las diferencias que declara respecto de
+#   versiones previas (se conservan Master_fultimo_cierre y Visa_fultimo_cierre, se excluyen los dos préstamos
+#   personales, numero_de_cliente y foto_mes quedan como predictores, ccajas_depositos pasa a NA en mayo) y
+#   señala que la OOF de junio posterior a la BO no es independiente de la elección de hiperparámetros.
+#%% celda 1 [texto]
+# DMEyF 2026 — E012 RAW T4 · BO junio 80/20 · producción agosto
+
+**Notebook único para Google Cloud, IRkernel / R.** Fuente oficial de Pasquini; cinco meses de historia posible, ninguna imputación. E012 utiliza únicamente junio 202106 FULL como entrenamiento y agosto 202108 como producción. La BO estratifica junio por sus tres clases y selecciona por AUC en un 20% fijo. Primero produce cinco semillas y los dos ensembles; luego completa hasta diez (o 20/50); OOF al final, opcional. No ejecuta nada en Drive ni sube submissions a Kaggle.
+
+**Diferencias obligatorias frente a referencias:** se retienen `Master_fultimo_cierre` y `Visa_fultimo_cierre` en current/lag/delta; sólo se excluyen los dos préstamos personales en todas sus versiones. Se retienen `numero_de_cliente` y `foto_mes` como predictores *current* para respetar E012 original; es una decisión metodológica deliberada (la evaluación junio 80/20 comparte mes), no una recomendación universal. `Master_status` y `Visa_status` tienen lag, no delta. `ccajas_depositos` se convierte en NA exclusivamente en mayo ANTES de temporalizar.
+
+**Advertencia de validación:** la OOF de junio posterior a BO no es independiente de la selección de HP: todas las etiquetas de junio pudieron influir en la elección. Ganancias de junio completo y GainBand 11.500–13.500 son indicadores de decisión; el Public de agosto es posterior y no está disponible desde este notebook. No se fabrica ganancia real de agosto.
+
+**Operación:** revisar BLOQUE 1 y ejecutar todas las celdas R en orden. En la VM debe existir `gcloud` con acceso al bucket. Cambiar sólo `n_semillas`, `n_semillas_OOF`, `bo_horas`, `ejecutar_OOF`, `solo_ensembles` o `limite_ART` para reanudar la misma versión. El backup E012 usa exclusivamente su propio prefijo; SAFE, E010 y demás experimentos no se tocan. **No ejecutar dos instancias de E012 en paralelo en el mismo prefijo.** Los entrenamientos no se han ejecutado durante la creación de este notebook.
+
+# [Anotación · líneas 12–36] Configuración: carpeta raíz (variable E012_ROOT; por defecto /home/ds/Expe si
+#   existe), experimento C01_E012_RAW_T4_BO_FINAL_V1, URL del crudo, n_semillas=10, n_semillas_OOF=5,
+#   ejecutar_OOF=TRUE, solo_ensembles=FALSE, bo_horas=8, respaldo_GCS=FALSE, guardar_modelos=FALSE, sin límite
+#   horario y margen de 30 minutos. Comprueba que n_semillas sea 5, 10, 20 o 50.
+#%% celda 2 [código]
+# BLOQUE 1 — Configuración, dependencias y presupuesto #####
+options(repos=c(CRAN="https://cloud.r-project.org"),warn=1,timeout=1800)
+ROOT <- Sys.getenv("E012_ROOT", unset=if (dir.exists("/home/ds")) "/home/ds/Expe" else file.path(path.expand("~"),"Expe"))
+EXPERIMENTO <- "C01_E012_RAW_T4_BO_FINAL_V1"
+OUT <- file.path(ROOT,"experimentos",EXPERIMENTO)
+url_oficial <- "https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv"
+crudo_oficial <- file.path(OUT,"fuentes","competencia_01_crudo.csv")
+
+n_semillas <- 10L                     # 5, 10, 20 o 50; 5 primeras antes de las adicionales
+n_semillas_OOF <- 5L                 # 1..5; la primera siempre se ejecuta primero
+ejecutar_OOF <- TRUE                 # ocurre DESPUÉS de la producción
+solo_ensembles <- FALSE             # no entrena ni BO ni OOF; reconstruye ensembles disponibles
+bo_horas <- 8                       # horas efectivamente invertidas (acumuladas) en BO
+respaldo_GCS <- FALSE                # requisito para producción en las VM del proyecto
+guardar_modelos <- FALSE            # modelos LightGBM opcionales; probabilidades obligatorias
+GCS <- Sys.getenv("E012_FINAL_GCS",unset=paste0(
+  "gs://pabloparisidat_buckito2026/Expe/experimentos/",EXPERIMENTO))
+limite_ART <- NA_character_  # cambiar a NA_character_ para correr luego del deadline
+margen_minutos <- 30                # no inicia entrenamientos nuevos en el margen final
+limite <- if (is.na(limite_ART)) as.POSIXct(NA) else
+  as.POSIXct(limite_ART,tz="America/Argentina/Buenos_Aires")-margen_minutos*60
+hay_tiempo <- function() is.na(limite) || Sys.time()<limite
+stopifnot(n_semillas %in% c(5L,10L,20L,50L),n_semillas_OOF %in% 1:5,
+          is.numeric(bo_horas),length(bo_horas)==1L,bo_horas>=0,margen_minutos>=0)
+# [Anotación · líneas 37–56] Crea las carpetas y la biblioteca local, instala los paquetes que falten de la
+#   misma lista de 11 y los carga. Define las 10 semillas base y la extensión a 50 con set.seed(727777) y
+#   sample.int, igual que en el notebook 1.
+dir.create(OUT,recursive=TRUE,showWarnings=FALSE)
+dir.create(file.path(ROOT,"R_libs"),recursive=TRUE,showWarnings=FALSE)
+.libPaths(c(file.path(ROOT,"R_libs"),.libPaths()))
+paquetes <- c("data.table","lightgbm","DiceKriging","mlr3","mlr3mbo",
+              "mlr3learners","paradox","bbotk","lhs","jsonlite","rgenoud")
+faltan <- paquetes[!vapply(paquetes,requireNamespace,logical(1),quietly=TRUE)]
+if (length(faltan)) install.packages(faltan,lib=.libPaths()[1],Ncpus=2L)
+faltan <- paquetes[!vapply(paquetes,requireNamespace,logical(1),quietly=TRUE)]
+if (length(faltan)) stop("Faltan paquetes: ",paste(faltan,collapse=", "))
+suppressPackageStartupMessages({
+  library(data.table); library(lightgbm); library(DiceKriging)
+  library(mlr3); library(mlr3mbo); library(mlr3learners)
+  library(paradox); library(bbotk)
+})
+semillas_originales <- c(727777L,773777L,775777L,777737L,787777L,
+                        777727L,777773L,777775L,777787L,797777L)
+set.seed(727777L,kind="L'Ecuyer-CMRG",normal.kind="Inversion",sample.kind="Rejection")
+semillas_50 <- c(semillas_originales,
+  head(setdiff(sample.int(1000000000L,100L),semillas_originales),40L))
+stopifnot(length(semillas_50)==50L,!anyDuplicated(semillas_50))
+# [Anotación · líneas 57–79] PARAM: entrena en 202106 y predice 202108; semilla de BO 727777; 10 puntos LHS +
+#   10 de EI, 20 evaluaciones; 5 folds; excluye cprestamos_personales y mprestamos_personales; nombra las dos
+#   variables de cierre; cortes de 9.000 a 15.000 de a 500 (13); GainBand de 11.500 a 13.500; ganancia 1.072.500
+#   y costo 27.500. Parámetros fijos de LightGBM: learning_rate=0,005, feature_fraction=0,50,
+#   min_data_in_leaf=0, max_bin=31, métrica auc, sin feature_fraction_bynode.
+PARAM <- list(
+  version="E012_RAW_T4_BO80_20_V1_20261011",train=202106L,score=202108L,
+  seed_BO=727777L,n_LHS=10L,n_EI=10L,n_total=20L,n_folds=5L,
+  excluidas=c("cprestamos_personales","mprestamos_personales"),
+  cierres=c("Master_fultimo_cierre","Visa_fultimo_cierre"),
+  cortes=seq(9000L,15000L,by=500L),gainband=seq(11500L,13500L,by=500L),#ACA!!!
+  ganancia_baja2=1072500,costo_estimulo=27500,
+  semillas=semillas_50,
+  space=list(num_iterations=c(64L,4096L),num_leaves=c(16L,2048L),
+             min_sum_hessian_in_leaf=c(1e-6,0.1))
+)
+# Parámetros E012 originales; ÚNICO cambio de métrica: average_precision -> auc.
+# feature_fraction_bynode no figura: no se importa 0.20 desde SAFE.
+PARAM$lgbm_fijos <- list(
+  boosting="gbdt",objective="binary",metric="auc",feature_pre_filter=FALSE,
+  first_metric_only=FALSE,boost_from_average=TRUE,force_row_wise=TRUE,
+  deterministic=TRUE,verbosity=-100,use_missing=TRUE,zero_as_missing=FALSE,
+  max_depth=-1L,min_gain_to_split=0,lambda_l1=0,lambda_l2=0,
+  bagging_fraction=1.0,pos_bagging_fraction=1.0,neg_bagging_fraction=1.0,
+  is_unbalance=FALSE,scale_pos_weight=1.0,drop_rate=0.1,max_drop=50,
+  skip_drop=0.5,extra_trees=FALSE,early_stopping=0,
+  learning_rate=0.005,feature_fraction=0.50,min_data_in_leaf=0L,max_bin=31L
+)
+# [Anotación · líneas 80–88] Registra versiones de R, paquetes y dependencias e imprime la configuración.
+versiones <- c(R=as.character(getRversion()),vapply(paquetes,
+  function(p) as.character(packageVersion(p)),character(1)))
+dependencias <- sort(unique(c(paquetes,unlist(tools::package_dependencies(
+  paquetes,db=installed.packages(),which=c("Depends","Imports","LinkingTo"),recursive=TRUE)))))
+dependencias <- setdiff(dependencias,"R")
+versiones_dependencias <- vapply(dependencias,
+  function(p) as.character(packageVersion(p)),character(1))
+message("E012 salida: ",OUT," | GCS: ",GCS," | seeds: ",n_semillas,
+        " | OOF: ",ejecutar_OOF," | BO horas: ",bo_horas)
+
+# [Anotación · líneas 90–128] Mismas funciones de escritura que el notebook 1: md5, firma(), rds_atomico()
+#   (aquí con opción de no comprimir) y csv_atomico() con relectura de control. Calcula CONFIG_ID y comprueba
+#   gcloud si el respaldo está activo.
+#%% celda 3 [código]
+# BLOQUE 2 — Escritura atómica, GCS y recuperación #####
+md5 <- function(f) unname(tools::md5sum(f))
+firma <- function(x) {
+  f <- tempfile(); on.exit(unlink(f), add=TRUE)
+  saveRDS(x, f, compress=FALSE, version=3)
+  md5(f)
+}
+rds_atomico <- function(x, f, comprimir=TRUE) {
+  dir.create(dirname(f), recursive=TRUE, showWarnings=FALSE)
+  t <- paste0(f,".tmp_",Sys.getpid()); on.exit(unlink(t), add=TRUE)
+  saveRDS(x, t, compress=if(comprimir) "gzip" else FALSE, version=3)
+  invisible(readRDS(t))
+  if (!file.rename(t,f)) stop("No se pudo promover: ", f)
+  invisible(f)
+}
+csv_atomico <- function(x, f, encabezado=TRUE) {
+  dir.create(dirname(f), recursive=TRUE, showWarnings=FALSE)
+  t <- paste0(f,".tmp_",Sys.getpid()); on.exit(unlink(t), add=TRUE)
+  fwrite(x, t, col.names=encabezado, na="NA")
+  z <- fread(t, header=encabezado, na.strings=c("","NA"), showProgress=FALSE)
+  if (!identical(dim(z),dim(x))) stop("CSV cambió dimensiones: ", f)
+  if (encabezado && !identical(names(z),names(x))) stop("CSV cambió columnas: ",f)
+  for (j in seq_along(x)) {
+    if (!identical(is.na(z[[j]]),is.na(x[[j]]))) stop("CSV cambió NA: ",f)
+    ok <- if (is.numeric(x[[j]])) isTRUE(all.equal(as.numeric(z[[j]]),
+      as.numeric(x[[j]]), tolerance=1e-12, check.attributes=FALSE)) else
+      identical(as.character(z[[j]]),as.character(x[[j]]))
+    if (!ok) stop("CSV cambió valores: ",f)
+  }
+  if (!file.rename(t,f)) stop("No se pudo promover CSV: ",f)
+  invisible(f)
+}
+CONFIG_ID <- firma(list(PARAM=PARAM, versiones=versiones,
+                       versiones_dependencias=versiones_dependencias))
+GCS <- sub("/+$", "", GCS)
+gcloud <- unname(Sys.which("gcloud"))
+if (respaldo_GCS && (!nzchar(gcloud) || !grepl("^gs://[^/]+/.+",GCS)))
+  stop("Configurar gcloud y GCS con un prefijo propio, o desactivar GCS fuera de esta VM.")
+
+# [Anotación · líneas 130–177] Funciones de Google Cloud Storage iguales a las del notebook 1: ejecutar gcloud
+#   distinguiendo un objeto ausente de otros errores, metadatos, comparación de MD5 y tamaño, subida sólo si el
+#   objeto no existe y descarga verificada.
+gcs_comando <- function(args, permitir_ausente=FALSE) {
+  err <- tempfile(); on.exit(unlink(err), add=TRUE)
+  out <- suppressWarnings(system2(gcloud, vapply(c(args,"--quiet"),shQuote,character(1)),
+                                  stdout=TRUE, stderr=err))
+  status <- attr(out,"status")
+  if (!is.null(status) && status!=0L) {
+    detalle <- paste(readLines(err,warn=FALSE),collapse="\n")
+    # Sólo una ausencia inequívoca es un experimento/objeto nuevo. 403/red NO lo son.
+    if (permitir_ausente && grepl("(?i)(404|not found|no such object|matched no objects|no urls matched|does not exist)",
+                                 detalle,perl=TRUE) &&
+        !grepl("(?i)(403|permission|forbidden|access denied)",detalle,perl=TRUE)) return(NULL)
+    stop("GCS falló; no se inicia el siguiente trabajo. ", detalle)
+  }
+  out
+}
+gcs_info <- function(uri) {
+  z <- gcs_comando(c("storage","objects","describe",uri,"--raw","--format=json"),TRUE)
+  if (is.null(z)) return(NULL)
+  jsonlite::fromJSON(paste(z,collapse="\n"))
+}
+md5_base64 <- function(h) jsonlite::base64_enc(as.raw(strtoi(
+  substring(h,seq(1,31,2),seq(2,32,2)),16L)))
+verificar_remoto <- function(info, f) {
+  !is.null(info) && identical(info$md5Hash,md5_base64(md5(f))) &&
+    isTRUE(as.numeric(info$size)==file.info(f)$size)
+}
+subir_inmutable <- function(f, uri) {
+  info <- gcs_info(uri)
+  if (is.null(info)) {
+    gcs_comando(c("storage","cp",f,uri,"--if-generation-match=0",
+                  paste0("--content-md5=",md5_base64(md5(f)))))
+    info <- gcs_info(uri)
+  }
+  if (!verificar_remoto(info,f)) stop("Objeto remoto diferente o sin MD5 verificable: ",uri)
+  invisible(TRUE)
+}
+descargar_verificado <- function(uri, f, hash=NULL) {
+  info <- gcs_info(uri)
+  if (is.null(info)) stop("Falta un objeto de un checkpoint confirmado: ",uri)
+  dir.create(dirname(f),recursive=TRUE,showWarnings=FALSE)
+  t <- paste0(f,".download_",Sys.getpid()); on.exit(unlink(t),add=TRUE)
+  gcs_comando(c("storage","cp",uri,t))
+  if (!verificar_remoto(info,t) || (!is.null(hash) && md5(t)!=hash))
+    stop("Descarga no verificable: ",uri)
+  if (file.exists(f) && md5(f)!=md5(t)) stop("Conflicto local, no se sobrescribe: ",f)
+  if (!file.exists(f) && !file.rename(t,f)) stop("No se pudo recuperar: ",f)
+  invisible(f)
+}
+# [Anotación · líneas 178–204] Rutas local y remota de los checkpoints, validación del COMMIT y respaldar(),
+#   que no hace nada con respaldo_GCS=FALSE.
+ck_dir <- function(key) file.path(OUT,"checkpoints",key)
+ck_uri <- function(key) paste0(GCS,"/checkpoints/",key,".rds")
+confirmados_sesion <- new.env(parent=emptyenv())
+clave_confirmacion <- function(key) paste(GCS,CONFIG_ID,key,sep="|")
+
+validar_commit <- function(z,key,sig=NULL) {
+  if (!is.list(z) || !identical(z$key,key) || !identical(z$config_id,CONFIG_ID) ||
+      (!is.null(sig) && !identical(z$firma,sig)))
+    stop("Checkpoint de otro experimento/configuración: ",key)
+  a <- z$archivos
+  if (!nrow(a) || anyDuplicated(a$archivo) || anyNA(a) ||
+      any(basename(a$archivo)!=a$archivo) || any(!grepl("^[a-f0-9]{32}$",a$md5)))
+    stop("Manifiesto de archivos inválido: ",key)
+  invisible(TRUE)
+}
+respaldar <- function(key,z) {
+  if (!respaldo_GCS) return(invisible(TRUE))
+  for (i in seq_len(nrow(z$archivos))) {
+    a <- z$archivos[i,]
+    subir_inmutable(file.path(ck_dir(key),a$archivo),paste0(GCS,"/objetos/",a$md5,"/",a$archivo))
+  }
+  # El commit remoto se publica ÚLTIMO. Sólo él declara terminado el trabajo.
+  subir_inmutable(file.path(ck_dir(key),"COMMIT.rds"),ck_uri(key))
+  assign(clave_confirmacion(key),md5(file.path(ck_dir(key),"COMMIT.rds")),
+         envir=confirmados_sesion)
+  invisible(TRUE)
+}
+# [Anotación · líneas 205–251] abrir_checkpoint(), iniciar_checkpoint() y cerrar_checkpoint(), con el mismo
+#   comportamiento que en el notebook 1: verificación por firma, MD5 y tamaño, carpeta aparte para intentos
+#   incompletos y COMMIT.rds escrito al final.
+abrir_checkpoint <- function(key,sig=NULL,remoto=TRUE) {
+  d <- ck_dir(key); f <- file.path(d,"COMMIT.rds")
+  confirmado <- file.exists(f) && exists(clave_confirmacion(key),envir=confirmados_sesion,inherits=FALSE) &&
+    identical(get(clave_confirmacion(key),envir=confirmados_sesion),md5(f))
+  info <- if (respaldo_GCS && remoto && !confirmado) gcs_info(ck_uri(key)) else NULL
+  if (!file.exists(f) && !is.null(info)) {
+    descargar_verificado(ck_uri(key),f)
+    message("Recuperado desde GCS: ",key)
+  }
+  if (!file.exists(f)) return(NULL)
+  z <- readRDS(f); validar_commit(z,key,sig)
+  if (!is.null(info) && !verificar_remoto(info,f)) stop("Conflicto de commits: ",key)
+  for (i in seq_len(nrow(z$archivos))) {
+    a <- z$archivos[i,]; p <- file.path(d,a$archivo)
+    if (!file.exists(p) && respaldo_GCS && remoto)
+      descargar_verificado(paste0(GCS,"/objetos/",a$md5,"/",a$archivo),p,a$md5)
+    if (!file.exists(p) || md5(p)!=a$md5 || file.info(p)$size!=a$bytes)
+      stop("Checkpoint corrupto/incompleto: ",key," / ",a$archivo)
+  }
+  # Si el backup falló luego del commit local, ahora se completa sin reentrenar.
+  if (remoto && !confirmado) respaldar(key,z)
+  z
+}
+iniciar_checkpoint <- function(key) {
+  d <- ck_dir(key)
+  if (file.exists(file.path(d,"COMMIT.rds"))) stop("No sobrescribir checkpoint: ",key)
+  if (dir.exists(d) && length(list.files(d,all.files=TRUE,no..=TRUE))) {
+    destino <- paste0(d,"_incompleto_",format(Sys.time(),"%Y%m%d%H%M%OS6"),"_",Sys.getpid())
+    if (!file.rename(d,destino)) stop("No se pudo apartar intento incompleto: ",d)
+    message("Intento interrumpido conservado: ",destino)
+  }
+  dir.create(d,recursive=TRUE,showWarnings=FALSE)
+  d
+}
+cerrar_checkpoint <- function(key,sig,remoto=TRUE) {
+  d <- ck_dir(key)
+  fs <- list.files(d,full.names=TRUE)
+  fs <- fs[!grepl("COMMIT\\.rds$|\\.tmp_|\\.download_",fs)]
+  stopifnot(length(fs)>0L, !any(file.info(fs)$isdir))
+  z <- list(key=key, config_id=CONFIG_ID, firma=sig,
+    archivos=data.frame(archivo=basename(fs),md5=unname(tools::md5sum(fs)),
+                         bytes=unname(file.info(fs)$size),stringsAsFactors=FALSE))
+  validar_commit(z,key,sig)
+  rds_atomico(z,file.path(d,"COMMIT.rds"))
+  if (remoto) respaldar(key,z)             # ERROR de GCS se propaga; nunca un mero warning
+  invisible(z)
+}
+# [Anotación · líneas 252–264] Consulta el bucket si hay respaldo y crea el checkpoint config/base con
+#   config.rds, sessionInfo.txt y semillas.csv si no existe.
+if (respaldo_GCS) {
+  bucket <- sub("^(gs://[^/]+).*", "\\1",GCS)
+  invisible(gcs_comando(c("storage","buckets","describe",bucket,"--format=json")))
+}
+if (is.null(abrir_checkpoint("config/base",CONFIG_ID))) {
+  d <- iniciar_checkpoint("config/base")
+  rds_atomico(list(PARAM=PARAM,versiones=versiones,dependencias=versiones_dependencias,
+                   config_id=CONFIG_ID),file.path(d,"config.rds"))
+  writeLines(capture.output(sessionInfo()),file.path(d,"sessionInfo.txt"))
+  csv_atomico(data.table(orden=seq_along(semillas_50),seed=semillas_50,
+    origen=c(rep("SAFE_original",10),rep("extension_determinista",40))),file.path(d,"semillas.csv"))
+  cerrar_checkpoint("config/base",CONFIG_ID)
+}
+
+# [Anotación · líneas 266–290] generar_targets(): misma lógica que en el notebook 1. Con los dos períodos
+#   siguientes de cada cliente asigna CONTINUA, BAJA+1 o BAJA+2 y crea binaria2 = 1 para BAJA+1 o BAJA+2.
+#%% celda 4 [código]
+# BLOQUE 3 — Targets Pasquini, métricas y funciones compartidas #####
+generar_targets <- function(dataset) {
+  if (anyNA(dataset$numero_de_cliente) || anyNA(dataset$foto_mes) ||
+      anyDuplicated(dataset,by=c("numero_de_cliente","foto_mes")))
+    stop("IDs/meses faltantes o duplicados cliente-mes en fuente oficial.")
+  dsimple <- dataset[,.(pos=.I,numero_de_cliente,
+    periodo0=as.integer(foto_mes/100)*12L+foto_mes%%100L)]
+  setorder(dsimple,numero_de_cliente,periodo0)
+  periodo_ultimo <- max(dsimple$periodo0)
+  periodo_anteultimo <- periodo_ultimo-1L
+  dsimple[,c("periodo1","periodo2") := shift(periodo0,n=1:2,fill=NA,type="lead"),
+          by=numero_de_cliente]
+  dsimple[,clase_ternaria := NA_character_]
+  dsimple[periodo0<periodo_anteultimo,clase_ternaria := "CONTINUA"]
+  dsimple[periodo0<periodo_ultimo & (is.na(periodo1) | periodo0+1L<periodo1),
+          clase_ternaria := "BAJA+1"]
+  dsimple[periodo0<periodo_anteultimo & periodo0+1L==periodo1 &
+          (is.na(periodo2) | periodo0+2L<periodo2),clase_ternaria := "BAJA+2"]
+  setorder(dsimple,pos)
+  dataset[,clase_ternaria := dsimple$clase_ternaria]
+  dataset[,binaria2 := fifelse(is.na(clase_ternaria),NA_integer_,
+    as.integer(clase_ternaria %in% c("BAJA+1","BAJA+2")))]
+  dataset
+}
+# [Anotación · líneas 291–333] Funciones auxiliares: mes_anterior(), validación de probabilidades y de IDs,
+#   AUC por suma de ranks, curva de ganancia acumulada (+1.072.500 por BAJA+2, −27.500 por el resto, orden por
+#   probabilidad descendente) y validación de la clase.
+mes_anterior <- function(ym,k) {
+  total <- (ym%/%100L)*12L+ym%%100L-1L-as.integer(k)
+  as.integer((total%/%12L)*100L+total%%12L+1L)
+}
+validar_prob <- function(p,n=length(p)) {
+  if (length(p)!=n || anyNA(p) || any(!is.finite(p)) || any(p<0 | p>1))
+    stop("Predicciones inválidas, incompletas o fuera de [0,1].")
+  invisible(TRUE)
+}
+validar_ids <- function(ids,referencia) {
+  if (anyNA(ids) || anyDuplicated(ids) ||
+      !identical(as.character(ids),as.character(referencia)))
+    stop("IDs duplicados o en distinto orden.")
+  invisible(TRUE)
+}
+auc_binaria <- function(y,p) {
+  validar_prob(p,length(y))
+  if (anyNA(y) || any(!y %in% 0:1)) stop("Target inválido para AUC.")
+  n1 <- sum(y==1L); n0 <- sum(y==0L)
+  if (!n1 || !n0) stop("AUC requiere ambas clases.")
+  (sum(rank(p,ties.method="average")[y==1L])-n1*(n1+1)/2)/(n1*n0)
+}
+curva_ganancia <- function(d,p) {
+  validar_prob(p,nrow(d))
+  x <- d[,.(numero_de_cliente,clase_ternaria)]
+  x[,prediction := p]
+  setorder(x,-prediction,numero_de_cliente)
+  x[,baja2 := as.integer(clase_ternaria=="BAJA+2")]
+  x[,.(cutoff=seq_len(.N),numero_de_cliente,prediction,
+    bajas2_acumuladas=cumsum(baja2),
+    ganancia_acumulada=cumsum(fifelse(baja2==1L,PARAM$ganancia_baja2,-PARAM$costo_estimulo)))]
+}
+validar_target <- function(d,etiquetado=TRUE) {
+  if (!identical(is.na(d$clase_ternaria),is.na(d$binaria2)) ||
+      any(!is.na(d$clase_ternaria) & !d$clase_ternaria %in% c("CONTINUA","BAJA+1","BAJA+2")))
+    stop("Máscara de target alterada.")
+  if (etiquetado && (anyNA(d$binaria2) ||
+      any(d$binaria2 != as.integer(d$clase_ternaria %in% c("BAJA+1","BAJA+2")))))
+    stop("Target incorrecto.")
+  if (!etiquetado && (!all(is.na(d$clase_ternaria)) || !all(is.na(d$binaria2))))
+    stop("Agosto debe estar íntegramente sin etiquetas.")
+  invisible(TRUE)
+}
+# [Anotación · líneas 334–351] Nombres de los tres hiperparámetros buscados, armado de la lista de parámetros
+#   de un modelo (fijos + los tres + semilla) y matriz_E012(), que pasa FEATURES a matriz numérica comprobando
+#   que no cambien NA ni valores.
+hp_campos <- c("num_iterations","num_leaves","min_sum_hessian_in_leaf")
+hp_lista <- function(hp) list(num_iterations=as.integer(hp$num_iterations),
+  num_leaves=as.integer(hp$num_leaves),
+  min_sum_hessian_in_leaf=as.numeric(hp$min_sum_hessian_in_leaf))
+param_modelo <- function(hp,seed) modifyList(PARAM$lgbm_fijos,
+  c(hp_lista(hp),list(seed=as.integer(seed))))
+matriz_E012 <- function(d) {
+  if (!identical(names(d[,..FEATURES]),FEATURES)) stop("Manifiesto distinto en matriz.")
+  x <- data.matrix(d[,..FEATURES])
+  if (!identical(colnames(x),FEATURES) || nrow(x)!=nrow(d)) stop("Error de dimensiones.")
+  for (j in seq_along(FEATURES)) {
+    v <- d[[FEATURES[j]]]
+    if (!identical(is.na(x[,j]),is.na(v)) ||
+        any(!is.na(x[,j]) & !is.finite(x[,j])))
+      stop("data.matrix modificó NA, valor o tipo: ",FEATURES[j])
+  }
+  x
+}
+# [Anotación · líneas 352–370] ajustar_E012(): entrena un LightGBM con lgb.train sobre la matriz y la etiqueta
+#   recibidas, sin validación ni early stopping, predice sobre la matriz de puntuación y devuelve probabilidades
+#   y tiempos; guarda el modelo sólo si se pide.
+ajustar_E012 <- function(X,y,Xscore,hp,seed,modelo_archivo=NULL) {
+  stopifnot(identical(colnames(X),FEATURES),identical(colnames(Xscore),FEATURES),
+            !anyNA(y),all(y %in% 0:1))
+  t0 <- proc.time()[["elapsed"]]
+  dtrain <- lgb.Dataset(X,label=y,params=list(max_bin=31L,feature_pre_filter=FALSE,
+    use_missing=TRUE,zero_as_missing=FALSE))
+  modelo <- lgb.train(params=param_modelo(hp,seed),data=dtrain)
+  t1 <- proc.time()[["elapsed"]]
+  p <- as.numeric(predict(modelo,Xscore))
+  validar_prob(p,nrow(Xscore))
+  if (!is.null(modelo_archivo)) {
+    t <- paste0(modelo_archivo,".tmp_",Sys.getpid())
+    on.exit(unlink(t),add=TRUE)
+    lgb.save(modelo,t)
+    invisible(lgb.load(t))
+    if (!file.rename(t,modelo_archivo)) stop("No se pudo guardar modelo.")
+  }
+  list(p=p,seg_entrenamiento=t1-t0,seg_prediccion=proc.time()[["elapsed"]]-t1)
+}
+
+# [Anotación · líneas 372–392] Pruebas con datos de ejemplo: mes_anterior en varios casos, clases de tres
+#   clientes ficticios y escritura de un CSV de IDs sin encabezado.
+#%% celda 5 [código]
+# BLOQUE 3b — Pruebas pequeñas de targets, fechas, NA y submissions #####
+local({
+  stopifnot(mes_anterior(202106L,1L)==202105L,
+            mes_anterior(202106L,4L)==202102L,
+            mes_anterior(202108L,3L)==202105L,
+            mes_anterior(202108L,4L)==202104L)
+  ej <- data.table(numero_de_cliente=c(rep(1L,6),rep(2L,3),rep(3L,4)),
+    foto_mes=c(202103L:202108L,202103L:202105L,202103L,202105L,202106L,202108L))
+  ej <- generar_targets(ej)
+  stopifnot(ej[numero_de_cliente==2L & foto_mes==202104L,clase_ternaria]=="BAJA+2",
+            ej[numero_de_cliente==2L & foto_mes==202105L,clase_ternaria]=="BAJA+1",
+            ej[numero_de_cliente==3L & foto_mes==202103L,clase_ternaria]=="BAJA+1",
+            ej[numero_de_cliente==1L & foto_mes==202106L,binaria2]==0L,
+            all(is.na(ej[foto_mes==202108L,binaria2])))
+  f <- tempfile(fileext=".csv"); on.exit(unlink(f),add=TRUE)
+  csv_atomico(data.table(numero_de_cliente=c(9L,2L,7L)),f,encabezado=FALSE)
+  stopifnot(length(readLines(f))==3L,
+            identical(as.integer(fread(f,header=FALSE)[[1L]]),c(9L,2L,7L)))
+  message("Pruebas pequeñas iniciales OK.")
+})
+
+# [Anotación · líneas 394–415] Descarga el crudo si no está, lo lee, comprueba que los meses sean 202103 a
+#   202108 sin duplicados cliente-mes y que la cantidad de filas por mes coincida con seis valores escritos en
+#   el código (de 162.900 a 164.647). Genera las clases y valida los meses con y sin clase.
+#%% celda 6 [código]
+# BLOQUE 4 — Descarga cruda y preparación oficial sin alterar fuente #####
+dir.create(dirname(crudo_oficial),recursive=TRUE,showWarnings=FALSE)
+if (!file.exists(crudo_oficial)) {
+  tmp <- paste0(crudo_oficial,".descarga")
+  if (file.exists(tmp)) unlink(tmp)
+  download.file(url_oficial,tmp,mode="wb",quiet=FALSE)
+  if (!file.exists(tmp) || file.info(tmp)$size==0) stop("Descarga oficial vacía.")
+  if (!file.rename(tmp,crudo_oficial)) stop("No se pudo promover descarga.")
+}
+raw_md5 <- md5(crudo_oficial)
+dataset <- fread(crudo_oficial,na.strings=c("","NA"),showProgress=TRUE)
+stopifnot(identical(sort(unique(dataset$foto_mes)),202103L:202108L),
+          !anyDuplicated(dataset,by=c("numero_de_cliente","foto_mes")))
+filas_oficiales <- data.table(foto_mes=202103L:202108L,
+  N=c(162900L,163284L,163768L,164114L,164348L,164647L))
+if (!isTRUE(all.equal(as.data.frame(dataset[,.(N=.N),by=foto_mes]),
+                     as.data.frame(filas_oficiales),check.attributes=FALSE)))
+  stop("Conteos mensuales oficiales inesperados.")
+dataset <- generar_targets(dataset)
+validar_target(dataset[foto_mes %in% 202103L:202106L])
+validar_target(dataset[foto_mes==202108L],FALSE)
+# [Anotación · líneas 416–437] Compara los conteos por mes y clase con la tabla escrita en el código, define
+#   UNIVERSO (164.647 clientes de 202108), pasa ccajas_depositos a NA en 202105 antes de armar la historia y
+#   calcula DATA_ID.
+conteos_pasquini <- data.table(
+  foto_mes=c(rep(202103L:202106L,each=3),202107L,202107L,202108L),
+  clase_ternaria=c(rep(c("BAJA+1","BAJA+2","CONTINUA"),4),
+                   NA_character_,"BAJA+1",NA_character_),
+  N=c(1019L,960L,160921L,964L,1139L,161181L,1143L,870L,161755L,
+      874L,1098L,162142L,163245L,1103L,164647L))
+conteos <- dataset[,.N,by=.(foto_mes,clase_ternaria)]
+setorderv(conteos,c("foto_mes","clase_ternaria"),na.last=TRUE)
+setorderv(conteos_pasquini,c("foto_mes","clase_ternaria"),na.last=TRUE)
+if (!isTRUE(all.equal(as.data.frame(conteos),as.data.frame(conteos_pasquini),check.attributes=FALSE)))
+  stop("Targets difieren del inventario oficial de Pasquini/SAFE.")
+UNIVERSO <- dataset[foto_mes==202108L,numero_de_cliente]
+stopifnot(length(UNIVERSO)==164647L,!anyNA(UNIVERSO),!anyDuplicated(UNIVERSO))
+# ÚNICA corrección DQ: exclusivamente en mayo y antes de temporalizar.
+stopifnot("ccajas_depositos" %in% names(dataset))
+no_mayo <- dataset[foto_mes!=202105L,ccajas_depositos]
+dataset[foto_mes==202105L,ccajas_depositos := NA_real_]
+stopifnot(all(is.na(dataset[foto_mes==202105L,ccajas_depositos])),
+          identical(no_mayo,dataset[foto_mes!=202105L,ccajas_depositos]))
+rm(no_mayo)
+DATA_ID <- firma(list(version=PARAM$version,raw_md5=raw_md5,
+  mes=filas_oficiales))
+
+# [Anotación · líneas 439–492] vars_lag: lista literal de 148 nombres de variables del dataset a las que se
+#   les calcula lag.
+#%% celda 7 [código]
+# BLOQUE 5 — Vectores literales E012 RAW T4 (referencia original) #####
+vars_lag <- c(
+  "active_quarter", "cliente_vip", "internet",
+  "cliente_edad", "cliente_antiguedad", "mrentabilidad",
+  "mrentabilidad_annual", "mcomisiones", "mactivos_margen",
+  "mpasivos_margen", "cproductos", "tcuentas",
+  "ccuenta_corriente", "mcuenta_corriente_adicional", "mcuenta_corriente",
+  "ccaja_ahorro", "mcaja_ahorro", "mcaja_ahorro_adicional",
+  "mcaja_ahorro_dolares", "cdescubierto_preacordado", "mcuentas_saldo",
+  "ctarjeta_debito", "ctarjeta_debito_transacciones", "mautoservicio",
+  "ctarjeta_visa", "ctarjeta_visa_transacciones", "mtarjeta_visa_consumo",
+  "ctarjeta_master", "ctarjeta_master_transacciones", "mtarjeta_master_consumo",
+  "cprestamos_prendarios", "mprestamos_prendarios", "cprestamos_hipotecarios",
+  "mprestamos_hipotecarios", "cplazo_fijo", "mplazo_fijo_dolares",
+  "mplazo_fijo_pesos", "cinversion1", "minversion1_pesos",
+  "minversion1_dolares", "cinversion2", "minversion2",
+  "cseguro_vida", "cseguro_auto", "cseguro_vivienda",
+  "cseguro_accidentes_personales", "ccaja_seguridad", "cpayroll_trx",
+  "mpayroll", "mpayroll2", "cpayroll2_trx",
+  "ccuenta_debitos_automaticos", "mcuenta_debitos_automaticos", "ctarjeta_visa_debitos_automaticos",
+  "mttarjeta_visa_debitos_automaticos", "ctarjeta_master_debitos_automaticos", "mttarjeta_master_debitos_automaticos",
+  "cpagodeservicios", "mpagodeservicios", "cpagomiscuentas",
+  "mpagomiscuentas", "ccajeros_propios_descuentos", "mcajeros_propios_descuentos",
+  "ctarjeta_visa_descuentos", "mtarjeta_visa_descuentos", "ctarjeta_master_descuentos",
+  "mtarjeta_master_descuentos", "ccomisiones_mantenimiento", "mcomisiones_mantenimiento",
+  "ccomisiones_otras", "mcomisiones_otras", "cforex",
+  "cforex_buy", "mforex_buy", "cforex_sell",
+  "mforex_sell", "ctransferencias_recibidas", "mtransferencias_recibidas",
+  "ctransferencias_emitidas", "mtransferencias_emitidas", "cextraccion_autoservicio",
+  "mextraccion_autoservicio", "ccheques_depositados", "mcheques_depositados",
+  "ccheques_emitidos", "mcheques_emitidos", "ccheques_depositados_rechazados",
+  "mcheques_depositados_rechazados", "ccheques_emitidos_rechazados", "mcheques_emitidos_rechazados",
+  "tcallcenter", "ccallcenter_transacciones", "thomebanking",
+  "chomebanking_transacciones", "ccajas_transacciones", "ccajas_consultas",
+  "ccajas_depositos", "ccajas_extracciones", "ccajas_otras",
+  "catm_trx", "matm", "catm_trx_other",
+  "matm_other", "ctrx_quarter", "tmobile_app",
+  "cmobile_app_trx", "Master_delinquency", "Master_status",
+  "Master_mfinanciacion_limite", "Master_Fvencimiento", "Master_Finiciomora",
+  "Master_msaldototal", "Master_msaldopesos", "Master_msaldodolares",
+  "Master_mconsumospesos", "Master_mconsumosdolares", "Master_mlimitecompra",
+  "Master_madelantopesos", "Master_madelantodolares", "Master_mpagado",
+  "Master_mpagospesos", "Master_mpagosdolares", "Master_fechaalta",
+  "Master_mconsumototal", "Master_cconsumos", "Master_cadelantosefectivo",
+  "Master_mpagominimo", "Visa_delinquency", "Visa_status",
+  "Visa_mfinanciacion_limite", "Visa_Fvencimiento", "Visa_Finiciomora",
+  "Visa_msaldototal", "Visa_msaldopesos", "Visa_msaldodolares",
+  "Visa_mconsumospesos", "Visa_mconsumosdolares", "Visa_mlimitecompra",
+  "Visa_madelantopesos", "Visa_madelantodolares", "Visa_mpagado",
+  "Visa_mpagospesos", "Visa_mpagosdolares", "Visa_fechaalta",
+  "Visa_mconsumototal", "Visa_cconsumos", "Visa_cadelantosefectivo",
+  "Visa_mpagominimo"
+)
+
+# [Anotación · líneas 494–544] vars_delta: lista literal de 146 nombres a los que se les calcula delta; es la
+#   lista anterior sin Master_status ni Visa_status.
+vars_delta <- c(
+  "active_quarter", "cliente_vip", "internet",
+  "cliente_edad", "cliente_antiguedad", "mrentabilidad",
+  "mrentabilidad_annual", "mcomisiones", "mactivos_margen",
+  "mpasivos_margen", "cproductos", "tcuentas",
+  "ccuenta_corriente", "mcuenta_corriente_adicional", "mcuenta_corriente",
+  "ccaja_ahorro", "mcaja_ahorro", "mcaja_ahorro_adicional",
+  "mcaja_ahorro_dolares", "cdescubierto_preacordado", "mcuentas_saldo",
+  "ctarjeta_debito", "ctarjeta_debito_transacciones", "mautoservicio",
+  "ctarjeta_visa", "ctarjeta_visa_transacciones", "mtarjeta_visa_consumo",
+  "ctarjeta_master", "ctarjeta_master_transacciones", "mtarjeta_master_consumo",
+  "cprestamos_prendarios", "mprestamos_prendarios", "cprestamos_hipotecarios",
+  "mprestamos_hipotecarios", "cplazo_fijo", "mplazo_fijo_dolares",
+  "mplazo_fijo_pesos", "cinversion1", "minversion1_pesos",
+  "minversion1_dolares", "cinversion2", "minversion2",
+  "cseguro_vida", "cseguro_auto", "cseguro_vivienda",
+  "cseguro_accidentes_personales", "ccaja_seguridad", "cpayroll_trx",
+  "mpayroll", "mpayroll2", "cpayroll2_trx",
+  "ccuenta_debitos_automaticos", "mcuenta_debitos_automaticos", "ctarjeta_visa_debitos_automaticos",
+  "mttarjeta_visa_debitos_automaticos", "ctarjeta_master_debitos_automaticos", "mttarjeta_master_debitos_automaticos",
+  "cpagodeservicios", "mpagodeservicios", "cpagomiscuentas",
+  "mpagomiscuentas", "ccajeros_propios_descuentos", "mcajeros_propios_descuentos",
+  "ctarjeta_visa_descuentos", "mtarjeta_visa_descuentos", "ctarjeta_master_descuentos",
+  "mtarjeta_master_descuentos", "ccomisiones_mantenimiento", "mcomisiones_mantenimiento",
+  "ccomisiones_otras", "mcomisiones_otras", "cforex",
+  "cforex_buy", "mforex_buy", "cforex_sell",
+  "mforex_sell", "ctransferencias_recibidas", "mtransferencias_recibidas",
+  "ctransferencias_emitidas", "mtransferencias_emitidas", "cextraccion_autoservicio",
+  "mextraccion_autoservicio", "ccheques_depositados", "mcheques_depositados",
+  "ccheques_emitidos", "mcheques_emitidos", "ccheques_depositados_rechazados",
+  "mcheques_depositados_rechazados", "ccheques_emitidos_rechazados", "mcheques_emitidos_rechazados",
+  "tcallcenter", "ccallcenter_transacciones", "thomebanking",
+  "chomebanking_transacciones", "ccajas_transacciones", "ccajas_consultas",
+  "ccajas_depositos", "ccajas_extracciones", "ccajas_otras",
+  "catm_trx", "matm", "catm_trx_other",
+  "matm_other", "ctrx_quarter", "tmobile_app",
+  "cmobile_app_trx", "Master_delinquency", "Master_mfinanciacion_limite",
+  "Master_Fvencimiento", "Master_Finiciomora", "Master_msaldototal",
+  "Master_msaldopesos", "Master_msaldodolares", "Master_mconsumospesos",
+  "Master_mconsumosdolares", "Master_mlimitecompra", "Master_madelantopesos",
+  "Master_madelantodolares", "Master_mpagado", "Master_mpagospesos",
+  "Master_mpagosdolares", "Master_fechaalta", "Master_mconsumototal",
+  "Master_cconsumos", "Master_cadelantosefectivo", "Master_mpagominimo",
+  "Visa_delinquency", "Visa_mfinanciacion_limite", "Visa_Fvencimiento",
+  "Visa_Finiciomora", "Visa_msaldototal", "Visa_msaldopesos",
+  "Visa_msaldodolares", "Visa_mconsumospesos", "Visa_mconsumosdolares",
+  "Visa_mlimitecompra", "Visa_madelantopesos", "Visa_madelantodolares",
+  "Visa_mpagado", "Visa_mpagospesos", "Visa_mpagosdolares",
+  "Visa_fechaalta", "Visa_mconsumototal", "Visa_cconsumos",
+  "Visa_cadelantosefectivo", "Visa_mpagominimo"
+)
+# [Anotación · líneas 545–558] Agrega Master_fultimo_cierre y Visa_fultimo_cierre a ambas listas y comprueba
+#   los tamaños (150 con lag, 148 con delta), que sólo los dos status tengan lag sin delta, que no estén los
+#   préstamos personales y que las variables de cierre existan y sean numéricas.
+# Cambio explícito respecto del E012 previo: se RESTITUYEN ambas variables de cierre.
+vars_lag <- c(vars_lag,PARAM$cierres)
+vars_delta <- c(vars_delta,PARAM$cierres)
+if (length(vars_lag)!=150L || uniqueN(vars_lag)!=150L ||
+    length(vars_delta)!=148L || uniqueN(vars_delta)!=148L)
+  stop("Conteo literal inesperado para RAW T4 corregido.")
+if (!setequal(vars_delta,setdiff(vars_lag,c("Master_status","Visa_status"))))
+  stop("Sólo los status tienen lag sin delta.")
+if (any(PARAM$excluidas %in% c(vars_lag,vars_delta))) stop("Préstamos presentes.")
+stopifnot(!any(c("numero_de_cliente","foto_mes","clase_ternaria","binaria2") %in% vars_lag))
+for (v in PARAM$cierres) {
+  if (!v %in% names(dataset)) stop("Cierre no presente en crudo: ",v)
+  if (!is.numeric(dataset[[v]])) stop("Cierre no es numérico y no puede temporalizarse: ",v)
+}
+# [Anotación · líneas 559–588] Define CURRENT (numero_de_cliente, foto_mes y las 150 variables) y FEATURES:
+#   CURRENT, lag1 a lag4 de las 150, delta1 a delta4 de las 148 y cuatro indicadores lagK_disponible. Comprueba
+#   que sean 1.348, que CURRENT coincida con todas las columnas del crudo menos los dos préstamos y que todas
+#   sean numéricas. Guarda el inventario por bloque en el checkpoint features/manifiesto.
+CURRENT <- c("numero_de_cliente","foto_mes",vars_lag)
+FEATURES <- c(CURRENT,
+  unlist(lapply(1:4,function(k) paste0("lag",k,"_",vars_lag)),use.names=FALSE),
+  unlist(lapply(1:4,function(k) paste0("delta",k,"_",vars_delta)),use.names=FALSE),
+  paste0("lag",1:4,"_disponible"))
+if (length(FEATURES)!=1348L || anyDuplicated(FEATURES)) stop("Inventario != 1348.")
+if (length(setdiff(c(vars_lag,vars_delta),names(dataset)))) stop("Faltan columnas.")
+fuentes_reales <- setdiff(names(dataset),c("clase_ternaria","binaria2",PARAM$excluidas))
+if (!setequal(fuentes_reales,CURRENT))
+  stop("El conjunto CURRENT difiere del esquema E012 original corregido. Revisar fuente.")
+no_numericas <- CURRENT[!vapply(dataset[,..CURRENT],is.numeric,logical(1))]
+if (length(no_numericas)) stop("Predictores no numéricos: ",paste(no_numericas,collapse=", "))
+PIPE_ID <- firma(list(data=DATA_ID,vars_lag=vars_lag,vars_delta=vars_delta,
+  features=FEATURES,correccion="ccajas_depositos_202105_NA"))
+FEATURE_ID <- firma(FEATURES)
+inventario <- rbindlist(list(data.table(bloque="current",feature=CURRENT),
+  rbindlist(lapply(1:4,function(k) data.table(bloque=paste0("lag",k),feature=paste0("lag",k,"_",vars_lag)))),
+  rbindlist(lapply(1:4,function(k) data.table(bloque=paste0("delta",k),feature=paste0("delta",k,"_",vars_delta)))),
+  data.table(bloque="flags",feature=paste0("lag",1:4,"_disponible"))))
+stopifnot(identical(inventario$feature,FEATURES))
+if (is.null(abrir_checkpoint("features/manifiesto",PIPE_ID))) {
+  d <- iniciar_checkpoint("features/manifiesto")
+  csv_atomico(inventario,file.path(d,"features.csv"))
+  csv_atomico(inventario[,.(N=.N),by=bloque],file.path(d,"inventario_resumen.csv"))
+  rds_atomico(list(CURRENT=CURRENT,vars_lag=vars_lag,vars_delta=vars_delta,
+    FEATURES=FEATURES,DATA_ID=DATA_ID,FEATURE_ID=FEATURE_ID,PIPE_ID=PIPE_ID),file.path(d,"manifiesto.rds"))
+  csv_atomico(conteos,file.path(d,"conteos_oficiales.csv"))
+  cerrar_checkpoint("features/manifiesto",PIPE_ID)
+}
+print(inventario[,.(N=.N),by=bloque]); message("Features RAW T4: ",length(FEATURES))
+
+# [Anotación · líneas 590–619] construir_mes(): para un mes y para k de 1 a 4 busca el mes calendario k meses
+#   antes, empareja por numero_de_cliente, crea el indicador lagK_disponible (1 si el cliente está en ese mes),
+#   copia el valor de cada variable como lagK_ y calcula deltaK_ como valor actual menos lag. Los faltantes
+#   quedan en NA.
+#%% celda 8 [código]
+# BLOQUE 6 — Historia exacta por cliente/mes y caches verificadas #####
+construir_mes <- function(origen,mes) {
+  act <- origen[foto_mes==mes]
+  if (!nrow(act) || anyDuplicated(act$numero_de_cliente)) stop("Mes actual inválido: ",mes)
+  d <- copy(act[,c("numero_de_cliente","foto_mes","clase_ternaria","binaria2",vars_lag),with=FALSE])
+  for (k in 1:4) {
+    mes_k <- mes_anterior(mes,k)
+    hist <- origen[foto_mes==mes_k]
+    if (anyDuplicated(hist$numero_de_cliente)) stop("Duplicados en historia: ",mes_k)
+    pos <- match(d$numero_de_cliente,hist$numero_de_cliente)
+    flag <- as.integer(!is.na(pos))
+    set(d,j=paste0("lag",k,"_disponible"),value=flag)
+    for (v in vars_lag) {
+      value <- hist[[v]][pos]
+      # En historia global ausente, se crea un vector NA del tipo correcto.
+      if (!length(hist)) value <- rep(NA_real_,nrow(d))
+      set(d,j=paste0("lag",k,"_",v),value=value)
+    }
+    for (v in vars_delta)
+      set(d,j=paste0("delta",k,"_",v),
+          value=d[[v]]-d[[paste0("lag",k,"_",v)]])
+    stopifnot(all(d[[paste0("lag",k,"_disponible")]]==flag))
+    message("Mes ",mes," lag",k," = ",mes_k," / clientes con historia ",sum(flag))
+  }
+  setcolorder(d,c("numero_de_cliente","foto_mes","clase_ternaria","binaria2",FEATURES[-(1:2)]))
+  stopifnot(identical(names(d)[-(3:4)],FEATURES),nrow(d)==nrow(act),
+            identical(as.character(d$numero_de_cliente),as.character(act$numero_de_cliente)))
+  d
+}
+# [Anotación · líneas 620–642] cache_mes(): si existe el archivo RDS del mes con su metadato, comprueba firma,
+#   MD5, columnas y cantidad de filas y lo devuelve; si no, construye el mes, valida la clase y lo guarda sin
+#   comprimir en OUT/cache.
+cache_mes <- function(m) {
+  f <- file.path(OUT,"cache",paste0("mes_",m,"_RAW_T4.rds"))
+  meta_f <- paste0(f,".meta.rds")
+  sig <- firma(list(pipe=PIPE_ID,mes=m,raw_md5=raw_md5))
+  if (file.exists(f) && file.exists(meta_f)) {
+    meta <- readRDS(meta_f)
+    if (!identical(meta$sig,sig) || !identical(meta$md5,md5(f)))
+      stop("Cache existente incompatible/corrupta: ",f)
+    z <- readRDS(f)
+    if (!identical(names(z)[-(3:4)],FEATURES) ||
+        any(z$foto_mes!=m) || nrow(z)!=filas_oficiales[foto_mes==m,N])
+      stop("Cache no superó controles: ",f)
+    message("Cache verificada: ",f)
+    return(z)
+  }
+  if (file.exists(f) || file.exists(meta_f)) stop("Cache incompleta; conservar y revisar: ",f)
+  z <- construir_mes(dataset,m)
+  validar_target(z,m!=202108L)
+  rds_atomico(z,f,comprimir=FALSE)
+  rds_atomico(list(sig=sig,md5=md5(f),n=nrow(z),features=FEATURE_ID),meta_f)
+  message("Cache creada e íntegra: ",f)
+  z
+}
+# [Anotación · líneas 643–675] Construye 202106 y 202108. Comprueba las cantidades de filas (164.114 y
+#   164.647), que los indicadores de disponibilidad coincidan con la presencia del cliente en cada mes anterior,
+#   que el lag 4 de junio (202102) no tenga datos, que los lags y deltas de ccajas_depositos que caen en mayo
+#   sean NA y que todas las variables sean numéricas. Libera el crudo de memoria.
+JUNIO <- cache_mes(202106L)
+AGOSTO <- cache_mes(202108L)
+validar_ids(AGOSTO$numero_de_cliente,UNIVERSO)
+stopifnot(nrow(JUNIO)==164114L,nrow(AGOSTO)==164647L,
+          identical(names(JUNIO),names(AGOSTO)),
+          identical(names(JUNIO)[-(3:4)],FEATURES))
+# Disponibilidad exacta, incluidas las ausencias en febrero.
+for (k in 1:4) {
+  mj <- mes_anterior(202106L,k)
+  ma <- mes_anterior(202108L,k)
+  nj <- JUNIO[[paste0("lag",k,"_disponible")]]
+  na <- AGOSTO[[paste0("lag",k,"_disponible")]]
+  stopifnot(identical(nj,as.integer(JUNIO$numero_de_cliente %in%
+                       dataset[foto_mes==mj,numero_de_cliente])),
+            identical(na,as.integer(AGOSTO$numero_de_cliente %in%
+                       dataset[foto_mes==ma,numero_de_cliente])))
+  if (k==4L) stopifnot(all(nj==0L))
+}
+# Mayo ccajas_depositos corregido: sus lags/deltas de junio/agosto deben ser NA.
+stopifnot(all(is.na(JUNIO[lag1_disponible==1L,lag1_ccajas_depositos])),
+          all(is.na(JUNIO[lag1_disponible==1L,delta1_ccajas_depositos])),
+          all(is.na(AGOSTO[lag3_disponible==1L,lag3_ccajas_depositos])),
+          all(is.na(AGOSTO[lag3_disponible==1L,delta3_ccajas_depositos])),
+          all(is.na(JUNIO$lag4_ccajas_depositos)),all(is.na(JUNIO$delta4_ccajas_depositos)))
+# Verificar tipos/NA al convertir a data.matrix; no imputar nada.
+for (v in FEATURES)
+  if (!is.numeric(JUNIO[[v]]) || !is.numeric(AGOSTO[[v]]))
+    stop("Feature no numérica: ",v)
+stopifnot(identical(is.na(data.matrix(JUNIO[1:20,..FEATURES])),
+                    is.na(as.matrix(JUNIO[1:20,..FEATURES]))))
+# El crudo en memoria puede liberarse: junio y agosto son autosuficientes.
+rm(dataset); gc(verbose=FALSE)
+message("Preflight OK: 1348 RAW; sin febrero; mayo depósitos NA; junio/agosto íntegros.")
+
+# [Anotación · líneas 677–703] Partición fija de junio para la BO: con set.seed(727777), dentro de cada clase
+#   (BAJA+1, BAJA+2, CONTINUA) sortea el 20% de las filas como validación y deja el resto como entrenamiento. La
+#   guarda en el checkpoint bo/split, la relee, la valida e imprime las fracciones.
+#%% celda 9 [código]
+# BLOQUE 7 — Split BO fijo, estratificado en tres clases y persistido #####
+SPLIT_ID <- firma(list(pipe=PIPE_ID,mes=202106L,pct=0.20,seed=727777L,
+  criterio="ESTRATIFICADO_CLASE_TERNARIA"))
+ck <- abrir_checkpoint("bo/split",SPLIT_ID)
+if (is.null(ck)) {
+  part <- JUNIO[,.(numero_de_cliente,clase_ternaria)]
+  part[,split := "train"]
+  set.seed(727777L,kind="L'Ecuyer-CMRG",normal.kind="Inversion",sample.kind="Rejection")
+  for (cl in c("BAJA+1","BAJA+2","CONTINUA")) {
+    idx <- which(part$clase_ternaria==cl)
+    valid_idx <- sample(idx,size=as.integer(round(length(idx)*0.20)))
+    set(part,i=valid_idx,j="split",value="valid")
+  }
+  d <- iniciar_checkpoint("bo/split")
+  csv_atomico(part,file.path(d,"particion_junio_80_20.csv"))
+  csv_atomico(part[,.(N=.N),by=.(clase_ternaria,split)],file.path(d,"conteos_strata.csv"))
+  cerrar_checkpoint("bo/split",SPLIT_ID)
+}
+part <- fread(file.path(ck_dir("bo/split"),"particion_junio_80_20.csv"))
+validar_ids(part$numero_de_cliente,JUNIO$numero_de_cliente)
+stopifnot(!anyNA(part$split),all(part$split %in% c("train","valid")),
+          all(part$clase_ternaria==JUNIO$clase_ternaria),
+          !length(intersect(part[split=="train",numero_de_cliente],
+                            part[split=="valid",numero_de_cliente])))
+print(part[,.(N=.N,fraccion=.N/sum(JUNIO$clase_ternaria==clase_ternaria[1L])),
+  by=.(clase_ternaria,split)][order(clase_ternaria,split)])
+
+# [Anotación · líneas 705–714] Espacio de búsqueda: num_iterations 64–4096, num_leaves 16–2048,
+#   min_sum_hessian_in_leaf 0,000001–0,1. BO_ID firma el método con 10 puntos iniciales y 10 de EI.
+#%% celda 10 [código]
+# BLOQUE 8 — BO E012: Kriging + EI; 10 LHS + 10 EGO #####
+dominio_BO <- function() ps(
+  num_iterations=p_int(lower=64L,upper=4096L),
+  num_leaves=p_int(lower=16L,upper=2048L),
+  min_sum_hessian_in_leaf=p_dbl(lower=1e-6,upper=0.1)
+)
+BO_ID <- firma(list(pipe=PIPE_ID,split=SPLIT_ID,metodo="REGR_KM_BFGS_EI_RANDOM1000_EGO",
+                   iniciales=10L,EI=10L,seed=727777L,escala="LINEAL"))
+BO_CTX <- new.env(parent=emptyenv())
+
+# [Anotación · líneas 716–740] objetivo_BO(): entrena con el 80% de junio y la semilla 727777, predice el 20%
+#   restante y calcula AUC y Brier; devuelve el AUC como métrica a maximizar y vuelve a fijar la semilla.
+# Función global: al serializar el motor NO se incrustan matrices de entrenamiento.
+objetivo_BO <- function(xs) {
+  hp <- hp_lista(xs)
+  if (!identical(hp,BO_CTX$hp)) stop("La propuesta BO no coincide con el checkpoint pendiente.")
+  t0 <- proc.time()[["elapsed"]]
+  resultado <- ajustar_E012(BO_CTX$X,BO_CTX$y,BO_CTX$Xvalid,hp,PARAM$seed_BO)
+  pred <- copy(BO_CTX$valid)
+  pred[,prediction := resultado$p]
+  auc <- auc_binaria(pred$binaria2,pred$prediction)
+  stopifnot(is.finite(auc))
+  BO_CTX$resultado <- list(pred=pred,meta=data.table(
+    eval_id=BO_CTX$eval_id,origen=BO_CTX$origen,
+    num_iterations=hp$num_iterations,num_leaves=hp$num_leaves,
+    min_sum_hessian_in_leaf=hp$min_sum_hessian_in_leaf,
+    seed=PARAM$seed_BO,AUC=auc,
+    brier=mean((pred$prediction-pred$binaria2)^2),
+    contexto="HOLDOUT_20PC_JUNIO_NO_GANANCIA_COMPLETA",feature_id=FEATURE_ID,
+    n_train=nrow(BO_CTX$X),n_valid=nrow(pred),
+    seg_entrenamiento=resultado$seg_entrenamiento,seg_prediccion=resultado$seg_prediccion,
+    seg_evaluacion=proc.time()[["elapsed"]]-t0-resultado$seg_entrenamiento,
+    seg_total=proc.time()[["elapsed"]]-t0))
+  # Reset presente en SAFE efectivamente ejecutado y en Pasquini.
+  set.seed(PARAM$seed_BO,kind="L'Ecuyer-CMRG",normal.kind="Inversion",sample.kind="Rejection")
+  list(metrica=auc)
+}
+# [Anotación · líneas 741–784] Motor de la BO (instancia bbotk con tope de 20 evaluaciones, surrogate Kriging
+#   regr.km, adquisición EI con búsqueda al azar de 1.000 puntos), propuesta del siguiente punto, guardado y
+#   reposición del generador aleatorio y validación del estado guardado (10 puntos LHS).
+nuevo_motor_BO <- function(fun=objetivo_BO) {
+  instancia <- OptimInstanceBatchSingleCrit$new(
+    objective=ObjectiveRFun$new(fun=fun,domain=dominio_BO(),
+      codomain=ps(metrica=p_dbl(tags="maximize")),id="BO_E012_JUNIO_80_20"),
+    terminator=trm("evals",n_evals=PARAM$n_total))
+  surrogate <- srlrn(lrn("regr.km",optim.method="BFGS",nugget.estim=TRUE,
+                         control=list(trace=FALSE)))
+  acq <- acqf("ei")
+  acqopt <- acqo(optimizer=opt("random_search",batch_size=1000),
+                terminator=trm("evals",n_evals=1000))
+  surrogate$archive <- instancia$archive
+  acq$surrogate <- surrogate
+  acqopt$acq_function <- acq
+  list(instance=instancia,surrogate=surrogate,acq_function=acq,acq_optimizer=acqopt)
+}
+proponer_EI <- function(motor) {
+  # Las mismas tres llamadas del cuerpo de bayesopt_ego(), separadas para poder
+  # confirmar la propuesta ANTES de entrenar. No se cambia el optimizador de EI.
+  motor$surrogate$archive <- motor$instance$archive
+  motor$acq_function$surrogate <- motor$surrogate
+  motor$acq_optimizer$acq_function <- motor$acq_function
+  motor$surrogate$update()
+  motor$acq_function$update()
+  x <- motor$acq_optimizer$optimize()
+  as.data.table(x)[,..hp_campos]
+}
+guardar_rng <- function() list(kind=RNGkind(),seed=get(".Random.seed",envir=.GlobalEnv))
+restaurar_rng <- function(rng) {
+  do.call(RNGkind,as.list(rng$kind))
+  assign(".Random.seed",rng$seed,envir=.GlobalEnv)
+}
+validar_estado_BO <- function(z,n) {
+  stopifnot(identical(z$bo_id,BO_ID),nrow(z$historia)==n,
+            z$motor$instance$archive$n_evals==n,
+            nrow(z$lhs)==10L,identical(names(z$lhs),hp_campos))
+  if (n) {
+    stopifnot(identical(as.integer(z$historia$eval_id),seq_len(n)))
+    ar <- z$motor$instance$archive$data
+    stopifnot(isTRUE(all.equal(ar$metrica,z$historia$AUC,tolerance=1e-14)))
+    for (v in hp_campos) stopifnot(isTRUE(all.equal(as.numeric(ar[[v]]),
+      as.numeric(z$historia[[v]]),tolerance=1e-14)))
+  }
+  invisible(TRUE)
+}
+
+# [Anotación · líneas 786–815] ejecutar_BO(), inicio: genera el diseño LHS de 10 puntos bajo la semilla 727777
+#   si no hay checkpoint bo/inicio, recupera las evaluaciones cerradas y devuelve el estado sin entrenar si la
+#   selección ya está fijada, no queda tiempo o ya hay 20 evaluaciones.
+ejecutar_BO <- function() {
+  on.exit({rm(list=ls(BO_CTX),envir=BO_CTX);gc(verbose=FALSE)},add=TRUE)
+  if (is.null(abrir_checkpoint("bo/inicio",BO_ID))) {
+    set.seed(PARAM$seed_BO,kind="L'Ecuyer-CMRG",normal.kind="Inversion",sample.kind="Rejection")
+    lhs <- paradox::generate_design_lhs(dominio_BO(),n=10L)$data
+    lhs <- lhs[,..hp_campos]
+    lhs[,`:=`(num_iterations=as.integer(num_iterations),num_leaves=as.integer(num_leaves))]
+    stopifnot(nrow(lhs)==10L,!anyDuplicated(lhs))
+    motor <- nuevo_motor_BO()
+    set.seed(PARAM$seed_BO,kind="L'Ecuyer-CMRG",normal.kind="Inversion",sample.kind="Rejection")
+    estado <- list(bo_id=BO_ID,motor=motor,lhs=lhs,historia=data.table(),
+                   rng=guardar_rng(),seg_acumulados=0)
+    d <- iniciar_checkpoint("bo/inicio")
+    rds_atomico(estado,file.path(d,"estado.rds"))
+    csv_atomico(lhs,file.path(d,"LHS_10.csv"))
+    cerrar_checkpoint("bo/inicio",BO_ID)
+  }
+  ultima <- "bo/inicio"; n <- 0L
+  # Recuperación automática de TODOS los trabajos confirmados, en orden; no replay de modelos.
+  for (i in seq_len(PARAM$n_total)) {
+    key <- sprintf("bo/eval_%02d",i)
+    ck <- abrir_checkpoint(key,firma(list(bo=BO_ID,eval_id=i)))
+    if (is.null(ck)) break
+    ultima <- key; n <- i
+  }
+  estado <- readRDS(file.path(ck_dir(ultima),"estado.rds"))
+  validar_estado_BO(estado,n)
+  fijada <- abrir_checkpoint("bo/seleccion",BO_ID)
+  if (!is.null(fijada) || solo_ensembles || !hay_tiempo() ||
+      estado$seg_acumulados>=bo_horas*3600 || n==PARAM$n_total) return(estado)
+
+# [Anotación · líneas 817–851] Arma las matrices de entrenamiento (filas train de la partición) y de
+#   validación (filas valid). En cada vuelta toma la propuesta pendiente guardada o genera una nueva (fila del
+#   LHS para las evaluaciones 1 a 10, EI desde la 11) y la guarda en un checkpoint antes de entrenar.
+  it <- which(part$split=="train"); iv <- which(part$split=="valid")
+  BO_CTX$X <- matriz_E012(JUNIO[it]); BO_CTX$y <- JUNIO$binaria2[it]
+  BO_CTX$Xvalid <- matriz_E012(JUNIO[iv])
+  BO_CTX$valid <- JUNIO[iv,.(numero_de_cliente,foto_mes,clase_ternaria,binaria2)]
+  rm(it,iv); gc(verbose=FALSE)
+  base_tiempo <- estado$seg_acumulados
+  inicio_sesion <- proc.time()[["elapsed"]]
+  while (n<PARAM$n_total) {
+    gastado <- base_tiempo+proc.time()[["elapsed"]]-inicio_sesion
+    if (gastado>=bo_horas*3600 || !hay_tiempo()) break
+    i <- n+1L
+    key_p <- sprintf("bo/propuesta_%02d",i)
+    sig_p <- firma(list(bo=BO_ID,propuesta=i))
+    ck_p <- abrir_checkpoint(key_p,sig_p)
+    if (!is.null(ck_p)) {
+      pendiente <- readRDS(file.path(ck_dir(key_p),"pendiente.rds"))
+      estado <- pendiente$estado
+      hp <- pendiente$hp
+      validar_estado_BO(estado,n)
+      restaurar_rng(estado$rng)
+      message("Reanudando la misma propuesta BO ",i)
+    } else {
+      restaurar_rng(estado$rng)
+      hp <- if (i<=10L) copy(estado$lhs[i]) else proponer_EI(estado$motor)
+      hp <- as.data.table(hp_lista(hp))
+      # El continuo de Hessian hace improbable una repetición; nunca la reentrenamos silenciosamente.
+      if (n && any(vapply(seq_len(n),function(k)
+          identical(hp_lista(estado$historia[k]),hp_lista(hp)),logical(1))))
+        stop("EI propuso HP ya evaluados; revisar la adquisición sin repetir entrenamiento.")
+      estado$rng <- guardar_rng()
+      d <- iniciar_checkpoint(key_p)
+      rds_atomico(list(estado=estado,hp=hp),file.path(d,"pendiente.rds"))
+      csv_atomico(hp,file.path(d,"hiperparametros.csv"))
+      cerrar_checkpoint(key_p,sig_p)
+    }
+# [Anotación · líneas 852–876] Evalúa la propuesta, agrega el resultado a la historia y cierra el checkpoint
+#   de la evaluación con las predicciones del 20% de junio, las métricas, el historial y el estado. Imprime AUC,
+#   Brier y minutos.
+    # El backup de la propuesta también consume tiempo: volver a consultar el límite.
+    if (base_tiempo+proc.time()[["elapsed"]]-inicio_sesion>=bo_horas*3600 || !hay_tiempo()) break
+    BO_CTX$hp <- hp_lista(hp); BO_CTX$eval_id <- i
+    BO_CTX$origen <- if (i<=10L) "LHS" else "EI"
+    message("BO ",i,"/20: ",paste(unlist(BO_CTX$hp),collapse=" / "))
+    restaurar_rng(estado$rng)
+    estado$motor$instance$eval_batch(hp)
+    z <- BO_CTX$resultado
+    estado$historia <- rbindlist(list(estado$historia,z$meta),use.names=TRUE,fill=TRUE)
+    estado$rng <- guardar_rng()
+    estado$seg_acumulados <- base_tiempo+proc.time()[["elapsed"]]-inicio_sesion
+    validar_estado_BO(estado,i)
+    key <- sprintf("bo/eval_%02d",i); d <- iniciar_checkpoint(key)
+    csv_atomico(z$pred,file.path(d,"predicciones_junio.csv"))
+    csv_atomico(z$meta,file.path(d,"metricas.csv"))
+    csv_atomico(estado$historia,file.path(d,"historial_BO.csv"))
+    rds_atomico(estado,file.path(d,"estado.rds"))
+    cerrar_checkpoint(key,firma(list(bo=BO_ID,eval_id=i)))
+    n <- i
+    message(sprintf("BO %d confirmada: AUC %.8f | Brier %.6f | %.1f min",
+                    i,z$meta$AUC,z$meta$brier,z$meta$seg_total/60))
+    rm(z); BO_CTX$resultado <- NULL; gc(verbose=FALSE)
+  }
+  estado
+}
+
+# [Anotación · líneas 878–915] Redefine gcs_comando() con la misma lógica y expresiones regulares que piden
+#   404 y 403 como palabras completas. La celda siguiente vuelve a poner respaldo_GCS en FALSE.
+#%% celda 11 [código]
+gcs_comando <- function(args, permitir_ausente=FALSE) {
+  err <- tempfile()
+  on.exit(unlink(err), add=TRUE)
+
+  out <- suppressWarnings(system2(
+    gcloud, vapply(c(args, "--quiet"), shQuote, character(1)),
+    stdout=TRUE, stderr=err
+  ))
+
+  status <- attr(out, "status")
+
+  if (!is.null(status) && status != 0L) {
+    detalle <- paste(readLines(err, warn=FALSE), collapse="\n")
+
+    ausente <- grepl(
+      "(?i)(\\b404\\b|not found|no such object|matched no objects|no urls matched|does not exist)",
+      detalle, perl=TRUE
+    )
+
+    permisos <- grepl(
+      "(?i)(\\b403\\b|permission|forbidden|access denied)",
+      detalle, perl=TRUE
+    )
+
+    if (permitir_ausente && ausente && !permisos)
+      return(NULL)
+
+    stop("GCS falló; no se inicia el siguiente trabajo. ", detalle)
+  }
+
+  out
+}
+
+#%% celda 12 [código]
+respaldo_GCS <- FALSE
+message("GCS interno desactivado; checkpoints locales activos")
+print(respaldo_GCS)
+
+# [Anotación · líneas 917–945] Ejecuta o reanuda la BO, ordena la historia por AUC descendente (empates por
+#   evaluación más temprana) y guarda la primera como selección en bo/seleccion. HP queda con esos
+#   hiperparámetros. Según la salida guardada: 20 evaluaciones (10 LHS + 10 EI), elegida la 17 con AUC
+#   0,9116981, num_iterations=2077, num_leaves=682, min_sum_hessian_in_leaf=0,0626847.
+#%% celda 13 [código]
+# BLOQUE 9 — Reanudar BO y congelar HP ganadores por AUC #####
+estado_BO <- ejecutar_BO()
+HIST_BO <- estado_BO$historia
+if (!nrow(HIST_BO)) stop("No hay evaluaciones BO terminadas. Ampliar bo_horas/límite y reanudar.")
+if (is.null(abrir_checkpoint("bo/seleccion",BO_ID))) {
+  if (solo_ensembles) stop("No existe selección congelada; ejecutar el pipeline para crearla.")
+  ranking <- copy(HIST_BO)
+  setorder(ranking,-AUC,eval_id)
+  seleccion <- list(hp=hp_lista(ranking[1]),eval_id=ranking$eval_id[1],
+    auc=ranking$AUC[1],brier=ranking$brier[1],n_evaluaciones=nrow(HIST_BO),
+    n_LHS=sum(HIST_BO$origen=="LHS"),n_EI=sum(HIST_BO$origen=="EI"),
+    bo_id=BO_ID,feature_id=FEATURE_ID,criterio="AUC_HOLDOUT_JUNIO_20PC",
+    cierre=if(nrow(HIST_BO)==20L) "20_EVALUACIONES" else "PRESUPUESTO_O_LIMITE")
+  d <- iniciar_checkpoint("bo/seleccion")
+  rds_atomico(seleccion,file.path(d,"seleccion.rds"))
+  csv_atomico(ranking,file.path(d,"ranking_AUC.csv"))
+  cerrar_checkpoint("bo/seleccion",BO_ID)
+}
+seleccion <- readRDS(file.path(ck_dir("bo/seleccion"),"seleccion.rds"))
+HP <- seleccion$hp
+HP_ID <- firma(list(bo=BO_ID,seleccion=seleccion))
+stopifnot(seleccion$n_evaluaciones==nrow(HIST_BO),identical(seleccion$feature_id,FEATURE_ID))
+message("HP congelados tras ",seleccion$n_evaluaciones," evaluaciones (",
+        seleccion$n_LHS," LHS + ",seleccion$n_EI," EI). BO posterior no se mezcla con esta producción.")
+print(data.table(eval_id=seleccion$eval_id,AUC=seleccion$auc,
+  Brier_holdout=seleccion$brier,as.data.table(HP)))
+rm(estado_BO)
+gc(verbose=FALSE)
+
+# [Anotación · líneas 947–960] Celda con todas sus líneas comentadas: una envoltura de gcs_comando() para
+#   tratar como ausente un error terminado en 'not found: 404'. No se ejecuta.
+#%% celda 14 [código]
+# gcs_comando_original <- gcs_comando
+
+# gcs_comando <- function(args, permitir_ausente=FALSE) {
+#   tryCatch(
+#     gcs_comando_original(args, permitir_ausente),
+#     error=function(e) {
+#       if (permitir_ausente &&
+#           grepl("not found: 404\\.?$", conditionMessage(e), ignore.case=TRUE))
+#         return(NULL)
+#       stop(e)
+#     }
+#   )
+# }
+
+# [Anotación · líneas 962–976] Clave y firma del checkpoint de cada semilla y leer_pred_semilla(), que
+#   devuelve las probabilidades de agosto de una semilla ya cerrada, validadas contra el universo.
+#%% celda 15 [código]
+# BLOQUE 10 — Predicción agosto por semilla; checkpoints GCS #####
+clave_semilla <- function(s) paste0("produccion/seed_",s)
+firma_semilla <- function(s) firma(list(pipe=PIPE_ID,split=SPLIT_ID,hp=HP_ID,
+  mes_train=202106L,mes_score=202108L,seed=as.integer(s)))
+leer_pred_semilla <- function(s) {
+  key <- clave_semilla(s)
+  if (is.null(abrir_checkpoint(key,firma_semilla(s)))) return(NULL)
+  meta <- readRDS(file.path(ck_dir(key),"meta.rds"))
+  stopifnot(identical(meta$hp_id,HP_ID),identical(meta$feature_id,FEATURE_ID),meta$seed==s)
+  p <- fread(file.path(ck_dir(key),"predicciones_agosto.csv"))
+  validar_ids(p$numero_de_cliente,UNIVERSO)
+  validar_prob(p$prediction,length(UNIVERSO))
+  p
+}
+# [Anotación · líneas 977–999] generar_ensemble(), agregación: entre las semillas disponibles suma las
+#   probabilidades y también las posiciones de cada semilla (frank(-probabilidad), empates promedio). Calcula
+#   prediction_media y rank_medio dividiendo por la cantidad de semillas y define la carpeta
+#   ensembles/nNN_<firma>.
+# Ambas agregaciones son diferentes: average(p) != average(rank(p)).
+# Rank ascendente numérico es la posición de mayor probabilidad (rank=1).
+generar_ensemble <- function(max_semillas=n_semillas) {
+  permitidas <- PARAM$semillas[seq_len(max_semillas)]
+  suma_p <- numeric(length(UNIVERSO))
+  suma_rank <- numeric(length(UNIVERSO))
+  usadas <- integer()
+  for (s in permitidas) {
+    p <- leer_pred_semilla(s)
+    if (is.null(p)) next
+    suma_p <- suma_p+p$prediction
+    # E012 original: frank(-prediction, ties.method="average").
+    # El desempate por ID aplica SOLO al ordenar el ensemble/submission.
+    rk <- frank(-p$prediction,ties.method="average")
+    suma_rank <- suma_rank+rk
+    usadas <- c(usadas,s)
+  }
+  n <- length(usadas)
+  if (!n) return(list(n=0L,completo=FALSE,carpeta=NA_character_))
+  ens <- data.table(numero_de_cliente=UNIVERSO,prediction_media=suma_p/n,rank_medio=suma_rank/n)
+  sig <- firma(list(pipe=PIPE_ID,hp=HP_ID,semillas=usadas,
+                    agregacion=c("prediction_media","rank_medio"),cortes=PARAM$cortes))
+  key <- paste0("ensembles/n",sprintf("%02d",n),"_",substr(sig,1,12))
+# [Anotación · líneas 1000–1032] Escribe ensemble_agosto_ambos_criterios.csv (numero_de_cliente,
+#   prediction_media, rank_medio). Para cada criterio ordena (probabilidad media descendente o rank medio
+#   ascendente; empates por ID como texto), guarda el ranking y, para cada uno de los 13 cortes de 9.000 a
+#   15.000, un archivo de IDs sin encabezado que relee y comprueba. Guarda el manifiesto de listas y meta.rds.
+  if (is.null(abrir_checkpoint(key,sig))) {
+    d <- iniciar_checkpoint(key)
+    csv_atomico(ens,file.path(d,"ensemble_agosto_ambos_criterios.csv"))
+    submits <- list()
+    for (tipo in c("prediction_media","rank_medio")) {
+      orden <- if (tipo=="prediction_media")
+        order(-ens$prediction_media,as.character(ens$numero_de_cliente),method="radix") else
+        order(ens$rank_medio,as.character(ens$numero_de_cliente),method="radix")
+      ranking <- ens[orden,.(numero_de_cliente,prediction_media,rank_medio)]
+      ranking[,posicion := seq_len(.N)]
+      csv_atomico(ranking,file.path(d,paste0(tipo,"_ranking_agosto.csv")))
+      for (topN in PARAM$cortes) {
+        arch <- paste0("E012_RAW_T4_BO",sprintf("%02d",seleccion$eval_id),"_",
+          tipo,"_n",sprintf("%02d",n),"_top",topN,".csv")
+        csv_atomico(ranking[seq_len(topN),.(numero_de_cliente)],file.path(d,arch),encabezado=FALSE)
+        ids <- fread(file.path(d,arch),header=FALSE)[[1L]]
+        stopifnot(length(ids)==topN,!anyDuplicated(ids))
+        validar_ids(ids,ranking$numero_de_cliente[seq_len(topN)])
+        submits[[length(submits)+1L]] <- data.table(tipo=tipo,n_semillas=n,
+          topN=topN,archivo=arch,md5=md5(file.path(d,arch)))
+      }
+    }
+    csv_atomico(rbindlist(submits),file.path(d,"manifiesto_submissions.csv"))
+    rds_atomico(list(hp=HP,hp_id=HP_ID,feature_id=FEATURE_ID,
+      semillas=usadas,n_semillas=n,objetivo_al_crear=max_semillas,
+      metodos=c("media probabilidades","frank(-prob) por seed con empates promedio; desempate final ID texto ascendente")),
+      file.path(d,"meta.rds"))
+    cerrar_checkpoint(key,sig)
+    message("Ensemble E012 de ",n," semillas; 2 criterios × ",length(PARAM$cortes),
+            " submissions, verificados y respaldados.")
+  }
+  list(n=n,completo=n==max_semillas,carpeta=ck_dir(key),checkpoint=key)
+}
+# [Anotación · líneas 1033–1061] ejecutar_produccion(): exporta el ensemble con lo disponible; luego arma la
+#   matriz con junio completo (164.114 filas) y la de agosto (164.647) y, para cada semilla sin checkpoint entre
+#   las primeras n_semillas, entrena, guarda predicciones_agosto.csv y metadatos, cierra el checkpoint y
+#   regenera el ensemble.
+ejecutar_produccion <- function() {
+  estado <- generar_ensemble()
+  if (estado$completo || solo_ensembles || !hay_tiempo()) return(estado)
+  X <- matriz_E012(JUNIO); y <- JUNIO$binaria2
+  Xscore <- matriz_E012(AGOSTO)
+  stopifnot(!anyNA(y),nrow(X)==164114L,nrow(Xscore)==164647L,
+            identical(colnames(X),colnames(Xscore)))
+  for (s in PARAM$semillas[seq_len(n_semillas)]) {
+    key <- clave_semilla(s); sig <- firma_semilla(s)
+    if (!is.null(abrir_checkpoint(key,sig))) next
+    if (!hay_tiempo()) break
+    d <- iniciar_checkpoint(key)
+    message("E012 producción seed ",s," (junio FULL => agosto)")
+    z <- ajustar_E012(X,y,Xscore,HP,s,
+      modelo_archivo=if (guardar_modelos) file.path(d,"modelo.txt") else NULL)
+    p <- data.table(numero_de_cliente=UNIVERSO,prediction=z$p)
+    validar_ids(p$numero_de_cliente,UNIVERSO)
+    csv_atomico(p,file.path(d,"predicciones_agosto.csv"))
+    rds_atomico(list(seed=as.integer(s),hp=HP,hp_id=HP_ID,
+      feature_id=FEATURE_ID,train=202106L,score=202108L,n_train=nrow(X),
+      n_score=length(UNIVERSO),seg_entrenamiento=z$seg_entrenamiento,
+      seg_prediccion=z$seg_prediccion),file.path(d,"meta.rds"))
+    cerrar_checkpoint(key,sig)
+    rm(z,p);gc(verbose=FALSE)
+    # Primera submission tras seed 1, otras tras cada seed; seed 5 queda garantizada.
+    estado <- generar_ensemble()
+  }
+  generar_ensemble()
+}
+
+# [Anotación · líneas 1063–1077] Ejecuta la producción con n_semillas=10 e informa cuántas semillas quedan
+#   listas. La celda siguiente cambia n_semillas a 20 y vuelve a ejecutar la producción, que entrena sólo las
+#   semillas que faltan; cada cantidad de semillas deja su propia carpeta de ensemble (el notebook 3 lee la de
+#   12).
+#%% celda 16 [código]
+# BLOQUE 11 — Ejecutar producción prioritaria: cinco y luego diez semillas #####
+# La misma función confirma un checkpoint por semilla y ensambla tras cada una.
+# Las 5 primeras están antes que las adicionales en PARAM$semillas.
+PRODUCCION <- ejecutar_produccion()
+if (PRODUCCION$n>=5L) message("CINCO semillas de producción y ambos ensembles disponibles.")
+if (PRODUCCION$n<n_semillas)
+  message("Producción parcial: ",PRODUCCION$n,"/",n_semillas,
+          ". Reanudar para completar las faltantes.")
+print(data.table(semillas_listas=PRODUCCION$n,objetivo=n_semillas,
+  ruta=PRODUCCION$carpeta))
+
+#%% celda 17 [código]
+n_semillas <- 20L
+PRODUCCION <- ejecutar_produccion()
+
+# [Anotación · líneas 1079–1116] OOF de junio, preparación: crear_folds() reparte las filas de junio en 5
+#   folds dentro de cada clase ternaria con set.seed(727777) y los guarda; leer_oof_fold() devuelve las
+#   predicciones de un fold ya cerrado. Esta parte se ejecuta después de la producción y no interviene en las
+#   predicciones de agosto.
+#%% celda 18 [código]
+# BLOQUE 12 — Folds OOF junio (tres clases, deterministas, postproducción) #####
+OOF_ID <- firma(list(pipe=PIPE_ID,split=SPLIT_ID,hp=HP_ID,
+  criterio="5_FOLDS_ESTRATIFICADOS_TERNARIA",seed=727777L,mes=202106L))
+crear_folds <- function() {
+  ck <- abrir_checkpoint("oof/folds",OOF_ID)
+  if (!is.null(ck)) {
+    f <- fread(file.path(ck_dir("oof/folds"),"folds.csv"))
+  } else {
+    f <- JUNIO[,.(numero_de_cliente,clase_ternaria)]
+    f[,fold := NA_integer_]
+    set.seed(727777L,kind="L'Ecuyer-CMRG",normal.kind="Inversion",sample.kind="Rejection")
+    for (cl in c("BAJA+1","BAJA+2","CONTINUA")) {
+      idx <- which(f$clase_ternaria==cl)
+      sh <- sample(idx,length(idx))
+      set(f,i=sh,j="fold",value=rep(1:5,length.out=length(sh)))
+    }
+    d <- iniciar_checkpoint("oof/folds")
+    csv_atomico(f,file.path(d,"folds.csv"))
+    csv_atomico(f[,.(N=.N),by=.(fold,clase_ternaria)],file.path(d,"conteos_fold.csv"))
+    cerrar_checkpoint("oof/folds",OOF_ID)
+  }
+  validar_ids(f$numero_de_cliente,JUNIO$numero_de_cliente)
+  stopifnot(!anyNA(f$fold),all(f$fold %in% 1:5),
+            all(f$clase_ternaria==JUNIO$clase_ternaria))
+  f
+}
+leer_oof_fold <- function(seed,k,ff) {
+  key <- paste0("oof/seed_",seed,"/fold_",k)
+  sig <- firma(list(oof=OOF_ID,seed=as.integer(seed),fold=as.integer(k)))
+  if (is.null(abrir_checkpoint(key,sig))) return(NULL)
+  d <- fread(file.path(ck_dir(key),"predicciones.csv"))
+  ids <- JUNIO$numero_de_cliente[which(ff$fold==k)]
+  validar_ids(d$numero_de_cliente,ids)
+  validar_prob(d$prediction,length(ids))
+  stopifnot(all(d$fold==k))
+  d
+}
+# [Anotación · líneas 1117–1153] ejecutar_oof(): sólo corre si ejecutar_OOF es TRUE y la producción está
+#   completa. Para cada una de las primeras n_semillas_OOF=5 semillas y cada fold entrena con los otros cuatro
+#   folds y predice el fold, con un checkpoint por semilla y fold.
+ejecutar_oof <- function() {
+  if (!ejecutar_OOF || solo_ensembles || !isTRUE(PRODUCCION$completo)) {
+    message("OOF no ejecutada: desactivada o producción pendiente.")
+    return(invisible(NULL))
+  }
+  ff <- crear_folds()
+  X <- NULL
+  for (s in PARAM$semillas[seq_len(n_semillas_OOF)]) {
+    preds <- rep(NA_real_,nrow(JUNIO))
+    for (k in 1:5) {
+      it <- which(ff$fold!=k);iv <- which(ff$fold==k)
+      stopifnot(!length(intersect(JUNIO$numero_de_cliente[it],JUNIO$numero_de_cliente[iv])))
+      p <- leer_oof_fold(s,k,ff)
+      if (is.null(p)) {
+        if (!hay_tiempo()) {
+          message("Deadline: OOF pausada en seed ",s," fold ",k)
+          return(invisible(NULL))
+        }
+        if (is.null(X)) X <- matriz_E012(JUNIO)
+        key <- paste0("oof/seed_",s,"/fold_",k)
+        sig <- firma(list(oof=OOF_ID,seed=as.integer(s),fold=as.integer(k)))
+        d <- iniciar_checkpoint(key)
+        message("E012 OOF: seed ",s," fold ",k,"/5")
+        z <- ajustar_E012(X[it,,drop=FALSE],JUNIO$binaria2[it],
+          X[iv,,drop=FALSE],HP,s,
+          modelo_archivo=if(guardar_modelos) file.path(d,"modelo.txt") else NULL)
+        p <- JUNIO[iv,.(numero_de_cliente,foto_mes,clase_ternaria,binaria2)]
+        p[,`:=`(fold=k,seed=as.integer(s),prediction=z$p)]
+        csv_atomico(p,file.path(d,"predicciones.csv"))
+        rds_atomico(list(seed=s,fold=k,hp_id=HP_ID,feature_id=FEATURE_ID,
+          n_train=length(it),n_valid=length(iv),seg_entrenamiento=z$seg_entrenamiento),
+          file.path(d,"meta.rds"))
+        cerrar_checkpoint(key,sig)
+        rm(z);gc(verbose=FALSE)
+      }
+      preds[iv] <- p$prediction
+    }
+# [Anotación · líneas 1154–1173] Por semilla calcula sobre junio completo el AUC, la curva de ganancia,
+#   GainBand (promedio de la ganancia acumulada en 11.500, 12.000, 12.500, 13.000 y 13.500) y la ganancia en
+#   12.500, y guarda las predicciones fuera de fold, la curva completa, la ganancia en los cortes y las
+#   métricas.
+    validar_prob(preds,nrow(JUNIO))
+    key <- paste0("oof/resumen_seed_",s)
+    sig <- firma(list(oof=OOF_ID,seed=as.integer(s),resumen="GAIN_JUNIO_COMPLETO"))
+    if (is.null(abrir_checkpoint(key,sig))) {
+      d <- iniciar_checkpoint(key)
+      curva <- curva_ganancia(JUNIO,preds)
+      metricas <- data.table(seed=s,auc=auc_binaria(JUNIO$binaria2,preds),
+        GainBand=mean(curva$ganancia_acumulada[PARAM$gainband]),
+        ganancia_top12500=curva$ganancia_acumulada[12500L],
+        n_junio=nrow(JUNIO),n_folds=5L,independiente_BO=FALSE)
+      csv_atomico(JUNIO[,.(numero_de_cliente,foto_mes,clase_ternaria,binaria2)][,
+        prediction := preds],file.path(d,"OOF_junio.csv"))
+      csv_atomico(curva,file.path(d,"curva_completa.csv"))
+      csv_atomico(curva[cutoff %in% PARAM$cortes],file.path(d,"ganancia_topN.csv"))
+      csv_atomico(metricas,file.path(d,"metricas.csv"))
+      cerrar_checkpoint(key,sig)
+      message(sprintf("OOF seed %d: AUC %.7f | GainBand %.3f M",s,
+                      metricas$auc,metricas$GainBand/1e6))
+    }
+  }
+# [Anotación · líneas 1174–1197] Reúne las métricas de las semillas disponibles, imprime media, desvío, mínimo
+#   y máximo de AUC y GainBand y guarda el agregado en un checkpoint.
+  disponible <- rbindlist(lapply(PARAM$semillas[1:n_semillas_OOF],function(s) {
+    key <- paste0("oof/resumen_seed_",s)
+    sig <- firma(list(oof=OOF_ID,seed=as.integer(s),resumen="GAIN_JUNIO_COMPLETO"))
+    if (is.null(abrir_checkpoint(key,sig))) return(NULL)
+    fread(file.path(ck_dir(key),"metricas.csv"))
+  }),fill=TRUE)
+  if (nrow(disponible)) {
+    print(disponible)
+    print(disponible[,.(semillas=.N,AUC_media=mean(auc),AUC_sd=if(.N>1)sd(auc) else NA_real_,
+      GainBand_media=mean(GainBand),GainBand_sd=if(.N>1)sd(GainBand) else NA_real_,
+      GainBand_min=min(GainBand),GainBand_max=max(GainBand))])
+    sig <- firma(list(oof=OOF_ID,seeds=disponible$seed,resumen="AGREGADO"))
+    key <- paste0("oof/agregado_n",nrow(disponible),"_",substr(sig,1,12))
+    if (is.null(abrir_checkpoint(key,sig))) {
+      d <- iniciar_checkpoint(key)
+      csv_atomico(disponible,file.path(d,"metricas_por_semilla.csv"))
+      csv_atomico(disponible[,.(N=.N,AUC_media=mean(auc),AUC_sd=if(.N>1)sd(auc) else NA_real_,
+        GainBand_media=mean(GainBand),GainBand_sd=if(.N>1)sd(GainBand) else NA_real_)],
+        file.path(d,"resumen.csv"))
+      cerrar_checkpoint(key,sig)
+    }
+  }
+  invisible(disponible)
+}
+
+# [Anotación · líneas 1199–1212] Ejecuta la OOF e imprime mensajes de cierre con las semillas de producción
+#   completadas y la carpeta del ensemble. Sigue una celda de texto sobre la recuperación desde checkpoints, el
+#   presupuesto bo_horas, el límite horario y la relación entre la OOF y la BO.
+#%% celda 19 [código]
+# BLOQUE 13 — OOF opcional posterior a la producción #####
+RESUMEN_OOF <- ejecutar_oof()
+message("E012 completó lo habilitado por configuraciones y límite horario.")
+message("Producción: ",PRODUCCION$n,"/",n_semillas," semillas; carpeta: ",PRODUCCION$carpeta)
+message("Submissions: IDs únicos SIN cabecera; tipos prediction_media y rank_medio; topN 9000:15000.")
+message("Nunca se suben automáticamente a Kaggle; los commits GCS son independientes de SAFE.")
+
+#%% celda 20 [texto]
+## Recuperación, límites y trazabilidad
+
+Cada `checkpoints/` confirmado tiene metadatos, tamaño, MD5 de todos sus archivos, COMMIT local y copia GCS inmutable. Al reiniciar otra VM se recupera de GCS antes de entrenar otra vez. Un checkpoint local sin copia remota se termina de respaldar sin volver a entrenar. Las caches grandes RAW T4 se regeneran desde la URL oficial (sin dependencia de Drive). El crudo original permanece intacto. Si hay un cambio de librerías, datos, features o HP, las firmas impiden mezclar resultados.
+
+**Importante sobre deadline:** `bo_horas` es un presupuesto acumulado que permite terminar la BO antes de las 20 evaluaciones, pero una evaluación en curso no se interrumpe. La selección de HP se congela una sola vez; ampliar `bo_horas` después de congelarla no vuelve a optimizar. La producción puede quedar parcial y deja submissions utilizables de cada conjunto de semillas completadas; si se quiere reanudar luego de 23:59 ART hay que actualizar `limite_ART` a `NA_character_`. La OOF se programa al final y exige producción completa de `n_semillas`, salvo que se reduzca ese control para priorizarla. Ninguna OOF posterior se presenta como evaluación externa de la BO.
+
+# [Anotación · líneas 1214–1258] Celda de consulta con ruta absoluta /home/ds/Expe/...: lee la selección de la
+#   BO y las métricas OOF de cinco semillas, promedia entre semillas la ganancia acumulada de junio por corte e
+#   imprime los 10 cortes de mayor ganancia media. No escribe archivos.
+#%% celda 21 [código]
+library(data.table)
+
+base <- "/home/ds/Expe/experimentos/C01_E012_RAW_T4_BO_FINAL_V1/checkpoints"
+
+# 1. HIPERPARÁMETROS GANADORES DE LA BO
+
+sel <- readRDS(file.path(base, "bo/seleccion/seleccion.rds"))
+
+print(sel[c("eval_id", "auc", "n_evaluaciones")])
+print(sel$hp)
+
+# 2. GANANCIA OOF DE JUNIO POR SEMILLA
+
+semillas <- c(727777L, 773777L, 775777L, 777737L, 787777L)
+
+metricas <- rbindlist(lapply(semillas, function(s) {
+  fread(file.path(base, paste0("oof/resumen_seed_", s), "metricas.csv"))
+}))
+
+print(metricas)
+
+print(metricas[, .(
+  AUC_media = mean(auc),
+  GainBand_media = mean(GainBand),
+  ganancia_top12500_media = mean(ganancia_top12500)
+)])
+
+# 3. CURVA DE GANANCIA DE JUNIO, PROMEDIO DE 5 SEMILLAS
+
+curvas <- rbindlist(lapply(semillas, function(s) {
+  x <- fread(file.path(base, paste0("oof/resumen_seed_", s), "ganancia_topN.csv"))
+  x[, seed := s]
+  x
+}))
+
+resumen <- curvas[, .(
+  ganancia_media = mean(ganancia_acumulada),
+  ganancia_sd = sd(ganancia_acumulada),
+  bajas2_media = mean(bajas2_acumuladas)
+), by = cutoff][order(-ganancia_media)]
+
+# 4. MEJORES 10 CUTOFFS DE JUNIO
+
+print(head(resumen, 10))
+
+# [Anotación · líneas 1260–1317] Celda de utilidad con ruta absoluta: busca las carpetas de ensembles
+#   cerradas, elige la que tiene más semillas, comprueba el archivo (164.647 filas, tres columnas,
+#   probabilidades entre 0 y 1) y lo copia a E012_AGOSTO_<NN>_SEMILLAS_PREDICCIONES_COMPLETAS.csv verificando el
+#   MD5 de la copia. El notebook 3 no lee esta copia.
+#%% celda 22 [código]
+library(data.table)
+
+base <- "/home/ds/Expe/experimentos/C01_E012_RAW_T4_BO_FINAL_V1"
+
+# Buscar ensembles terminados
+carpetas <- list.files(
+  file.path(base, "checkpoints", "ensembles"),
+  full.names = TRUE
+)
+carpetas <- carpetas[dir.exists(carpetas)]
+
+carpetas <- carpetas[
+  file.exists(file.path(carpetas, "COMMIT.rds")) &
+  file.exists(file.path(carpetas, "meta.rds")) &
+  file.exists(file.path(carpetas, "ensemble_agosto_ambos_criterios.csv"))
+]
+
+if (!length(carpetas)) stop("No se encontraron ensembles terminados")
+
+# Elegir el que tenga más semillas
+metas <- lapply(carpetas, function(d) readRDS(file.path(d, "meta.rds")))
+ns <- vapply(metas, function(m) m$n_semillas, integer(1))
+i <- which.max(ns)
+
+origen <- file.path(carpetas[i], "ensemble_agosto_ambos_criterios.csv")
+
+# Verificar predicciones
+pred <- fread(origen)
+
+stopifnot(
+  nrow(pred) == 164647L,
+  identical(names(pred), c("numero_de_cliente", "prediction_media", "rank_medio")),
+  !anyNA(pred),
+  !anyDuplicated(pred$numero_de_cliente),
+  all(is.finite(pred$prediction_media)),
+  all(pred$prediction_media >= 0 & pred$prediction_media <= 1)
+)
+
+# Guardar copia fácilmente accesible
+destino <- file.path(
+  base,
+  sprintf("E012_AGOSTO_%02d_SEMILLAS_PREDICCIONES_COMPLETAS.csv", ns[i])
+)
+
+if (!file.copy(origen, destino, overwrite=TRUE))
+  stop("No se pudo copiar el archivo")
+
+stopifnot(
+  identical(
+    unname(tools::md5sum(origen)),
+    unname(tools::md5sum(destino))
+  )
+)
+
+message("Semillas: ", ns[i])
+message("Clientes: ", nrow(pred))
+message("Archivo guardado: ", destino)

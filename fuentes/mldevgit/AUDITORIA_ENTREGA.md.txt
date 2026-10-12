@@ -1,0 +1,67 @@
+# Auditoría de entrega — FINAL Z636 C25 FULL762
+
+**Z636 PACKAGE STATIC AUDIT: PASS**
+
+Alcance: código, features, parámetros, orden, fórmula, verificación del CSV y seguridad del paquete. La reproducción end-to-end está diferida. No se ejecutan fits, tuning, uploads, git add, commit ni push. No se modifica el repositorio de entrega publicado.
+
+Modelo final oficial: Z636 C25 FULL762. Public gain informado: 98.6150 M. Submission ID: 1560-1791746981180245.
+
+LightGBM usa FULL762 y CatBoost FULL457; ambos entrenan April+May+June con pesos .75/1/1 y orden estable cliente/mes. Los hiperparámetros y seeds se conservan, definidos en `src/common.py`. La etapa LightGBM utiliza matrices float64 por lotes para limitar memoria, con valores y orden idénticos al protocolo de referencia. Los temporales propios se eliminan al cerrar las matrices. CatBoost conserva FULL457, tipos numéricos y configuración original.
+
+FULL457:
+`c3578882fcf1adf79df9c20c472864719672522fa2ee9283d4a9b1c0fe080c12`
+
+FULL762:
+`1e9747955f214a8ddcb405af0e3a71d4a516f1818bf829c0d6c14ca0f934e8f6`
+
+CSV final:
+`00534f4c23bb87c5e0962ee615a0f81740cf1e2f3e64232c7af5bc83aae697a0`
+
+## Seguridad y autonomía
+
+Sólo código y documentación. Fuente original en `data/competencia_01.csv`, aportada externamente por el usuario. Las salidas se crean en `output/`, excluido de Git. No hay acceso a modelos, scores o código histórico desde los scripts del paquete. Las referencias del manifiesto son informativas y nunca se resuelven como rutas.
+
+Las proyecciones de modelado y verificación August excluyen target. La ingeniería transporta la columna de target, y sólo audita los meses del train. No se entrena ni selecciona con etiquetas July/August.
+
+Requirements permanece intacto con versiones exactas: numpy 2.5.2, pandas 3.0.5, scipy 1.18.1, scikit-learn 1.9.0, lightgbm 4.7.0, catboost 1.2.10, pyarrow 25.0.0, graphviz 0.21, matplotlib 3.11.1, plotly 7.0.0, six 1.17.0 y python-dateutil 2.9.0.post0. Python 3.12.0. No se agregaron dependencias ni se instalaron paquetes.
+
+## Archivos exactos del paquete
+
+```text
+.gitignore
+AUDITORIA_ENTREGA.md
+README.md
+REPRODUCCION.md
+fuentes_auditadas.json
+requirements.txt
+src/01_feature_engineering.py
+src/02_train_lightgbm.py
+src/03_train_catboost.py
+src/04_build_final_c25.py
+src/05_verify_submission.py
+src/common.py
+```
+
+## Controles ejecutados
+
+- Sintaxis e importación de los seis módulos: PASS; no se invocó ningún fit.
+- Igualdad de FULL457/FULL762 y sus hashes con las referencias: PASS.
+- Fixture de 152 variables: huecos mensuales, enero/febrero y cambio de año, registro existente con NaN, deltas sin imputación e indicadores int8: PASS.
+- Prefijo FULL457 exactamente igual a la implementación anterior: PASS. Valores FULL762 float64 iguales a las funciones puras de la referencia: PASS.
+- Roundtrip de un parquet sintético pequeño y orden cliente/mes: PASS; temporales propios eliminados, fuera del paquete.
+- Seeds, pesos y diccionarios de parámetros comparados por igualdad con las auditorías de referencia: PASS. CatBoost permanece en 457 columnas; LightGBM en 762.
+- Ranking con empate, normalización y combinación en memoria con probabilidades existentes: SHA256 oficial exacto. No se crearon CSV finales ni se incorporaron scores al paquete.
+- Verificador sobre el CSV oficial existente en lectura: 12000 IDs únicos, sin header/index, pertenencia a August usando sólo la columna de IDs y SHA256 exacto: PASS.
+- Requirements intacto, todas sus versiones exactas: PASS; sin nuevas dependencias ni instalaciones.
+- Inventario: exactamente los 12 archivos listados. No hay datos, parquet, scores, modelos, CSV, archivos privados, credenciales, claves ni archivos grandes.
+- Referencias restantes al modelo anterior: 0. Las referencias a Z636 corresponden a modelo oficial, nombre del CSV, documentación y manifiesto informativo.
+- Rutas absolutas personales y dependencias históricas en el código: NONE. Imports locales limitados a `common.py`; sólo se consumen el CSV original y las salidas propias.
+- Git ignore comprobado con paths NUL-delimited: dataset, parquet, CSV final, scores, modelos, `.env`, claves y archivos históricos excluidos; código y documentación previstos incluidos.
+
+La entrada predeterminada pasó a `data/competencia_01.csv` dentro del paquete. No se copió el dataset. El fichero `fuentes_auditadas.json` registra hashes de las fuentes informativas y del código actual, sin ubicaciones privadas ni dependencias de ejecución.
+
+**0 fits. 0 tuning. 0 uploads. 0 git add. 0 commit. 0 push.**
+
+## Alcance pendiente
+
+PASS estático no demuestra identidad de nuevos entrenamientos. Se debe ejecutar una reproducción completa independiente para confirmar el CSV final byte a byte, usando el entorno fijado y sin cambiar parámetros ante diferencias. El tiempo observado de la referencia no es una medición del paquete actualizado. Public sólo es metadata informativa suministrada por el autor.

@@ -1,0 +1,13 @@
+{
+  "experimento": 6007,
+  "nombre": "zulip_final_5011",
+  "modo": "final",
+  "fuente": "5011_prod_rank_bo4105",
+  "envios": [
+    11500,
+    12000,
+    12500,
+    13000
+  ],
+  "descripcion": "Archivos finales de la receta mejorada (5011, BO 4105, 50 semillas): 11.500 a 13.000 envios."
+}

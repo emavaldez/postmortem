@@ -1,0 +1,40 @@
+{
+  "resumen": [
+    {
+      "modelo": "bo4102",
+      "meseta_M": 433.7,
+      "maximo_M": 443.3,
+      "envios_optimos": 13000,
+      "proporcion_clientes": 0.0792
+    },
+    {
+      "modelo": "bo4103",
+      "meseta_M": 433.0,
+      "maximo_M": 441.1,
+      "envios_optimos": 13000,
+      "proporcion_clientes": 0.0792
+    },
+    {
+      "modelo": "combinacion_todos",
+      "meseta_M": 422.8,
+      "maximo_M": 440.0,
+      "envios_optimos": 16000,
+      "proporcion_clientes": 0.0975
+    },
+    {
+      "modelo": "combinacion_z601_bo4102",
+      "meseta_M": 417.3,
+      "maximo_M": 423.5,
+      "envios_optimos": 15000,
+      "proporcion_clientes": 0.0914
+    },
+    {
+      "modelo": "z601",
+      "meseta_M": 387.4,
+      "maximo_M": 395.4,
+      "envios_optimos": 14500,
+      "proporcion_clientes": 0.0884
+    }
+  ],
+  "_minutos": 2.43
+}

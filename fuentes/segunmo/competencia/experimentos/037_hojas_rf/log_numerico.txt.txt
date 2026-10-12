@@ -1,0 +1,15 @@
+
+===== 037f 2026-10-09 22:04 | RF con 202103–04 (326184 filas, 1975 positivos) | LightGBM con 202105–06 (327882 filas, 2010 positivos) | valid 202107 =====
+[s=676057] F0 601.4 | F2 (+hojas numéricas) -11.1 (1 min)
+[s=482687] F0 607.9 | F2 (+hojas numéricas) -12.9 (1 min)
+[s=399221] F0 605.8 | F2 (+hojas numéricas) -13.6 (2 min)
+[s=121109] F0 604.3 | F2 (+hojas numéricas) -9.4 (2 min)
+[s=292131] F0 600.7 | F2 (+hojas numéricas) -15.0 (3 min)
+[s=133559] F0 609.3 | F2 (+hojas numéricas) -12.4 (3 min)
+[s=956184] F0 606.8 | F2 (+hojas numéricas) -17.1 (4 min)
+[s=853814] F0 596.2 | F2 (+hojas numéricas) -5.4 (4 min)
+
+F2 (hojas numéricas) contra F0 (pareado):
+                         variante  delta_M     ee pares+  delta_auc  p_unilateral
+037f_hojas_rf_numerico(posterior)    -12.1 1.2661    0/8     -0.001           1.0
+[037f numérico] terminado

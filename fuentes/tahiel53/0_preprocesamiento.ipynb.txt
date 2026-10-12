@@ -1,0 +1,220 @@
+#%% celda 1 [texto]
+# 0 · Preprocesamiento del dataset
+
+Se corre **una sola vez**. Lee `../competencia_01_crudo.csv`, lo transforma y guarda
+`datos/dataset_preprocesado.fst`, que es lo que usan los notebooks 1, 2 y 3.
+
+**Qué hace, en orden:**
+1. **Clase ternaria** (BAJA+1, BAJA+2, CONTINUA).
+2. **Data Quality:** `ccajas_depositos` en 202105 tiene todos ceros → `NA` en ese mes
+3. **Data Drifting:** saca `cprestamos_personales` y `mprestamos_personales`
+4. **Lags y delta lags de orden 1 y 2** de todas las variables
+   (`_lag1`, `_lag2`, `_delta1` = actual − lag1, `_delta2` = actual − lag2)
+5. **Ranking con cero fijo, por variable y por mes**, a todas las columnas (también lags y deltas):
+   * los valores positivos pasan a (0, 1], equiespaciados según su ranking dentro del mes
+   * los negativos pasan a [−1, 0), equiespaciados según su ranking dentro del mes
+   * el cero queda en 0 y los NA quedan NA
+   * **reemplaza** a las columnas originales (no quedan los valores originales)
+6. Se queda con los meses que se usan después (202103, 202104, 202105, 202106 y 202108) y guarda
+
+No se transforman `numero_de_cliente`, `foto_mes` ni `clase_ternaria`.
+
+#%% celda 2 [texto]
+### Librerías
+
+#%% celda 3 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+# limpio la memoria
+rm(list=ls(all.names=TRUE))
+gc(full=TRUE, verbose=FALSE)
+
+# cargo las librerias (la primera vez se instalan y tarda varios minutos)
+options(repos= c(CRAN= "https://cloud.r-project.org"))
+options(width= 200)
+
+for (paquete in c("data.table", "R.utils", "fst", "lightgbm")) {
+  if (!require(paquete, character.only= TRUE)) {
+    install.packages(paquete)
+    library(paquete, character.only= TRUE)
+  }
+}
+
+cat("Nucleos disponibles:", parallel::detectCores(), "\n")
+
+#%% celda 4 [texto]
+### Parámetros
+
+#%% celda 5 [código]
+PARAM <- list()
+
+# meses que se guardan (los que usan la BO, los modelos y el scoring)
+PARAM$meses_a_guardar <- c(202103, 202104, 202105, 202106, 202108)
+
+PARAM$archivo_entrada <- "../competencia_01_crudo.csv"
+PARAM$archivo_dataset <- "datos/dataset_preprocesado.fst"
+
+if (!file.exists(PARAM$archivo_entrada))
+  stop("No encuentro ", PARAM$archivo_entrada,
+    ". Esta carpeta tiene que estar adentro de la carpeta del dataset")
+
+#%% celda 6 [texto]
+## 1 · Clase ternaria
+
+#%% celda 7 [código]
+dataset <- fread(PARAM$archivo_entrada)
+
+# Los períodos se convierten a número lineal (año*12 + mes) para poder comparar 
+# correctamente si los meses son consecutivos.
+dsimple <- dataset[, list(
+    "pos" = .I,
+    numero_de_cliente,
+    periodo0 = as.integer(foto_mes/100)*12 +  foto_mes%%100 ) ]
+
+setorder( dsimple, numero_de_cliente, periodo0 )
+
+periodo_ultimo     <- dsimple[, max(periodo0) ]
+periodo_anteultimo <- periodo_ultimo - 1
+
+dsimple[, c("periodo1", "periodo2") :=
+    shift(periodo0, n=1:2, fill=NA, type="lead"),  numero_de_cliente ]
+
+# El cliente sigue en el banco en los dos meses siguientes
+dsimple[ periodo0 < periodo_anteultimo, clase_ternaria := "CONTINUA" ]
+
+# El cliente se da de baja en el mes siguiente
+dsimple[ periodo0 < periodo_ultimo &
+    ( is.na(periodo1) | periodo0 + 1 < periodo1 ),
+    clase_ternaria := "BAJA+1" ]
+
+# El cliente sigue se da de baja en dos meses
+dsimple[ periodo0 < periodo_anteultimo & (periodo0+1 == periodo1 )
+    & ( is.na(periodo2) | periodo0 + 2 < periodo2 ),
+    clase_ternaria := "BAJA+2" ]
+
+setorder( dsimple, pos )
+dataset[, clase_ternaria := dsimple$clase_ternaria ]
+rm(dsimple)
+
+dataset[, .N, list(foto_mes, clase_ternaria)][order(foto_mes, clase_ternaria)]
+
+#%% celda 8 [texto]
+## 2 · Data Quality y 3 · Data Drifting
+
+#%% celda 9 [código]
+# ccajas_depositos esta rota en 202105: todos sus valores son cero
+dataset[foto_mes == 202105, ccajas_depositos := NA]
+
+# variables con data drifting que saco
+dataset[, c("cprestamos_personales", "mprestamos_personales") := NULL]
+
+#%% celda 10 [texto]
+## 4 · Lags y delta lags de orden 1 y 2
+
+#%% celda 11 [código]
+# ordeno por cliente y mes, asi el "mes anterior" queda en la fila de arriba
+setorder(dataset, numero_de_cliente, foto_mes)
+
+cols_originales <- setdiff(colnames(dataset),
+  c("numero_de_cliente", "foto_mes", "clase_ternaria"))
+
+# lag1 = valor del mes anterior,  lag2 = valor de hace dos meses (por cliente)
+dataset[, paste0(cols_originales, "_lag1") := shift(.SD, 1L, NA, "lag"),
+  by= numero_de_cliente, .SDcols= cols_originales]
+dataset[, paste0(cols_originales, "_lag2") := shift(.SD, 2L, NA, "lag"),
+  by= numero_de_cliente, .SDcols= cols_originales]
+
+# me quedo solo con los meses que se usan despues (para ahorrar ram)
+dataset <- dataset[foto_mes %in% PARAM$meses_a_guardar]
+gc(full=TRUE, verbose=FALSE)
+
+# delta1 = valor actual - lag1,   delta2 = valor actual - lag2
+for (col in cols_originales) {
+  dataset[, paste0(col, "_delta1") := get(col) - get(paste0(col, "_lag1"))]
+  dataset[, paste0(col, "_delta2") := get(col) - get(paste0(col, "_lag2"))]
+}
+
+cat("Columnas:", ncol(dataset), "  Filas:", nrow(dataset), "\n")
+
+#%% celda 12 [texto]
+## 5 · Ranking con cero fijo, por variable y por mes
+
+Para cada variable y cada mes por separado:
+* positivos → `ranking / cantidad de positivos` (valores equiespaciados entre 0 y 1; el más grande vale 1)
+* negativos → `−ranking / cantidad de negativos`, ordenados por valor absoluto (el más negativo vale −1)
+* cero → 0
+* NA → NA
+
+Así el modelo aprende comportamiento relativo del cliente dentro de su cohorte, no valores absolutos que varían por inflación u otros factores externos.
+
+#%% celda 13 [código]
+# La función convierte cada valor numérico en su posición relativa dentro del mes, 
+# separando positivos y negativos y respetando el cero
+rank_cero_fijo <- function(x) {
+  r <- rep(NA_real_, length(x))
+  positivos <- which(x > 0)
+  negativos <- which(x < 0)
+  if (length(positivos) > 0) r[positivos] <-  frank(x[positivos]) / length(positivos)
+  if (length(negativos) > 0) r[negativos] <- -frank(-x[negativos]) / length(negativos)
+  r[which(x == 0)] <- 0
+  r
+}
+
+cols_a_transformar <- setdiff(colnames(dataset),
+  c("numero_de_cliente", "foto_mes", "clase_ternaria"))
+
+# las filas de cada mes
+filas_por_mes <- split(seq_len(nrow(dataset)), dataset$foto_mes)
+
+avisar <- function(...) {
+  cat(format(Sys.time(), "%H:%M:%S"), " ", ..., "\n", sep= "")
+  flush.console()
+}
+
+avisar("Transformando ", length(cols_a_transformar), " columnas")
+for (k in seq_along(cols_a_transformar)) {
+  col <- cols_a_transformar[k]
+  x <- dataset[[col]]
+  nuevo <- rep(NA_real_, length(x))
+  for (filas in filas_por_mes) nuevo[filas] <- rank_cero_fijo(x[filas])
+  set(dataset, j= col, value= nuevo)   # reemplaza la columna original
+
+  if (k %% 100 == 0) avisar("   ", k, " de ", length(cols_a_transformar), " columnas")
+}
+avisar("Listo")
+
+#%% celda 14 [texto]
+### Control
+
+Para cada mes, el mínimo y el máximo de todas las columnas transformadas tienen que estar entre −1 y 1.
+Abajo, como ejemplo, cómo queda `mcuentas_saldo` en cada mes.
+
+#%% celda 15 [código]
+minimo <- min(sapply(cols_a_transformar, function(c) min(dataset[[c]], na.rm= TRUE)))
+maximo <- max(sapply(cols_a_transformar, function(c) max(dataset[[c]], na.rm= TRUE)))
+cat("Minimo de todas las columnas:", minimo, "  Maximo:", maximo, "\n\n")
+stopifnot(minimo >= -1, maximo <= 1)
+
+dataset[, list(minimo= min(mcuentas_saldo, na.rm= TRUE),
+               mediana= median(mcuentas_saldo, na.rm= TRUE),
+               maximo= max(mcuentas_saldo, na.rm= TRUE),
+               ceros= sum(mcuentas_saldo == 0, na.rm= TRUE),
+               nulos= sum(is.na(mcuentas_saldo))), foto_mes][order(foto_mes)]
+
+#%% celda 16 [texto]
+## 6 · Guardo el dataset preprocesado
+
+#%% celda 17 [código]
+# ordenado por mes (asi los notebooks siguientes pueden leer solo los meses que necesitan)
+setorder(dataset, foto_mes, numero_de_cliente)
+
+dir.create("datos", showWarnings= FALSE)
+avisar("Grabando ", PARAM$archivo_dataset)
+write_fst(dataset, PARAM$archivo_dataset, compress= 50)
+avisar("Listo: ", round(file.size(PARAM$archivo_dataset) / 1e9, 2), " GB, ",
+  nrow(dataset), " filas, ", ncol(dataset), " columnas")
+
+dataset[, .N, list(foto_mes, clase_ternaria)][order(foto_mes, clase_ternaria)]
+
+#%% celda 18 [código]
+format(Sys.time(), "%a %b %d %X %Y")

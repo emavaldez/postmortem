@@ -1,0 +1,26 @@
+
+===== 016 2026-10-08 00:20 | semillas [676057, 482687, 399221, 121109, 292131] | 3 configs M1 =====
+[L s=676057] V0 396.0 | lag2 +8.8 | barajado -13.8 (9 min)
+[L s=482687] V0 382.5 | lag2 +31.5 | barajado -10.4 (17 min)
+[L s=399221] V0 387.3 | lag2 +19.1 | barajado +13.8 (26 min)
+[L s=121109] V0 398.6 | lag2 +16.6 | barajado -17.2 (34 min)
+[L s=292131] V0 405.1 | lag2 +18.6 | barajado +10.4 (43 min)
+[B2 s=676057] V0 420.2 | lag2 +4.7 | barajado -6.7 (52 min)
+[B2 s=482687] V0 408.9 | lag2 +10.2 | barajado -22.8 (62 min)
+[B2 s=399221] V0 393.1 | lag2 +9.8 | barajado -28.3 (71 min)
+[B2 s=121109] V0 412.6 | lag2 -2.8 | barajado -19.8 (81 min)
+[B2 s=292131] V0 415.1 | lag2 +5.2 | barajado -20.6 (90 min)
+
+Niveles (M ARS):
+fold                  B2      L
+variante                       
+V0_sin_lag2        410.0  393.9
+V1_lag2            415.4  412.8
+V1c_lag2_barajado  390.3  390.5
+
+Diferencias pareadas:
+                    comparacion  L_delta  L_ee  B2_delta  B2_ee pares_positivos
+          V1_lag2 - V0_sin_lag2    18.92  3.65      5.42   2.33            9/10
+V1c_lag2_barajado - V0_sin_lag2    -3.44  6.45    -19.66   3.56            2/10
+    V1_lag2 - V1c_lag2_barajado    22.36  7.09     25.08   4.92           10/10
+[016] terminado

@@ -1,0 +1,74 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–5] Importa csv, pyarrow y, con from common import *, todo lo definido o importado en
+#   common.py (constantes, controles, funciones de generación de variables y los nombres np, pd, pq y Path).
+"""FULL457 y FULL762: meses calendario exactos, NaN y orden CSV preservados."""
+import csv
+import pyarrow as pa
+from common import *
+
+# [Anotación · líneas 6–14] Lee los argumentos --output-dir e --input, exige que la carpeta de salida no
+#   exista y que el SHA256 del CSV sea el esperado. Lee sólo el encabezado, exige nombres sin repetir y la
+#   presencia de claves y clase, toma como variables las demás columnas y arma las listas de nombres FULL457 y
+#   FULL762.
+def main():
+    p=args(__doc__); p.add_argument('--input',type=Path,default=INPUT); opts=p.parse_args()
+    output=opts.output_dir
+    exigir(not output.exists(),'La carpeta de salida debe ser NUEVA')
+    exigir(sha256_archivo(opts.input)==EXPECTED_INPUT,'SHA256 fuente diferente al original validado')
+    with opts.input.open(encoding='utf-8-sig',newline='') as f: header=next(csv.reader(f))
+    exigir(len(header)==len(set(header)) and set(CLAVES+[TARGET]).issubset(header),'Encabezado inválido')
+    features=[c for c in header if c not in {*CLAVES,TARGET}]
+    full,full762=nombres_features(features)
+# [Anotación · líneas 15–20] Carga el CSV completo con pandas, ejecuta auditar_fuente, comprueba la aritmética
+#   de dos meses atrás con cuatro meses de ejemplo (incluye enero y febrero de 2022) y calcula, para cada fila,
+#   la posición del registro del mismo cliente uno y dos meses antes.
+    base=pd.read_csv(opts.input,encoding='utf-8-sig',low_memory=False)
+    digest=auditar_fuente(base,features,full)
+    exigir(meses_atras(np.array([202105,202106,202201,202202]),2).tolist()
+           ==[202103,202104,202111,202112],'Aritmética lag2 incorrecta')
+    previous=predecesores(base)
+    previous2=predecesores(base,lag=2)
+# [Anotación · líneas 21–37] Crea la carpeta de salida y, para cada esquema (457 y 762), escribe un archivo
+#   features_<tamaño>.partial recorriendo la tabla en bloques de 50.000 filas: genera el bloque de variables
+#   correspondiente y lo agrega con ParquetWriter (compresión snappy, formato 2.6, grupos de 50.000 filas).
+    output.mkdir(parents=True)
+    import os
+    # Dos esquemas explícitos: CatBoost no recibe columnas lag2.
+    for size,name in [(457,PARQUET457),(762,PARQUET762)]:
+        pending=output/f'features_{size}.partial'
+        with pending.open('xb') as f:
+            writer=None
+            try:
+                for start in range(0,len(base),50000):
+                    end=min(start+50000,len(base))
+                    block=(generar_lote(base,features,full,previous,start,end) if size==457 else
+                           generar_lote_full762(base,features,full,full762,previous,previous2,start,end))
+                    table=pa.Table.from_pandas(block,preserve_index=False)
+                    if writer is None: writer=pq.ParquetWriter(f,table.schema,compression='snappy',version='2.6')
+                    writer.write_table(table,row_group_size=50000)
+            finally:
+                if writer is not None: writer.close()
+# [Anotación · líneas 38–43] Relee el archivo parcial con la función de verificación de su esquema y, si pasa,
+#   crea un enlace duro con el nombre definitivo del parquet y borra el parcial.
+        if size==457:
+            verificar_parquet(pending,base,features,full,previous,50000)
+        else:
+            verificar_full762(pending,base,features,full,full762,previous,previous2,50000)
+        os.link(pending,output/name)
+        pending.unlink()
+# [Anotación · líneas 44–54] Para 202104, 202105, 202106 y 202108 cuenta las filas y cuántas tienen registro
+#   dos meses antes, y guarda feature_audit.json con cantidad de filas, hashes, listas de nombres, SHA256 de la
+#   entrada y esa disponibilidad. La última línea ejecuta main cuando el archivo se corre como script.
+    availability=[]
+    for month in [202104,202105,202106,202108]:
+        mask=base.foto_mes.eq(month)
+        rows=int(mask.sum()); count=int((mask & previous2.notna()).sum())
+        availability.append(dict(foto_mes=month,filas=rows,lag2_disponible=count,porcentaje=100*count/rows))
+    save_json(output/'feature_audit.json',dict(rows=len(base),FULL457_hash=digest,FULL762_hash=HASH_FULL762,
+              FULL457=full,FULL762=full762,input_sha256=EXPECTED_INPUT,
+              lag1='MES_CALENDARIO_ANTERIOR_EXACTO',lag2='DOS_MESES_CALENDARIO_ANTES_EXACTO',
+              validation='PASS',row_order='CSV original',lag2_availability=availability))
+
+if __name__=='__main__': main()

@@ -1,0 +1,293 @@
+#%% celda 1 [texto]
+# Exportar los datasets de A y B ya procesados y rankeados
+
+**Objetivo:** dejar en archivos los dos datasets exactamente como los usan los modelos finales, para que se pueda entrenar "el mejor modelo" sobre ellos sin repetir el procesamiento.
+
+**Qué contienen (ranking ACTUAL: cero fijo en 0 y no-cero a 1..100 por mes; NA queda NA):**
+- **Dataset A (A'plus):** 576 variables = las sobrevivientes de los canaritos (A original unida con A') + `gen_1`; incluye lags, deltas, resumenes de 3 meses (avg3, max3, min3, razones, tendencia) y variables compuestas.
+- **Dataset B:** 760 variables = 152 variables x (original, lag1, lag2, delta1, delta2), sin `foto_mes` ni `numero_de_cliente` como variables.
+- **Filas:** meses 202103, 202104, 202105, 202106 (con etiqueta) y 202108 (a predecir, sin etiqueta).
+- **Columnas de control (NO son variables):** `numero_de_cliente`, `foto_mes`, `clase_ternaria`, `clase01` (1 = BAJA+1 o BAJA+2). Para el modelo final solo se usan las columnas de variables.
+
+**Procesamiento:** correccion de `ccajas_depositos` 202105 (cero -> NA); sin Salsa Magica (B incluye `cprestamos_personales` y `mprestamos_personales`); lags y deltas calculados sobre valores crudos y despues rankeados por mes.
+
+**Salidas:** `exp/datasets_rankeados/` (parquet si esta el paquete `arrow`; si no, csv.gz).
+**Duracion estimada:** ~1 h (el ranking de A ~27 min y el de B ~37 min). No correr otra notebook al mismo tiempo (RAM).
+
+#%% celda 2 [código]
+rm(list = ls())
+gc()
+
+require("data.table")
+require("lightgbm")
+options(scipen = 999)
+
+PARAM_carpeta_datasets <- "C:/Users/Laura/Documents/DMEyF/datasets/"
+PARAM_carpeta_exp      <- "C:/Users/Laura/Documents/DMEyF/exp/"
+
+MODO <- "submit"
+TAG  <- "Aprimaplus_simple"        # nombre interno de esta entrega; cambiarlo en cada corrida de submit
+
+if (MODO == "validar") {
+  MESES_TRAIN  <- c(202103, 202104)
+  MES_FUTURE   <- 202106
+} else {
+  MESES_TRAIN  <- c(202103, 202104, 202105, 202106)
+  MES_FUTURE   <- 202108
+}
+
+# foto_mes entra como variable en el Modelo B tal como se valido (lo agrega setdiff de colnames).
+# Con 4 meses de train y prediccion en 202108 conviene sacarla: un valor de foto_mes nunca visto no tiene
+# sentido como variable. En "validar" se deja como estaba, para reproducir los 472 M.
+EXCLUIR_FOTO_MES_B <- (MODO == "submit")
+
+# Ceros rotos a corregir (cero -> NA) y mes(es) donde se rompen. Definido a partir de la tabla de la celda 3
+# (% de ceros 202103..202108). cpayroll2_trx y mpayroll2 NO se corrigen: tienen ~99,9% de ceros todos los meses.
+CORRECCIONES <- list(ccajas_depositos = c(202105))   # unica correccion: cero -> NA en 202105
+
+USAR_SALSA_MAGICA <- FALSE   # FALSE: no se excluyen cprestamos_personales ni mprestamos_personales
+# Otras variables con un mes anomalo que encontramos (NO se corrigen: sin indicacion del profe y sin mejora medida):
+#   Visa_Finiciomora = c(202105, 202108), Visa_mpagado = c(202105, 202108),
+#   Master_fultimo_cierre = c(202106), Visa_fultimo_cierre = c(202106)
+
+SEMILLAS_10 <- c(585581, 249449, 655649, 503039, 798191, 112909, 334667, 421303, 667021, 887923)
+CORTE_FIJO  <- 12000
+CORTES <- c(10500, 10750)
+
+cat("MODO:", MODO, "| train:", paste(MESES_TRAIN, collapse = "+"), "| future:", MES_FUTURE, "\n")
+
+#%% celda 3 [texto]
+### Carga, corrección de ceros, lags/deltas
+
+#%% celda 4 [código]
+t0 <- Sys.time()
+dataset <- fread(paste0(PARAM_carpeta_datasets, "competencia_01.csv"), stringsAsFactors = TRUE)
+cat("Cargado:", nrow(dataset), "filas x", ncol(dataset), "columnas en", round(as.numeric(Sys.time() - t0, units = "secs"), 1), "seg\n")
+
+if (!("clase_ternaria" %in% colnames(dataset))) stop("No se encontro clase_ternaria")
+
+cat("\nFilas por mes y clase_ternaria:\n")
+print(dcast(dataset[, .N, by = .(foto_mes, clase_ternaria)], foto_mes ~ clase_ternaria, value.var = "N"))
+
+if (!(MES_FUTURE %in% dataset$foto_mes)) stop("No esta el mes future en el dataset: ", MES_FUTURE)
+if (dataset[foto_mes %in% MESES_TRAIN & is.na(clase_ternaria), .N] > 0) {
+  stop("Hay filas de train sin clase_ternaria (NA). Revisar los meses de train.")
+}
+setorder(dataset, numero_de_cliente, foto_mes)
+
+#%% celda 5 [código]
+for (v in names(CORRECCIONES)) {
+  meses <- CORRECCIONES[[v]]
+  n <- dataset[foto_mes %in% meses & get(v) == 0, .N]
+  dataset[foto_mes %in% meses & get(v) == 0, (v) := NA_real_]
+  cat(v, "-- meses", paste(meses, collapse = ","), "-- ceros pasados a NA:", n, "\n")
+}
+
+#%% celda 6 [código]
+campos_no_procesar     <- c("numero_de_cliente", "foto_mes", "clase_ternaria")
+campos_data_drifting   <- if (USAR_SALSA_MAGICA) c("cprestamos_personales", "mprestamos_personales") else character(0)   # Salsa Magica
+campos_lag <- setdiff(colnames(dataset), c(campos_no_procesar, campos_data_drifting))
+campos_lag <- campos_lag[sapply(dataset[, ..campos_lag], is.numeric)]
+cat("Lags/deltas para", length(campos_lag), "variables\n")
+
+t0 <- Sys.time()
+dataset[, (paste0(campos_lag, "_lag1")) := shift(.SD, n = 1, fill = NA, type = "lag"), by = numero_de_cliente, .SDcols = campos_lag]
+dataset[, (paste0(campos_lag, "_lag2")) := shift(.SD, n = 2, fill = NA, type = "lag"), by = numero_de_cliente, .SDcols = campos_lag]
+for (campo in campos_lag) {
+  dataset[, paste0(campo, "_delta1") := get(campo) - get(paste0(campo, "_lag1"))]
+  dataset[, paste0(campo, "_delta2") := get(campo) - get(paste0(campo, "_lag2"))]
+}
+cat("Listo en", round(as.numeric(Sys.time() - t0, units = "secs"), 1), "seg |", nrow(dataset), "filas x", ncol(dataset), "columnas\n")
+
+# ya con los lags calculados, me quedo solo con los meses que se usan (el ranking es por mes, no cambia)
+MESES_USAR <- c(MESES_TRAIN, MES_FUTURE)
+dataset <- dataset[foto_mes %in% MESES_USAR]
+gc()
+cat("Filas que quedan (", paste(MESES_USAR, collapse = ","), "):", nrow(dataset), "\n")
+
+#%% celda 7 [texto]
+### Lista de variables: unión de A original (358) y A' (526)
+
+#%% celda 8 [código]
+n1 <- fread(paste0(PARAM_carpeta_exp, "campos_canaritos_202105_06_s585581_2sd.txt"))$variable
+n2 <- fread(paste0(PARAM_carpeta_exp, "campos_canaritos_202105_06_s249449_2sd.txt"))$variable
+LISTA_APRIMA <- intersect(n1, n2)
+LISTA_A      <- fread(paste0(PARAM_carpeta_exp, "campos_canaritos_asesinos_2sd.txt"))$variable
+LISTA_NUEVA  <- union(LISTA_APRIMA, LISTA_A)
+cat("A original:", length(LISTA_A), "| A' :", length(LISTA_APRIMA), "| union (A'plus):", length(LISTA_NUEVA),
+    "| de A que A' habia perdido:", length(setdiff(LISTA_A, LISTA_APRIMA)), "\n")
+
+#%% celda 9 [texto]
+### Dataset de A'plus con el ranking actual
+
+#%% celda 10 [código]
+# RANKING ACTUAL (cero fijo): el cero queda en 0, los valores no-cero (negativos y positivos juntos) pasan
+# a un percentil de 1 a 100 dentro de cada foto_mes, y NA queda NA.
+rankear_cero_fijo <- function(x) {
+  out <- rep(0, length(x))
+  idx_nz <- which(x != 0 & !is.na(x))
+  n <- length(idx_nz)
+  if (n == 1) {
+    out[idx_nz] <- 100
+  } else if (n > 1) {
+    r <- frank(x[idx_nz], ties.method = "average")
+    out[idx_nz] <- 1 + 99 * (r - 1) / (n - 1)
+  }
+  out[is.na(x)] <- NA_real_
+  out
+}
+
+rankear_dataset <- function(dt) {
+  campos_no_rankear <- c("numero_de_cliente", "foto_mes", "clase_ternaria")
+  campos_rankear <- setdiff(colnames(dt), campos_no_rankear)
+  campos_rankear <- campos_rankear[sapply(dt[, ..campos_rankear], is.numeric)]
+  for (campo in campos_rankear) {
+    # las columnas enteras (fread) no pueden guardar percentiles con decimales: se truncaban (warnings
+    # "truncated (precision lost)"). Se pasan a numeric antes de rankear.
+    if (is.integer(dt[[campo]])) set(dt, j = campo, value = as.numeric(dt[[campo]]))
+    dt[, (campo) := rankear_cero_fijo(get(campo)), by = foto_mes]
+  }
+  invisible(dt)
+}
+
+t0 <- Sys.time()
+
+# Solo se calculan y rankean las columnas que el Modelo A realmente usa. El ranking es independiente por
+# columna, asi que el resultado es identico al de rankear las ~1.600; solo ahorra tiempo y memoria.
+campos_A_archivo <- LISTA_NUEVA
+insumos_compuestas <- c("mtarjeta_visa_consumo", "mtarjeta_master_consumo", "Visa_mconsumototal", "Master_mconsumototal",
+  "Visa_msaldototal", "Master_msaldototal", "Visa_mlimitecompra", "Master_mlimitecompra", "Visa_mpagado", "Master_mpagado",
+  "Visa_mpagominimo", "Master_mpagominimo", "mcajeros_propios_descuentos", "mtarjeta_visa_descuentos",
+  "mtarjeta_master_descuentos", "Visa_status", "Master_status", "mpayroll", "mpayroll2", "mprestamos_prendarios",
+  "mprestamos_hipotecarios", "minversion1_pesos", "minversion1_dolares", "minversion2", "mplazo_fijo_dolares",
+  "mplazo_fijo_pesos", "mtransferencias_recibidas", "mtransferencias_emitidas", "mcomisiones_mantenimiento",
+  "mcomisiones_otras")
+patron_ruidoso <- "Master_fultimo_cierre|Visa_fultimo_cierre|Visa_mpagado"   # se sacan del modelo A (como en la cadena original)
+necesarias <- unique(c(campos_A_archivo, insumos_compuestas, "ctrx_quarter", "cpayroll_trx_min3"))
+necesarias <- necesarias[!grepl(patron_ruidoso, necesarias)]
+sufijos_fe <- c("_avg3", "_max3", "_min3", "_ratio_avg", "_ratio_max", "_tendencia")
+
+# columnas que ya existen (originales, lags, deltas) y se necesitan
+claves <- c("numero_de_cliente", "foto_mes", "clase_ternaria")
+dataset_A <- dataset[, unique(c(claves, intersect(necesarias, colnames(dataset)))), with = FALSE]
+
+# --- FE historico, solo para las variables base de las que se necesita alguna derivada ---
+todas <- colnames(dataset)
+bases <- sub("_lag1$", "", grep("_lag1$", todas, value = TRUE))
+bases <- bases[bases %in% todas & paste0(bases, "_lag2") %in% todas]
+bases <- bases[!grepl(patron_ruidoso, bases)]
+bases_fe <- bases[vapply(bases, function(b) any(paste0(b, sufijos_fe) %in% necesarias), logical(1))]
+for (b in bases_fe) {
+  a  <- dataset[[b]]
+  l1 <- dataset[[paste0(b, "_lag1")]]
+  l2 <- dataset[[paste0(b, "_lag2")]]
+  avg3 <- rowMeans(cbind(a, l1, l2), na.rm = TRUE)
+  avg3[is.nan(avg3)] <- NA_real_
+  max3 <- pmax(a, l1, l2, na.rm = TRUE)
+  min3 <- pmin(a, l1, l2, na.rm = TRUE)
+  derivadas <- list(
+    avg3 = avg3, max3 = max3, min3 = min3,
+    ratio_avg = ifelse(!is.na(avg3) & avg3 != 0, a / avg3, NA_real_),
+    ratio_max = ifelse(!is.na(max3) & max3 != 0, a / max3, NA_real_),
+    tendencia = ifelse(!is.na(l2), (a - l2) / 2, ifelse(!is.na(l1), a - l1, NA_real_))
+  )
+  for (s in names(derivadas)) {
+    nom <- paste0(b, "_", s)
+    if (nom %in% necesarias) dataset_A[, (nom) := derivadas[[s]]]
+  }
+}
+cat("FE historico:", length(bases_fe), "variables base de", length(bases), "\n")
+
+# --- ranking cero fijo (solo las columnas de dataset_A) ---
+rankear_dataset(dataset_A)
+gc()
+cat("dataset_A listo en", round(as.numeric(Sys.time() - t0, units = "secs"), 1), "seg |", ncol(dataset_A), "columnas\n")
+
+#%% celda 11 [código]
+# --- compuestas y gen_1 (identico a z_ensamble_463_471, sobre valores ya rankeados) ---
+agregar_si_existen <- function(dt, nombre_nueva, columnas, fun_combinacion) {
+  presentes <- columnas[columnas %in% colnames(dt)]
+  if (length(presentes) < 2) return(invisible(NULL))
+  dt[, (nombre_nueva) := fun_combinacion(.SD), .SDcols = presentes]
+}
+suma_filas <- function(sd) Reduce(`+`, sd)
+
+agregar_si_existen(dataset_A, "consumo_tarjetas_total", c("mtarjeta_visa_consumo", "mtarjeta_master_consumo"), suma_filas)
+agregar_si_existen(dataset_A, "consumototal_tarjetas", c("Visa_mconsumototal", "Master_mconsumototal"), suma_filas)
+agregar_si_existen(dataset_A, "saldo_tarjetas_total", c("Visa_msaldototal", "Master_msaldototal"), suma_filas)
+agregar_si_existen(dataset_A, "limite_tarjetas_total", c("Visa_mlimitecompra", "Master_mlimitecompra"), suma_filas)
+agregar_si_existen(dataset_A, "pagado_tarjetas_total", c("Visa_mpagado", "Master_mpagado"), suma_filas)
+agregar_si_existen(dataset_A, "pagominimo_tarjetas_total", c("Visa_mpagominimo", "Master_mpagominimo"), suma_filas)
+agregar_si_existen(dataset_A, "descuentos_tarjetas_total",
+                   c("mcajeros_propios_descuentos", "mtarjeta_visa_descuentos", "mtarjeta_master_descuentos"), suma_filas)
+if (all(c("consumototal_tarjetas", "limite_tarjetas_total") %in% colnames(dataset_A))) {
+  dataset_A[, utilizacion_tarjetas := ifelse(limite_tarjetas_total == 0, 0, consumototal_tarjetas / limite_tarjetas_total)]
+}
+if (all(c("Visa_status", "Master_status") %in% colnames(dataset_A))) {
+  dataset_A[, tarjetas_activas_count := as.integer(Visa_status == 0) + as.integer(Master_status == 0)]
+}
+agregar_si_existen(dataset_A, "ingresos_payroll_total", c("mpayroll", "mpayroll2"), suma_filas)
+agregar_si_existen(dataset_A, "prestamos_sin_personales_total", c("mprestamos_prendarios", "mprestamos_hipotecarios"), suma_filas)
+agregar_si_existen(dataset_A, "inversiones_totales", c("minversion1_pesos", "minversion1_dolares", "minversion2"), suma_filas)
+agregar_si_existen(dataset_A, "plazo_fijo_total", c("mplazo_fijo_dolares", "mplazo_fijo_pesos"), suma_filas)
+if (all(c("mtransferencias_recibidas", "mtransferencias_emitidas") %in% colnames(dataset_A))) {
+  dataset_A[, transferencias_netas := mtransferencias_recibidas - mtransferencias_emitidas]
+}
+agregar_si_existen(dataset_A, "comisiones_totales_manual", c("mcomisiones_mantenimiento", "mcomisiones_otras"), suma_filas)
+dataset_A[, gen_1 := ctrx_quarter + cpayroll_trx_min3]
+
+dataset_A[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+campos_A <- LISTA_NUEVA
+campos_A <- campos_A[campos_A %in% colnames(dataset_A)]
+campos_A <- c(campos_A, "gen_1")
+cat("Variables modelo A:", length(campos_A), "\n")
+
+#%% celda 12 [texto]
+### Exportar el dataset A (A'plus)
+
+#%% celda 13 [código]
+carpeta_out <- paste0(PARAM_carpeta_exp, "datasets_rankeados/"); dir.create(carpeta_out, showWarnings = FALSE, recursive = TRUE)
+claves_out <- c("numero_de_cliente", "foto_mes", "clase_ternaria", "clase01")
+
+exportar <- function(dt, columnas, nombre) {
+  setorder(dt, foto_mes, numero_de_cliente)
+  x <- dt[, ..columnas]
+  if (requireNamespace("arrow", quietly = TRUE)) {
+    archivo <- paste0(carpeta_out, nombre, ".parquet")
+    arrow::write_parquet(x, archivo)
+  } else {
+    archivo <- paste0(carpeta_out, nombre, ".csv.gz")
+    fwrite(x, archivo, compress = "gzip")
+  }
+  cat("Guardado:", archivo, "|", nrow(x), "filas x", ncol(x), "columnas |", round(file.size(archivo) / 1e9, 2), "GB\n")
+  invisible(archivo)
+}
+
+stopifnot(!("foto_mes" %in% campos_A), !("numero_de_cliente" %in% campos_A))
+cat("Variables de A:", length(campos_A), "\n")
+print(dataset_A[, .(filas = .N, BAJA1 = sum(clase_ternaria == "BAJA+1", na.rm = TRUE), BAJA2 = sum(clase_ternaria == "BAJA+2", na.rm = TRUE)), by = foto_mes][order(foto_mes)])
+ids_A_future <- sort(dataset_A[foto_mes == MES_FUTURE, numero_de_cliente])
+exportar(dataset_A, c(claves_out, campos_A), "dataset_A_Aprimaplus_rankeado_202103-06_future202108")
+writeLines(campos_A, paste0(carpeta_out, "variables_A.txt"))
+rm(dataset_A); gc(full = TRUE, verbose = FALSE)
+
+#%% celda 14 [texto]
+### Exportar el dataset B
+
+#%% celda 15 [código]
+dataset_B <- dataset; rm(dataset); gc(full = TRUE, verbose = FALSE)
+rankear_dataset(dataset_B)
+dataset_B[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+campos_B <- setdiff(colnames(dataset_B), c("clase_ternaria", "clase01", "numero_de_cliente", "foto_mes"))
+cat("Variables de B:", length(campos_B), "(esperado 760)\n")
+stopifnot(identical(sort(dataset_B[foto_mes == MES_FUTURE, numero_de_cliente]), ids_A_future))   # mismos clientes que en A
+exportar(dataset_B, c(claves_out, campos_B), "dataset_B_rankeado_202103-06_future202108")
+writeLines(campos_B, paste0(carpeta_out, "variables_B.txt"))
+
+#%% celda 16 [texto]
+### Cómo se usan los archivos
+- Entrenamiento: filas con `foto_mes` en 202103, 202104, 202105 y 202106; objetivo `clase01` (1 = BAJA+1 o BAJA+2).
+- Predicción: filas con `foto_mes` = 202108 (sin etiqueta). Se ordena por score y se marcan los primeros 10.600 clientes (corte del final).
+- Variables: todas las columnas **menos** `numero_de_cliente`, `foto_mes`, `clase_ternaria` y `clase01`. La lista exacta está en `variables_A.txt` y `variables_B.txt`.
+- El modelo final de nuestro equipo es el ensamble por promedio de rankings de A'plus + B, 100 semillas cada uno.

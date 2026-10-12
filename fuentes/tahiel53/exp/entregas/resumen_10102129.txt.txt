@@ -1,0 +1,18 @@
+RESUMEN DE LA ENTREGA   2026-10-10 21:29
+
+Ensemble: promedio simple de 40 LightGBM
+Set 1: 20 modelos.  num_iterations = 3172, num_leaves = 943, min_sum_hessian_in_leaf = 0.02584
+   semillas: 195361, 236655, 403489, 450862, 490646, 520928, 547247, 593810, 598549, 623217, 674659, 697241, 805062, 907503, 943042, 944552, 962589, 967354, 976901, 991514
+Set 2: 20 modelos.  num_iterations = 2033, num_leaves = 1874, min_sum_hessian_in_leaf = 0.08125
+   semillas: 195361, 236655, 403489, 450862, 490646, 520928, 547247, 593810, 598549, 623217, 674659, 697241, 805062, 907503, 943042, 944552, 962589, 967354, 976901, 991514
+Fijos: max_bin 31, min_data_in_leaf 0, feature_fraction 0.5, feature_fraction_bynode 0.2, learning_rate 0.005
+
+Ganancia en el backtest 202106 (todos juntos, 10 modelos):
+   11750 envios: 456.8 millones
+   maximo solo set 1: 462.8 millones con 11852 envios
+   maximo solo set 2: 464.6 millones con 10746 envios
+   maximo todos juntos: 461.7 millones con 10530 envios
+
+Mensaje para el bot:  submit    v3sets12c11750t10102129
+Archivos:
+   v3_sets12_40mod_c11750_10102129.csv   ->  ganancia del bot: 

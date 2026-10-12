@@ -1,0 +1,33 @@
+{
+  "resumen": [
+    {
+      "modelo": "muerte_conteo_sin_lag2",
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": 461,
+      "hiper": "4105 p23_4104",
+      "arboles": 580,
+      "meseta_M": 430.9,
+      "maximo_M": 436.2,
+      "envios_optimos": 15500,
+      "envios_agosto_p25_p50_p75": "10,133 / 14,346 / 16,152",
+      "dif_vs_muerte_conteo_sin_lag2_M": NaN,
+      "IC90_M": NaN,
+      "pct_remuestreos_gana": NaN
+    },
+    {
+      "modelo": "muerte_conteo_con_lag2",
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": 766,
+      "hiper": "4105 p23_4104",
+      "arboles": 580,
+      "meseta_M": 429.1,
+      "maximo_M": 443.3,
+      "envios_optimos": 13000,
+      "envios_agosto_p25_p50_p75": "12,340 / 12,842 / 13,143",
+      "dif_vs_muerte_conteo_sin_lag2_M": -1.5,
+      "IC90_M": "[-13.3 ; 10.8]",
+      "pct_remuestreos_gana": "42%"
+    }
+  ],
+  "_minutos": 18.15
+}

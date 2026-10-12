@@ -1,0 +1,31 @@
+{
+  "origen": "4105 p23_4104",
+  "params": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "max_bin": 31,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "deterministic": true,
+    "force_row_wise": true,
+    "verbose": -1,
+    "learning_rate": 0.0678,
+    "num_leaves": 41,
+    "min_data_in_leaf": 10124,
+    "feature_fraction": 0.1798,
+    "bagging_fraction": 0.3124,
+    "lambda_l1": 0.001,
+    "lambda_l2": 0.001
+  },
+  "arboles": 580,
+  "fraccion_mes_referencia": 1.0,
+  "variables": null,
+  "evidencia": {
+    "meseta_B_elegido_M": 427.2,
+    "referencia": "p23_4104",
+    "meseta_B_referencia_M": 427.2,
+    "meseta_B_z601_M": 372.6,
+    "mejor_retador_segun_A": "prueba_88",
+    "semillas_ganadas_por_el_retador": "0/20"
+  }
+}

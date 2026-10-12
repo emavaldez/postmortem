@@ -1,0 +1,129 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–7] Celdas 1 y 2. Monta Google Drive en /content/drive e instala los paquetes jupysql y
+#   duckdb-engine con %pip.
+#%% celda 1 [código]
+from google.colab import drive
+drive.mount('/content/drive')
+
+#%% celda 2 [código]
+%pip install jupysql
+%pip install duckdb-engine
+
+# [Anotación · líneas 9–18] Celda 3. Importa duckdb y pandas, carga la extensión sql de Jupyter, la configura
+#   para que las consultas devuelvan DataFrames de pandas sin mensajes adicionales y abre una conexión DuckDB en
+#   memoria para la magia %sql. Las celdas siguientes no contienen consultas %sql.
+#%% celda 3 [código]
+import duckdb
+import pandas as pd
+
+%load_ext sql
+%config SqlMagic.autopandas = True
+%config SqlMagic.feedback = False
+%config SqlMagic.displaycon = False
+
+%sql duckdb://
+
+# [Anotación · líneas 20–40] Celda 4, primera parte. Vuelve a montar Drive, arma la ruta
+#   /content/drive/MyDrive/DMEyF/competencia_01.csv, abre una conexión DuckDB en memoria con duckdb.connect y
+#   crea la tabla dataset_original leyendo el CSV con read_csv_auto.
+#%% celda 4 [código]
+import duckdb
+from google.colab import drive
+
+# 1. Montar Google Drive
+drive.mount('/content/drive')
+
+# 2. Definir las rutas
+dataset_path = '/content/drive/MyDrive/DMEyF/'
+dataset_file = 'competencia_01.csv'
+ruta_completa = dataset_path + dataset_file
+
+# 3. Conectar a DuckDB
+con = duckdb.connect(database=':memory:', read_only=False)
+
+# 4. Cargar el dataset original usando la ruta completa
+print(f"Cargando datos desde: {ruta_completa}...")
+con.execute(f"""
+    CREATE TABLE dataset_original AS
+    SELECT * FROM read_csv_auto('{ruta_completa}');
+""")
+
+# [Anotación · líneas 42–54] Comienza la consulta que crea la tabla churn_features_final con todas las
+#   columnas originales más las nuevas. Bloque A: ratio_digital_trx = (chomebanking_transacciones +
+#   cmobile_app_trx) / ctrx_quarter, con nulos del numerador como 0 y resultado NULL si ctrx_quarter es 0;
+#   share_homebanking = chomebanking_transacciones / (cmobile_app_trx + chomebanking_transacciones), con
+#   resultado NULL si el denominador es 0.
+# 5. Ejecutar la ingeniería de características optimizada para LightGBM
+print("Calculando features de ingeniería...")
+query_features = f"""
+CREATE OR REPLACE TABLE churn_features_final AS
+SELECT
+    *,
+
+    -- === A. INTENSIDAD DIGITAL Y CANALES ===
+    (COALESCE(chomebanking_transacciones, 0) + COALESCE(cmobile_app_trx, 0)) /
+    NULLIF(CAST(ctrx_quarter AS DOUBLE), 0) AS ratio_digital_trx,
+
+    COALESCE(chomebanking_transacciones, 0) /
+    NULLIF(CAST(cmobile_app_trx AS DOUBLE) + COALESCE(chomebanking_transacciones, 0), 0) AS share_homebanking,
+
+# [Anotación · líneas 56–70] Bloque B. visa_utilization_ratio y master_utilization_ratio dividen el saldo
+#   total de cada tarjeta por su límite de compra y valen 0 cuando el límite no es mayor a 0.
+#   visa_ratio_pago_minimo divide Visa_mpagado por Visa_mpagominimo y vale 1 cuando el pago mínimo no es mayor a
+#   0.
+    -- === B. UTILIZACIÓN DE LÍNEAS DE CRÉDITO ===
+    CASE
+        WHEN Visa_mlimitecompra > 0 THEN Visa_msaldototal / Visa_mlimitecompra
+        ELSE 0
+    END AS visa_utilization_ratio,
+
+    CASE
+        WHEN Master_mlimitecompra > 0 THEN Master_msaldototal / Master_mlimitecompra
+        ELSE 0
+    END AS master_utilization_ratio,
+
+    CASE
+        WHEN Visa_mpagominimo > 0 THEN Visa_mpagado / Visa_mpagominimo
+        ELSE 1
+    END AS visa_ratio_pago_minimo,
+
+# [Anotación · líneas 72–79] Bloque C: productos_por_antiguedad = cproductos / (cliente_antiguedad + 1).
+#   Bloque D: total_cheques_rechazados suma ccheques_depositados_rechazados y ccheques_emitidos_rechazados;
+#   max_delinquency_cards toma el mayor entre Visa_delinquency y Master_delinquency. En ambos los nulos se toman
+#   como 0.
+    -- === C. PROFUNDIZACIÓN Y DENSIDAD DE PRODUCTOS ===
+    cproductos / (cliente_antiguedad + 1.0) AS productos_por_antiguedad,
+
+    -- === D. ESTRÉS FINANCIERO Y RIESGO ===
+    COALESCE(ccheques_depositados_rechazados, 0) +
+    COALESCE(ccheques_emitidos_rechazados, 0) AS total_cheques_rechazados,
+
+    GREATEST(COALESCE(Visa_delinquency, 0), COALESCE(Master_delinquency, 0)) AS max_delinquency_cards,
+
+# [Anotación · líneas 81–90] Bloque E: ratio_pasivos_activos = mpasivos_margen / mactivos_margen, con valor 0
+#   cuando mactivos_margen no es mayor a 0. Cierra la consulta sobre dataset_original y la ejecuta en la
+#   conexión.
+    -- === E. RATIOS FINANCIEROS Y MÁRGENES ===
+    CASE
+        WHEN mactivos_margen > 0 THEN mpasivos_margen / mactivos_margen
+        ELSE 0
+    END AS ratio_pasivos_activos
+
+FROM dataset_original;
+"""
+
+con.execute(query_features)
+
+# [Anotación · líneas 92–99] Exporta churn_features_final a
+#   /content/drive/MyDrive/DMEyF/churn_features_lightgbm.csv con encabezado y separador coma (COPY ... TO) e
+#   imprime un mensaje de finalización.
+# 6. Exportar el nuevo dataset enriquecido de vuelta a Google Drive
+output_file = dataset_path + 'churn_features_lightgbm.csv'
+print(f"Exportando resultado a: {output_file}...")
+con.execute(f"""
+    COPY churn_features_final TO '{output_file}' (HEADER, DELIMITER ',');
+""")
+
+print("¡Proceso finalizado con éxito! El archivo ya está disponible en tu Google Drive.")

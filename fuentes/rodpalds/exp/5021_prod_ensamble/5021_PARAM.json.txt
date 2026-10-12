@@ -1,0 +1,65 @@
+{
+  "experimento": 5021,
+  "nombre": "prod_ensamble",
+  "descripcion": "Final Training + Scoring del profesor: los modelos elegidos en 5113 (hiperparametros distintos, 10+) entrenados con 202103-202106 sin undersampling, aplicados a 202108 y ensamblados promediando probabilidades. Corte lunes 07:30 con al menos 10 modelos.",
+  "sobrescribir": true,
+  "modo": "produccion",
+  "dataset": "ds3007_profesor.parquet",
+  "usar_lag2": true,
+  "clase": "clase_binaria2",
+  "top": "4112_bo_profesor_ds3007/4112_top.json",
+  "eleccion": "5113_eval_ensamble/5113_eleccion.json",
+  "top_k": 12,
+  "ayudante": false,
+  "min_modelos": 10,
+  "hora_limite": "2026-10-12 07:30",
+  "meses_train": [
+    202103,
+    202104,
+    202105,
+    202106
+  ],
+  "mes_futuro": 202106,
+  "mes_prediccion": 202108,
+  "fraccion_train_cv": 0.7,
+  "referencia_p23": {
+    "dataset": "ds3003_rank_extra.parquet",
+    "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+  },
+  "tolerancia_R7_M": 3.0,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "semilla_publico": 571369,
+  "fraccion_publico": 0.3,
+  "meseta": [
+    12000,
+    17000
+  ],
+  "cortes": [
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "reanudar": true,
+  "_config": "5021_prod_ensamble.json",
+  "_fecha_inicio": "2026-10-11 17:23:21",
+  "_script": "18_ensamble_profesor.py",
+  "_git_commit": "sin_git"
+}

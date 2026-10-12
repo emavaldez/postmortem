@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="es" data-raiz="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comparar · Postmortem Primera Competencia DMEyF 2026</title>
+<meta name="description" content="Comparador de dos entregas: fichas y códigos en paralelo.">
+<link rel="stylesheet" href="assets/estilo.css">
+<link rel="help" href="llms.txt" title="Guía para agentes">
+
+<script src="assets/app.js" defer></script>
+</head>
+<body>
+<header class="barra"><div class="barra-int"><a class="marca" href="index.html">Postmortem · Primera Competencia</a><nav aria-label="Secciones"><a href="index.html">Resumen</a><a href="index.html#entregas">Entregas</a><a href="comparar.html" aria-current="page">Comparar</a><a href="fichas.html">Fichas</a><a href="tecnicas.html">Técnicas</a><a href="reproducibilidad.html">Reproducibilidad</a><a href="buscar.html">Buscar en el código</a><a href="glosario.html">Glosario</a><a href="agentes.html">Para agentes</a></nav></div></header>
+<main class="ancho">
+<h1>Comparar dos entregas</h1>
+<p class="bajada">Elegí dos alumnos para ver sus fichas lado a lado y sus códigos en paralelo. Los pasos de cada uno llevan a la parte del código donde ocurren.</p>
+<div class="filtros"><select id="sel-a" aria-label="Entrega A"></select><button id="invertir" type="button" aria-label="Intercambiar A y B">⇄</button><select id="sel-b" aria-label="Entrega B"></select></div>
+<p id="aviso-carga" class="aviso oculto">No se pudieron cargar los datos. Esta página necesita abrirse desde un servidor web (por ejemplo GitHub Pages, o <code>python3 -m http.server</code> en la carpeta del repositorio), no como archivo suelto.</p>
+<noscript><p class="aviso">El comparador necesita JavaScript. Sin él, se pueden abrir las páginas de dos entregas en dos pestañas, o leer sus versiones en Markdown desde <a href="agentes.html">la guía para agentes</a>.</p></noscript>
+<div id="comparacion" class="oculto">
+<h2>Resumen</h2><div class="dos"><p id="res-a"></p><p id="res-b"></p></div>
+<h2>Ficha</h2><p class="meta">Las celdas resaltadas son las que difieren entre las dos entregas.</p><div class="tabla"><table class="ficha dif" id="tabla-ficha"></table></div>
+<h2>Técnicas</h2><div class="tabla"><table><thead><tr><th id="tec-na">Sólo A</th><th>Las dos</th><th id="tec-nb">Sólo B</th></tr></thead><tbody><tr><td><div class="chips" id="tec-a"></div></td><td><div class="chips" id="tec-ab"></div></td><td><div class="chips" id="tec-b"></div></td></tr></tbody></table></div>
+<h2>Reproducibilidad</h2><div class="tabla"><table class="ficha" id="tabla-repro"></table></div>
+<h2>Código en paralelo</h2><div class="dos"><section class="panel" id="panel-a" aria-label="Entrega A"></section><section class="panel" id="panel-b" aria-label="Entrega B"></section></div>
+</div>
+<footer class="pie">
+<p>Página armada el 2026-10-12 a partir de los repositorios públicos que cada alumno posteó como entrega de la Primera Competencia de DMEyF 2026 (UBA). Las descripciones y las anotaciones del código son lecturas automáticas hechas con asistencia de IA y revisadas por una segunda pasada automática; describen lo que el código hace, sin valorarlo, y pueden contener errores. El código y los textos de cada entrega pertenecen a sus autores y se muestran tal como estaban en el commit indicado en cada página.</p>
+<p>Para corregir una descripción o pedir que se retire una entrega: <a href="https://github.com/emavaldez/postmortem/issues">abrir un issue</a>. <a href="agentes.html">Versión para agentes</a> · <a href="llms.txt">llms.txt</a> · <a href="https://github.com/emavaldez/postmortem">repositorio de esta página</a>.</p>
+</footer>
+</main>
+</body>
+</html>

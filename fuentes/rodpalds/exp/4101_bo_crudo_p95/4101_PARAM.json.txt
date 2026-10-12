@@ -1,0 +1,81 @@
+{
+  "experimento": 4101,
+  "nombre": "bo_crudo_p95",
+  "descripcion": "Optuna sobre crudo + binaria2, variables p95 de canaritos (4003). CV 5 folds en 202104 midiendo ganancia; top 5 validados en 202106 con 5 semillas.",
+  "reanudar": false,
+  "dataset": "ds3001_crudo.parquet",
+  "variables": "4003_canaritos/4003_variables_p95.txt",
+  "mes_train": 202104,
+  "mes_test": 202106,
+  "clase": "clase_binaria2",
+  "n_trials": 100,
+  "n_startup_trials": 20,
+  "cv_folds": 5,
+  "max_boost_round": 3000,
+  "espacio": {
+    "learning_rate": [
+      0.005,
+      0.1,
+      "log"
+    ],
+    "num_leaves": [
+      8,
+      256,
+      "log"
+    ],
+    "min_data_in_leaf": [
+      20,
+      3000,
+      "log"
+    ],
+    "feature_fraction": [
+      0.1,
+      1.0,
+      "lineal"
+    ],
+    "bagging_fraction": [
+      0.3,
+      1.0,
+      "lineal"
+    ],
+    "lambda_l1": [
+      0.001,
+      10.0,
+      "log"
+    ],
+    "lambda_l2": [
+      0.001,
+      100.0,
+      "log"
+    ]
+  },
+  "lgbm_fijos": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "metric": "None",
+    "max_bin": 31,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "first_metric_only": true,
+    "verbose": -1
+  },
+  "top_validar": 5,
+  "semillas": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "ventana_meseta": 401,
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "cortes": {
+    "desde": 2000,
+    "hasta": 20000,
+    "paso": 500
+  },
+  "_fecha_inicio": "2026-10-05 02:09:32",
+  "_script": "06_optimizacion_bayesiana.py",
+  "_git_commit": "sin_git"
+}

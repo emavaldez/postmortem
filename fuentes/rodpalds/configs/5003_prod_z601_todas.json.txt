@@ -1,0 +1,48 @@
+{
+  "dataset": "ds3001_crudo.parquet",
+  "clase": "clase_binaria2",
+  "escalar_min_data_in_leaf": true,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000,
+    15500,
+    16000,
+    16500,
+    17000,
+    17500,
+    18000,
+    18500,
+    19000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "modo": "produccion",
+  "meses_train": [
+    202104,
+    202105,
+    202106
+  ],
+  "mes_prediccion": 202108,
+  "experimento": 5003,
+  "nombre": "prod_z601_todas",
+  "variables": null,
+  "hiperparametros": "z601",
+  "n_semillas": 50,
+  "descripcion": "Produccion: semillerio 50 semillas, z601, todas las variables. Train 202104-202106 -> 202108."
+}

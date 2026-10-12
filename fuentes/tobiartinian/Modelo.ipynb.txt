@@ -1,0 +1,201 @@
+#%% celda 1 [texto]
+<a href="https://colab.research.google.com/github/tobiartinian/Econom-a-y-Finanzas/blob/main/Modelo.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+
+#%% celda 2 [código]
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import duckdb
+%pip install jupysql
+%pip install duckdb-engine
+%load_ext sql
+%config SqlMagic.autopandas = True
+%config SqlMagic.feedback = False
+%config SqlMagic.displaycon = False
+%sql duckdb://
+
+#%% celda 3 [código]
+dataset_filename = "competencia_01.csv"
+dataset_path = "/content/drive/MyDrive/Economía y finanzas"
+
+#%% celda 4 [texto]
+# Feature Enginering
+
+#%% celda 5 [texto]
+## Generamos nuevas variables LAG
+
+#%% celda 6 [código]
+df = pd.read_csv(f'{dataset_path}/{dataset_filename}')
+
+# Columnas que deseas ignorar
+excluir = {'foto_mes', 'numero_de_cliente', 'clase_ternaria'}
+
+# Obtener todas las columnas excepto las 3 especificadas
+variables_lag = [col for col in df.columns if col not in excluir]
+
+#%% celda 7 [código]
+file_path = f"{dataset_path}/{dataset_filename}"
+con = duckdb.connect("competencia.duckdb")
+
+# 1. Leer solo las columnas del CSV usando Pandas (nrows=0 lee instantáneamente)
+df_header = pd.read_csv(file_path, nrows=0)
+columnas_existentes = set(df_header.columns)
+
+# 2. Excluir las variables que NO deben llevar Lag
+excluir = {'foto_mes', 'numero_de_cliente', 'clase_ternaria'}
+variables_lag_validas = [col for col in df_header.columns if col not in excluir]
+
+# 3. Validar si alguna variable esperada faltó (Opcional)
+if 'variables_lag' in locals():
+    columnas_faltantes = set(variables_lag) - columnas_existentes
+    if columnas_faltantes:
+        print(f"⚠️ Las siguientes columnas no existen y fueron ignoradas: {columnas_faltantes}")
+
+# 4. Generar la consulta SQL para los Lags
+lags_sql = ",\n    ".join([
+    f"LAG({col}, 1) OVER (PARTITION BY numero_de_cliente ORDER BY foto_mes) AS {col}_lag1"
+    for col in variables_lag_validas
+])
+
+# 5. Ejecutar la creación de la tabla en DuckDB
+query = f"""
+CREATE OR REPLACE TABLE competencia_01 AS
+SELECT
+    *,
+    {lags_sql}
+FROM read_csv_auto('{file_path}');
+"""
+
+con.execute(query)
+print(f"¡Tabla cargada con éxito! Se procesaron {len(variables_lag_validas)} variables con Lag.")
+
+#%% celda 8 [texto]
+# Modelo
+
+#%% celda 9 [texto]
+## Entrenamiento del modelo
+
+#%% celda 10 [código]
+import lightgbm as lgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+# 1. Leer los datos procesados directamente desde DuckDB
+con = duckdb.connect("competencia.duckdb")
+
+# Si tu target es binario (ej. 1 para BAJA+2, 0 para el resto):
+df = con.execute("""
+    SELECT
+        *,
+        CASE WHEN clase_ternaria = 'BAJA+2' THEN 1 ELSE 0 END AS target
+    FROM competencia_01
+""").df()
+
+# 2. Separar Features (X) y Target (y)
+excluir = {"foto_mes", "numero_de_cliente", "clase_ternaria", "target"}
+features = [col for col in df.columns if col not in excluir]
+
+# Variables únicamente del período Marzo 21 a Junio 21
+
+X = df[features].loc[df["foto_mes"].between(202103, 202106)]
+y = df["target"].loc[df["foto_mes"].between(202103, 202106)]
+
+# 3. Train / Validation Split (Stratified para mantener la proporción de bajas)
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# 4. Hiperparámetros Basicos por Defecto
+params = {
+    "objective": "binary",
+    "metric": "auc",
+    "boosting_type": "gbdt",
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "feature_fraction": 0.8,  # Muestra 80% de columnas por árbol (útil cuando hay muchos lags)
+    "random_state": 42,
+    "verbose": -1
+}
+
+# 5. Crear Datasets de LightGBM y Entrenar
+train_data = lgb.Dataset(X_train, label=y_train)
+val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+
+model = lgb.train(
+    params,
+    train_data,
+    num_boost_round=300,
+    valid_sets=[train_data, val_data],
+    callbacks=[
+        lgb.early_stopping(stopping_rounds=30),
+        lgb.log_evaluation(period=50)
+    ]
+)
+
+# 6. Evaluar Métrica Base
+preds_val = model.predict(X_val, num_iteration=model.best_iteration)
+auc_val = roc_auc_score(y_val, preds_val)
+
+print(f"\nResultado del Modelo Base:")
+print(f"Mejor Iteración: {model.best_iteration}")
+print(f"ROC AUC en Validación: {auc_val:.5f}")
+
+#%% celda 11 [texto]
+## Validación del modelo
+
+#%% celda 12 [texto]
+Ganancia del modelo
+
+#%% celda 13 [código]
+ganancia_acierto = 1_072_500
+costo_estimulo = 27_500
+
+def ganancia(model, X, y, prop=1, threshold=0.025):
+  y_hat = model.predict(X)
+
+  # Quitamos el threshold de los argumentos internos para que use el de la función principal
+  @np.vectorize
+  def ganancia_row(predicted, actual):
+    return (predicted >= threshold) * (ganancia_acierto if actual == 1 else -costo_estimulo)
+
+  return ganancia_row(y_hat, y).sum() / prop
+
+#%% celda 14 [código]
+ganancia(model,X_val, y_val)
+
+#%% celda 15 [texto]
+## Entrega
+
+#%% celda 16 [código]
+# 1. Definir el mes que deseas predecir (reemplaza por el mes de test correspondiente)
+mes_test = 202108  # Ejemplo de mes objetivo para predicción
+
+# Extraer los datos de ese mes desde DuckDB (que ya contiene los 152 lags calculados)
+df_test = con.execute(f"""
+    SELECT *
+    FROM competencia_01
+    WHERE foto_mes = {mes_test}
+""").df()
+
+# 2. Utilizar exactamente las mismas features que en el entrenamiento
+excluir_test = {"foto_mes", "numero_de_cliente", "clase_ternaria", "target"}
+features_test = [col for col in df_test.columns if col not in excluir_test]
+
+X_test = df_test[features_test]
+
+# 3. Realizar la predicción utilizando la mejor iteración del modelo entrenado[cite: 1]
+df_test['probabilidad'] = model.predict(X_test, num_iteration=model.best_iteration)
+
+# 4. FILTRAR: Quedarnos únicamente con los clientes cuya probabilidad sea mayor o igual al umbral óptimo (0.025)
+umbral_optimo = 0.025
+df_bajas_predichas = df_test[df_test['probabilidad'] >= umbral_optimo].copy()
+
+# 5. Preparar el DataFrame de entrega con el número de cliente y su probabilidad predicha[cite: 1]
+df_submission = df_bajas_predichas['numero_de_cliente'].copy()
+
+# 6. Guardar el archivo CSV filtrado[cite: 1]
+df_submission.to_csv('submission_2.csv', index=False, header=False)
+
+print(f"¡Se filtraron y guardaron {len(df_submission)} clientes predichos como baja+2!")
+df_submission.head(10)

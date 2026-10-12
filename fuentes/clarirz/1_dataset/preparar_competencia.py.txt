@@ -1,0 +1,96 @@
+from pathlib import Path
+import argparse
+import urllib.request
+import duckdb
+
+URL = "https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv"
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--workdir", type=Path, default=Path("_cluster_work"))
+    args = p.parse_args()
+    args.workdir.mkdir(parents=True, exist_ok=True)
+
+    raw = args.workdir / "competencia_01_crudo.csv"
+    out = args.workdir / "competencia_01.parquet"
+    counts = args.workdir / "target_counts.csv"
+
+    if not raw.exists():
+        print("Descargando dataset crudo...")
+        urllib.request.urlretrieve(URL, raw)
+
+    con = duckdb.connect()
+    print("Construyendo target...")
+    q = f"""
+    COPY (
+      WITH raw AS (
+        SELECT * REPLACE (CAST(numero_de_cliente AS BIGINT) AS numero_de_cliente)
+        FROM read_csv('{raw.as_posix()}', sample_size=-1)
+      ),
+      periodos AS (
+        SELECT DISTINCT foto_mes FROM raw
+      ),
+      clientes AS (
+        SELECT DISTINCT numero_de_cliente FROM raw
+      ),
+      todo AS (
+        SELECT numero_de_cliente, foto_mes
+        FROM clientes CROSS JOIN periodos
+      ),
+      presencia AS (
+        SELECT
+          t.numero_de_cliente,
+          t.foto_mes,
+          CASE WHEN r.numero_de_cliente IS NULL THEN 0 ELSE 1 END AS mes_0
+        FROM todo t
+        LEFT JOIN raw r USING (numero_de_cliente, foto_mes)
+      ),
+      ventana AS (
+        SELECT
+          *,
+          lead(mes_0, 1) OVER (PARTITION BY numero_de_cliente ORDER BY foto_mes) AS mes_1,
+          lead(mes_0, 2) OVER (PARTITION BY numero_de_cliente ORDER BY foto_mes) AS mes_2
+        FROM presencia
+      ),
+      etiquetas AS (
+        SELECT
+          numero_de_cliente,
+          foto_mes,
+          CASE
+            -- Intermitente: falta el mes siguiente pero vuelve al subsiguiente.
+            -- Se conserva como CONTINUA para reproducir la base canónica usada en el EDA.
+            WHEN mes_1 = 0 AND mes_2 = 1 THEN 'CONTINUA'
+            WHEN mes_1 = 0 THEN 'BAJA+1'
+            WHEN mes_1 = 1 AND mes_2 = 0 THEN 'BAJA+2'
+            WHEN mes_1 = 1 AND mes_2 = 1 THEN 'CONTINUA'
+            ELSE NULL
+          END AS clase_ternaria
+        FROM ventana
+        WHERE mes_0 = 1
+      )
+      SELECT r.*, e.clase_ternaria
+      FROM raw r
+      JOIN etiquetas e USING (numero_de_cliente, foto_mes)
+      ORDER BY numero_de_cliente, foto_mes
+    ) TO '{out.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+    """
+    con.execute(q)
+
+    con.execute(f"""
+      COPY (
+        SELECT foto_mes, clase_ternaria, count(*) AS n
+        FROM read_parquet('{out.as_posix()}')
+        GROUP BY foto_mes, clase_ternaria
+        ORDER BY foto_mes, clase_ternaria
+      ) TO '{counts.as_posix()}' (HEADER, DELIMITER ',')
+    """)
+
+    print(con.execute(f"""
+      SELECT foto_mes, clase_ternaria, count(*) n
+      FROM read_parquet('{out.as_posix()}')
+      GROUP BY 1,2 ORDER BY 1,2
+    """).df().to_string(index=False))
+    print("Listo:", out)
+
+if __name__ == "__main__":
+    main()

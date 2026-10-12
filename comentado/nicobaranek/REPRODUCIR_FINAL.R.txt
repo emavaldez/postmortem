@@ -1,0 +1,9 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–3] Ejecuta en orden codigo/configuracion.R (parámetros, verificaciones y carga de
+#   motor.R), codigo/preparacion.R (base, lags y lectura de hiperparámetros) y codigo/final.R (entrenamiento de
+#   10 semillas, promedio, corte y verificación).
+source('codigo/configuracion.R')
+source('codigo/preparacion.R')
+source('codigo/final.R')

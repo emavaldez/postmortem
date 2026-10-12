@@ -1,0 +1,41 @@
+
+===== 011 2026-10-07 10:57 | r=0.099 rondas=688 | 10 semillas | TOP20 derivadas: ['n_ingresos', 'n_productos_activos', 'n_egresos', 'r_trx_por_producto', 'n_deuda']... =====
+[B] columnas: V0_base 150, V1_agregados 156, V2_lags_derivadas 210, V3_eventos 158, V4_comisiones_norm 150
+[B s=676057] V0 406.7 | V1 -4.0 | V2 -12.9 | V3 -8.8 | V4 -1.2 (5 min)
+[B s=482687] V0 404.7 | V1 +3.6 | V2 -1.5 | V3 +1.0 | V4 -1.2 (10 min)
+[B s=399221] V0 405.5 | V1 +0.4 | V2 -8.5 | V3 +0.6 | V4 -1.0 (16 min)
+[B s=121109] V0 403.7 | V1 +4.7 | V2 -11.6 | V3 -11.1 | V4 +0.8 (21 min)
+[B s=292131] V0 408.5 | V1 +1.9 | V2 -5.2 | V3 +2.2 | V4 -3.2 (26 min)
+[B s=133559] V0 407.8 | V1 +0.3 | V2 -12.2 | V3 -10.4 | V4 +1.0 (31 min)
+[B s=956184] V0 404.1 | V1 -2.6 | V2 -1.7 | V3 +2.6 | V4 +3.2 (36 min)
+[B s=853814] V0 400.9 | V1 -0.3 | V2 -6.7 | V3 -8.5 | V4 +3.2 (41 min)
+[B s=796055] V0 420.8 | V1 -6.6 | V2 -19.9 | V3 -6.9 | V4 -6.7 (46 min)
+[B s=407085] V0 406.4 | V1 +3.0 | V2 -9.6 | V3 -5.8 | V4 +2.6 (51 min)
+[Bh] columnas: V0_base 150, V1_agregados 156, V2_lags_derivadas 210, V3_eventos 158, V4_comisiones_norm 151
+[Bh s=676057] V0 392.7 | V1 -0.6 | V2 -3.0 | V3 -4.5 | V4 +1.8 (56 min)
+[Bh s=482687] V0 393.8 | V1 +12.6 | V2 +3.6 | V3 +7.6 | V4 +2.5 (61 min)
+[Bh s=399221] V0 393.4 | V1 +1.2 | V2 -6.3 | V3 +3.9 | V4 -0.8 (65 min)
+[Bh s=121109] V0 388.0 | V1 +0.7 | V2 -1.5 | V3 +2.1 | V4 -1.0 (70 min)
+[Bh s=292131] V0 395.6 | V1 +8.9 | V2 -8.4 | V3 +10.7 | V4 -3.0 (75 min)
+[Bh s=133559] V0 398.9 | V1 +1.1 | V2 -4.9 | V3 -1.5 | V4 -1.9 (80 min)
+[Bh s=956184] V0 390.1 | V1 +8.5 | V2 -5.2 | V3 +10.6 | V4 -2.3 (84 min)
+[Bh s=853814] V0 396.3 | V1 -4.5 | V2 -13.2 | V3 -9.3 | V4 -0.8 (89 min)
+[Bh s=796055] V0 404.0 | V1 -2.1 | V2 +1.0 | V3 -1.5 | V4 +5.9 (94 min)
+[Bh s=407085] V0 394.9 | V1 +0.6 | V2 -2.9 | V3 -8.7 | V4 -2.1 (99 min)
+
+Niveles (M ARS):
+fold                    B     Bh
+variante                        
+V0_base             406.9  394.8
+V1_agregados        407.0  397.4
+V2_lags_derivadas   397.9  390.7
+V3_eventos          402.4  395.7
+V4_comisiones_norm  406.7  394.6
+
+Diferencias pareadas vs V0:
+          variante  B_delta  B_ee  Bh_delta  Bh_ee pares_positivos
+      V1_agregados     0.04  1.13      2.65   1.73           13/20
+ V2_lags_derivadas    -8.99  1.77     -4.10   1.50            2/20
+        V3_eventos    -4.52  1.74      0.92   2.32            9/20
+V4_comisiones_norm    -0.26  0.98     -0.18   0.87            8/20
+[011] terminado

@@ -1,0 +1,224 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–25] Docstring con los cuatro controles de estabilidad. Importa `KMeans`,
+#   `RandomForestClassifier`, `adjusted_rand_score` y `linear_sum_assignment`, y de `eda_clusters_profundo.py`
+#   las constantes y las funciones `load_full`, `numeric_features` y `leaf_profile`.
+"""
+Validación de estabilidad de la segmentación z501.
+
+NO selecciona k por silhouette.
+Evalúa:
+1) sensibilidad de KMeans a semillas sobre la misma representación;
+2) estabilidad por bootstrap de clientes;
+3) estabilidad al reconstruir Random Forest + muestra de fieles con otras semillas;
+4) cómo se fusiona/subdivide k=5 al usar otras resoluciones.
+"""
+from __future__ import annotations
+import argparse, json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import adjusted_rand_score
+from scipy.optimize import linear_sum_assignment
+
+from eda_clusters_profundo import (
+    ID,MES,TARGET,GRUPO,CLUSTER,RAIZ,SEED,N_TREES,MIN_LEAF,
+    load_full,numeric_features,leaf_profile
+)
+import duckdb
+
+# [Anotación · líneas 27–42] `build_sample` arma la muestra con una semilla dada: filas de los clientes con
+#   algún BAJA+2 (grupo 1) y de igual cantidad de clientes presentes en todos los meses sin ninguna baja (grupo
+#   0), elegidos por orden de `hash(numero_de_cliente + semilla)`.
+def build_sample(full, seed):
+    churn_ids=full.loc[full[TARGET].eq("BAJA+2"),ID].drop_duplicates()
+    n_months=full[MES].nunique()
+    faithful=full.groupby(ID,sort=False).agg(
+        n_rows=(MES,"size"),
+        any_baja=(TARGET,lambda s:s.isin(["BAJA+1","BAJA+2"]).any())
+    )
+    fid=faithful.index[(faithful.n_rows.eq(n_months)) & (~faithful.any_baja)]
+    ids_df=pd.DataFrame({ID:fid.to_numpy(dtype=np.int64)})
+    con=duckdb.connect(); con.register("ids_df",ids_df)
+    fs=con.execute(
+        f"SELECT {ID} FROM ids_df ORDER BY hash({ID}+{seed}) LIMIT {len(churn_ids)}"
+    ).df()[ID]
+    a=full[full[ID].isin(churn_ids)].copy(); a[GRUPO]=1
+    b=full[full[ID].isin(fs)].copy(); b[GRUPO]=0
+    return pd.concat([a,b],ignore_index=True).sort_values([ID,MES])
+
+# [Anotación · líneas 44–55] `fit_profile` entrena el Random Forest (300 árboles por defecto, 50 filas mínimas
+#   por hoja, clases balanceadas, semilla dada) sobre todas las columnas numéricas de la muestra y devuelve el
+#   perfil de hojas de los clientes BAJA+2.
+def fit_profile(full, seed=SEED, n_trees=N_TREES):
+    sample=build_sample(full,seed)
+    feats=numeric_features(sample)
+    X=sample[feats].to_numpy(dtype=np.float32)
+    y=sample[GRUPO].to_numpy(); ids=sample[ID].to_numpy()
+    rf=RandomForestClassifier(
+        n_estimators=n_trees,min_samples_leaf=MIN_LEAF,max_features="sqrt",
+        class_weight="balanced",oob_score=True,n_jobs=-1,random_state=seed
+    ).fit(X,y)
+    P=leaf_profile(rf,X,ids,feats)
+    churn_ids=pd.Index(sample.loc[sample[GRUPO].eq(1),ID].unique())
+    return rf,P.loc[churn_ids]
+
+# [Anotación · líneas 57–65] `fit_k` ajusta KMeans con k grupos y 20 inicializaciones (opcionalmente sobre un
+#   remuestreo de filas) y asigna grupo a todos los clientes; `size_remap` renumera los grupos de mayor a menor
+#   tamaño empezando en 1.
+def fit_k(P,k,seed=SEED,n_init=20,weights_idx=None):
+    X=P.values if weights_idx is None else P.values[weights_idx]
+    km=KMeans(n_clusters=k,n_init=n_init,random_state=seed).fit(X)
+    return km,km.predict(P.values)
+
+def size_remap(labels):
+    order=pd.Series(labels).value_counts().index.tolist()
+    remap={old:new+1 for new,old in enumerate(order)}
+    return np.array([remap[x] for x in labels])
+
+# [Anotación · líneas 67–83] `best_map` empareja las etiquetas de dos particiones con el algoritmo húngaro
+#   sobre la tabla cruzada; `top_features` devuelve, por grupo, las 10 variables con mayor cociente entre su
+#   peso en el grupo y su peso global.
+def best_map(ref,pred):
+    tab=pd.crosstab(pd.Series(ref,name="ref"),pd.Series(pred,name="pred"))
+    M=tab.to_numpy()
+    rr,cc=linear_sum_assignment(-M)
+    mapping={tab.columns[c]:tab.index[r] for r,c in zip(rr,cc)}
+    mapped=np.array([mapping.get(x,-1) for x in pred])
+    return mapped,mapping,tab
+
+def top_features(P,labels,n=10):
+    global_mean=P.mean(axis=0)
+    out={}
+    for c in sorted(np.unique(labels)):
+        ids=np.flatnonzero(labels==c)
+        sh=P.iloc[ids].mean(axis=0)
+        lift=(sh/global_mean.replace(0,np.nan)).sort_values(ascending=False)
+        out[c]=set(lift.head(n).index)
+    return out
+
+# [Anotación · líneas 85–119] `report` lee los CSV de estabilidad y escribe `ESTABILIDAD_CLUSTERS.md` con el
+#   índice de Rand ajustado (mediana, mínimo y máximo) de cada control y la estabilidad de pertenencia por
+#   grupo.
+def report(outdir):
+    km=pd.read_csv(outdir/"stability_kmeans_seeds.csv")
+    boot=pd.read_csv(outdir/"stability_bootstrap.csv")
+    rf=pd.read_csv(outdir/"stability_rf_seeds.csv")
+    pc=pd.read_csv(outdir/"bootstrap_client_stability.csv")
+
+    lines=["# Estabilidad de clusters z501","",
+      "Esta validación **no elige k mediante silhouette**. Pregunta si la partición k=5 reaparece cuando perturbamos el algoritmo, los clientes y la representación del Random Forest.","",
+      "## 1. Semilla de KMeans sobre la misma representación","",
+      f"- ARI mediano: **{km.ari.median():.4f}**",
+      f"- ARI mínimo: **{km.ari.min():.4f}**",
+      f"- ARI máximo: **{km.ari.max():.4f}**","",
+      "## 2. Bootstrap de clientes","",
+      f"- ARI mediano: **{boot.ari.median():.4f}**",
+      f"- ARI mínimo: **{boot.ari.min():.4f}**",
+      f"- ARI máximo: **{boot.ari.max():.4f}**","",
+      "Estabilidad de pertenencia individual tras hacer matching de etiquetas:","",
+      "| cluster referencia | estabilidad media | P10 | P90 |",
+      "|---:|---:|---:|---:|"]
+    for c,g in pc.groupby("cluster_ref"):
+        lines.append(f"| C{c} | {g.stability.mean():.3f} | {g.stability.quantile(.10):.3f} | {g.stability.quantile(.90):.3f} |")
+    lines += ["","## 3. Reconstrucción RF + muestra de fieles con otras semillas","",
+      "| seed | OOB | ARI vs referencia | overlap medio top-10 atributos |",
+      "|---:|---:|---:|---:|"]
+    for r in rf.itertuples():
+        lines.append(f"| {r.seed} | {r.oob:.4f} | {r.ari:.4f} | {r.top10_overlap_mean:.3f} |")
+    lines += ["","## 4. Otras resoluciones de k","",
+      "El archivo k_resolution_crosswalk.csv muestra cómo cada C1–C5 se reparte cuando usamos k=3,4,6,7. Se interpreta como **fusión/subdivisión**, no como concurso para encontrar un k verdadero.","",
+      "## Regla de interpretación","",
+      "- ARI alto bajo semillas: KMeans no depende demasiado de una inicialización particular.",
+      "- ARI alto bajo bootstrap: la geometría de la partición es reproducible al perturbar clientes.",
+      "- ARI alto al reconstruir RF: los perfiles no dependen sólo de una muestra de fieles o un bosque particular.",
+      "- Un cluster que se divide al aumentar k pero conserva su familia de atributos puede representar una familia estable con subtipos.",
+      "- Un cluster que cambia de identidad o membresía en todas las perturbaciones debe narrarse con más cautela.",""]
+    (outdir/"ESTABILIDAD_CLUSTERS.md").write_text("\n".join(lines),encoding="utf-8")
+
+# [Anotación · líneas 121–131] `main` lee el dataset, calcula el perfil de referencia con semilla 214363 y 300
+#   árboles, corre KMeans con k = 5, renumera por tamaño y escribe `reference_labels.csv` con
+#   `numero_de_cliente` y `cluster_ref`. Ese archivo es la entrada de grupos del modelo final.
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--data",type=Path,required=True)
+    ap.add_argument("--out",type=Path,required=True)
+    args=ap.parse_args(); args.out.mkdir(parents=True,exist_ok=True)
+    full=load_full(args.data)
+
+    print("Referencia RF/P")
+    rf0,P0=fit_profile(full,SEED,N_TREES)
+    km0,raw0=fit_k(P0,5,SEED); ref=size_remap(raw0)
+    pd.DataFrame({ID:P0.index,"cluster_ref":ref}).to_csv(args.out/"reference_labels.csv",index=False)
+
+# [Anotación · líneas 133–138] Repite KMeans con 20 semillas sobre el mismo perfil y guarda el índice de Rand
+#   ajustado contra la referencia en `stability_kmeans_seeds.csv`.
+    print("KMeans seeds")
+    rows=[]
+    for s in [17,101,202,303,404,505,606,707,808,909,1010,1111,1212,1313,1414,1515,1616,1717,1818,1919]:
+        km,p=fit_k(P0,5,s)
+        rows.append({"seed":s,"ari":adjusted_rand_score(ref,p),"inertia":km.inertia_})
+    pd.DataFrame(rows).to_csv(args.out/"stability_kmeans_seeds.csv",index=False)
+
+# [Anotación · líneas 140–152] Hace 30 remuestreos con reposición de clientes, ajusta KMeans en cada uno,
+#   empareja etiquetas con la referencia y guarda el índice de Rand ajustado y, por cliente, la fracción de
+#   remuestreos en que conserva su grupo.
+    print("Bootstrap customers")
+    rng=np.random.default_rng(SEED); brow=[]; same=np.zeros((len(ref),30),dtype=np.int8)
+    n=len(P0)
+    for b in range(30):
+        idx=rng.integers(0,n,size=n)
+        km,p=fit_k(P0,5,SEED+b+1,weights_idx=idx)
+        mapped,mapping,tab=best_map(ref,p)
+        ari=adjusted_rand_score(ref,p)
+        same[:,b]=(mapped==ref)
+        brow.append({"bootstrap":b+1,"ari":ari,"inertia":km.inertia_})
+    pd.DataFrame(brow).to_csv(args.out/"stability_bootstrap.csv",index=False)
+    stab=same.mean(axis=1)
+    pd.DataFrame({ID:P0.index,"cluster_ref":ref,"stability":stab}).to_csv(args.out/"bootstrap_client_stability.csv",index=False)
+
+# [Anotación · líneas 154–172] Reconstruye la muestra y el Random Forest con 5 semillas (17, 101, 202, 303 y
+#   404), vuelve a agrupar y guarda el OOB, el índice de Rand ajustado, la superposición de las 10 variables
+#   principales por grupo y los tamaños.
+    print("RF/sample seeds")
+    ref_top=top_features(P0,ref,10); rrows=[]
+    for s in [17,101,202,303,404]:
+        rf,P=fit_profile(full,s,N_TREES)
+        P=P.reindex(P0.index)
+        km,p=fit_k(P,5,SEED)
+        mapped,mapping,tab=best_map(ref,p)
+        ari=adjusted_rand_score(ref,p)
+        tops=top_features(P,mapped,10)
+        overlaps=[]
+        for c in range(1,6):
+            a=ref_top.get(c,set()); bb=tops.get(c,set())
+            overlaps.append(len(a&bb)/len(a|bb) if a|bb else np.nan)
+        rrows.append({
+            "seed":s,"oob":rf.oob_score_,"ari":ari,
+            "top10_overlap_mean":np.nanmean(overlaps),
+            "cluster_sizes":json.dumps(pd.Series(mapped).value_counts().sort_index().to_dict())
+        })
+    pd.DataFrame(rrows).to_csv(args.out/"stability_rf_seeds.csv",index=False)
+
+# [Anotación · líneas 174–190] Ajusta KMeans con k = 3, 4, 6 y 7 y guarda cómo se reparte cada grupo de
+#   referencia en los grupos alternativos (`k_resolution_crosswalk.csv`). Por último escribe el informe.
+    print("k resolution crosswalk")
+    rows=[]
+    for k in [3,4,6,7]:
+        km,p=fit_k(P0,k,SEED)
+        p=size_remap(p)
+        tab=pd.crosstab(pd.Series(ref,name="cluster_ref"),pd.Series(p,name="cluster_alt"))
+        for c in tab.index:
+            den=tab.loc[c].sum()
+            for alt,nc in tab.loc[c].items():
+                rows.append({"k_alt":k,"cluster_ref":c,"cluster_alt":alt,"n":nc,"share_of_ref":nc/den})
+    pd.DataFrame(rows).to_csv(args.out/"k_resolution_crosswalk.csv",index=False)
+
+    report(args.out)
+    print("Listo",args.out)
+
+if __name__=="__main__":
+    main()

@@ -1,0 +1,297 @@
+#%% celda 1 [texto]
+## 0. Configuración
+
+#%% celda 2 [código]
+!pip install -q lightgbm optuna
+
+#%% celda 3 [código]
+import gc, os
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import optuna
+import shutil
+
+DATA_PATH = './data/competencia_01.csv'
+OUTPUT_PATH = './output'
+
+GANANCIA_ACIERTO = 1_100_000  # 2.200.000 * 0.5
+COSTO_ENVIO = 27_500
+
+MES_TARGET = 202108
+TRAIN_MESES = [202103, 202104, 202105]
+VALID_MES = 202106
+FINAL_MESES = [202103, 202104, 202105, 202106]
+
+LAGS = [1, 2]
+FRAC_NEGATIVOS = 0.1  # submuestreo de CONTINUA
+N_TRIALS = 33  # llegue a correr hasta 33 trials
+
+# ----- Optimización de hiperparámetros -----
+N_SEEDS_TRIAL = 1  # seeds por trial (cambian submuestreo y LightGBM); se promedia la curva de ganancia
+MAX_ITER = 2000  # se entrena UNA vez hasta acá por trial y se elige la mejor iteración
+EVAL_CADA = 32  # cada cuántas iteraciones se mide la ganancia
+SUAVIZAR_CKPT = 5  # media móvil (en checkpoints) sobre la curva de ganancia vs iteración
+MAX_BIN = 31  # hiperparametro fijo
+FACTOR_ITER_FINAL = 1.1  # el final entrena con 4 meses y se optimizó con 2: algo más de iteraciones
+
+SEED = 236983
+N_SEEDS_SUBMIT = 18  # modelos finales (llegue a hacer solo 18 modelos)
+
+#%% celda 4 [texto]
+## 1. Carga de datos
+
+#%% celda 5 [código]
+df = pd.read_csv(DATA_PATH, low_memory=False)
+df['clase_binaria'] = (df['clase_ternaria'].isin(['BAJA+2', 'BAJA+1'])).astype('int8')
+print(df.shape, f"{df.memory_usage().sum()/1e9:.2f} GB")
+print(df.groupby('foto_mes')['clase_binaria'].agg(['sum', 'mean', 'size']))
+
+#%% celda 6 [texto]
+## 2. Feature engineering
+
+#%% celda 7 [código]
+# ccajas_depositos esta roto en 202105
+df.loc[df.foto_mes == 202105, "ccajas_depositos"] = np.nan
+
+#%% celda 8 [código]
+def agregar_lags(df, cols, lags):
+    df = df.sort_values(['numero_de_cliente', 'foto_mes']).reset_index(drop=True)
+    cli  = df['numero_de_cliente'].values
+    midx = (df['foto_mes'] // 100 * 12 + df['foto_mes'] % 100).values   # índice de mes consecutivo
+    n = len(df)
+    nuevas = {}
+    for k in lags:
+        ok = np.zeros(n, dtype=bool)                  # mismo cliente y exactamente k meses antes
+        ok[k:] = (cli[k:] == cli[:-k]) & ((midx[k:] - midx[:-k]) == k)
+        for c in cols:
+            a = df[c].values.astype('float32')
+            lag = np.full(n, np.nan, dtype='float32')
+            lag[k:] = a[:-k]
+            lag[~ok] = np.nan
+            nuevas[f'{c}_lag{k}']   = lag
+            nuevas[f'{c}_delta{k}'] = a - lag
+    return pd.concat([df, pd.DataFrame(nuevas, index=df.index)], axis=1)
+
+excluir   = ['numero_de_cliente', 'foto_mes', 'clase_ternaria', 'clase_binaria']
+cols_base = [c for c in df.columns if c not in excluir]
+
+df = agregar_lags(df, cols_base, LAGS)
+df = df[df['foto_mes'].isin(FINAL_MESES + [VALID_MES, MES_TARGET])].reset_index(drop=True)  # 202107 solo servía para los lags
+gc.collect()
+
+features = [c for c in df.columns if c not in excluir]
+print('features:', len(features), '| filas:', len(df))
+
+#%% celda 9 [texto]
+## 3. Función de ganancia
+Se ordenan los clientes por probabilidad y se calcula la ganancia acumulada según cuántos reciben estímulo.  
+Para evitar quedarnos con un pico casual, se suaviza la curva con un promedio móvil.
+
+#%% celda 10 [código]
+def curva_ganancia(y, pred):
+    orden = np.argsort(-pred, kind='stable')
+    g = np.where(y[orden] == 1, GANANCIA_ACIERTO, 0) - COSTO_ENVIO
+    return np.cumsum(g)
+
+def ganancia_suavizada(y, pred, ventana=1001, top=30000):
+    """Devuelve (ganancia máxima suavizada, cantidad de envíos donde ocurre)."""
+    c = curva_ganancia(y, pred)[:top]
+    cs = np.concatenate([[0], np.cumsum(c)])
+    m = (cs[ventana:] - cs[:-ventana]) / ventana
+    return m.max(), int(m.argmax() + ventana // 2)
+
+def lgb_ganancia(preds, data):  # métrica custom para early stopping
+    g, _ = ganancia_suavizada(data.get_label(), preds)
+    return 'ganancia', g, True
+
+def corregir_prob(p, frac):  # deshace el submuestreo de negativos
+    return frac * p / (frac * p + (1 - p))
+
+#%% celda 11 [texto]
+## 4. Datasets de entrenamiento y validación
+- **Train:** todos los BAJA+2 y BAJA+1 y una fracción de los negativos.
+- **Validación:** el mes completo, sin submuestrear.
+
+#%% celda 12 [código]
+def submuestrear(d, frac, seed):
+    rng = np.random.RandomState(seed)
+    keep = (d['clase_binaria'] == 1).values | (rng.rand(len(d)) < frac)
+    return d[keep]
+
+# Params de Dataset: tienen que ser IDÉNTICOS en la optimización y en el modelo final
+DS_PARAMS = {'feature_pre_filter': False, 'max_bin': MAX_BIN}
+
+df_valid = df[df['foto_mes'] == VALID_MES]
+X_valid  = df_valid[features]
+y_valid  = df_valid['clase_binaria'].values
+df_train_base = df[df['foto_mes'].isin(TRAIN_MESES)]
+
+# un par (dtrain, dvalid) por seed: cada seed submuestrea distinto los negativos
+dsets = []
+for k in range(N_SEEDS_TRIAL):
+    d_tr = submuestrear(df_train_base, FRAC_NEGATIVOS, SEED + k)
+    dtrain = lgb.Dataset(d_tr[features], label=d_tr['clase_binaria'], params=DS_PARAMS, free_raw_data=False)
+    dvalid = lgb.Dataset(X_valid, label=y_valid, reference=dtrain, free_raw_data=False)
+    dsets.append((dtrain, dvalid))
+    print(f'seed {k}: train {len(d_tr)} | positivos {int(d_tr["clase_binaria"].sum())}')
+n_train_opt = len(d_tr)  # filas de train en la optimización (para comparar con el final)
+print('valid:', len(df_valid), '| positivos:', int(y_valid.sum()))
+
+#%% celda 13 [texto]
+## 5. Optimización bayesiana
+
+#%% celda 14 [código]
+# (1.7 Training Strategy)
+PARAMS_FIJOS = dict(
+    objective='binary', metric='None', verbosity=-1, boosting_type='gbdt',
+    feature_pre_filter=False,
+    max_bin=MAX_BIN,
+    min_data_in_leaf=0,
+    feature_fraction=0.50,
+    feature_fraction_bynode=0.20,
+    learning_rate=0.005
+)
+ESPACIO = {'num_leaves': (8, 2048), 'min_sum_hessian_in_leaf': (1e-8, 0.1)}
+
+class GananciaCada:
+    """feval: ganancia suavizada solo cada `cada` iteraciones (el resto devuelve NaN y se ignora)."""
+    def __init__(self, cada):
+        self.cada, self.i = cada, 0
+    def __call__(self, preds, data):
+        self.i += 1
+        if self.i % self.cada:
+            return 'ganancia', np.nan, True
+        g, _ = ganancia_suavizada(data.get_label(), preds)
+        return 'ganancia', g, True
+
+def objective(trial):
+    params = dict(PARAMS_FIJOS,
+        num_leaves=trial.suggest_int('num_leaves', *ESPACIO['num_leaves'], log=True),
+        min_sum_hessian_in_leaf=trial.suggest_float('min_sum_hessian_in_leaf', *ESPACIO['min_sum_hessian_in_leaf'], log=True))
+
+    curvas = []
+    for k, (dtrain, dvalid) in enumerate(dsets):
+        ev = {}
+        lgb.train({**params, 'seed': SEED + k}, dtrain, num_boost_round=MAX_ITER,
+                  valid_sets=[dvalid], valid_names=['valid'],
+                  feval=GananciaCada(EVAL_CADA),
+                  callbacks=[lgb.record_evaluation(ev)])
+        curvas.append(np.array(ev['valid']['ganancia']))
+
+    n = min(len(c) for c in curvas)  # LightGBM puede cortar antes si no hay más splits válidos
+    idx = np.arange(EVAL_CADA - 1, n, EVAL_CADA)  # iteraciones donde se midió (0-based)
+    if len(idx) == 0:
+        raise optuna.TrialPruned()
+    media = np.mean([c[idx] for c in curvas], axis=0)  # promedio entre seeds
+    media = pd.Series(media).rolling(SUAVIZAR_CKPT, center=True, min_periods=1).mean().values
+    i = int(media.argmax())
+    trial.set_user_attr('best_iter', int(idx[i] + 1))
+    trial.set_user_attr('ganancia_por_seed', [float(c[idx[i]]) for c in curvas])
+    return float(media[i])
+
+STUDY_NAME = (f'gan-frac{FRAC_NEGATIVOS}-lags{"_".join(map(str, LAGS))}-bin{MAX_BIN}'
+              f'-tr{"_".join(map(str, TRAIN_MESES))}-v{VALID_MES}-s{N_SEEDS_TRIAL}-it{MAX_ITER}-baja12')
+study = optuna.create_study(
+    direction='maximize',
+    sampler=optuna.samplers.TPESampler(seed=SEED, n_startup_trials=10),
+    study_name=STUDY_NAME,
+    storage=f'sqlite:///{OUTPUT_PATH}/Optuna.db',
+    load_if_exists=True)
+
+pendientes = max(0, N_TRIALS - len(study.trials))
+print(f'{STUDY_NAME}: {len(study.trials)} trials previos, {pendientes} por correr')
+study.optimize(objective, n_trials=pendientes, show_progress_bar=True)
+
+print('Mejor ganancia suavizada (media de seeds):', f'{study.best_value:,.0f}')
+print('Ganancia por seed:', [f'{g:,.0f}' for g in study.best_trial.user_attrs['ganancia_por_seed']])
+print('Mejores parámetros:', study.best_params, '| best_iter:', study.best_trial.user_attrs['best_iter'])
+
+#%% celda 15 [código]
+t = study.trials_dataframe()[['number', 'value', 'user_attrs_best_iter',
+                              'params_num_leaves', 'params_min_sum_hessian_in_leaf']]
+t = t.rename(columns={'value': 'ganancia', 'user_attrs_best_iter': 'best_iter'}).sort_values('ganancia', ascending=False)
+print(t.to_string())
+
+def chequear_bordes(study, top=5, margen=0.10):
+    """Avisa si los mejores trials se pegan a un borde del espacio (el óptimo estaría afuera)."""
+    mejores = sorted([tr for tr in study.trials if tr.value is not None], key=lambda tr: -tr.value)[:top]
+    ok = True
+    for nombre, (lo, hi) in ESPACIO.items():
+        pos = np.median([(np.log(tr.params[nombre]) - np.log(lo)) / (np.log(hi) - np.log(lo)) for tr in mejores])
+        if pos < margen or pos > 1 - margen:
+            ok = False
+            print(f'⚠ {nombre}: los {top} mejores trials están pegados al borde {"inferior" if pos < margen else "superior"} '
+                  f'de {ESPACIO[nombre]} -> ampliar el rango')
+    bi = [tr.user_attrs['best_iter'] for tr in mejores]
+    if np.median(bi) >= 0.9 * MAX_ITER:
+        ok = False
+        print(f'⚠ best_iter mediano = {int(np.median(bi))} ~ MAX_ITER={MAX_ITER} -> subir MAX_ITER')
+    if ok:
+        print('Bordes OK: los mejores trials no están pegados a los límites del espacio.')
+
+chequear_bordes(study)
+
+#%% celda 16 [código]
+bp = study.best_params
+best_params = dict(PARAMS_FIJOS, num_leaves=bp['num_leaves'],
+                   min_sum_hessian_in_leaf=bp['min_sum_hessian_in_leaf'])    # incluye max_bin
+best_iter = study.best_trial.user_attrs['best_iter']
+bp, best_iter
+
+#%% celda 17 [texto]
+## 6. Modelo final y predicción para 202108
+Se reentrena con los 4 meses etiquetados (202103–202106).
+
+#%% celda 18 [código]
+df_final = submuestrear(df[df['foto_mes'].isin(FINAL_MESES)], FRAC_NEGATIVOS, SEED)
+dfinal = lgb.Dataset(df_final[features], label=df_final['clase_binaria'], params=DS_PARAMS)
+df_target = df[df['foto_mes'] == MES_TARGET].copy()
+ids_target = df_target['numero_de_cliente'].values.astype('int64')
+
+# el final usa más datos que la optimización: se ajustan las iteraciones
+ratio_datos = len(df_final) / n_train_opt
+best_params_final = dict(best_params)
+n_rounds = int(best_iter * FACTOR_ITER_FINAL)
+print(f'filas final / filas optimización = {ratio_datos:.2f} | iteraciones: {best_iter} -> {n_rounds} | '
+      f'min_sum_hessian: {best_params["min_sum_hessian_in_leaf"]:.2e} -> {best_params_final["min_sum_hessian_in_leaf"]:.2e}')
+
+# for unziping
+import glob, zipfile
+for zip_path in glob.glob('./modelos/*.zip'):
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall('./modelos/')
+
+preds_target = []  # una predicción por seed (prob. corregida por el submuestreo)
+modelos = []
+for s in range(N_SEEDS_SUBMIT):
+    if os.path.exists(f'./modelos/lgb_seed{SEED + s}.txt'):
+      m = lgb.Booster(model_file=f'./modelos/lgb_seed{SEED + s}.txt')
+    else:
+      m = lgb.train({**best_params_final, 'seed': SEED + s}, dfinal, num_boost_round=n_rounds)
+    modelos.append(m)
+    preds_target.append(corregir_prob(m.predict(df_target[features]), FRAC_NEGATIVOS))
+    print(f'seed {s+1}/{N_SEEDS_SUBMIT} lista')
+
+#%% celda 19 [código]
+def generar_submit(tag, preds_list, ids, umbral=COSTO_ENVIO / GANANCIA_ACIERTO, env_min=0, env_max=15000):
+    """Un .csv por modelo: sin encabezado, ids enteros (nunca notación científica),
+    con los clientes de prob > umbral, acotado a [env_min, env_max]."""
+    carpeta = tag
+    if os.path.exists(carpeta):
+        raise FileExistsError(f'{carpeta} ya existe.')
+    os.makedirs(carpeta)
+
+    for s, p in enumerate(preds_list):
+        orden = np.argsort(-p, kind='stable')
+        n_umbral = int((p > umbral).sum())
+        n = min(max(n_umbral, env_min), env_max)
+        aviso = '' if n == n_umbral else f'  (recortado: el umbral daba {n_umbral})'
+        sel = ids[orden[:n]]
+        assert len(np.unique(sel)) == len(sel), 'ids repetidos'
+        pd.Series(sel, dtype='int64').to_csv(os.path.join(carpeta, f'{tag}_s{s:02d}.csv'), header=False, index=False)
+        print(f'{tag}_s{s:02d}.csv: {n} clientes{aviso}')
+    zip_path = shutil.make_archive(tag, 'zip', carpeta)
+    print(f'\nCarpeta: {carpeta}\nZip:     {zip_path}')
+
+generar_submit(OUTPUT_PATH + 'final_submit', [np.mean(preds_target, axis=0)], ids_target, env_min= 11000, env_max= 11000)

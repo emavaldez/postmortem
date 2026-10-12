@@ -1,0 +1,25 @@
+
+===== 037 d/e 2026-10-09 21:11 | train (654066, 866) | 855 columnas =====
+[037d s=676057] BASE(r=0.0986) 603.4 | r=0.3 +6.9 | r=1.0 -1.0 (2 min)
+[037d s=482687] BASE(r=0.0986) 609.1 | r=0.3 -2.2 | r=1.0 +0.8 (5 min)
+[037d s=399221] BASE(r=0.0986) 614.1 | r=0.3 -2.8 | r=1.0 -6.6 (7 min)
+[037d s=121109] BASE(r=0.0986) 604.6 | r=0.3 +6.3 | r=1.0 +11.0 (9 min)
+[037d s=292131] BASE(r=0.0986) 605.4 | r=0.3 +6.0 | r=1.0 +4.7 (11 min)
+
+037d — contra BASE (r=0.0986), 5 semillas:
+ variante  delta_M     ee pares+  p_unilateral  delta_auc
+037d_r0.3   2.8600 2.1838    3/5        0.1302     0.0001
+037d_r1.0   1.7875 2.9330    3/5        0.2876    -0.0005
+[037e s=676057] E3 (M1) 607.2 | E6 (M1+M0) +1.2 | solos: M1_top1 605, M1_top2 607, M1_top3 606, M0_top1 610, M0_top2 606, M0_top3 603 (15 min)
+[037e s=482687] E3 (M1) 610.9 | E6 (M1+M0) +2.1 | solos: M1_top1 609, M1_top2 613, M1_top3 606, M0_top1 606, M0_top2 617, M0_top3 610 (18 min)
+[037e s=399221] E3 (M1) 614.8 | E6 (M1+M0) -0.3 | solos: M1_top1 616, M1_top2 608, M1_top3 607, M0_top1 606, M0_top2 607, M0_top3 613 (21 min)
+[037e s=121109] E3 (M1) 607.5 | E6 (M1+M0) +2.5 | solos: M1_top1 608, M1_top2 600, M1_top3 609, M0_top1 605, M0_top2 604, M0_top3 609 (25 min)
+[037e s=292131] E3 (M1) 604.2 | E6 (M1+M0) +2.1 | solos: M1_top1 600, M1_top2 602, M1_top3 606, M0_top1 598, M0_top2 603, M0_top3 605 (28 min)
+[037e s=133559] E3 (M1) 611.9 | E6 (M1+M0) -0.8 | solos: M1_top1 612, M1_top2 609, M1_top3 609, M0_top1 607, M0_top2 608, M0_top3 606 (31 min)
+[037e s=956184] E3 (M1) 617.4 | E6 (M1+M0) -1.2 | solos: M1_top1 618, M1_top2 613, M1_top3 612, M0_top1 610, M0_top2 611, M0_top3 612 (35 min)
+[037e s=853814] E3 (M1) 608.6 | E6 (M1+M0) -0.8 | solos: M1_top1 598, M1_top2 610, M1_top3 611, M0_top1 602, M0_top2 604, M0_top3 607 (38 min)
+
+037e — E6 (M1+M0) contra E3 (M1), 8 semillas:
+  variante  delta_M     ee pares+  p_unilateral  delta_auc
+037e_E6-E3   0.5844 0.5412    4/8         0.158     0.0003
+[037 d/e] terminado

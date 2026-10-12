@@ -1,0 +1,14 @@
+ctrx_quarter
+ctrx_quarter_lag1
+r_trx_por_producto
+mcuentas_saldo
+mpasivos_margen
+mcaja_ahorro
+mprestamos_personales_r1
+r_gasto_vs_ingreso
+mprestamos_personales
+cliente_edad
+mcuenta_corriente_d1
+mcuentas_saldo_r1
+ctrx_quarter_r1
+mactivos_margen_r1

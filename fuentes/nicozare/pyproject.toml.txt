@@ -1,0 +1,11 @@
+[project]
+name = "competencia-01-retencion-premium"
+version = "0.1.0"
+description = "Predicción de baja de clientes (Paquete Premium) a partir del dataset crudo: feature engineering, ensamble de LightGBM y generación de submissions"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.5.5",
+    "lightgbm>=4.7.0",
+    "numpy>=2.4.6",
+    "pandas>=3.0.5",
+]

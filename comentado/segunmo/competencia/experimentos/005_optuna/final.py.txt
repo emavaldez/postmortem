@@ -1,0 +1,57 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–21] Docstring e imports.
+"""005 — entrega 5: MIX6 = promedio de las probabilidades de los 3 mejores trials de M0 y los 3 mejores de M1
+(hiperparámetros + undersampling r de Optuna), entrenados con 202103–202106, 10 semillas por configuración
+(las 5 propias + 5 derivadas), y puntuados sobre 202108. 8 archivos top-k (k=8000..15000) para comparar con las entregas anteriores.
+Guarda los hiperparámetros elegidos en mejores_trials.json (la base de Optuna vive en artifacts/, que no se versiona).
+Uso (raíz del repo): venv/bin/python competencia/experimentos/005_optuna/final.py"""
+import json
+import sys
+from pathlib import Path
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+AQUI = Path(__file__).resolve().parent
+sys.path.insert(0, str(AQUI))
+from optuna_run import CONJUNTOS, es_hist  # noqa: E402
+from reevaluar import N_TOP, SEMILLAS_20, configs  # noqa: E402
+from config import ID_COL, MES_SCORING  # noqa: E402
+from pool import cargar  # noqa: E402
+from submit import guardar_submit, top_k_ids  # noqa: E402
+from validacion import KS, xy  # noqa: E402
+
+# [Anotación · líneas 23–27] Toma 10 semillas y las configuraciones top1 a top3 de M0 y M1 y escribe
+#   mejores_trials.json con r, num_boost_round y siete hiperparámetros por configuración (num_leaves,
+#   learning_rate, min_data_in_leaf, feature_fraction, bagging_fraction, lambda_l1, lambda_l2).
+if __name__ == "__main__":
+    semillas = SEMILLAS_20[:10]
+    cfg = {k: v for k, v in configs().items() if k[1].startswith("top")}
+    (AQUI / "mejores_trials.json").write_text(json.dumps({f"{c}_{n}": {"r": r, "num_boost_round": rounds, **{k: v for k, v in p.items() if k in ("num_leaves", "learning_rate", "min_data_in_leaf", "feature_fraction", "bagging_fraction", "lambda_l1", "lambda_l2")}}
+                                                          for (c, n), (r, rounds, p) in cfg.items()}, indent=1))
+# [Anotación · líneas 28–39] Entrena cada configuración como binario BAJA+2 con 202103–202106 y submuestreo r,
+#   con 10 semillas, y promedia las predicciones sobre 202108.
+    Xt, yt = xy(cargar([202103, 202104, 202105, 202106], negocio=True)); yt = yt.values
+    score = cargar([MES_SCORING], solo_con_target=False, negocio=True)
+    cols = {"M0": [c for c in Xt.columns if not es_hist(c)], "M1": (AQUI / "sel" / "top150_final.txt").read_text().split()}
+    print(f"train {Xt.shape} ({yt.sum()} BAJA+2) | score {score.shape} | M0 {len(cols['M0'])} cols, M1 {len(cols['M1'])} cols | semillas {semillas}", flush=True)
+    P = {}
+    for (c, nombre), (r, rounds, params) in cfg.items():
+        ps = []
+        for s in semillas:
+            keep = (yt == 1) | (np.random.RandomState(s).rand(len(yt)) < r)
+            m = lgb.train({**params, "seed": s}, lgb.Dataset(Xt.loc[keep, cols[c]], label=yt[keep]), num_boost_round=rounds)
+            ps.append(m.predict(score[cols[c]]))
+        P[(c, nombre)] = np.mean(ps, axis=0); print(f"listo {c} {nombre}", flush=True)
+# [Anotación · líneas 40–46] Promedia las 6 configuraciones, guarda tmp/proba_202108.csv y escribe 8 archivos
+#   exp005_mix6_k8000 a k15000; imprime cuántos clientes tienen probabilidad mayor o igual a 0,025.
+    p = np.mean(list(P.values()), axis=0)
+    ids = score[ID_COL].values
+    (AQUI / "tmp").mkdir(exist_ok=True)
+    pd.DataFrame({ID_COL: ids, "p": p, **{f"{c}_{n}": v for (c, n), v in P.items()}}).to_csv(AQUI / "tmp" / "proba_202108.csv", index=False)
+    for k in KS:
+        print(guardar_submit(top_k_ids(ids, p, k), f"exp005_mix6_k{k}").name)
+    print("clientes con p>=0.025:", int((p >= .025).sum()), "| p media %.4f" % p.mean())

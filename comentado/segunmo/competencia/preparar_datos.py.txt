@@ -1,0 +1,66 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–13] Docstring con los tres pasos (descarga, clase_ternaria, parquet), imports de
+#   duckdb y pandas y la URL pública del CSV crudo de la cátedra.
+"""Prepara los datos de la competencia SIN notebooks, con los mismos pasos de clases/z101_target_sql.ipynb y clases/z701_drifting.ipynb:
+  1. baja competencia_01_crudo.csv de la URL pública de la cátedra (si no está);
+  2. construye competencia_01.csv con `clase_ternaria` (SQL de la celda 27 de z101: cross join cliente x mes, lead 1 y 2);
+  3. genera competencia_01.parquet.gzip desde ese CSV (celda 3 de z701).
+Uso (raíz del repo): venv/bin/python competencia/preparar_datos.py [--dir data] [--url URL]
+Los archivos quedan en --dir (por defecto `data/`, fuera de git). El orden de filas del CSV no importa: el código siempre ordena por (foto_mes, numero_de_cliente) al cargar."""
+import argparse
+from pathlib import Path
+
+import duckdb
+import pandas as pd
+
+URL = "https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv"
+# [Anotación · líneas 14–30] Consulta SQL que arma clase_ternaria: cruza todos los clientes con todos los
+#   meses, marca con mes_0 si el cliente está ese mes y mira con lead() su presencia uno y dos meses después. Si
+#   está a los dos meses es CONTINUA; si está al mes siguiente y no a los dos meses, BAJA+2; si no está al mes
+#   siguiente, BAJA+1; en otro caso queda NULL. Conserva sólo las filas en que el cliente está presente.
+SQL = """
+create or replace table competencia_01 as
+with periodos as (select distinct foto_mes from crudo),
+     clientes as (select distinct numero_de_cliente from crudo),
+     todo as (select numero_de_cliente, foto_mes from clientes cross join periodos),
+     clase_ternaria as (
+        select c.*,
+               if(c.numero_de_cliente is null, 0, 1) as mes_0,
+               lead(mes_0, 1) over (partition by t.numero_de_cliente order by foto_mes) as mes_1,
+               lead(mes_0, 2) over (partition by t.numero_de_cliente order by foto_mes) as mes_2,
+               case when mes_2 = 1 then 'CONTINUA'                     -- vuelve a aparecer en t+2: la ausencia fue transitoria
+                    when mes_1 = 1 and mes_2 = 0 then 'BAJA+2'         -- está en t+1 y no en t+2
+                    when mes_1 = 0 then 'BAJA+1'                       -- no está en t+1
+                    else null end as clase_ternaria                    -- últimos 2 meses: el futuro no se conoce
+        from todo t left join crudo c using (numero_de_cliente, foto_mes))
+select * exclude (mes_0, mes_1, mes_2) from clase_ternaria where mes_0 = 1
+"""
+
+# [Anotación · líneas 32–36] Argumentos --dir (por defecto data), --url y --crudo, y rutas de los tres
+#   archivos: CSV crudo, CSV con clase y parquet.
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("--dir", default="data"); ap.add_argument("--url", default=URL); ap.add_argument("--crudo", default=None)
+    a = ap.parse_args()
+    d = Path(a.dir); d.mkdir(parents=True, exist_ok=True)
+    crudo, csv, pq = Path(a.crudo) if a.crudo else d / "competencia_01_crudo.csv", d / "competencia_01.csv", d / "competencia_01.parquet.gzip"
+# [Anotación · líneas 37–44] Si el CSV crudo no existe, lo descarga con requests en bloques de 1 MB.
+    if not crudo.exists():
+        import requests
+        print("bajando", a.url)
+        with requests.get(a.url, stream=True) as r:
+            r.raise_for_status()
+            with open(crudo, "wb") as f:
+                for bloque in r.iter_content(1 << 20):
+                    f.write(bloque)
+# [Anotación · líneas 45–51] Carga el crudo en DuckDB, ejecuta la consulta, exporta competencia_01.csv con
+#   encabezado, imprime la cantidad de filas por mes y clase y convierte el CSV a competencia_01.parquet.gzip
+#   con pandas.
+    con = duckdb.connect()
+    con.execute(f"create table crudo as select * from read_csv_auto('{crudo.as_posix()}')")
+    con.execute(SQL)
+    con.execute(f"copy competencia_01 to '{csv.as_posix()}' (format csv, header)")
+    print("clase_ternaria por mes:\n", con.sql("select foto_mes, clase_ternaria, count(*) n from competencia_01 group by 1, 2 order by 1, 2").df().to_string(index=False))
+    pd.read_csv(csv).to_parquet(pq, compression="gzip")
+    print("listo:", csv, pq)

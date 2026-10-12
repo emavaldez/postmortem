@@ -1,0 +1,163 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–19] Encabezado: uso y esquema de la optimización (parámetros fijos
+#   param_fijos_tutoria, sin préstamos personales, entrenamiento 202103 y 202104, validación 202106, sin 202105,
+#   sin undersampling, AUC, 8 hilos, 10 evaluaciones) y sus salidas.
+# =============================================================================
+# 01_bayesiana.R del modelo A
+# uso, desde la carpeta de la entrega: Rscript modelo_A_FE026_B018/01_bayesiana.R
+# Bayesiana frugal del modelo A (B018) sobre FE026, armado en memoria:
+#   - parámetros fijos param_fijos_tutoria (incluye feature_fraction_bynode
+#     = 0.20)
+#   - sin mprestamos_personales, cprestamos_personales ni sus lags y deltas
+#     (columnas_sin_excluidas)
+#   - entrenamiento: 202103 y 202104 completos; validación: 202106 completo;
+#     202105 no se usa (hueco de un mes, como entre los datos de
+#     entrenamiento final y 202108)
+#   - sin undersampling
+#   - métrica AUC; 8 hilos
+#   - 10 evaluaciones (mlr3mbo hace igual un diseño inicial al azar de
+#     4 x 3 = 12)
+# Salida: exp/B018/BO_log.txt; al terminar, exp/B018/COMPLETA.
+# Si encuentra un BO_log incompleto (corrida interrumpida), lo renombra y
+# empieza de nuevo (mlr3mbo no retoma una corrida).
+# =============================================================================
+
+# [Anotación · líneas 21–36] Verifica que estén instalados los 11 paquetes que usa (data.table, R.utils,
+#   rlist, bbotk, mlr3, mlr3mbo, mlr3learners, paradox, DiceKriging, lightgbm y here), carga diez de ellos,
+#   carga R/datasets.R y R/parametros.R y define avance() para los mensajes con fecha y hora.
+paquetes <- c("data.table", "R.utils", "rlist", "bbotk", "mlr3", "mlr3mbo", "mlr3learners",
+              "paradox", "DiceKriging", "lightgbm", "here")
+faltan <- paquetes[!vapply(paquetes, requireNamespace, logical(1), quietly = TRUE)]
+if (length(faltan) > 0) stop("Faltan paquetes: ", paste(faltan, collapse = ", "))
+
+suppressPackageStartupMessages({
+  library(data.table); library(R.utils); library(rlist); library(bbotk); library(mlr3)
+  library(mlr3mbo); library(mlr3learners); library(paradox); library(DiceKriging); library(lightgbm)
+})
+source(file.path("R", "datasets.R"))
+source(file.path("R", "parametros.R"))
+
+if (!exists("param_fijos_tutoria") || !exists("columnas_sin_excluidas"))
+  stop("R/parametros.R no tiene param_fijos_tutoria o columnas_sin_excluidas")
+
+avance <- function(...) message(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), " [B018] ", ...)
+
+# [Anotación · líneas 38–51] Crea exp/B018/. Si existe el archivo COMPLETA termina sin repetir la
+#   optimización; si hay un BO_log.txt sin COMPLETA lo renombra a BO_log_interrumpido_<fecha_hora>.txt y empieza
+#   de nuevo.
+carpeta <- file.path("exp", "B018")
+dir.create(carpeta, showWarnings = FALSE, recursive = TRUE)
+archivo_log <- file.path(carpeta, "BO_log.txt")
+archivo_completa <- file.path(carpeta, "COMPLETA")
+
+if (file.exists(archivo_completa)) {
+  avance("B018 ya está completa; no se repite")
+  quit(save = "no", status = 0)
+}
+if (file.exists(archivo_log)) {
+  viejo <- file.path(carpeta, paste0("BO_log_interrumpido_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".txt"))
+  file.rename(archivo_log, viejo)
+  avance("BO_log incompleto renombrado a ", basename(viejo))
+}
+
+# [Anotación · líneas 53–57] PARAM: meses de entrenamiento 202103 y 202104, mes de validación 202106 y 10
+#   iteraciones.
+PARAM <- list(
+  train = c(202103L, 202104L),
+  validate = 202106L,
+  iteraciones = 10
+)
+
+# [Anotación · líneas 59–78] Construye FE026 en memoria, arma clase01 (1 si BAJA+2 o BAJA+1), separa las
+#   columnas de préstamos personales y sus derivadas y se detiene si no encuentra ninguna. Arma los lgb.Dataset
+#   de entrenamiento (202103 y 202104) y de validación (202106) con las columnas restantes, que son todas salvo
+#   clase_ternaria, clase01 y las excluidas.
+# Dataset
+dataset <- construir_FE026()
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+2", "BAJA+1"), 1L, 0L)]
+todas <- setdiff(colnames(dataset), c("clase_ternaria", "clase01"))
+excluidas <- columnas_excluidas(todas)
+campos_buenos <- columnas_sin_excluidas(todas)
+avance("Columnas excluidas (", length(excluidas), "): ", paste(excluidas, collapse = ", "))
+if (length(excluidas) == 0) stop("No se encontró ninguna columna a excluir: revisar los nombres")
+avance("Parámetro agregado: feature_fraction_bynode = ", param_fijos_tutoria$feature_fraction_bynode)
+
+tr <- dataset[foto_mes %in% PARAM$train]
+va <- dataset[foto_mes == PARAM$validate]
+stopifnot(tr[, !anyNA(clase_ternaria)], va[, !anyNA(clase_ternaria)])
+avance("Entrenamiento: ", nrow(tr), " registros (", paste(PARAM$train, collapse = "+"), ", positivos ",
+       tr[, sum(clase01)], "); validación: ", nrow(va), " (", PARAM$validate, ", positivos ", va[, sum(clase01)],
+       "); variables: ", length(campos_buenos))
+
+dtrain <- lgb.Dataset(data = data.matrix(tr[, campos_buenos, with = FALSE]), label = tr$clase01, free_raw_data = FALSE)
+dvalidate <- lgb.Dataset(data = data.matrix(va[, campos_buenos, with = FALSE]), label = va$clase01, free_raw_data = FALSE)
+rm(dataset, tr, va); gc(verbose = FALSE)
+
+# [Anotación · líneas 80–88] loguear(): agrega al log una línea separada por tabulaciones con fecha y hora y
+#   todos los valores de la lista recibida; si el archivo no existe escribe antes la línea de títulos.
+# Registro de cada evaluación
+loguear <- function(preg, arch, verbose = TRUE) {
+  t0 <- Sys.time()
+  reg <- copy(preg)
+  if (!file.exists(arch)) cat(paste0("fecha\t", paste(list.names(reg), collapse = "\t"), "\n"), file = arch)
+  linea <- paste0(format(t0, "%Y%m%d.%H%M%S"), "\t", gsub(", ", "\t", toString(reg)), "\n")
+  cat(linea, file = arch, append = TRUE)
+  if (verbose) cat(linea)
+}
+
+# [Anotación · líneas 90–106] Estimar_lightgbm(xs): función objetivo. Superpone los tres hiperparámetros
+#   propuestos a param_fijos_tutoria, entrena con lgb.train usando 202106 como conjunto de validación, toma
+#   modelo$best_score (metric = auc) como métrica, registra la evaluación en el log y vuelve a fijar la semilla
+#   del generador de R con 173207.
+giter <- 0
+Estimar_lightgbm <- function(xs) {
+  flush.console()
+  giter <<- giter + 1
+  t0 <- Sys.time()
+  param_completo <- modifyList(param_fijos_tutoria, xs)
+  xx <- copy(param_completo)
+  modelo <- lgb.train(data = dtrain, valids = list("val" = dvalidate), param = param_completo)
+  xx$iter <- giter
+  xx$metrica <- modelo$best_score
+  loguear(xx, archivo_log)
+  avance(sprintf("evaluación %d | %d árboles, %d hojas, hessian %.4g | AUC %.5f | %.1f min",
+                 giter, xs$num_iterations, xs$num_leaves, xs$min_sum_hessian_in_leaf, xx$metrica,
+                 as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+  set.seed(semilla_primigenia, kind = "L'Ecuyer-CMRG")
+  list(metrica = xx$metrica)
+}
+
+# [Anotación · líneas 108–124] Configura la optimización con bbotk y mlr3mbo: objetivo a maximizar sobre
+#   rangos_z495(), terminador de 10 evaluaciones, sustituto kriging (regr.km con BFGS y estimación de nugget),
+#   función de adquisición 'ei', optimizador de la adquisición por búsqueda al azar con 1.000 evaluaciones y
+#   ciclo bayesopt_ego.
+# Optimización bayesiana
+set.seed(semilla_primigenia, kind = "L'Ecuyer-CMRG")
+objective <- ObjectiveRFun$new(
+  fun = Estimar_lightgbm,
+  domain = rangos_z495(),
+  codomain = ps(metrica = p_dbl(tags = "maximize")),
+  id = "BO_lightgbm"
+)
+instance <- OptimInstanceBatchSingleCrit$new(
+  objective = objective,
+  terminator = trm("evals", n_evals = PARAM$iteraciones)
+)
+surrogate <- srlrn(lrn("regr.km", optim.method = "BFGS", nugget.estim = TRUE, control = list(trace = FALSE)))
+acq_function <- acqf("ei")
+acq_optimizer <- acqo(optimizer = opt("random_search", batch_size = 1000), terminator = trm("evals", n_evals = 1000))
+optimizer <- opt("mbo", loop_function = bayesopt_ego, surrogate = surrogate,
+                 acq_function = acq_function, acq_optimizer = acq_optimizer)
+
+# [Anotación · líneas 126–133] Ejecuta la optimización, lee el log ordenado por métrica descendente, informa
+#   la evaluación de mayor AUC con sus tres hiperparámetros y escribe el archivo COMPLETA con la fecha y hora.
+avance("Comienza la bayesiana")
+optimizer$optimize(instance)
+
+tb <- fread(archivo_log)
+setorder(tb, -metrica)
+avance("Terminada: ", nrow(tb), " evaluaciones; mejor AUC ", round(tb$metrica[1], 5), " (iter ", tb$iter[1],
+       ": ", tb$num_iterations[1], " árboles, ", tb$num_leaves[1], " hojas, hessian ", signif(tb$min_sum_hessian_in_leaf[1], 4), ")")
+writeLines(format(Sys.time()), archivo_completa)

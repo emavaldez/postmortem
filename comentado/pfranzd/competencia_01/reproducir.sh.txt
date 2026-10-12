@@ -1,0 +1,31 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–9] Comentarios de uso con los tres modos; activa `set -euo pipefail` y pasa a la
+#   carpeta del script.
+#!/usr/bin/env bash
+# Reproduce la entrega (Linux / VM de GCP). Uso:
+#   bash reproducir.sh              # predice con los modelos ya entrenados (~1 h)
+#   bash reproducir.sh entrenar     # reentrena los modelos (~4 h)
+#   bash reproducir.sh completo     # rehace también la optimización de Optuna (~5 h)
+# Crea un entorno virtual .venv con las versiones exactas de requirements-lock.txt (Python 3.11),
+# descarga el dataset si falta y termina con código 0 solo si el sha256 coincide.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# [Anotación · líneas 11–17] Busca un intérprete de Python 3.11 o superior (variable PYTHON, o python3.11,
+#   python3, python) y termina con un mensaje si no lo encuentra.
+PY="${PYTHON:-}"
+if [ -z "$PY" ]; then
+  for c in python3.11 python3 python; do
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then PY="$c"; break; fi
+  done
+fi
+[ -n "$PY" ] || { echo "Hace falta Python >= 3.11 (instalá python3.11 o exportá PYTHON=<ruta>)"; exit 1; }
+
+# [Anotación · líneas 19–22] Crea .venv si no existe, actualiza pip, instala requirements-lock.txt y ejecuta
+#   entrega.py con ENTREGA_MODO igual al primer argumento (por defecto `predecir`).
+[ -d .venv ] || "$PY" -m venv .venv
+.venv/bin/python -m pip install --quiet --upgrade pip
+.venv/bin/python -m pip install --quiet -r requirements-lock.txt
+ENTREGA_MODO="${1:-predecir}" exec .venv/bin/python entrega.py

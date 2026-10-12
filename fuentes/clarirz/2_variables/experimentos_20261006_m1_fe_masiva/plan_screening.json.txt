@@ -1,0 +1,33 @@
+{
+  "version": "c1m1femasiva03_screening_v1",
+  "run_c1": "c1m1femasiva03",
+  "parent": "c1panorama02/M1",
+  "public_exposure": "PUBLIC_INFORMED",
+  "dataset_sha256": "59231e670a1342ad6f689ad7edc7ece047fc9f7115c6d7845e6c72fa3bbd95bb",
+  "target_train": "baja2_vs_rest",
+  "raw_predictors": 152,
+  "generated_blocks": ["cobertura_panel","disponibilidad","estado_numerico","transformaciones","historia_numerica","ranks","transiciones_numericas","recencia","categoricas","fechas","relojes","ratios","tarjetas","funciones","stocks_productos_deuda","interacciones","historia_relaciones"],
+  "excluded_initial_blocks": ["ventanas","tendencias"],
+  "arms": {
+    "F0_M1_RAW": {"selection":"raw_only","folds":["mayo","junio"]},
+    "F1_TEMPORAL_MASIVA": {"selection":"derived_min_history_ge_1","folds":["junio"]},
+    "F2_REPRESENTACION_MASIVA": {"selection":"derived_min_history_eq_0","folds":["mayo","junio"]},
+    "F3_TOTAL_MASIVA": {"selection":"all_generated_derived","folds":["junio"]}
+  },
+  "folds": {
+    "mayo": {"train":[202103],"eval":202105},
+    "junio": {"train":[202103,202104],"eval":202106}
+  },
+  "seeds": [17,101,202,303,404],
+  "rounds": 300,
+  "cuts": [10500,11000,11500],
+  "fixed_cut": 11000,
+  "shortlist": {"top_per_arm":20,"requires_nonzero_gain_seeds":3},
+  "notes": [
+    "F1 y F3 no se interpretan en mayo porque marzo no puede enseñar historia.",
+    "F2 usa sólo derivadas con min_history=0.",
+    "F0 conserva exactamente 152 RAW.",
+    "Ventanas y tendencias largas quedan para una segunda etapa.",
+    "No usa agosto ni leaderboard para seleccionar features."
+  ]
+}

@@ -1,0 +1,244 @@
+{
+  "version": "v1_frozen",
+  "run": "c1clusteraware01",
+  "created_after_diagnostic": true,
+  "c2_only_result_is_not_an_input": true,
+  "hypothesis": "BAJA+2 contiene formas de salida heterogeneas y SUPERFINAL las captura de forma desigual; redistribuir el peso positivo entre clusters puede mejorar la ganancia a N fijo sin cambiar target, features, hiperparametros ni corte.",
+  "target": "BAJA+2_vs_resto",
+  "fixed_n": 13500,
+  "economics": {
+    "hit": 1072500,
+    "cost": 27500,
+    "one_swap_gain": 1100000
+  },
+  "source_superfinal": {
+    "run": "c1superfinal100v2",
+    "identity": "443bfe946db263f99b65e4290ccacd74df269a4c2e82bc70fe86ec34585a445f",
+    "use_same_features": true,
+    "use_same_params": true,
+    "use_same_rounds": true,
+    "use_same_recency": false,
+    "recency_rule": "Stage 1 screen uses unit weights on the single March training month, matching the SUPERFINAL tuning convention; Stage 2 onward uses the exact SUPERFINAL recency policy."
+  },
+  "cluster_source": {
+    "file": "../10_diagnostico_0fits/reference_labels_z501.csv",
+    "expected_baja2_clients": 4067,
+    "expected_clusters": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "use_as_feature": false,
+    "use_at_scoring": false,
+    "use_only_to_weight_historical_positive_rows": true,
+    "limitation": "z501 reference labels were learned on the full March-June BAJA+2 cohort; this experiment is diagnostic-informed competitive evidence, not independent temporal validation."
+  },
+  "weight_normalization": {
+    "rule": "within each training fold, rescale positive cluster multipliers so sum(base_recency_weight * positive_multiplier) equals the control positive-weight mass",
+    "purpose": "isolate redistribution among BAJA+2 subtypes from a global positive-class weight change"
+  },
+  "arms": {
+    "CONTROL": {
+      "type": "static",
+      "raw": {
+        "1": 1,
+        "2": 1,
+        "3": 1,
+        "4": 1,
+        "5": 1
+      }
+    },
+    "C25_FOCUSED": {
+      "type": "static",
+      "raw": {
+        "1": 1,
+        "2": 3,
+        "3": 1,
+        "4": 1,
+        "5": 2.5
+      }
+    },
+    "DIFFICULTY_JUNE": {
+      "type": "static",
+      "raw": {
+        "1": 1.36,
+        "2": 2.9,
+        "3": 1.02,
+        "4": 1.02,
+        "5": 2.5
+      },
+      "note": "predeclared from June recall diagnostic; therefore June confirmation is a retest, not independent validation"
+    },
+    "BALANCED_CAPPED": {
+      "type": "dynamic",
+      "rule": "raw_k = clip(median(weighted positive cluster mass)/weighted positive cluster mass_k, 0.5, 4.0), then positive-mass normalization",
+      "uses_only_training_fold_counts": true
+    }
+  },
+  "stages": {
+    "preflight": {
+      "checks": [
+        "SUPERFINAL AUDIT_OK",
+        "source identity exact",
+        "cluster labels unique and complete for all train/eval BAJA+2",
+        "all five clusters present where required",
+        "fixed N=13500"
+      ]
+    },
+    "screen_may": {
+      "train": [
+        202103
+      ],
+      "eval": 202105,
+      "seeds": [
+        17,
+        101,
+        202
+      ],
+      "candidates": [
+        "C25_FOCUSED",
+        "DIFFICULTY_JUNE",
+        "BALANCED_CAPPED"
+      ],
+      "control": "CONTROL",
+      "pass": [
+        "ensemble delta gain > 0",
+        "ensemble delta C2+C5 captured > 0",
+        "paired median delta gain > 0",
+        "paired wins >= 2/3"
+      ],
+      "winner_order": [
+        "ensemble_gain desc",
+        "delta_C2C5 desc",
+        "paired_median desc",
+        "arm name asc"
+      ],
+      "base_weights": "unit weights on March (single-month screen)"
+    },
+    "confirm5_june": {
+      "train": [
+        202103,
+        202104
+      ],
+      "eval": 202106,
+      "seeds": [
+        808,
+        909,
+        1001,
+        1102,
+        1203
+      ],
+      "exact_control_canary_seed": 808,
+      "control_source": "SUPERFINAL stage4 checkpoints",
+      "pass": [
+        "ensemble delta gain > 0",
+        "ensemble delta C2+C5 captured > 0",
+        "paired median delta gain > 0",
+        "paired wins >= 3/5"
+      ],
+      "recency": "exact SUPERFINAL policy"
+    },
+    "confirm20_june": {
+      "train": [
+        202103,
+        202104
+      ],
+      "eval": 202106,
+      "seeds": [
+        17,
+        101,
+        202,
+        303,
+        404,
+        505,
+        606,
+        707,
+        808,
+        909,
+        1001,
+        1102,
+        1203,
+        1304,
+        1405,
+        1506,
+        1607,
+        1708,
+        1809,
+        1910
+      ],
+      "control_source": "SUPERFINAL stage4 checkpoints",
+      "reuse_confirm5_candidate": true,
+      "pass": [
+        "ensemble delta hits >= 2",
+        "ensemble delta C2+C5 captured >= 1",
+        "paired mean delta gain > 0",
+        "paired median delta gain > 0",
+        "paired wins >= 14/20"
+      ],
+      "recency": "exact SUPERFINAL policy"
+    },
+    "august": {
+      "train": [
+        202103,
+        202104,
+        202105,
+        202106
+      ],
+      "score": 202108,
+      "seeds": [
+        17,
+        101,
+        202,
+        303,
+        404,
+        505,
+        606,
+        707,
+        808,
+        909,
+        1001,
+        1102,
+        1203,
+        1304,
+        1405,
+        1506,
+        1607,
+        1708,
+        1809,
+        1910
+      ],
+      "only_if_confirm20_pass": true,
+      "n": 13500,
+      "no_alternative_n": true,
+      "no_auto_submit": true,
+      "recency": "exact mapped SUPERFINAL final policy"
+    },
+    "audit": {
+      "zero_fits": true,
+      "reconstruct_ensemble": true,
+      "verify_model_hashes": true,
+      "verify_csv_exact": true,
+      "verify_positive_mass_conservation": true
+    }
+  },
+  "outputs": [
+    "stage0_preflight/RESULT.json",
+    "stage1_screen/RESULT.json",
+    "stage1_screen/comparison.csv",
+    "stage2_confirm5/RESULT.json",
+    "stage2_confirm5/comparison.csv",
+    "stage3_confirm20/RESULT.json",
+    "stage3_confirm20/comparison.csv",
+    "stage4_august/RESULT.json",
+    "stage4_august/delivery/MANIFEST.json",
+    "AUDIT.json"
+  ],
+  "stop_rules": [
+    "screen fail => stop",
+    "confirm5 fail => stop",
+    "confirm20 fail => stop",
+    "never submit automatically"
+  ]
+}

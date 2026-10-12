@@ -1,0 +1,64 @@
+{
+  "experimento": 4112,
+  "nombre": "bo_profesor_ds3007",
+  "descripcion": "Training Strategy 1.7 del profesor sobre ds3007 (dataset con todas sus indicaciones de FE: ccajas_depositos NA en 202105, _zero, lags/deltas 1 y 2, tend3 y avg3, rank cero fijo, proceso de muerte). Sin undersampling, AUC; fijos max_bin 31, min_data_in_leaf 0, feature_fraction 0.50, feature_fraction_bynode 0.20, learning_rate 0.005; bayesianos num_iterations (250-4000), num_leaves (8-2000), min_sum_hessian_in_leaf (0.001-100). Validacion interna 5 x 70/30 en 202103+202104. 40 pruebas (12 al azar), corte domingo 13:00 con al menos 15. Top 12 para el ensamble.",
+  "reanudar": true,
+  "dataset": "ds3007_profesor.parquet",
+  "usar_lag2": true,
+  "meses_train": [
+    202103,
+    202104
+  ],
+  "clase": "clase_binaria2",
+  "n_particiones": 5,
+  "fraccion_valida": 0.3,
+  "semilla_particiones": 571369,
+  "n_trials": 40,
+  "n_startup_trials": 12,
+  "min_pruebas": 15,
+  "hora_limite": "2026-10-11 13:00",
+  "semilla_sampler": 849571,
+  "espacio": {
+    "num_iterations": [
+      250,
+      4000,
+      "log"
+    ],
+    "num_leaves": [
+      8,
+      2000,
+      "log"
+    ],
+    "min_sum_hessian_in_leaf": [
+      0.001,
+      100.0,
+      "log"
+    ]
+  },
+  "lgbm_fijos": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "metric": "auc",
+    "max_bin": 31,
+    "min_data_in_leaf": 0,
+    "feature_fraction": 0.5,
+    "feature_fraction_bynode": 0.2,
+    "learning_rate": 0.005,
+    "feature_pre_filter": false,
+    "deterministic": true,
+    "force_row_wise": true,
+    "verbose": -1
+  },
+  "semilla_modelo": 571369,
+  "top_n": 12,
+  "meseta_mes_completo": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "_config": "4112_bo_profesor_ds3007.json",
+  "_fecha_inicio": "2026-10-10 20:48:51",
+  "_script": "16_bo_profesor_v2.py",
+  "_git_commit": "sin_git"
+}

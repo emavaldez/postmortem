@@ -1,0 +1,563 @@
+#%% celda 1 [código]
+#cargo las librerías a utilizar
+
+!pip install -q optuna
+
+import pandas as pd
+import numpy as np
+
+import matplotlib.pyplot as plt
+
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+import plotly.express as px
+
+from scipy.stats import gaussian_kde
+from scipy.stats import ks_2samp
+
+from sklearn.model_selection import StratifiedShuffleSplit
+
+import lightgbm as lgb
+
+import optuna
+from optuna.visualization import plot_optimization_history, plot_param_importances, plot_slice, plot_contour
+
+#%% celda 2 [código]
+#cargo el dataset con la target
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+base_path = '/content/drive/MyDrive/DMEyF/2026/notebooks/'
+
+dataset_path = base_path + 'data/'
+modelos_path = base_path + 'modelos/'
+db_path = base_path + 'db/'
+
+dataset_file = 'competencia_01.csv'
+
+ganancia_acierto = 1_072_500
+costo_estimulo = 27_500
+
+#meses de train y test
+
+mes_train = [202103, 202104]                 # validación
+mes_test  = 202106                           # con clase conocida
+mes_final_train = [202103, 202104, 202105, 202106]
+mes_futuro = 202108                          # solo para predecir
+
+# agregue sus semillas
+semilla = 2323
+np.random.seed(semilla)
+semillas = np.random.choice(1000000, size=50, replace=False).tolist()
+
+data = pd.read_csv(dataset_path + dataset_file)
+
+#%% celda 3 [texto]
+#Feature Engineering
+
+#%% celda 4 [código]
+#deltas
+
+CAMPOS_DELTA = [
+    "mpayroll", "cpayroll_trx",
+    "mtarjeta_visa_consumo", "ctarjeta_visa_transacciones", "mttarjeta_visa_debitos_automaticos",
+    "tc_consumo_total",
+    "cproductos", "ctrx_quarter", "active_quarter", "internet", "cdescubierto_preacordado",
+    "chomebanking_transacciones", "cmobile_app_trx",
+    "mcuentas_saldo", "mcaja_ahorro", "mprestamos_personales", "mplazo_fijo_pesos",
+]
+
+data = data.sort_values(["numero_de_cliente", "foto_mes"]).reset_index(drop=True)
+
+data["tc_consumo_total"] = data["Visa_mconsumototal"].fillna(0) + data["Master_mconsumototal"].fillna(0)
+
+faltan = [c for c in CAMPOS_DELTA if c not in data.columns]
+print("Columnas que faltan:", faltan)
+
+g = data.groupby("numero_de_cliente", sort=False)
+nuevas = {f"delta_1_{c}": data[c] - g[c].shift(1) for c in CAMPOS_DELTA if c not in faltan}
+
+nuevas = pd.DataFrame(nuevas).astype("float32")
+data = pd.concat([data, nuevas], axis=1)
+print("Variables nuevas:", nuevas.shape[1], "| shape final:", data.shape)
+
+# control: % de filas con delta calculado, por mes
+print(data.groupby("foto_mes")["delta_1_mpayroll"].apply(lambda s: s.notna().mean()).round(3))
+
+#%% celda 5 [texto]
+#LGBM
+
+#%% celda 6 [código]
+#consolido las clases
+
+data['clase_binaria'] = np.where(data['clase_ternaria'] == 'BAJA+2', 1, 0)
+
+#%% celda 7 [código]
+NO_FEATURES = ['clase_ternaria', 'clase_binaria', 'numero_de_cliente', 'foto_mes']
+
+train_data = data[data['foto_mes'].isin(mes_train)]
+test_data  = data[data['foto_mes'] == mes_test]
+
+X_train = train_data.drop(columns=NO_FEATURES)
+y_train_binaria = train_data['clase_binaria']
+
+X_test = test_data.drop(columns=NO_FEATURES)
+y_test_binaria = test_data['clase_binaria']
+y_test_class = test_data['clase_ternaria']
+
+train_data_lgb = lgb.Dataset(X_train, label=y_train_binaria)
+test_data_lgb = lgb.Dataset(X_test, label=y_test_binaria)
+
+#%% celda 8 [código]
+#optimización con Optuna
+
+import os
+
+sss_opt = StratifiedShuffleSplit(n_splits=5, test_size=0.3, random_state=semillas[0])
+
+def ganancia_prob_lgm(y_pred, data, prop=0.3):
+  y_true = data.get_label()
+  ganancia = np.where(y_true == 1, ganancia_acierto, 0) - np.where(y_true == 0, costo_estimulo, 0)
+  return 'gan_prob', ganancia[y_pred >= 0.025].sum() / prop, True
+
+
+
+def objective(trial):
+
+    num_leaves = trial.suggest_int('num_leaves', 8, 100)
+    learning_rate = trial.suggest_float('learning_rate', 0.005, 0.3) # mas bajo, más iteraciones necesita
+    min_data_in_leaf = trial.suggest_int('min_data_in_leaf', 1, 1000)
+    feature_fraction = trial.suggest_float('feature_fraction', 0.1, 1.0)
+    bagging_fraction = trial.suggest_float('bagging_fraction', 0.1, 1.0)
+
+    params = {
+        'objective': 'binary',
+        'metric': 'custom',
+        'boosting_type': 'gbdt',
+        'first_metric_only': True,
+        'boost_from_average': True,
+        'feature_pre_filter': False,
+        'max_bin': 31,
+        'num_leaves': num_leaves,
+        'learning_rate': learning_rate,
+        'min_data_in_leaf': min_data_in_leaf,
+        'feature_fraction': feature_fraction,
+        'bagging_fraction': bagging_fraction,
+        'seed': semillas[0],
+        'verbose': -1
+    }
+
+    cv_results = lgb.cv(
+        params,
+        train_data_lgb,
+        num_boost_round=1000, # modificar, subir y subir...
+        callbacks=[lgb.early_stopping(stopping_rounds=int(50 + 5 / learning_rate), verbose=False)],
+        feval=ganancia_prob_lgm,
+        folds=sss_opt.split(X_train, y_train_binaria), # usamos StratifiedShuffleSplit en vez del k-fold interno
+        seed=semillas[0]
+    )
+
+    max_gan = max(cv_results['valid gan_prob-mean'])
+    best_iter = cv_results['valid gan_prob-mean'].index(max_gan) + 1
+
+    # Guardamos cual es la mejor iteración del modelo
+    trial.set_user_attr("best_iter", best_iter)
+
+    return max_gan
+
+# Asegurar que el directorio de la base de datos exista
+os.makedirs(db_path, exist_ok=True)
+
+storage_name = "sqlite:///" + db_path + "optimization_lgbm.db"
+study_name = "exp_301_lgbm_sss"
+
+study = optuna.create_study(
+    direction="maximize",
+    study_name=study_name,
+    storage=storage_name,
+    load_if_exists=True,
+)
+
+#%% celda 9 [código]
+#Para evitar tener que correr optuna en la evaluación, seteo los parametros óptimos que utilicé
+# True  -> usa los hiperparámetros de la entrega (trial 15)
+# False -> corre la optimización con Optuna
+USAR_PARAMS_FIJOS = True
+
+PARAMS_OPTIMOS = {
+    'num_leaves': 19,
+    'learning_rate': 0.021127696716538504,
+    'min_data_in_leaf': 858,
+    'feature_fraction': 0.8257277981830174,
+    'bagging_fraction': 0.2302571235653956,
+}
+BEST_ITER = 418
+
+#%% celda 10 [código]
+if not USAR_PARAMS_FIJOS:
+    study.optimize(objective, n_trials=15)
+
+#%% celda 11 [código]
+#entreno el modelo
+
+#entreno el modelo
+
+if USAR_PARAMS_FIJOS:
+    # hiperparámetros de la entrega (trial 30), definidos en la celda anterior
+    best_iter = BEST_ITER
+    num_leaves = PARAMS_OPTIMOS['num_leaves']
+    learning_rate = PARAMS_OPTIMOS['learning_rate']
+    min_data_in_leaf = PARAMS_OPTIMOS['min_data_in_leaf']
+    feature_fraction = PARAMS_OPTIMOS['feature_fraction']
+    bagging_fraction = PARAMS_OPTIMOS['bagging_fraction']
+else:
+    # mejor trial del estudio de Optuna
+    best_iter = study.best_trial.user_attrs["best_iter"]
+    num_leaves = study.best_trial.params['num_leaves']
+    learning_rate = study.best_trial.params['learning_rate']
+    min_data_in_leaf = study.best_trial.params['min_data_in_leaf']
+    feature_fraction = study.best_trial.params['feature_fraction']
+    bagging_fraction = study.best_trial.params['bagging_fraction']
+
+print(f"Árboles: {best_iter} | num_leaves: {num_leaves} | learning_rate: {learning_rate:.4f}")
+
+params = {
+    'objective': 'binary',
+    'boosting_type': 'gbdt',
+    'first_metric_only': True,
+    'boost_from_average': True,
+    'feature_pre_filter': False,
+    'max_bin': 31,
+    'num_leaves': num_leaves,
+    'learning_rate': learning_rate,
+    'min_data_in_leaf': min_data_in_leaf,
+    'feature_fraction': feature_fraction,
+    'bagging_fraction': bagging_fraction,
+    'seed': semillas[0],
+    'verbose': 0
+}
+
+model = lgb.train(params,
+                  train_data_lgb,
+                  num_boost_round=best_iter)
+
+#%% celda 12 [código]
+#importancia de las variables
+
+importances = model.feature_importance()
+feature_names = X_train.columns.tolist()
+importance_df = pd.DataFrame({'feature': feature_names, 'importance': importances})
+importance_df = importance_df.sort_values('importance', ascending=False)
+importance_df[importance_df['importance'] > 0]
+
+#%% celda 13 [código]
+#predicción
+
+y_pred_lgm = model.predict(X_test)
+
+#%% celda 14 [texto]
+#Evaluación del modelo
+
+#%% celda 15 [código]
+#medición de ganancia en junio
+
+def gan_prob(y_pred, y_true, prop = 1):
+  ganancia = np.where(y_true == 1, ganancia_acierto, 0) - np.where(y_true == 0, costo_estimulo, 0)
+  return ganancia[y_pred >= 0.025].sum() / prop
+
+print("Ganancia LGBM en junio:", gan_prob(y_pred_lgm, y_test_binaria))
+
+#%% celda 16 [código]
+def get_leaf_info_lgbm(model, X, y_clase):
+    # Hoja asignada a cada observación para cada árbol
+    hojas = model.predict(X, pred_leaf=True)
+
+    # Si hay un solo árbol, garantizar que sea una matriz 2D
+    hojas = np.asarray(hojas)
+    if hojas.ndim == 1:
+        hojas = hojas.reshape(-1, 1)
+
+    # Clases reales
+    clases = pd.Series(y_clase).reset_index(drop=True)
+
+    leaf_info = []
+
+    # Analizar cada árbol por separado
+    for tree_idx in range(hojas.shape[1]):
+        df = pd.DataFrame({
+            'Node': hojas[:, tree_idx],
+            'Clase': clases
+        })
+
+        # Contar observaciones por hoja y clase
+        tabla = pd.crosstab(df['Node'], df['Clase'])
+
+        # Asegurar que existan las tres columnas
+        for clase in ['BAJA+1', 'BAJA+2', 'CONTINUA']:
+            if clase not in tabla.columns:
+                tabla[clase] = 0
+
+        tabla = tabla[['BAJA+1', 'BAJA+2', 'CONTINUA']]
+        tabla['Samples'] = tabla.sum(axis=1)
+
+        # Clase mayoritaria de cada hoja
+        tabla['Predicted Class'] = tabla[
+            ['BAJA+1', 'BAJA+2', 'CONTINUA']
+        ].idxmax(axis=1)
+
+        tabla = tabla.reset_index()
+
+        # Ordenar columnas como en la tabla original
+        tabla = tabla[
+            ['Node', 'Samples', 'Predicted Class',
+             'BAJA+1', 'BAJA+2', 'CONTINUA']
+        ]
+
+        tabla.insert(0, 'Tree', tree_idx)
+        leaf_info.append(tabla)
+
+    return pd.concat(leaf_info, ignore_index=True)
+
+leaf_df = get_leaf_info_lgbm(
+    model,
+    X_train,
+    train_data['clase_ternaria']
+)
+
+leaf_df
+
+#%% celda 17 [código]
+#ganancia por nodo
+
+leaf_df["ganancia"] = (
+    ganancia_acierto * leaf_df["BAJA+2"]
+    - costo_estimulo * leaf_df["BAJA+1"]
+    - costo_estimulo * leaf_df["CONTINUA"]
+)
+
+leaf_df.sort_values("ganancia", ascending=False, inplace=True)
+
+leaf_df
+
+#%% celda 18 [código]
+# valor de cada hoja según el modelo (log-odds)
+td = model.trees_to_dataframe()
+hojas = td[td['split_feature'].isna()].copy()          # solo hojas
+hojas['Node'] = hojas['node_index'].str.split('-L').str[1].astype(int)
+hojas = hojas.rename(columns={'tree_index': 'Tree', 'value': 'valor_hoja'})
+hojas = hojas[['Tree', 'Node', 'valor_hoja']]
+
+# lo pego a leaf_df (mismas claves Tree / Node que devuelve pred_leaf)
+leaf_df = leaf_df.merge(hojas, on=['Tree', 'Node'], how='left')
+
+leaf_df["prob_empirica"] = leaf_df["BAJA+2"] / leaf_df["Samples"]
+leaf_df["prob_modelo_hoja"] = 1 / (1 + np.exp(-leaf_df["valor_hoja"]))
+
+leaf_df.sort_values("prob_modelo_hoja", ascending=False, inplace=True)
+leaf_df
+
+#%% celda 19 [código]
+import matplotlib.pyplot as plt
+
+# Regeneramos leaf_df para asegurar que esté limpio y evitar problemas de merges repetidos
+leaf_df = get_leaf_info_lgbm(
+    model,
+    X_train,
+    train_data['clase_ternaria']
+)
+
+y_pred_train = pd.Series(model.predict(X_train)).reset_index(drop=True)
+hojas_mat = model.predict(X_train, pred_leaf=True)
+
+prob_media = []
+for t in range(hojas_mat.shape[1]):
+    g = y_pred_train.groupby(hojas_mat[:, t]).mean().reset_index()
+    g.columns = ["Node", "prob_final_media"]
+    g.insert(0, "Tree", t)
+    prob_media.append(g)
+
+leaf_df = leaf_df.merge(pd.concat(prob_media), on=["Tree", "Node"], how="left")
+leaf_df["prob_empirica"] = leaf_df["BAJA+2"] / leaf_df["Samples"]
+
+# Gráfico: probabilidad empírica de la hoja vs probabilidad que le da el modelo completo
+fig, ax = plt.subplots(1, 2, figsize=(14, 5))
+
+ax[0].scatter(leaf_df["prob_empirica"], leaf_df["prob_final_media"], s=5, alpha=0.3)
+ax[0].axhline(0.025, color="red", ls="--", label="umbral 0.025")
+ax[0].axvline(0.025, color="red", ls="--")
+ax[0].set_xlabel("Prob. empírica de la hoja (BAJA+2 / Samples)")
+ax[0].set_ylabel("Prob. final media del modelo")
+ax[0].set_title("Hojas: empírica vs modelo")
+ax[0].legend()
+
+ax[1].hist(y_pred_train, bins=100, log=True)
+ax[1].axvline(0.025, color="red", ls="--")
+ax[1].set_xlabel("Probabilidad predicha (train)")
+ax[1].set_title("Distribución de probabilidades (escala log)")
+
+plt.tight_layout()
+plt.show()
+
+leaf_df.sort_values("prob_final_media", ascending=False)
+
+#%% celda 20 [código]
+#ganancia acumulada por posibles puntos de corte
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+mes_eval = 202106   # mes con clase conocida, distinto del mes con que entrenaste el modelo
+
+# 1) Predicciones en el mes de evaluación, ordenadas de mayor a menor probabilidad
+d_eval = data[data["foto_mes"] == mes_eval].copy()
+d_eval["prob"] = model.predict(d_eval[X_train.columns])
+d_eval = d_eval.sort_values("prob", ascending=False).reset_index(drop=True)
+
+# 2) Ganancia por cliente estimulado y ganancia acumulada
+g = np.where(d_eval["clase_ternaria"] == "BAJA+2", ganancia_acierto, -costo_estimulo)
+gan_acum = np.cumsum(g)
+n = np.arange(1, len(g) + 1)
+
+n_opt = int(gan_acum.argmax() + 1)
+n_umbral = int((d_eval["prob"] >= 0.025).sum())
+
+print(f"Clientes en {mes_eval}: {len(d_eval):,} | BAJA+2: {(d_eval['clase_ternaria']=='BAJA+2').sum():,}")
+print(f"Corte óptimo: {n_opt:,} envíos ({100*n_opt/len(d_eval):.2f}%) -> ganancia {gan_acum[n_opt-1]/1e6:,.2f} M")
+print(f"Corte por umbral 0.025: {n_umbral:,} envíos ({100*n_umbral/len(d_eval):.2f}%) -> ganancia {gan_acum[n_umbral-1]/1e6:,.2f} M")
+
+# 3) Tabla para distintos puntos de corte
+cortes = [500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000, 15000, 20000, 30000]
+cortes = [c for c in cortes if c <= len(d_eval)]
+tabla = pd.DataFrame({
+    "envios": cortes,
+    "% cartera": [100 * c / len(d_eval) for c in cortes],
+    "prob_corte": [d_eval["prob"].iloc[c - 1] for c in cortes],
+    "ganancia_M": [gan_acum[c - 1] / 1e6 for c in cortes],
+})
+display(tabla.round(4))
+
+# 4) Gráfico: curva completa y zoom alrededor del óptimo
+fig, ax = plt.subplots(1, 2, figsize=(15, 5))
+for a, lim in zip(ax, [len(n), min(len(n), n_opt * 4)]):
+    a.plot(n[:lim], gan_acum[:lim] / 1e6, color="#2a6fdb")
+    a.axvline(n_opt, color="green", ls="--", label=f"óptimo: {n_opt:,}")
+    a.axvline(n_umbral, color="red", ls="--", label=f"umbral 0.025: {n_umbral:,}")
+    a.axhline(0, color="gray", lw=0.8)
+    a.set_xlabel("Cantidad de clientes estimulados")
+    a.set_ylabel("Ganancia acumulada (millones)")
+    a.legend()
+ax[0].set_title(f"Ganancia acumulada ({mes_eval}) - curva completa")
+ax[1].set_title("Zoom alrededor del óptimo")
+plt.tight_layout()
+plt.show()
+
+# 5) Equivalente en agosto, trasladando el corte como proporción de la cartera
+n_agosto = int((data["foto_mes"] == 202108).sum())
+print(f"Corte óptimo trasladado a agosto: {round(n_opt / len(d_eval) * n_agosto):,} envíos "
+      f"(el que subiste fueron 5,589)")
+
+#%% celda 21 [texto]
+#Creación del archivo para la entrega
+
+#%% celda 22 [código]
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from google.colab import files
+
+mes_eval = 202106       # mes con clase conocida, distinto de los meses de train
+mes_futuro = 202108     # mes a predecir
+
+# Cómo cortar: "optimo" (N que maximiza la ganancia suavizada en mes_eval, trasladado a agosto),
+#              "umbral" (prob >= umbral) o "cantidad" (top N fijo)
+metodo = "optimo"
+umbral = 0.025
+n_envios_manual = 8000   # solo se usa si metodo == "cantidad"
+
+N_SEMILLAS = 5           # semillerío (probá con 3 la primera vez para medir el tiempo)
+VENTANA = 500            # ventana de la media móvil para suavizar la curva de ganancia
+
+assert mes_eval not in mes_train, "mes_eval no puede estar entre los meses con los que entrenaste el modelo"
+
+def entrenar_promedio(df_train, df_pred, n_semillas, max_bin):
+    """Entrena n_semillas modelos y devuelve el promedio de sus probabilidades sobre df_pred."""
+    X_tr = df_train[X_train.columns]
+    y_tr = df_train["clase_binaria"]
+    X_pr = df_pred[X_train.columns]
+    prob = np.zeros(len(df_pred))
+    for i, s in enumerate(semillas[:n_semillas], 1):
+        p = {**params, "seed": s, "max_bin": max_bin}
+        m = lgb.train(p, lgb.Dataset(X_tr, label=y_tr), num_boost_round=best_iter)
+        prob += m.predict(X_pr)
+        print(f"  semilla {i}/{n_semillas} lista")
+    return prob / n_semillas
+
+# 1) Validación: semillerío entrenado con mes_train y evaluado en mes_eval
+print("Validación:")
+d_val_train = data[data["foto_mes"].isin(mes_train)]
+d_eval = data[data["foto_mes"] == mes_eval].copy()
+d_eval["prob"] = entrenar_promedio(d_val_train, d_eval, N_SEMILLAS, max_bin=31)
+d_eval = d_eval.sort_values("prob", ascending=False).reset_index(drop=True)
+
+g = np.where(d_eval["clase_ternaria"] == "BAJA+2", ganancia_acierto, -costo_estimulo)
+gan_acum = np.cumsum(g)
+gan_suave = pd.Series(gan_acum).rolling(VENTANA, center=True, min_periods=1).mean().values
+
+n_opt = int(gan_suave.argmax() + 1)
+prop_opt = n_opt / len(d_eval)
+print(f"[{mes_eval}] corte óptimo (curva suavizada): {n_opt:,} envíos ({100*prop_opt:.2f}% de la cartera) "
+      f"-> ganancia {gan_acum[n_opt-1]/1e6:,.2f} M")
+print(f"[{mes_eval}] máximo crudo: {int(gan_acum.argmax()+1):,} envíos -> {gan_acum.max()/1e6:,.2f} M")
+
+x = np.arange(1, len(gan_acum) + 1)
+plt.figure(figsize=(9, 4))
+plt.plot(x, gan_acum / 1e6, alpha=0.4, label="cruda")
+plt.plot(x, gan_suave / 1e6, label="suavizada")
+plt.axvline(n_opt, color="green", ls="--", label=f"óptimo: {n_opt:,}")
+plt.axhline(0, color="gray", lw=0.8)
+plt.xlabel("Clientes estimulados"); plt.ylabel("Ganancia acumulada (M)")
+plt.title(f"Ganancia acumulada en {mes_eval} (promedio de {N_SEMILLAS} semillas)")
+plt.legend(); plt.show()
+
+# 2) Modelo final: semillerío entrenado con marzo-junio (max_bin 255), predice el mes futuro
+print("Modelo final:")
+d_final = data[data["foto_mes"].isin(mes_final_train)]
+d_futuro = data[data["foto_mes"] == mes_futuro].copy()
+d_futuro["prob"] = entrenar_promedio(d_final, d_futuro, N_SEMILLAS, max_bin=255)
+d_futuro = d_futuro.sort_values("prob", ascending=False)
+
+# 3) Selección de clientes según el método
+if metodo == "optimo":
+    n_envios = int(round(prop_opt * len(d_futuro)))      # mismo % de cartera que el óptimo de mes_eval
+    elegidos = d_futuro.head(n_envios)
+elif metodo == "umbral":
+    elegidos = d_futuro[d_futuro["prob"] >= umbral]
+else:
+    elegidos = d_futuro.head(n_envios_manual)
+
+entrega = elegidos[["numero_de_cliente"]]
+
+# 4) Controles
+assert entrega["numero_de_cliente"].is_unique
+assert entrega["numero_de_cliente"].isin(data.loc[data["foto_mes"] == mes_futuro, "numero_de_cliente"]).all()
+
+# 5) Guardado (sin encabezado): en Drive y en el entorno de Colab
+nombre_archivo = f"entrega_{mes_futuro}_{metodo}_{len(entrega)}.csv"
+
+os.makedirs(modelos_path, exist_ok=True)
+archivo_drive = modelos_path + nombre_archivo
+archivo_colab = "/content/" + nombre_archivo
+
+entrega.to_csv(archivo_drive, index=False, header=False)
+entrega.to_csv(archivo_colab, index=False, header=False)
+
+print(f"{len(entrega):,} clientes de {len(d_futuro):,} ({100*len(entrega)/len(d_futuro):.2f}%)")
+print("Guardado en Drive:", archivo_drive)
+print("Guardado en Colab:", archivo_colab)
+print("Prob. del último cliente incluido:", elegidos["prob"].min())
+
+# 6) Descarga a tu computadora
+files.download(archivo_colab)

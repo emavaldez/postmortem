@@ -1,0 +1,48 @@
+#%% celda 1 [texto]
+# Crear `competencia_01.parquet` a partir de `competencia_01.csv`
+
+Todos los notebooks de `submits/` leen `../competencia_01.parquet`. Este notebook lo crea desde el CSV de la cátedra
+(`competencia_01.csv`, en la carpeta raíz del repo) con **dos cambios**:
+
+1. **`clase_ternaria` recalculada con la definición estricta**: BAJA+1 = el cliente no está el mes siguiente;
+   BAJA+2 = está el mes siguiente pero no el subsiguiente; CONTINUA = está en los dos. 202107 solo puede ser BAJA+1
+   (o vacío) y 202108 queda vacío. Respecto del CSV, 29 filas pasan de CONTINUA a BAJA (clientes que se van y vuelven).
+2. **`ccajas_depositos` = NA en 202105** (en ese mes viene todo en cero: dato roto, recomendación del profesor).
+
+Si `competencia_01.parquet` ya existe, **no lo pisa**: verifica que lo que se genera es idéntico (`DataFrame.equals`).
+Tiempo: ~1 min.
+
+#%% celda 2 [código]
+import os
+import numpy as np
+import pandas as pd
+
+ENTRADA = "../competencia_01.csv"
+SALIDA  = "../competencia_01.parquet"
+
+df = pd.read_csv(ENTRADA)
+df = df.drop(columns=["clase_ternaria"])            # se recalcula abajo
+
+# Mes como número correlativo (202103 -> 2021*12 + 3) para poder sumar 1 y 2 meses
+mes_idx = ((df["foto_mes"] // 100) * 12 + df["foto_mes"] % 100).values
+cliente = df["numero_de_cliente"].values
+presentes = set(zip(cliente, mes_idx))               # pares (cliente, mes) que existen
+esta_mes1 = np.array([(c, m + 1) in presentes for c, m in zip(cliente, mes_idx)])   # ¿está el mes siguiente?
+esta_mes2 = np.array([(c, m + 2) in presentes for c, m in zip(cliente, mes_idx)])   # ¿y el subsiguiente?
+
+ultimo = mes_idx.max()
+clase = np.where(~esta_mes1, "BAJA+1", np.where(~esta_mes2, "BAJA+2", "CONTINUA")).astype(object)
+clase[mes_idx == ultimo] = None                      # 202108: no hay futuro
+clase[(mes_idx == ultimo - 1) & esta_mes1] = None    # 202107: solo se sabe si es BAJA+1
+df = df.assign(clase_ternaria=clase)
+
+df.loc[df["foto_mes"] == 202105, "ccajas_depositos"] = np.nan   # dato roto en 202105
+
+print(df.groupby("foto_mes")["clase_ternaria"].value_counts(dropna=False).unstack())
+
+#%% celda 3 [código]
+if os.path.exists(SALIDA):
+    print("Ya existe: ¿es idéntico al que se genera?", df.equals(pd.read_parquet(SALIDA)))
+else:
+    df.to_parquet(SALIDA, index=False)
+    print("Creado:", SALIDA, df.shape)

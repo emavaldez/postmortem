@@ -1,0 +1,52 @@
+{
+  "experimento": 5114,
+  "nombre": "eval_dataset",
+  "descripcion": "Solo cambia el dataset: prueba 23 sobre ds3003 (5015) contra prueba 23 sobre ds3007 (FE del profesor: 1.1, 1.3, 1.4). Train 202103+202104, junio completo, 20 semillas pareadas. R8 fijada de antemano: se adopta ds3007 si no es mas de 3 M peor.",
+  "sobrescribir": true,
+  "candidatos": {
+    "p23_ds3003": "ds3003_rank_extra.parquet",
+    "p23_ds3007": "ds3007_profesor.parquet"
+  },
+  "referencia": "p23_ds3003",
+  "retador": "p23_ds3007",
+  "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json",
+  "usar_lag2": true,
+  "clase": "clase_binaria2",
+  "meses_train": [
+    202103,
+    202104
+  ],
+  "mes_futuro": 202106,
+  "n_semillas": 20,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "tolerancia_R8_M": 3.0,
+  "meseta": [
+    12000,
+    17000
+  ],
+  "cortes": [
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "_config": "5114_eval_dataset.json",
+  "_fecha_inicio": "2026-10-11 17:44:46",
+  "_script": "19_eval_dataset.py",
+  "_git_commit": "sin_git"
+}

@@ -1,0 +1,525 @@
+"""Churn: FE persistente, dos estudios temporales y un único ranking de agosto."""
+from __future__ import annotations
+import argparse
+import gc
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+import pickle
+import platform
+import signal
+import time
+import warnings
+import duckdb
+import lightgbm as lgb
+import numpy as np
+import optuna
+import pandas as pd
+import psutil
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+
+ID, MES, CLASE, TARGET = 'numero_de_cliente', 'foto_mes', 'clase_ternaria', 'target_baja12'
+EXCLUDED = {ID, MES, CLASE, TARGET, '__month'}
+LOG = logging.getLogger('dual')
+
+
+def q(name):
+    return '"'+name.replace('"', '""')+'"'
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for block in iter(lambda: f.read(8*1024**2), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def write_json(path, value):
+    path = Path(path)
+    temp = path.with_suffix(path.suffix+'.tmp')
+    temp.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf-8')
+    temp.replace(path)
+
+
+def month_index(m):
+    return int(m)//100*12+int(m)%100
+
+
+def gain_curve(scores, ids, labels, cuts, cfg):
+    cuts = np.asarray(cuts, dtype=int)
+    if len(scores) < cuts.max():
+        raise ValueError('El TopN excede la población mensual')
+    scores=np.asarray(scores);ids=np.asarray(ids)
+    top=int(cuts.max())
+    if top<len(scores):
+        boundary=np.partition(scores,len(scores)-top)[len(scores)-top]
+        higher=np.flatnonzero(scores>boundary)
+        tied=np.flatnonzero(scores==boundary)
+        tied=tied[np.argsort(ids[tied],kind='stable')[:top-len(higher)]]
+        candidate=np.r_[higher,tied]
+        order=candidate[np.lexsort((ids[candidate],-scores[candidate]))]
+    else:
+        order=np.lexsort((ids,-scores))
+    rewards = np.where(np.asarray(labels)[order] == 'BAJA+2', cfg['gain'], -cfg['cost'])
+    return np.cumsum(rewards, dtype=np.int64)[cuts-1].astype(float)
+
+
+def psi(reference, current, bins=10):
+    a, b = np.asarray(reference, float), np.asarray(current, float)
+    valid = a[np.isfinite(a)]
+    # Missing es un bin explícito; referencia constante tiene bins propios.
+    if len(np.unique(valid)) <= 1:
+        if len(valid):
+            v = valid[0]
+            def count(x):
+                return np.array([np.sum(x < v), np.sum(x == v), np.sum(x > v), np.sum(~np.isfinite(x))], float)
+        else:
+            def count(x):
+                return np.array([np.isfinite(x).sum(), (~np.isfinite(x)).sum()], float)
+    else:
+        edges = np.unique(np.quantile(valid, np.linspace(0, 1, bins+1)))
+        edges[0], edges[-1] = -np.inf, np.inf
+        def count(x):
+            return np.append(np.histogram(x[np.isfinite(x)], edges)[0], np.sum(~np.isfinite(x))).astype(float)
+    ca, cb = count(a)+0.5, count(b)+0.5
+    pa, pb = ca/ca.sum(), cb/cb.sum()
+    return float(np.sum((pb-pa)*np.log(pb/pa)))
+
+
+def quality_month(df, cfg, rules):
+    month = int(df[MES].iloc[0])
+    records = []
+    zeros = {202105: ['Visa_Finiciomora', 'Master_Finiciomora'],
+             202106: ['Master_fultimo_cierre', 'Visa_fultimo_cierre'],
+             202108: ['Visa_Finiciomora', 'Master_Finiciomora']}
+    for c in df.select_dtypes(include=np.number):
+        if c not in EXCLUDED:
+            df[c] = df[c].astype('float32').replace([np.inf, -np.inf], np.nan)
+    df = df.copy()
+    for c, months in rules.items():
+        if month in months and c in df:
+            records.append(dict(month=month, column=c, action='todo_mes_NA', affected=int(df[c].notna().sum())))
+            df[c] = np.nan
+    for c in zeros.get(month, []):
+        if c not in df:
+            raise ValueError('Falta columna de calidad: '+c)
+        n = int(df[c].eq(0).sum())
+        df.loc[df[c].eq(0), c] = np.nan
+        records.append(dict(month=month, column=c, action='ceros_NA', affected=n))
+    if 'internet' in df:
+        invalid = df.internet.notna() & ~df.internet.isin([0, 1])
+        records.append(dict(month=month, column='internet', action='dominio_0_1', affected=int(invalid.sum())))
+        df.loc[invalid, 'internet'] = np.nan
+    factor = cfg['ipc'][str(cfg['score_month'])]/cfg['ipc'][str(month)]
+    real_limits = {}
+    for c in cfg['inflation_columns']:
+        if c in df:
+            if c in cfg['nominal_limits']:
+                real_limits[c+'_real'] = (df[c]*factor).astype('float32')
+            else:
+                df[c] = (df[c]*factor).astype('float32')
+    if real_limits:
+        df = pd.concat([df,pd.DataFrame(real_limits,index=df.index)],axis=1)
+    return df, records
+
+
+def prepare(cfg,root):
+    from basal_features import prepare_basal
+    prepare_basal(cfg,root)
+
+
+def parquet_path(root,month):
+    return root/f'month_{month}.parquet'
+
+
+def load_months(root, months, columns):
+    return pd.concat([pd.read_parquet(parquet_path(root,m), columns=columns) for m in months], ignore_index=True)
+
+
+def matrix_month(root, month, features, batch_size):
+    """Memmap en disco: decodifica Parquet una vez, no en cada trial/modelo."""
+    import pyarrow.parquet as pq
+    folder=root/'datasets'
+    folder.mkdir(exist_ok=True)
+    path=folder/f'matrix_{month}.npy'
+    if not path.exists():
+        parquet=pq.ParquetFile(parquet_path(root,month))
+        temp=path.with_suffix('.npy.tmp')
+        matrix=np.lib.format.open_memmap(temp,mode='w+',dtype='float32',
+                                       shape=(parquet.metadata.num_rows,len(features)))
+        offset=0
+        for batch in parquet.iter_batches(batch_size=batch_size,columns=features):
+            values=batch.to_pandas().to_numpy(dtype='float32')
+            matrix[offset:offset+len(values)]=values
+            offset+=len(values)
+        matrix.flush()
+        del matrix
+        temp.replace(path)
+    result=np.load(path,mmap_mode='r',allow_pickle=False)
+    if result.shape[1]!=len(features):
+        raise ValueError('Memmap incompatible con features')
+    return result
+
+
+def sample_training(frame,cfg,root,key):
+    if frame[TARGET].isna().any():raise ValueError('No muestrear target inmaduro')
+    hashes=pd.util.hash_pandas_object(frame[[ID,MES]],index=False).to_numpy(dtype='uint64')
+    # Máscara reproducible por cliente-mes; sólo CONTINUA se submuestrea.
+    values=(hashes ^ np.uint64(int.from_bytes(hashlib.sha256(str(cfg['sampling_seed']).encode()).digest()[:8],'little'))).astype('float64')/float(2**64)
+    keep=frame[TARGET].eq(1).to_numpy() | (values<cfg['undersampling_continua'])
+    sampled=frame.loc[keep].copy()
+    write_json(root/f'sampling_{key}.json',dict(before=len(frame),after=len(sampled),
+        positives_before=int(frame[TARGET].sum()),positives_after=int(sampled[TARGET].sum()),
+        continua_before=int(frame[TARGET].eq(0).sum()),continua_after=int(sampled[TARGET].eq(0).sum()),
+        fraction=cfg['undersampling_continua'],method='stable client-month hash'))
+    return sampled
+
+
+def gain_evaluator(meta,cuts,cfg):
+    ids=meta[ID].to_numpy(); labels=meta[CLASE].to_numpy()
+    def evaluate(pred,dataset):
+        return 'ganancia_topN',float(gain_curve(pred,ids,labels,cuts,cfg).max()),True
+    return evaluate
+
+
+def fixed_params(cfg):
+    return dict(objective='binary', metric='None', learning_rate=cfg['learning_rate'], max_bin=31,
+        min_data_in_leaf=cfg['min_data_in_leaf'], feature_fraction=cfg['feature_fraction'],
+        feature_fraction_bynode=1.0, bagging_fraction=cfg['bagging_fraction'], bagging_freq=1,
+        feature_pre_filter=False, force_col_wise=True, verbosity=-1, num_threads=cfg['threads'],
+        deterministic=True, data_random_seed=cfg['seed'])
+
+
+def model_params(cfg, hp, seed):
+    return {**fixed_params(cfg), **{k:v for k,v in hp.items() if k != 'num_iterations'},
+            'seed':seed, 'bagging_seed':seed, 'feature_fraction_seed':seed}
+
+
+def fold_data(root, cfg, features, plan, key):
+    cache = root/'datasets'
+    cache.mkdir(exist_ok=True)
+    trfile, vafile = cache/f'{key}_train.bin', cache/f'{key}_valid.bin'
+    meta = load_months(root, [plan['valid']], [ID, CLASE, TARGET])
+    dataset_params = {k:fixed_params(cfg)[k] for k in ['max_bin','feature_pre_filter','data_random_seed']}
+    if not trfile.exists() or not vafile.exists():
+        train = load_months(root, plan['train'], list(dict.fromkeys(features+[ID,MES,CLASE,TARGET])))
+        train = sample_training(train,cfg,root,key)
+        valid = load_months(root, [plan['valid']], features+[TARGET])
+        if train[TARGET].isna().any() or valid[TARGET].isna().any():
+            raise ValueError('Target inmaduro en fold')
+        cats=[c for c in cfg['categorical_columns'] if c in features]
+        dt = lgb.Dataset(train[features], label=train[TARGET], params=dataset_params,categorical_feature=cats).construct()
+        dv = lgb.Dataset(valid[features], label=valid[TARGET], reference=dt).construct()
+        for ds, dest in [(dt,trfile), (dv,vafile)]:
+            temp = dest.with_suffix('.bin.tmp')
+            if temp.exists():
+                temp.unlink()
+            ds.save_binary(str(temp))
+            temp.replace(dest)
+        del train, valid, dt, dv
+        gc.collect()
+    dt = lgb.Dataset(str(trfile), params=dataset_params)
+    dv = lgb.Dataset(str(vafile), reference=dt)
+    Xvalid = matrix_month(root,plan['valid'],features,cfg['score_batch_size'])
+    return dt, dv, Xvalid, meta
+
+
+def objective_value(curves, cuts, strategy, weights):
+    curves = np.asarray(curves)
+    if strategy == 'independent':
+        positions = curves.argmax(axis=1)
+        return float(np.dot(weights, curves[np.arange(len(curves)), positions])), [int(cuts[i]) for i in positions]
+    average = np.asarray(weights)@curves
+    i = int(average.argmax())
+    return float(average[i]), [int(cuts[i])]*len(curves)
+
+
+def optimize(cfg, root, name):
+    features = json.loads((root/'features.json').read_text(encoding='utf-8'))['features']
+    strategy = cfg['strategies'][name]
+    cuts = np.arange(cfg['n_min'], cfg['n_max']+1, cfg['n_step'])
+    # Caché de bins: deja sólo un fold/modelo activo, y reutiliza cuantización por trial.
+    storage = optuna.storages.RDBStorage('sqlite:///'+(root/f'{name}.db').as_posix(),
+                                        engine_kwargs={'connect_args':{'timeout':60}})
+    sampler_path = root/f'{name}_sampler.pkl'
+    sampler = pickle.loads(sampler_path.read_bytes()) if sampler_path.exists() else optuna.samplers.TPESampler(seed=cfg['seed'])
+    study = optuna.create_study(study_name=name, storage=storage, direction='maximize',
+                                sampler=sampler, load_if_exists=True)
+    # El lock global asegura que RUNNING pertenece a una ejecución muerta.
+    for trial in study.get_trials(states=[optuna.trial.TrialState.RUNNING]):
+        study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+    def objective(trial):
+        hp = dict(num_iterations=trial.suggest_int('num_iterations', cfg['trees_min'], cfg['max_trees'], step=100),
+                  num_leaves=trial.suggest_int('num_leaves', *cfg['leaves_range']),
+                  min_sum_hessian_in_leaf=trial.suggest_float('min_sum_hessian_in_leaf', *cfg['hessian_range'], log=True),
+                  learning_rate=trial.suggest_float('learning_rate',*cfg['learning_rate_range'],log=True),
+                  feature_fraction=trial.suggest_float('feature_fraction',*cfg['feature_fraction_range']),
+                  min_data_in_leaf=trial.suggest_int('min_data_in_leaf',*cfg['min_data_range'],log=True))
+        curves, metrics, iterations = [], [], []
+        for f, plan in enumerate(strategy['folds']):
+            key = '_'.join(map(str,plan['train']))+'_to_'+str(plan['valid'])
+            dt,dv,X,meta = fold_data(root,cfg,features,plan,key)
+            LOG.info('%s trial %s fold %s train=%s valid=%s',name,trial.number,f,plan['train'],plan['valid'])
+            start=time.monotonic()
+            model=lgb.train(model_params(cfg,hp,cfg['seed']+f),dt,num_boost_round=hp['num_iterations'],
+                valid_sets=[dv],feval=gain_evaluator(meta,cuts,cfg),callbacks=[lgb.early_stopping(cfg['early_stopping'],first_metric_only=True,verbose=False),lgb.log_evaluation(0)])
+            pred=model.predict(X,num_iteration=model.best_iteration)
+            curves.append(gain_curve(pred,meta[ID],meta[CLASE],cuts,cfg))
+            iterations.append(int(model.best_iteration))
+            metrics.append(dict(month=plan['valid'],auc=float(roc_auc_score(meta[TARGET],pred)),
+                ap=float(average_precision_score(meta[TARGET],pred)),seconds=time.monotonic()-start))
+            del dt,dv,X,meta,model,pred
+            gc.collect()
+        value,best_cuts=objective_value(curves,cuts,strategy['objective'],cfg['month_weights'])
+        trial.set_user_attr('curves',np.asarray(curves).tolist())
+        trial.set_user_attr('cuts',cuts.tolist())
+        trial.set_user_attr('best_cuts',best_cuts)
+        trial.set_user_attr('iterations',iterations)
+        trial.set_user_attr('final_iterations',int(np.rint(np.median(iterations))))
+        trial.set_user_attr('metrics',metrics)
+        return value
+    def checkpoint(study,trial):
+        temp=sampler_path.with_suffix('.pkl.tmp')
+        temp.write_bytes(pickle.dumps(study.sampler))
+        temp.replace(sampler_path)
+        study.trials_dataframe().to_csv(root/f'{name}_trials.csv',index=False)
+        LOG.info('%s trial %s %s value=%s',name,trial.number,trial.state.name,trial.value)
+    remaining=cfg['trials']-len(study.get_trials(states=[optuna.trial.TrialState.COMPLETE]))
+    if remaining>0:
+        study.optimize(objective,n_trials=remaining,n_jobs=1,callbacks=[checkpoint])
+    ranked=sorted(study.get_trials(states=[optuna.trial.TrialState.COMPLETE]),key=lambda t:(-t.value,t.number))
+    selected,seen=[],set()
+    for t in ranked:
+        identity=json.dumps(t.params,sort_keys=True)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        selected.append(dict(strategy=name,trial=t.number,params=t.params,value=t.value,**t.user_attrs))
+        if len(selected)==cfg['top_k']:
+            break
+    if len(selected)!=cfg['top_k']:
+        raise ValueError(f'No hay {cfg["top_k"]} configuraciones distintas completas')
+    write_json(root/f'{name}_selected.json',selected)
+
+
+def selected_configs(cfg,root,strategy=None):
+    names=[strategy] if strategy else cfg['strategies']
+    return [item for name in names for item in json.loads((root/f'{name}_selected.json').read_text(encoding='utf-8'))]
+
+
+def choose_cut(cfg,root):
+    if (root/'frozen.json').exists():
+        return
+    features=json.loads((root/'features.json').read_text(encoding='utf-8'))['features']
+    selected=selected_configs(cfg,root)
+    cuts=np.arange(cfg['n_min'],cfg['n_max']+1,cfg['n_step'])
+    validation_months=[plan['valid'] for plan in cfg['strategies'][next(iter(cfg['strategies']))]['folds']]
+    sums=[None]*len(validation_months)
+    for item in selected:
+        for f,plan in enumerate(cfg['strategies'][item['strategy']]['folds']):
+            path=root/f'validation_{item["strategy"]}_trial{item["trial"]}_fold{f}.npz'
+            if path.exists():
+                with np.load(path,allow_pickle=False) as state:
+                    pred=state['pred']
+            else:
+                key='_'.join(map(str,plan['train']))+'_to_'+str(plan['valid'])
+                dt,dv,X,meta=fold_data(root,cfg,features,plan,key)
+                # Misma semilla y best_iter del trial: reusa la selección congelada.
+                model=lgb.train(model_params(cfg,item['params'],cfg['seed']+f),dt,
+                                num_boost_round=item['iterations'][f])
+                pred=model.predict(X,num_iteration=item['iterations'][f])
+                temp=path.with_suffix('.npz.tmp')
+                with temp.open('wb') as stream:
+                    np.savez_compressed(stream,pred=pred)
+                temp.replace(path)
+                del dt,dv,X,meta,model
+                gc.collect()
+            month=plan['valid']
+            sums[f]=pred/len(selected) if sums[f] is None else sums[f]+pred/len(selected)
+    curves=[]
+    for f,month in enumerate(validation_months):
+        meta=load_months(root,[month],[ID,CLASE])
+        curves.append(gain_curve(sums[f],meta[ID],meta[CLASE],cuts,cfg))
+    avg=np.asarray(cfg['month_weights'])@np.asarray(curves)
+    n=int(cuts[avg.argmax()])
+    if n not in cuts:
+        raise ValueError('N manual fuera de grilla')
+    table={'N':cuts,'weighted_gain':avg}
+    table.update({f'gain_fold{f}_{month}':curve for f,(month,curve) in enumerate(zip(validation_months,curves))})
+    pd.DataFrame(table).to_csv(root/'ensemble_validation_curve.csv',index=False)
+    write_json(root/'cut.json',dict(N=n,criterion='max curva ponderada 50/25/25 del ensamble de validacion',
+                                  development_months=validation_months,independent_test=False))
+    write_json(root/'frozen.json',dict(N=n,selected=selected,cut_sha256=digest(root/'cut.json'),
+        features_sha256=digest(root/'features.json'),selection='top10 gain; common N from ensemble validation'))
+
+
+def score_final(cfg,root,strategy=None,combine=True):
+    if not (root/'frozen.json').exists(): raise ValueError('Congelar hiperparámetros y TopN antes de score')
+    frozen=json.loads((root/'frozen.json').read_text(encoding='utf-8'))
+    if frozen['features_sha256']!=digest(root/'features.json') or frozen['cut_sha256']!=digest(root/'cut.json'):
+        raise ValueError('Freeze alterado')
+    features=json.loads((root/'features.json').read_text(encoding='utf-8'))['features']
+    selected=frozen['selected']
+    cache=root/'datasets'/'final.bin'
+    pending=any(not (root/'scores'/f'{item["strategy"]}_trial{item["trial"]}_seed{seed}.npz').exists()
+                for item in selected for seed in cfg['final_seeds'])
+    if pending and not cache.exists():
+        train=load_months(root,cfg['final_train_months'],list(dict.fromkeys(features+[ID,MES,CLASE,TARGET])))
+        train=sample_training(train,cfg,root,'final')
+        if train[TARGET].isna().any():
+            raise ValueError('Target final inmaduro')
+        params={k:fixed_params(cfg)[k] for k in ['max_bin','feature_pre_filter','data_random_seed']}
+        dataset=lgb.Dataset(train[features],label=train[TARGET],params=params,
+                            categorical_feature=[c for c in cfg['categorical_columns'] if c in features]).construct()
+        temp=cache.with_suffix('.bin.tmp')
+        if temp.exists(): temp.unlink()
+        dataset.save_binary(str(temp));temp.replace(cache)
+        del dataset,train
+        gc.collect()
+    dataset=(lgb.Dataset(str(cache),params={k:fixed_params(cfg)[k] for k in
+        ['max_bin','feature_pre_filter','data_random_seed']}).construct()) if pending else None
+    scoremeta=load_months(root,[cfg['score_month']],[ID])
+    ids=scoremeta[ID].to_numpy(dtype='int64')
+    if len(np.unique(ids))!=len(ids):
+        raise ValueError('IDs score duplicados')
+    scores_dir=root/'scores';scores_dir.mkdir(exist_ok=True)
+    model_dir=root/'models';model_dir.mkdir(exist_ok=True)
+    # Agosto se lee por bloques, evitando mantenerlo entero junto al dataset final.
+    score_matrix=matrix_month(root,cfg['score_month'],features,cfg['score_batch_size'])
+    for item in selected:
+        for seed in cfg['final_seeds']:
+            tag=f'{item["strategy"]}_trial{item["trial"]}_seed{seed}'
+            dest=scores_dir/f'{tag}.npz'
+            if dest.exists():
+                continue
+            LOG.info('FINAL %s árboles=%s',tag,item['final_iterations'])
+            model=lgb.train(model_params(cfg,item['params'],seed),dataset,num_boost_round=item['final_iterations'])
+            pred=[]
+            for start in range(0,len(ids),cfg['score_batch_size']):
+                pred.append(model.predict(score_matrix[start:start+cfg['score_batch_size']],
+                                          num_iteration=item['final_iterations']))
+            pred=np.concatenate(pred)
+            if len(pred)!=len(ids) or not np.isfinite(pred).all():
+                raise ValueError('Score inválido')
+            if cfg['save_models']:
+                model.save_model(str(model_dir/f'{tag}.txt'))
+            temp=dest.with_suffix('.npz.tmp')
+            with temp.open('wb') as stream:
+                np.savez_compressed(stream,pred=pred,ids=ids)
+            temp.replace(dest)
+            del model,pred
+            gc.collect()
+    if not combine:
+        write_json(root/f'{strategy}_FINALIZADO.json',dict(strategy=strategy,
+            models=len(selected)*len(cfg['final_seeds']),score_month=cfg['score_month']))
+        LOG.info('Estrategia %s terminada; falta combinar ambas para el envío único',strategy)
+        return
+    avg=np.zeros(len(ids),dtype=np.float64)
+    count=0
+    for item in selected:
+        for seed in cfg['final_seeds']:
+            path=scores_dir/f'{item["strategy"]}_trial{item["trial"]}_seed{seed}.npz'
+            with np.load(path,allow_pickle=False) as state:
+                if not np.array_equal(ids,state['ids']):
+                    raise ValueError('Orden de IDs incompatible en checkpoint')
+                avg+=state['pred'];count+=1
+    avg/=count
+    n=json.loads((root/'cut.json').read_text())['N']
+    if n>len(ids): raise ValueError('TopN superior a población agosto')
+    order=np.lexsort((ids,-avg))[:n]
+    pd.DataFrame({ID:ids,'score':avg}).to_csv(root/'scores_agosto_ensemble.csv.gz',index=False)
+    pd.Series(ids[order]).to_csv(root/f'envio_agosto_top{n}.csv',header=False,index=False)
+    write_json(root/'FINALIZADO.json',dict(models=count,N=n,features=len(features),score_month=cfg['score_month']))
+
+
+def run(config_path, stage='all', resume=False):
+    cfg=json.loads(Path(config_path).read_text(encoding='utf-8-sig'))
+    cfg['raw_path']=str(Path(cfg['raw_path']).expanduser().resolve())
+    root=Path(cfg['work_dir']).expanduser().resolve()
+    if cfg['max_columns']>1000: raise ValueError('Máximo permitido: 1000 columnas')
+    if not cfg['final_seeds'] or len(set(cfg['final_seeds']))!=len(cfg['final_seeds']): raise ValueError('Semillas distintas requeridas')
+    if not 0<cfg['undersampling_continua']<=1:raise ValueError('Fracción CONTINUA inválida')
+    if not np.isclose(sum(cfg['month_weights']),1) or any(w<0 for w in cfg['month_weights']):
+        raise ValueError('Pesos mensuales no negativos que sumen uno requeridos')
+    for name,strategy in cfg['strategies'].items():
+        if len(strategy['folds'])!=len(cfg['month_weights']):
+            raise ValueError('Número de folds y pesos diferente')
+        for plan in strategy['folds']:
+            if month_index(plan['valid'])-max(map(month_index,plan['train']))<cfg.get('min_train_valid_gap',2):
+                raise ValueError('Validación debe ser posterior al entrenamiento con el gap configurado')
+    if os.name!='nt':
+        import subprocess
+        ancestor=next(p for p in [root,*root.parents] if p.exists())
+        filesystem=subprocess.run(['stat','-f','-c','%T',str(ancestor)],capture_output=True,text=True,check=True).stdout
+        if 'fuse' in filesystem.lower():
+            raise ValueError('work_dir requiere disco local: no usar GCSFuse')
+    root.mkdir(parents=True,exist_ok=True)
+    # Lock del sistema: liberación automática al morir el proceso, Windows y Linux.
+    with (root/'.run.lock').open('a+b') as lock:
+        lock.seek(0);lock.write(b'0');lock.flush();lock.seek(0)
+        if os.name=='nt':
+            import msvcrt
+            msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
+        else:
+            import fcntl
+            fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s',
+            handlers=[logging.StreamHandler(),logging.FileHandler(root/'run.log',encoding='utf-8')],force=True)
+        raw_hash=digest(cfg['raw_path'])
+        signature=dict(config=cfg,raw_sha256=raw_hash,
+            code={p.name:digest(p) for p in Path(__file__).parent.iterdir() if p.suffix in ['.py'] or p.name=='dq_rules.json'},
+            versions=dict(python=platform.python_version(),lightgbm=lgb.__version__,optuna=optuna.__version__,
+                          duckdb=duckdb.__version__,pandas=pd.__version__,numpy=np.__version__))
+        if cfg.get('prepared_source_dir'):
+            source=Path(cfg['prepared_source_dir']).expanduser().resolve()
+            signature['prepared_source_manifest_sha256']=digest(source/'manifest.json')
+            signature['prepared_source_parquets']={str(month):dict(size=(source/f'month_{month}.parquet').stat().st_size,
+                mtime_ns=(source/f'month_{month}.parquet').stat().st_mtime_ns) for month in cfg['months']}
+        manifest=root/'manifest.json'
+        if manifest.exists():
+            if not resume or json.loads(manifest.read_text(encoding='utf-8'))!=signature:
+                raise ValueError('Corrida existente: --resume exige misma config/código/CSV/versiones')
+        else:
+            write_json(manifest,signature)
+        LOG.info('Etapa=%s RAM disponible %.1f GB; CPU=%s',stage,psutil.virtual_memory().available/1e9,os.cpu_count())
+        def stop(signum,frame):
+            raise KeyboardInterrupt('Interrupción: reanudar con --resume')
+        signal.signal(signal.SIGTERM,stop)
+        if stage in ['all','prepare']: prepare(cfg,root)
+        if stage in ['all','search']:
+            for name in cfg['strategies']: optimize(cfg,root,name)
+        if stage in ['all','select']: choose_cut(cfg,root)
+        if stage in ['all','score']: score_final(cfg,root)
+        LOG.info('Etapa %s terminada',stage)
+
+
+def entry_stage(stage):
+    """Entradas separadas: reutilizan la misma configuración y preparación."""
+    parser=argparse.ArgumentParser(description=f'Basal temporal: {stage}')
+    parser.add_argument('--config',default=str(Path(__file__).with_name('config.local.json')))
+    parser.add_argument('--resume',action='store_true',help='Compatible; reanudación automática en estas entradas')
+    args=parser.parse_args()
+    cfg=json.loads(Path(args.config).read_text(encoding='utf-8-sig'))
+    exists=(Path(cfg['work_dir']).expanduser()/'manifest.json').exists()
+    try:
+        run(args.config,stage,resume=args.resume or exists)
+    except BaseException:
+        LOG.exception('Entrada %s interrumpida; checkpoints conservados',stage)
+        raise
+
+
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config',default=str(Path(__file__).with_name('config.local.json')))
+    parser.add_argument('--stage',choices=['all','prepare','search','select','score'],default='all')
+    parser.add_argument('--resume',action='store_true')
+    args=parser.parse_args()
+    try:
+        run(args.config,args.stage,args.resume)
+    except BaseException:
+        LOG.exception('Etapa interrumpida o fallida; checkpoints conservados')
+        raise

@@ -1,0 +1,8 @@
+{
+  "archivo": "ds3007_profesor.parquet",
+  "columnas": 1215,
+  "MB": 876,
+  "variables_originales": 152,
+  "flags_zero": 140,
+  "_minutos": 1.59
+}

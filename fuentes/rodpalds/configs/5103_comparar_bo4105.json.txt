@@ -1,0 +1,32 @@
+{
+  "experimento": 5103,
+  "nombre": "comparar_bo4105",
+  "descripcion": "Pipeline actual contra la receta del profesor SIN lag2 con hiperparametros de 4104 y de 4105 (BO ampliada). Semillerio de 30, train 202104, mitad B de 202106 (x2), bootstrap pareado.",
+  "n_semillas": 30,
+  "candidatos": {
+    "actual_crudo_p95": {
+      "dataset": "ds3001_crudo.parquet",
+      "variables": "4003_canaritos/4003_variables_p95.txt",
+      "usar_lag2": false,
+      "hiperparametros": {
+        "eleccion": "4102_bo_fuera_de_tiempo/4102_eleccion.json"
+      }
+    },
+    "rank_bo4104": {
+      "dataset": "ds3002_rank_total.parquet",
+      "variables": null,
+      "usar_lag2": false,
+      "hiperparametros": {
+        "eleccion": "4104_bo_rank_total/4104_eleccion.json"
+      }
+    },
+    "rank_bo4105": {
+      "dataset": "ds3002_rank_total.parquet",
+      "variables": null,
+      "usar_lag2": false,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    }
+  }
+}

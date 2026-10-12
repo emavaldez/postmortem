@@ -1,0 +1,721 @@
+#%% celda 1 [texto]
+# Libraries
+
+#%% celda 2 [código]
+import os
+import pandas as pd
+import numpy as np
+
+#%% celda 3 [código]
+# dispongo la carpeta con funciones e importo ternara. 
+from pathlib import Path
+import sys
+import importlib
+
+# Obtiene la ruta del directorio actual y sube un nivel (.parent)
+raiz_proyecto = Path().resolve().parent
+# Agrega la ruta al sistema si no está ya incluida
+if str(raiz_proyecto) not in sys.path:
+  sys.path.append(str(raiz_proyecto))
+
+# Importa tu librería o módulo
+from funciones.ternaria import ternaria, rankear_por_mes
+
+#%% celda 4 [texto]
+# URLs y Constantes
+
+#%% celda 5 [código]
+DATA_FOLDER = os.getcwd()
+DATA_CRUDO_URL = os.path.join(DATA_FOLDER, 'competencia_01_crudo.csv')
+DATA_TERNARIA_URL = os.path.join(DATA_FOLDER, 'c_01_tern_2.csv')
+DATA_LAGS_URL = os.path.join(DATA_FOLDER, 'c_01_tern_2_lags.csv')
+DATA_LAGS_O2_URL = os.path.join(DATA_FOLDER, 'c_01_tern_2_lags_O2.csv')
+DATA_DICT_URL= os.path.join(DATA_FOLDER, 'data_dict.csv')
+
+SEED = 230047
+SEEDS =[230047, 230059, 230063, 230077, 230081]
+
+#%% celda 6 [texto]
+# LEEMOS DATOS CRUDOS
+
+#%% celda 7 [código]
+df_crudo = pd.read_csv(
+    DATA_CRUDO_URL,
+    dtype={'numero_de_cliente': 'int32', 'foto_mes': 'int32'}
+)
+
+#%% celda 8 [código]
+df_crudo.head()
+
+#%% celda 9 [texto]
+## "IMPUTAMOS" CCAJAS_DEPOSITOS con NA para 202105
+
+#%% celda 10 [código]
+df_crudo.loc[df_crudo['foto_mes']==202105, 'ccajas_depositos'] = np.nan
+
+#%% celda 11 [texto]
+# VERSIONES
+
+#%% celda 12 [texto]
+## Agregamos TERNARIA
+
+#%% celda 13 [código]
+df_ternaria = ternaria(df_crudo)
+
+#%% celda 14 [código]
+df_ternaria.head()
+
+#%% celda 15 [texto]
+### GUARDAMOS
+
+#%% celda 16 [código]
+df_ternaria.to_csv(DATA_TERNARIA_URL, index=False)
+
+#%% celda 17 [texto]
+## LAGs
+
+#%% celda 18 [código]
+# df_trabajo = df_ternaria.copy()
+
+#%% celda 19 [código]
+# # Debe existir una sola fila por cliente y mes
+# claves = ["numero_de_cliente", "foto_mes"]
+
+# if df_trabajo.duplicated(claves).any():
+#     raise ValueError("Hay más de una fila para algún cliente y foto_mes")
+
+# df_trabajo = (
+#     df_trabajo
+#     .sort_values(claves)
+#     .reset_index(drop=True)
+#     .copy()
+# )
+
+#%% celda 20 [código]
+
+# # Índice mensual: permite controlar correctamente pasos como 202112 -> 202201
+# foto_mes_num = pd.to_numeric(df_trabajo["foto_mes"])
+
+# anio = foto_mes_num // 100
+# mes = foto_mes_num % 100
+
+# if not mes.between(1, 12).all():
+#     raise ValueError("foto_mes contiene meses inválidos")
+
+# df_trabajo["_mes_idx"] = anio * 12 + mes
+
+# # Columnas sobre las que se generan los lags
+# columnas_excluidas = {
+#     "numero_de_cliente",
+#     "foto_mes",
+#     "clase_ternaria",
+#     "ternaria",
+#     "_mes_idx"
+# }
+
+# columnas_base = [
+#     columna
+#     for columna in df_trabajo.columns
+#     if columna not in columnas_excluidas
+# ]
+
+#%% celda 21 [código]
+
+# agrupado = df_trabajo.groupby("numero_de_cliente", sort=False)
+
+# # Valor de la fila anterior para el mismo cliente
+# lags = agrupado[columnas_base].shift(1)
+# mes_anterior = agrupado["_mes_idx"].shift(1)
+
+# # Sólo es válido si corresponde exactamente al mes anterior
+# mes_consecutivo = (df_trabajo["_mes_idx"] - mes_anterior).eq(1)
+# lags.loc[~mes_consecutivo, :] = np.nan
+
+# # Delta únicamente para variables numéricas
+# columnas_numericas = (
+#     df_trabajo[columnas_base]
+#     .select_dtypes(include="number")
+#     .columns
+# )
+
+# deltas = df_trabajo[columnas_numericas] - lags[columnas_numericas]
+
+# lags.columns = [f"{columna}_lag1" for columna in lags.columns]
+# deltas.columns = [f"{columna}_delta1" for columna in deltas.columns]
+
+# df_lags = pd.concat(
+#     [df_trabajo, lags, deltas],
+#     axis=1
+# ).drop(columns="_mes_idx")
+
+#%% celda 22 [código]
+# df_lags.head(20)
+
+#%% celda 23 [código]
+# pd.Series(df_lags.columns)[pd.Series(df_lags.columns).str.contains('mrentabilidad') ]
+# df_lags.loc[df_lags['numero_de_cliente']==12159858][['foto_mes','mrentabilidad','mrentabilidad_lag1', 'mrentabilidad_delta1']]
+# df_lags.loc[df_lags['numero_de_cliente']==12159858][['foto_mes','mcomisiones','mcomisiones_lag1', 'mcomisiones_delta1']]
+# df_lags.loc[df_lags['numero_de_cliente']==12159858]
+
+#%% celda 24 [texto]
+### GUARDAMOS
+
+#%% celda 25 [código]
+# guardamos como csv
+# df_lags.to_csv(DATA_LAGS_URL, index=False)
+
+#%% celda 26 [texto]
+## LAGs fracionarios
+
+#%% celda 27 [código]
+df_trabajo = df_ternaria.copy()
+
+#%% celda 28 [código]
+
+
+def generar_pesos(K, factor_perdida):
+    """
+    factor_perdida indica qué proporción de importancia se pierde
+    por cada mes adicional hacia atrás.
+    """
+    if K < 1:
+        raise ValueError("K debe ser mayor o igual a 1")
+
+    if not 0 <= factor_perdida < 1:
+        raise ValueError("factor_perdida debe estar entre 0 y 1")
+
+    retencion = 1 - factor_perdida
+    pesos = retencion ** np.arange(K, dtype=float)
+
+    return pesos / pesos.sum()
+
+
+def agregar_lags_ponderados(
+    df,
+    K=6,
+    factor_perdida=0.4,
+    columnas=None,
+    tam_bloque=20
+):
+    df = df.copy()
+
+    claves = ["numero_de_cliente", "foto_mes"]
+
+    if df.duplicated(claves).any():
+        raise ValueError("Hay más de una fila para algún cliente y mes")
+
+    # Convierto YYYYMM a un índice mensual continuo.
+    foto_mes = pd.to_numeric(df["foto_mes"], errors="raise").astype("int64")
+    mes = foto_mes % 100
+
+    if not mes.between(1, 12).all():
+        raise ValueError("foto_mes contiene meses inválidos")
+
+    df["_mes_idx"] = (foto_mes // 100) * 12 + mes
+
+    # El cálculo necesita los registros ordenados cronológicamente.
+    df = (
+        df.sort_values(
+            ["numero_de_cliente", "_mes_idx"],
+            kind="stable"
+        )
+        .reset_index(drop=True)
+    )
+
+    if columnas is None:
+        excluidas = {
+            "numero_de_cliente",
+            "foto_mes",
+            "clase_ternaria",
+            "_mes_idx"
+        }
+
+        columnas = [
+            columna
+            for columna in df.select_dtypes(include=np.number).columns
+            if columna not in excluidas
+            and not columna.endswith("_lag_pond")
+            and not columna.endswith("_delta_lag_pond")
+        ]
+
+    no_numericas = [
+        columna
+        for columna in columnas
+        if not pd.api.types.is_numeric_dtype(df[columna])
+    ]
+
+    if no_numericas:
+        raise TypeError(
+            f"Las siguientes columnas no son numéricas: {no_numericas}"
+        )
+
+    pesos = generar_pesos(K, factor_perdida)
+    n_filas = len(df)
+
+    # Peso correspondiente a cada observación histórica.
+    # Se usa la distancia real entre meses, no simplemente la fila anterior.
+    pesos_por_fila = np.zeros((n_filas, K), dtype=np.float64)
+
+    grupo_mes = df.groupby(
+        "numero_de_cliente",
+        sort=False
+    )["_mes_idx"]
+
+    for desplazamiento in range(1, K + 1):
+        mes_anterior = grupo_mes.shift(desplazamiento)
+        distancia = df["_mes_idx"] - mes_anterior
+
+        valido = distancia.between(1, K)
+        posiciones = distancia.loc[valido].astype(int).to_numpy() - 1
+
+        pesos_por_fila[
+            valido.to_numpy(),
+            desplazamiento - 1
+        ] = pesos[posiciones]
+
+    nuevas_columnas = []
+
+    # Se procesa por bloques para limitar el uso de memoria.
+    for inicio in range(0, len(columnas), tam_bloque):
+        bloque = columnas[inicio:inicio + tam_bloque]
+
+        numerador = np.zeros((n_filas, len(bloque)), dtype=np.float64)
+        denominador = np.zeros_like(numerador)
+
+        grupo = df[bloque].groupby(
+            df["numero_de_cliente"],
+            sort=False
+        )
+
+        for desplazamiento in range(1, K + 1):
+            valores_pasados = grupo.shift(desplazamiento).to_numpy(
+                dtype=np.float64,
+                na_value=np.nan
+            )
+
+            peso = pesos_por_fila[
+                :, desplazamiento - 1
+            ][:, None]
+
+            disponible = valores_pasados.notna() if False else ~np.isnan(
+                valores_pasados
+            )
+
+            numerador += np.where(
+                disponible,
+                valores_pasados * peso,
+                0.0
+            )
+
+            denominador += disponible * peso
+
+        lag_ponderado = np.divide(
+            numerador,
+            denominador,
+            out=np.full_like(numerador, np.nan),
+            where=denominador > 0
+        )
+
+        valores_actuales = df[bloque].to_numpy(
+            dtype=np.float64,
+            na_value=np.nan
+        )
+
+        delta_ponderado = valores_actuales - lag_ponderado
+
+        nuevas_columnas.append(
+            pd.DataFrame(
+                lag_ponderado,
+                columns=[f"{c}_lag_pond" for c in bloque]
+            )
+        )
+
+        nuevas_columnas.append(
+            pd.DataFrame(
+                delta_ponderado,
+                columns=[f"{c}_delta_lag_pond" for c in bloque]
+            )
+        )
+
+    df = pd.concat([df, *nuevas_columnas], axis=1)
+
+    return df.drop(columns="_mes_idx")
+
+#%% celda 29 [código]
+df_trabajo.shape
+
+#%% celda 30 [código]
+k = 6
+factor_perdida = .4
+print(generar_pesos(3, 0.4))
+df_lags_fraccionarios = agregar_lags_ponderados(
+    df_trabajo,
+    K=k,
+    factor_perdida=factor_perdida
+)
+
+#%% celda 31 [código]
+print(generar_pesos(3, 0.7))
+print(generar_pesos(3, 0.7))
+print(generar_pesos(6, 0.7))
+
+#%% celda 32 [código]
+df_lags_fraccionarios.columns
+
+#%% celda 33 [código]
+df_lags_fraccionarios.shape
+
+#%% celda 34 [texto]
+### GUARDAMOS
+
+#%% celda 35 [código]
+pd.Series(df_lags_fraccionarios.columns).loc[pd.Series(df_lags_fraccionarios.columns).str.contains('tern')]
+
+#%% celda 36 [código]
+filename = f'c_01_tern_2_lf_k{k}_p{factor_perdida*10:.0f}.csv'
+df_lags_fraccionarios.to_csv(os.path.join(DATA_FOLDER, filename), index=False)
+
+#%% celda 37 [código]
+df_lags_fraccionarios
+
+#%% celda 38 [texto]
+## LAGS ORDEN 2
+
+#%% celda 39 [código]
+def agregar_lags_2(df_ternaria):
+    df_trabajo = df_ternaria.copy()
+
+    # Debe existir una sola fila por cliente y mes
+    claves = ["numero_de_cliente", "foto_mes"]
+
+    if df_trabajo.duplicated(claves).any():
+        raise ValueError("Hay más de una fila para algún cliente y foto_mes")
+
+    df_trabajo = (
+        df_trabajo
+        .sort_values(claves)
+        .reset_index(drop=True)
+        .copy()
+    )
+
+    # Índice mensual: controla pasos como 202112 -> 202201
+    foto_mes_num = pd.to_numeric(df_trabajo["foto_mes"])
+    anio = foto_mes_num // 100
+    mes = foto_mes_num % 100
+
+    if not mes.between(1, 12).all():
+        raise ValueError("foto_mes contiene meses inválidos")
+
+    df_trabajo["_mes_idx"] = anio * 12 + mes
+
+    columnas_excluidas = {
+        "numero_de_cliente",
+        "foto_mes",
+        "clase_ternaria",
+        "ternaria",
+        "_mes_idx"
+    }
+
+    columnas_base = [
+        columna
+        for columna in df_trabajo.columns
+        if columna not in columnas_excluidas
+    ]
+
+    agrupado = df_trabajo.groupby("numero_de_cliente", sort=False)
+
+    # Delta únicamente para variables numéricas
+    columnas_numericas = (
+        df_trabajo[columnas_base]
+        .select_dtypes(include="number")
+        .columns
+    )
+
+    nuevas_columnas = []
+
+    for periodo in (1, 2):
+        lags = agrupado[columnas_base].shift(periodo)
+        mes_anterior = agrupado["_mes_idx"].shift(periodo)
+
+        mes_consecutivo = (
+            df_trabajo["_mes_idx"] - mes_anterior
+        ).eq(periodo)
+        lags.loc[~mes_consecutivo, :] = np.nan
+
+        # Para lag2, recupero t-2 también cuando falta t-1
+        if periodo == 2:
+            mes_anterior = agrupado["_mes_idx"].shift(1)
+            falta_mes_intermedio = (
+                df_trabajo["_mes_idx"] - mes_anterior
+            ).eq(2)
+
+            lags.loc[falta_mes_intermedio, :] = (
+                agrupado[columnas_base].shift(1)
+                .loc[falta_mes_intermedio, :]
+            )
+
+        deltas = df_trabajo[columnas_numericas] - lags[columnas_numericas]
+
+        lags.columns = [
+            f"{columna}_lag{periodo}" for columna in lags.columns
+        ]
+        deltas.columns = [
+            f"{columna}_delta{periodo}" for columna in deltas.columns
+        ]
+
+        nuevas_columnas.extend([lags, deltas])
+
+    return pd.concat(
+        [df_trabajo, *nuevas_columnas],
+        axis=1
+    ).drop(columns="_mes_idx")
+
+#%% celda 40 [código]
+# df_lags_o2 = agregar_lags_2(df_ternaria)
+
+#%% celda 41 [código]
+# df_lags_o2.shape
+
+#%% celda 42 [código]
+# pd.Series(df_lags_o2.columns).loc[pd.Series(df_lags_o2.columns).str.contains('tern')]
+
+#%% celda 43 [código]
+# df_lags_o2.loc[df_lags_o2['numero_de_cliente']==12159858][['foto_mes','mrentabilidad','mrentabilidad_lag1','mrentabilidad_lag2', 'mrentabilidad_delta1','mrentabilidad_delta2']]
+# # df_lags.loc[df_lags['numero_de_cliente']==12159858][['foto_mes','mcomisiones','mcomisiones_lag1', 'mcomisiones_delta1']]
+
+#%% celda 44 [código]
+# df_lags_o2.to_csv(DATA_LAGS_O2_URL, index=False)
+
+#%% celda 45 [texto]
+## LAGs Fraccionarios orden 2
+
+#%% celda 46 [código]
+def agregar_lags_ponderados_2(
+    df,
+    K=6,
+    factor_perdida=0.4,
+    columnas=None,
+    tam_bloque=20
+):
+    df = df.copy()
+
+    claves = ["numero_de_cliente", "foto_mes"]
+
+    if df.duplicated(claves).any():
+        raise ValueError("Hay más de una fila para algún cliente y mes")
+
+    # Convierto YYYYMM a un índice mensual continuo.
+    foto_mes = pd.to_numeric(df["foto_mes"], errors="raise").astype("int64")
+    mes = foto_mes % 100
+
+    if not mes.between(1, 12).all():
+        raise ValueError("foto_mes contiene meses inválidos")
+
+    df["_mes_idx"] = (foto_mes // 100) * 12 + mes
+
+    # El cálculo necesita los registros ordenados cronológicamente.
+    df = (
+        df.sort_values(
+            ["numero_de_cliente", "_mes_idx"],
+            kind="stable"
+        )
+        .reset_index(drop=True)
+    )
+
+    if columnas is None:
+        excluidas = {
+            "numero_de_cliente",
+            "foto_mes",
+            "clase_ternaria",
+            "ternaria",
+            "_mes_idx"
+        }
+
+        columnas = [
+            columna
+            for columna in df.select_dtypes(include=np.number).columns
+            if columna not in excluidas
+            and not columna.endswith("_lag_pond")
+            and not columna.endswith("_delta_lag_pond")
+            and not columna.endswith("_lag_pond2")
+            and not columna.endswith("_delta_lag_pond2")
+        ]
+
+    no_numericas = [
+        columna
+        for columna in columnas
+        if not pd.api.types.is_numeric_dtype(df[columna])
+    ]
+
+    if no_numericas:
+        raise TypeError(
+            f"Las siguientes columnas no son numéricas: {no_numericas}"
+        )
+
+    pesos = generar_pesos(K, factor_perdida)
+    n_filas = len(df)
+    nuevas_columnas = []
+
+    for inicio_lag in (1, 2):
+        # Conservo los nombres actuales para la primera ventana.
+        sufijo = "" if inicio_lag == 1 else "2"
+
+        # Se usa la distancia real entre meses.
+        pesos_por_fila = np.zeros(
+            (n_filas, K + inicio_lag - 1),
+            dtype=np.float64
+        )
+
+        grupo_mes = df.groupby(
+            "numero_de_cliente",
+            sort=False
+        )["_mes_idx"]
+
+        for desplazamiento in range(1, K + inicio_lag):
+            mes_anterior = grupo_mes.shift(desplazamiento)
+            distancia = df["_mes_idx"] - mes_anterior
+
+            valido = distancia.between(inicio_lag, K + inicio_lag - 1)
+            posiciones = (
+                distancia.loc[valido].astype(int).to_numpy() - inicio_lag
+            )
+
+            pesos_por_fila[
+                valido.to_numpy(),
+                desplazamiento - 1
+            ] = pesos[posiciones]
+
+        # Se procesa por bloques para limitar el uso de memoria.
+        for inicio in range(0, len(columnas), tam_bloque):
+            bloque = columnas[inicio:inicio + tam_bloque]
+
+            numerador = np.zeros((n_filas, len(bloque)), dtype=np.float64)
+            denominador = np.zeros_like(numerador)
+
+            grupo = df[bloque].groupby(
+                df["numero_de_cliente"],
+                sort=False
+            )
+
+            for desplazamiento in range(1, K + inicio_lag):
+                valores_pasados = grupo.shift(desplazamiento).to_numpy(
+                    dtype=np.float64,
+                    na_value=np.nan
+                )
+
+                peso = pesos_por_fila[
+                    :, desplazamiento - 1
+                ][:, None]
+
+                disponible = valores_pasados.notna() if False else ~np.isnan(
+                    valores_pasados
+                )
+
+                numerador += np.where(
+                    disponible,
+                    valores_pasados * peso,
+                    0.0
+                )
+
+                denominador += disponible * peso
+
+            lag_ponderado = np.divide(
+                numerador,
+                denominador,
+                out=np.full_like(numerador, np.nan),
+                where=denominador > 0
+            )
+
+            valores_actuales = df[bloque].to_numpy(
+                dtype=np.float64,
+                na_value=np.nan
+            )
+
+            delta_ponderado = valores_actuales - lag_ponderado
+
+            nuevas_columnas.append(
+                pd.DataFrame(
+                    lag_ponderado,
+                    columns=[f"{c}_lag_pond{sufijo}" for c in bloque]
+                )
+            )
+
+            nuevas_columnas.append(
+                pd.DataFrame(
+                    delta_ponderado,
+                    columns=[f"{c}_delta_lag_pond{sufijo}" for c in bloque]
+                )
+            )
+
+    df = pd.concat([df, *nuevas_columnas], axis=1)
+
+    return df.drop(columns="_mes_idx")
+
+#%% celda 47 [código]
+k2 = 3
+factor_perdida_2 = 0.6
+
+#%% celda 48 [código]
+
+df_lags_fraccionarios_2 = agregar_lags_ponderados_2(
+    df_ternaria,
+    K=k2,
+    factor_perdida=factor_perdida_2
+)
+
+#%% celda 49 [código]
+# pd.Series(df_lags_fraccionarios_2.columns).loc[pd.Series(df_lags_fraccionarios_2.columns).str.contains('tern')]
+
+#%% celda 50 [código]
+filename = f'c_01_tern_2_lf_O2_k{k2}_p{factor_perdida_2*10:.0f}.csv'
+df_lags_fraccionarios_2.to_csv(os.path.join(DATA_FOLDER, filename), index=False)
+
+#%% celda 51 [código]
+df_lags_fraccionarios_2.shape
+
+#%% celda 52 [texto]
+## RANKING a LAG FRACCIONARIOS ORDEN 1
+
+#%% celda 53 [código]
+df_lags_fraccionarios.columns
+
+#%% celda 54 [código]
+pd.Series(df_lags_fraccionarios.columns).loc[pd.Series(df_lags_fraccionarios.columns).str.contains('tern')]
+
+#%% celda 55 [código]
+columnas_no_rankear =['numero_de_cliente','foto_mes','ternaria']
+df_lags_fracc_ranking_comun_average = rankear_por_mes(df_lags_fraccionarios,columnas_excluidas=columnas_no_rankear, escala="comun", empates="average" )
+
+#%% celda 56 [código]
+df_lags_fraccionarios.shape, df_lags_fracc_ranking_comun_average.shape
+
+#%% celda 57 [código]
+df_lags_fracc_ranking_comun_average[[column for column in df_lags_fracc_ranking_comun_average.columns if column not in columnas_no_rankear]].max().sum()
+pd.Series(df_lags_fracc_ranking_comun_average[[column for column in df_lags_fracc_ranking_comun_average.columns if column not in columnas_no_rankear]].max())[df_lags_fracc_ranking_comun_average[[column for column in df_lags_fracc_ranking_comun_average.columns if column not in columnas_no_rankear]].max()<1]
+
+#%% celda 58 [código]
+df_lags_fracc_ranking_comun_average.Visa_mpagosdolares_delta_lag_pond.max(),df_lags_fracc_ranking_comun_average.Visa_mpagosdolares_delta_lag_pond.min()
+
+#%% celda 59 [texto]
+### GUARDAMOS
+
+#%% celda 60 [código]
+filename = f'RANKS_LF_O2_K{k}_P{factor_perdida*10:.0f}.csv'
+df_lags_fracc_ranking_comun_average.to_csv(os.path.join(DATA_FOLDER, filename), index=False)
+
+#%% celda 61 [texto]
+## RANKING a LAGS NORMALES ORDEN 2
+
+#%% celda 62 [código]
+# columnas_no_rankear =['numero_de_cliente','foto_mes','ternaria']
+# df_lags_o2_ranking_comun_average = rankear_por_mes(df_lags_o2,columnas_excluidas=columnas_no_rankear, escala="comun", empates="average" )
+
+#%% celda 63 [código]
+# df_lags_o2.shape, df_lags_o2_ranking_comun_average.shape
+
+#%% celda 64 [texto]
+### GUARDAMOS
+
+#%% celda 65 [código]
+# filename = f'RANKS_LAGS_O2.csv'
+# df_lags_o2_ranking_comun_average.to_csv(os.path.join(DATA_FOLDER, filename), index=False)

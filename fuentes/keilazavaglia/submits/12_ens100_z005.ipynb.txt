@@ -1,0 +1,132 @@
+#%% celda 1 [texto]
+# Submit 12 - Ensamble de 100 modelos (trials de z005)
+
+- **Modelos:** los 10 mejores trials de z005 (revalidados con 5 semillas; lista en `0_exploracion/z005_top10_final.csv`,
+  ver `z005_optuna.ipynb` y `z005b_revalidar_extra.ipynb`) × 10 semillas = **100 modelos**.
+- Train 202103-202106, predice 202108, promedio de probabilidades por cliente.
+- Cada predicción se guarda en `probs_noche/` (si se corta, al volver a correr sigue desde ahí).
+- Se corrió la noche del 07/10 (241 min). Archivo enviado: `12_ens100_12000.csv` (generado como
+  `13_final_ens100_12000.csv` y renombrado; el de 11.500 quedó como `sin_enviar_ens100_11500.csv`).
+
+Este notebook solo genera el submit.
+
+#%% celda 2 [código]
+# --- 1. Librerías y parámetros ---
+import os
+import time
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+GANANCIA_ACIERTO = 1_072_500
+COSTO_ESTIMULO   = 27_500
+SEMILLAS_REVAL = [501419, 623353, 786349, 834569, 946331]
+SEMILLAS = SEMILLAS_REVAL + [111119, 222227, 333331, 444443, 555557]   # tus 5 + 5 nuevas
+N_TRIALS_EXTRA = 4     # trials nuevos a revalidar
+TOP_TRIALS = 10
+MESES_FINAL = [202103, 202104, 202105, 202106]
+MES_PRED = 202108
+# Archivos a generar: (número de submit, N). El de 12.000 va último.
+ARCHIVOS = [(12, 11_500), (13, 12_000)]
+CARPETA = "probs_noche"
+os.makedirs(CARPETA, exist_ok=True)
+
+params_fijos = {
+    "objective": "binary", "learning_rate": 0.005, "min_data_in_leaf": 0,
+    "feature_fraction": 0.5, "feature_fraction_bynode": 0.2, "max_bin": 31, "verbose": -1,
+}
+
+trials = pd.read_csv("../0_exploracion/z005_optuna_trials.csv", sep=";", decimal=",", encoding="utf-8-sig")
+ranking = pd.read_csv("../0_exploracion/z005_top10_5semillas.csv", sep=";", decimal=",",
+                      encoding="utf-8-sig", index_col="trial")
+
+#%% celda 3 [código]
+# --- 2. Cargar datos, target y lags (igual que z003) ---
+df = pd.read_parquet("../competencia_01.parquet")
+df["clase_binaria"] = (df["clase_ternaria"] == "BAJA+2").astype(int)
+
+no_usar = ["foto_mes", "clase_ternaria", "clase_binaria"]
+originales = [c for c in df.columns if c not in no_usar]
+cols = [c for c in originales if c != "numero_de_cliente"]
+
+df = df.sort_values(["numero_de_cliente", "foto_mes"]).reset_index(drop=True)
+grupo = df.groupby("numero_de_cliente")[cols]
+nuevas = []
+for k in [1, 2]:
+    lag = grupo.shift(k).astype("float32")
+    delta = (df[cols] - lag).astype("float32")
+    lag.columns   = [f"{c}_lag{k}" for c in cols]
+    delta.columns = [f"{c}_delta{k}" for c in cols]
+    nuevas += [lag, delta]
+df = pd.concat([df] + nuevas, axis=1)
+del nuevas, lag, delta, grupo
+variables = [c for c in df.columns if c not in no_usar]
+print("Variables:", len(variables))
+
+#%% celda 4 [código]
+# --- 3. Trials elegidos (decididos en z005 y z005b) ---
+elegidos = pd.read_csv("../0_exploracion/z005_top10_final.csv", sep=";", decimal=",",
+                       encoding="utf-8-sig", index_col="trial")
+elegidos
+
+#%% celda 5 [código]
+# --- 4. Entrenar 10 trials × 10 semillas con 202103-202106 (retoma si se cortó) ---
+final  = df[df["foto_mes"].isin(MESES_FINAL)]
+futuro = df[df["foto_mes"] == MES_PRED][["numero_de_cliente"]].copy()
+X_futuro = df.loc[futuro.index, variables]
+datos_final = lgb.Dataset(final[variables], label=final["clase_binaria"], free_raw_data=False)
+
+inicio_total = time.time()
+for trial, r in elegidos.iterrows():
+    p = {**params_fijos, "num_leaves": int(r["params_num_leaves"]),
+         "min_sum_hessian_in_leaf": float(r["params_min_sum_hessian_in_leaf"])}
+    for semilla in SEMILLAS:
+        archivo = f"{CARPETA}/t{trial}_s{semilla}.npy"
+        if os.path.exists(archivo):          # ya estaba hecho: lo salteamos
+            continue
+        inicio = time.time()
+        modelo = lgb.train({**p, "seed": semilla}, datos_final, num_boost_round=int(r["user_attrs_best_iter"]))
+        np.save(archivo, modelo.predict(X_futuro))
+        print(f"Trial {trial}, semilla {semilla}: {(time.time() - inicio) / 60:.1f} min")
+print(f"Total: {(time.time() - inicio_total) / 60:.0f} min")
+
+#%% celda 6 [código]
+# --- 5. Ensamble y archivos para el bot ---
+probs = [np.load(f"{CARPETA}/t{t}_s{s}.npy") for t in elegidos.index for s in SEMILLAS]
+futuro["prob_ensamble"] = np.mean(probs, axis=0)
+n_modelos = len(probs)
+futuro.to_parquet(f"final_ens{n_modelos}_probs.parquet")
+
+ordenados = futuro.sort_values("prob_ensamble", ascending=False)
+for num, n in ARCHIVOS:
+    archivo = f"{num}_final_ens{n_modelos}_{n}.csv"
+    ordenados.head(n)["numero_de_cliente"].astype("int64").to_csv(archivo, index=False, header=False)
+    with open(archivo) as f:
+        contenido = f.read()
+    print(archivo, "| filas:", len(contenido.splitlines()), "| ¿e+?", "e+" in contenido)
+
+# ¿Cuánto cambia respecto del ensamble de 8 modelos que ya mandamos?
+previo = pd.read_parquet("optuna_ens_probs_8modelos.parquet")
+top_prev = set(previo.nlargest(12_000, "prob_ensamble")["numero_de_cliente"])
+top_new  = set(futuro.nlargest(12_000, "prob_ensamble")["numero_de_cliente"])
+print("Coincidencia con el ensamble de 8 (top 12.000):", round(len(top_prev & top_new) / 12_000 * 100, 1), "%")
+
+#%% celda 7 [código]
+# --- 6. Anotar en resultados_experimentos.csv ---
+ruta_res = "../0_exploracion/resultados_experimentos.csv"
+res = pd.read_csv(ruta_res, sep=";", decimal=",", encoding="utf-8-sig")
+for num, n in ARCHIVOS:
+    res = res[~res["descripcion"].str.startswith(f"{num}_FinalEns")]
+    nueva = {
+        "fecha": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "descripcion": f"{num}_FinalEns_{n}: ensamble {TOP_TRIALS} trials z005 x {len(SEMILLAS)} semillas, lags 1 y 2 (submit)",
+        "meses_train": str(MESES_FINAL),
+        "mes_valid": MES_PRED,
+        "semilla": str(SEMILLAS),
+        "params": str(params_fijos) + " | trials " + str(list(elegidos.index)),
+        "n_enviados": n,
+    }
+    res = pd.concat([res, pd.DataFrame([nueva])], ignore_index=True)
+res["n_enviados"] = res["n_enviados"].astype("Int64")
+res.to_csv(ruta_res, sep=";", decimal=",", index=False, encoding="utf-8-sig")
+res.tail(2)

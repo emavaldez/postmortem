@@ -1,0 +1,17 @@
+name|type|data|command|depend|seed|path|time|size|bytes|format|repository|iteration|parent|children|seconds|warnings|error
+logger|object|9ef19fc1fed80968
+imprimir_ruta_base|function|b1d6d590726b62f6
+BASE_PATH|object|729868f09603f66e
+result|stem|d75237686f2245f1|b53eba0242daf163|5c3c5161308a5f91|1270947991||t20735.733427746s|s144b|144|rds|local|vector|||0.46||
+config_bayesian|function|3b9eaa501810b22b
+dataset_train|stem|7b6076e34bce106c|6852063f9d311e50|7a4b452c9a25ed26|2068060025||t20735.8198536121s|s13790027b|13790027|rds|local|vector|||129.17||
+parametros|stem|79782263ab4ba7e0|b53eba0242daf163|a4e64213825cd788|-513768358||t20735.8326250282s|s935b|935|rds|local|vector|||0.64||
+particionar|function|173463d7db164025
+definicion_parametros|function|ff6cb8927f39a7ad
+.Last|function|651e15f3ebe38d56
+realidad_evaluar|function|c667673f8765267b
+preprocesamiento|function|502ae221bbb88ca3
+realidad_inicializar|function|8030bdc37d63b7de
+EstimarGanancia_AUC_lightgbm|function|d6f1009421d654f3
+bayesian_optimization|function|e6cfaeb4bc9f6cdd
+df_bayesiana|stem||a0f9db2c08a7176b|196afe4b1da7fca1|-353980917||t20735.8064000701s||0|rds|local|vector|||3||objeto 'dtrain' no encontrado

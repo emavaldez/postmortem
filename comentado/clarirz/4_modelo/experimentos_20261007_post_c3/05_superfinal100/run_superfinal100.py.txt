@@ -1,0 +1,880 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–34] Importa las utilidades de `super_common.py` y define `_gcs`.
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import fcntl
+import gc
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+
+from super_common import (
+
+    RUN, REMOTE, DATA_SHA, SEEDS3, SEEDS5, SEEDS20, TRAIN_EVAL, EVAL_MONTH,
+    TUNE_TRAIN, TUNE_EVAL, FINAL_TRAIN, SCORE_MONTH, EXPECTED_ROWS, N_GRID,
+    THREADS, SUPER_BLOCKS, require, digest, fingerprint, load_json, write_json,
+    paths, add_fe_path, base_params, gain_curve, robust_choice, summarize_scores,
+    paired_at_plateau, export_csv, preflight_base, ensure_quality_bank,
+    feature_arms, split_derived, load_fold, train_seeds, load_s3_control,
+    validate_catalog_compat, policy_weights
+)
+
+
+def _gcs(cmd, check=True, **kw):
+    """Respaldo opcional a Cloud Storage. Se omite cuando el bucket es el placeholder de publicacion."""
+    if any("REEMPLAZAR_CON_BUCKET_PROPIO" in str(a) or "BUCKET_PRIVADO_NO_PUBLICADO" in str(a) for a in cmd):
+        return None
+    return subprocess.run(cmd, check=check, **kw)
+
+# [Anotación · líneas 36–52] Lista de los 10 brazos de representación y las cuatro políticas de peso por mes.
+#   En evaluación (202103, 202104): EXPANDING 1 y 1, RECENCY_050 0,5 y 1, RECENCY_025 0,25 y 1, RECENT_ONLY 0 y
+#   1. Su traducción a los cuatro meses del entrenamiento final: EXPANDING 1 en los cuatro; RECENCY_050 0,125,
+#   0,25, 0,5 y 1; RECENCY_025 0,015625, 0,0625, 0,25 y 1; RECENT_ONLY sólo 202106.
+REP_ARMS = [
+    "C3","NOPREST","C3_OBS","NOPREST_OBS","C3_RANK","NOPREST_RANK",
+    "C3_STATE","NOPREST_STATE","NOPREST_OBS_STATE","NOPREST_RANK_OBS"
+]
+
+RECENCY = {
+    "EXPANDING": {202103:1.0,202104:1.0},
+    "RECENCY_050": {202103:0.5,202104:1.0},
+    "RECENCY_025": {202103:0.25,202104:1.0},
+    "RECENT_ONLY": {202103:0.0,202104:1.0},
+}
+FINAL_RECENCY = {
+    "EXPANDING": {202103:1.0,202104:1.0,202105:1.0,202106:1.0},
+    "RECENCY_050": {202103:0.125,202104:0.25,202105:0.5,202106:1.0},
+    "RECENCY_025": {202103:0.015625,202104:0.0625,202105:0.25,202106:1.0},
+    "RECENT_ONLY": {202103:0.0,202104:0.0,202105:0.0,202106:1.0},
+}
+
+
+# [Anotación · líneas 55–66] `repo_root`, `plan_doc` (lee `plan_superfinal100.json`; la versión 2 la reemplaza
+#   por su propio plan) y `stage_path` (carpeta de salida de cada etapa).
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def plan_doc() -> dict:
+    return load_json(Path(__file__).resolve().parent / "plan_superfinal100.json")
+
+
+def stage_path(ctx: dict, n: int, name: str) -> Path:
+    p = ctx["paths"]["out"] / f"stage{n}_{name}"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# [Anotación · líneas 69–95] `read_scores_dir` lee los puntajes guardados de una lista de semillas validando
+#   identidad, etiqueta y claves. `control_gain_at_ns` calcula la ganancia promedio del promedio de semillas del
+#   control en una lista de cortes.
+def read_scores_dir(
+    root: Path, identity: str, label: str, seeds: list[int]
+) -> tuple[np.ndarray,np.ndarray,dict[int,np.ndarray]]:
+    ids0=None;y0=None;out={}
+    for seed in seeds:
+        cp=root/f"seed_{seed}.npz"
+        require(cp.is_file(),f"Falta checkpoint {cp}")
+        with np.load(cp,allow_pickle=False) as z:
+            require(str(z["identity"].item())==identity,f"Identity distinta {cp}")
+            require(str(z["label"].item())==label,f"Label distinto {cp}")
+            require(int(z["seed"].item())==seed,f"Seed distinta {cp}")
+            ids=np.asarray(z["ids"],dtype=np.int64)
+            y=np.asarray(z["y"],dtype=np.int8)
+            sc=np.asarray(z["scores"],dtype=np.float64)
+        if ids0 is None:
+            ids0=ids.copy();y0=y.copy()
+        else:
+            require(np.array_equal(ids0,ids) and np.array_equal(y0,y),"Checkpoints desalineados")
+        require(sc.shape==ids.shape and np.isfinite(sc).all(),f"Scores inválidos {cp}")
+        out[seed]=sc.copy()
+    return ids0,y0,out
+
+
+def control_gain_at_ns(ids: np.ndarray,y: np.ndarray,scores: dict[int,np.ndarray],seeds:list[int],ns:list[int]) -> float:
+    mat=np.vstack([scores[s] for s in seeds])
+    curve=gain_curve(ids,y,mat.mean(axis=0,dtype=np.float64))
+    return float(np.mean([curve[n] for n in ns]))
+
+
+# [Anotación · líneas 98–110] `run_b1_if_needed` ejecuta `run_b1.py --prepare` y `--execute` como subprocesos
+#   si B1 no tiene `LISTO.json` completo.
+def run_b1_if_needed(ctx: dict) -> None:
+    p=ctx["paths"]
+    if (p["b1"]/"LISTO.json").is_file():
+        done=load_json(p["b1"]/"LISTO.json")
+        if done.get("status")=="completed":
+            return
+    b1=repo_root()/"experimentos_20261007_post_c3/04_b1_variables_rotas/run_b1.py"
+    require(b1.is_file(),f"Falta runner B1: {b1}")
+    py=Path(sys.executable)
+    print("STAGE0: B1 prepare",flush=True)
+    subprocess.run([str(py),str(b1),"--prepare","--home",str(Path.home())],check=True)
+    print("STAGE0: B1 execute",flush=True)
+    subprocess.run([str(py),str(b1),"--execute","--home",str(Path.home())],check=True)
+
+
+# [Anotación · líneas 113–149] `stage0` (etapa 0) corre B1 si falta, lee de su `RESUMEN.json` el brazo
+#   promovido (o C3_ORIG), obtiene el dataset y el banco de evaluación de ese brazo, verifica compatibilidad del
+#   catálogo si el banco no es el original y guarda `RESULT.json` con dataset, hash y banco.
+def stage0(ctx: dict) -> dict:
+    out=stage_path(ctx,0,"quality")
+    result_path=out/"RESULT.json"
+    if result_path.is_file():
+        r=load_json(result_path)
+        data=Path(r["dataset"])
+        bank=Path(r["eval_bank"])
+        require(data.is_file() and (bank/"manifest.json").is_file(),"Stage0 previo roto")
+        return r
+
+    run_b1_if_needed(ctx)
+    b1res=load_json(ctx["paths"]["b1"]/"RESUMEN.json")
+    require(b1res.get("status")=="completed","B1 no completado")
+    quality=b1res.get("best_promoted_arm","C3_ORIG")
+    allowed={"C3_ORIG","Q0_CCAJAS","B1_VISA","B1_MASTER","B1_FECHAS","B1_ALL3"}
+    require(quality in allowed,f"Quality arm inesperado: {quality}")
+    data,bank=ensure_quality_bank(ctx,quality)
+
+    arms=feature_arms(ctx)
+    union=list(dict.fromkeys(f for feats in arms.values() for f in feats))
+    if bank != ctx["paths"]["bank_orig"]:
+        validate_catalog_compat(ctx["paths"]["bank_orig"],bank,union)
+
+    r={
+        "status":"completed",
+        "quality_arm":quality,
+        "dataset":str(data),
+        "dataset_sha256":digest(data),
+        "eval_bank":str(bank),
+        "b1_identity":b1res.get("identity"),
+        "b1_best_promoted_arm":quality,
+    }
+    r["identity"]=fingerprint({"stage":0,"plan":plan_doc(),"payload":r})
+    write_json(result_path,r)
+    _gcs(["gcloud","storage","cp",str(result_path),REMOTE+"/stage0_RESULT.json"],check=True)
+    print("STAGE0 COMPLETO:",quality,flush=True)
+    return r
+
+
+# [Anotación · líneas 152–194] `stage1`, cribado: para cada uno de los 10 brazos guarda su lista de variables,
+#   carga entrenamiento 202103–202104 y evaluación 202106, entrena con los parámetros base, 300 rondas y las
+#   semillas de cribado, y calcula la meseta del promedio de semillas. El brazo C3 queda como control.
+def stage1(ctx: dict,s0:dict) -> dict:
+    out=stage_path(ctx,1,"representation")
+    result_path=out/"RESULT.json"
+    if result_path.is_file():
+        return load_json(result_path)
+
+    eval_bank=Path(s0["eval_bank"])
+    arms=feature_arms(ctx)
+    params=base_params(ctx["paths"])
+    rounds=300
+    identity_base=fingerprint({
+        "stage":1,"plan":plan_doc(),"stage0":s0["identity"],
+        "params":params,"rounds":rounds
+    })
+
+    screen_meta={}
+    ids_ref=None;y_ref=None
+    control_scores=None
+    control_curves=None
+
+    for arm in REP_ARMS:
+        feats=arms[arm]
+        arm_id=fingerprint({"parent":identity_base,"phase":"screen","arm":arm,"features":feats})
+        write_json(out/f"features_{arm}.json",{"arm":arm,"features":feats,"sha256":fingerprint(feats)})
+        data=load_fold(ctx,feats,TRAIN_EVAL,EVAL_MONTH,eval_bank)
+        scores=train_seeds(
+            data,feats,params,rounds,SEEDS3,{202103:1,202104:1},
+            out/"screen"/arm,arm_id,arm
+        )
+        choice,curves,ens=summarize_scores(data["ids"],data["y_eval"],scores,SEEDS3)
+        if arm=="C3":
+            ids_ref=data["ids"].copy();y_ref=data["y_eval"].copy()
+            control_scores={k:v.copy() for k,v in scores.items()}
+            control_curves=curves
+        require(ids_ref is None or np.array_equal(ids_ref,data["ids"]),"IDs distintos entre arms")
+        screen_meta[arm]={
+            "identity":arm_id,
+            "choice":choice,
+            "n_features":len(feats),
+        }
+        del data,scores,curves,ens
+        gc.collect()
+
+# [Anotación · líneas 195–234] Compara cada brazo con C3: pasa si su ganancia de meseta supera la del control
+#   en los mismos cortes, la diferencia pareada media y mediana son positivas y gana en al menos 2 semillas.
+#   Escribe `screening.csv` y elige tres brazos distintos de C3, ordenando primero los que pasan y luego por
+#   ganancia de meseta.
+    require(control_scores is not None and control_curves is not None,"Falta control C3")
+    rows=[]
+    for arm in REP_ARMS:
+        meta=screen_meta[arm]
+        arm_id=meta["identity"]
+        _,_,scores=read_scores_dir(out/"screen"/arm,arm_id,arm,SEEDS3)
+        choice=meta["choice"]
+        if arm=="C3":
+            paired={"mean":0.0,"median":0.0,"sd":0.0,"positive_fraction":0.0,"wins":0,"ties":3,"losses":0}
+            control_same=choice["ganancia_robusta"]
+            passed=True
+        else:
+            _,arm_curves,_=summarize_scores(ids_ref,y_ref,scores,SEEDS3)
+            paired=paired_at_plateau(arm_curves,control_curves,SEEDS3,choice["meseta_n"])
+            control_same=control_gain_at_ns(ids_ref,y_ref,control_scores,SEEDS3,choice["meseta_n"])
+            passed=bool(
+                choice["ganancia_robusta"]>control_same and
+                paired["mean"]>0 and paired["median"]>0 and paired["wins"]>=2
+            )
+        rows.append({
+            "arm":arm,
+            "passed":passed,
+            "control_gain_same_plateau":float(control_same),
+            "delta_ensemble_same_plateau":float(choice["ganancia_robusta"]-control_same),
+            **{k:v for k,v in choice.items() if k not in ("meseta_gain",)},
+            **{f"paired_{k}":v for k,v in paired.items() if k!="deltas"},
+            "n_features":meta["n_features"],
+        })
+
+    sdf=pd.DataFrame(rows)
+    sdf.to_csv(out/"screening.csv",index=False)
+    candidates=sdf[sdf.arm.ne("C3")].copy()
+    candidates["pass_rank"]=candidates.passed.astype(int)
+    candidates=candidates.sort_values(
+        ["pass_rank","ganancia_robusta","delta_ensemble_same_plateau"],
+        ascending=[False,False,False]
+    )
+    top3=candidates.arm.head(3).tolist()
+    require(len(top3)==3,"No se pudieron elegir top3")
+    confirm_arms=["C3"]+top3
+
+# [Anotación · líneas 236–306] Confirmación: reentrena C3 y los tres elegidos con las semillas de confirmación
+#   y aplica la misma regla con un mínimo de 3 semillas a favor. Gana el brazo promovido de mayor ganancia de
+#   meseta, o C3 si ninguno pasa. Escribe `confirmation.csv` y `RESULT.json` con el ganador y la ruta de su
+#   lista de variables.
+    confirm_meta={}
+    confirm_scores={}
+    for arm in confirm_arms:
+        feats=arms[arm]
+        screen_id=screen_meta[arm]["identity"]
+        _,_,reuse=read_scores_dir(out/"screen"/arm,screen_id,arm,SEEDS3)
+        arm_id=fingerprint({"parent":identity_base,"phase":"confirm","arm":arm,"features":feats})
+        data=load_fold(ctx,feats,TRAIN_EVAL,EVAL_MONTH,eval_bank)
+        scores=train_seeds(
+            data,feats,params,rounds,SEEDS5,{202103:1,202104:1},
+            out/"confirm"/arm,arm_id,arm,reuse_scores=reuse
+        )
+        choice,curves,ens=summarize_scores(data["ids"],data["y_eval"],scores,SEEDS5)
+        confirm_meta[arm]={"identity":arm_id,"choice":choice,"n_features":len(feats)}
+        confirm_scores[arm]={k:v.copy() for k,v in scores.items()}
+        if arm=="C3":
+            ids5=data["ids"].copy();y5=data["y_eval"].copy();control_curves5=curves
+        del data,scores,curves,ens
+        gc.collect()
+
+    c3scores=confirm_scores["C3"]
+    crows=[]
+    promoted=[]
+    for arm in confirm_arms:
+        choice=confirm_meta[arm]["choice"]
+        if arm=="C3":
+            paired={"mean":0.0,"median":0.0,"sd":0.0,"positive_fraction":0.0,"wins":0,"ties":5,"losses":0}
+            c_same=choice["ganancia_robusta"];passed=True
+        else:
+            _,acurves,_=summarize_scores(ids5,y5,confirm_scores[arm],SEEDS5)
+            paired=paired_at_plateau(acurves,control_curves5,SEEDS5,choice["meseta_n"])
+            c_same=control_gain_at_ns(ids5,y5,c3scores,SEEDS5,choice["meseta_n"])
+            passed=bool(
+                choice["ganancia_robusta"]>c_same and paired["mean"]>0 and
+                paired["median"]>0 and paired["wins"]>=3
+            )
+            if passed:
+                promoted.append(arm)
+        crows.append({
+            "arm":arm,"passed":passed,
+            "control_gain_same_plateau":float(c_same),
+            "delta_ensemble_same_plateau":float(choice["ganancia_robusta"]-c_same),
+            **{k:v for k,v in choice.items() if k!="meseta_gain"},
+            **{f"paired_{k}":v for k,v in paired.items() if k!="deltas"},
+            "n_features":confirm_meta[arm]["n_features"],
+        })
+
+    cdf=pd.DataFrame(crows)
+    cdf.to_csv(out/"confirmation.csv",index=False)
+    if promoted:
+        winner=(
+            cdf[cdf.arm.isin(promoted)]
+            .sort_values(["ganancia_robusta","delta_ensemble_same_plateau"],ascending=[False,False])
+            .iloc[0].arm
+        )
+    else:
+        winner="C3"
+
+    r={
+        "status":"completed","identity":identity_base,"screen_top3":top3,
+        "winner":winner,"winner_features_file":str(out/f"features_{winner}.json"),
+        "quality_arm":s0["quality_arm"],
+        "promoted":promoted,
+    }
+    write_json(result_path,r)
+    _gcs(
+        ["gcloud","storage","cp",str(result_path),str(out/"screening.csv"),str(out/"confirmation.csv"),REMOTE+"/"],
+        check=True
+    )
+    print("STAGE1 COMPLETO. Winner:",winner,flush=True)
+    return r
+
+
+# [Anotación · líneas 309–395] `stage2` de la versión 1: compara las cuatro políticas de peso por mes
+#   reutilizando puntajes de la etapa 1. La versión 2 no llama a esta función; usa `stage2_v2`.
+def stage2(ctx:dict,s0:dict,s1:dict)->dict:
+    out=stage_path(ctx,2,"recency")
+    result_path=out/"RESULT.json"
+    if result_path.is_file():
+        return load_json(result_path)
+
+    features=load_json(Path(s1["winner_features_file"]))["features"]
+    eval_bank=Path(s0["eval_bank"])
+    params=base_params(ctx["paths"]);rounds=300
+    data=load_fold(ctx,features,TRAIN_EVAL,EVAL_MONTH,eval_bank)
+
+    # Reutilizar EXPANDING de stage1 confirm.
+    s1out=stage_path(ctx,1,"representation")
+    winner=s1["winner"]
+    confirm_meta=pd.read_csv(s1out/"confirmation.csv")
+    # Leer identity desde checkpoint directamente.
+    cp0=s1out/"confirm"/winner/f"seed_{SEEDS5[0]}.npz"
+    with np.load(cp0,allow_pickle=False) as z:
+        s1id=str(z["identity"].item());s1label=str(z["label"].item())
+    _,_,exp_reuse=read_scores_dir(s1out/"confirm"/winner,s1id,s1label,SEEDS5)
+
+    scores_by_policy={}
+    meta={}
+    base_identity=fingerprint({
+        "stage":2,"plan":plan_doc(),"stage1":s1["identity"],
+        "winner":winner,"features":fingerprint(features),"params":params,"rounds":rounds
+    })
+
+    for policy,wmap in RECENCY.items():
+        pid=fingerprint({"parent":base_identity,"policy":policy,"weights":wmap})
+        reuse=exp_reuse if policy=="EXPANDING" else None
+        sc=train_seeds(
+            data,features,params,rounds,SEEDS5,wmap,out/policy,pid,policy,reuse_scores=reuse
+        )
+        choice,curves,ens=summarize_scores(data["ids"],data["y_eval"],sc,SEEDS5)
+        scores_by_policy[policy]={k:v.copy() for k,v in sc.items()}
+        meta[policy]={"identity":pid,"choice":choice}
+        if policy=="EXPANDING":
+            control_curves=curves
+        del sc,curves,ens
+        gc.collect()
+
+    exp=scores_by_policy["EXPANDING"]
+    rows=[];promoted=[]
+    for policy in RECENCY:
+        choice=meta[policy]["choice"]
+        if policy=="EXPANDING":
+            paired={"mean":0.0,"median":0.0,"sd":0.0,"positive_fraction":0.0,"wins":0,"ties":5,"losses":0}
+            c_same=choice["ganancia_robusta"];passed=True
+        else:
+            _,curves,_=summarize_scores(data["ids"],data["y_eval"],scores_by_policy[policy],SEEDS5)
+            paired=paired_at_plateau(curves,control_curves,SEEDS5,choice["meseta_n"])
+            c_same=control_gain_at_ns(data["ids"],data["y_eval"],exp,SEEDS5,choice["meseta_n"])
+            passed=bool(
+                choice["ganancia_robusta"]>c_same and paired["mean"]>0 and
+                paired["median"]>0 and paired["wins"]>=3
+            )
+            if passed: promoted.append(policy)
+        rows.append({
+            "policy":policy,"passed":passed,
+            "control_gain_same_plateau":float(c_same),
+            "delta_ensemble_same_plateau":float(choice["ganancia_robusta"]-c_same),
+            **{k:v for k,v in choice.items() if k!="meseta_gain"},
+            **{f"paired_{k}":v for k,v in paired.items() if k!="deltas"},
+        })
+
+    df=pd.DataFrame(rows);df.to_csv(out/"comparison.csv",index=False)
+    if promoted:
+        winner_policy=(
+            df[df.policy.isin(promoted)]
+            .sort_values(["ganancia_robusta","delta_ensemble_same_plateau"],ascending=[False,False])
+            .iloc[0].policy
+        )
+    else:
+        winner_policy="EXPANDING"
+
+    r={
+        "status":"completed","identity":base_identity,"winner_policy":winner_policy,
+        "representation":winner,"quality_arm":s0["quality_arm"],
+        "winner_features_file":s1["winner_features_file"],"promoted":promoted,
+    }
+    write_json(result_path,r)
+    _gcs(["gcloud","storage","cp",str(result_path),str(out/"comparison.csv"),REMOTE+"/"],check=True)
+    print("STAGE2 COMPLETO. Policy:",winner_policy,flush=True)
+    del data
+    gc.collect()
+    return r
+
+
+# [Anotación · líneas 398–431] `tune_objective_factory` carga entrenamiento 202103 y evaluación 202105 y
+#   define el objetivo de Optuna: propone learning_rate (0,015–0,06, log), num_leaves (24–128), min_data_in_leaf
+#   (100–1.200, log), feature_fraction (0,55–1), bagging_fraction (0,65–1), lambda_l1 (1e-8–5, log), lambda_l2
+#   (1e-8–10, log), max_bin (63, 127 o 255) y rondas (200–550); entrena con semilla 17 y devuelve la ganancia
+#   promedio de la meseta elegida en 202105.
+def tune_objective_factory(ctx:dict,features:list[str],eval_bank:Path,out:Path):
+    import lightgbm as lgb
+    data=load_fold(ctx,features,TUNE_TRAIN,TUNE_EVAL,eval_bank)
+    xtr=data["x_train"]; ytr=data["y_train"]; xev=data["x_eval"]
+    ids=data["ids"];yev=data["y_eval"]
+
+    def objective(trial):
+        params=base_params(ctx["paths"])
+        params.update({
+            "learning_rate":trial.suggest_float("learning_rate",0.015,0.06,log=True),
+            "num_leaves":trial.suggest_int("num_leaves",24,128),
+            "min_data_in_leaf":trial.suggest_int("min_data_in_leaf",100,1200,log=True),
+            "feature_fraction":trial.suggest_float("feature_fraction",0.55,1.0),
+            "bagging_fraction":trial.suggest_float("bagging_fraction",0.65,1.0),
+            "lambda_l1":trial.suggest_float("lambda_l1",1e-8,5.0,log=True),
+            "lambda_l2":trial.suggest_float("lambda_l2",1e-8,10.0,log=True),
+            "max_bin":trial.suggest_categorical("max_bin",[63,127,255]),
+        })
+        rounds=trial.suggest_int("rounds",200,550)
+        ds=lgb.Dataset(
+            xtr,label=ytr,feature_name=features,free_raw_data=True,
+            params={"max_bin":int(params["max_bin"])}
+        )
+        model=lgb.train(dict(params,seed=17),ds,num_boost_round=int(rounds))
+        scores=np.asarray(model.predict(xev,num_threads=THREADS),dtype=np.float64)
+        curve=gain_curve(ids,yev,scores)
+        choice=robust_choice(curve)
+        trial.set_user_attr("n_robusto",choice["n_robusto"])
+        trial.set_user_attr("gain_peak",choice["gain_peak"])
+        del model,ds,scores
+        gc.collect()
+        return float(choice["ganancia_robusta"])
+
+    return data,objective
+
+
+# [Anotación · líneas 434–465] `stage3`, búsqueda: crea o retoma un estudio de Optuna guardado en `optuna.db`
+#   (SQLite) que maximiza el objetivo con `TPESampler(seed=17)` y corre los trials que falten hasta 20. Ordena
+#   los completos por valor, toma los tres primeros y escribe `trials.csv`.
+def stage3(ctx:dict,s0:dict,s1:dict,s2:dict)->dict:
+    import optuna
+    out=stage_path(ctx,3,"tuning")
+    result_path=out/"RESULT.json"
+    if result_path.is_file():
+        return load_json(result_path)
+
+    features=load_json(Path(s1["winner_features_file"]))["features"]
+    eval_bank=Path(s0["eval_bank"])
+    data_may,objective=tune_objective_factory(ctx,features,eval_bank,out)
+    storage=f"sqlite:///{out/'optuna.db'}"
+    study_name="superfinal100_"+fingerprint({
+        "stage":3,"stage2":s2["identity"],"features":fingerprint(features)
+    })[:16]
+    study=optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=17),
+        storage=storage,study_name=study_name,load_if_exists=True,
+    )
+    complete=[t for t in study.trials if t.state==optuna.trial.TrialState.COMPLETE]
+    todo=max(0,20-len(complete))
+    if todo:
+        study.optimize(objective,n_trials=todo,gc_after_trial=True)
+    complete=[t for t in study.trials if t.state==optuna.trial.TrialState.COMPLETE]
+    require(len(complete)>=20,"Optuna no completó 20 trials")
+    ranked=sorted(complete,key=lambda t:(t.value,-t.number),reverse=True)
+    top=ranked[:3]
+
+    trial_rows=[]
+    for t in complete:
+        trial_rows.append({"trial":t.number,"value":t.value,**t.params})
+    pd.DataFrame(trial_rows).sort_values("value",ascending=False).to_csv(out/"trials.csv",index=False)
+
+# [Anotación · líneas 467–545] `stage3`, revalidación: arma cuatro candidatos (BASE con parámetros base y 300
+#   rondas, y los tres trials), los entrena con 202103–202104 y los pesos de la política ganadora, con 5
+#   semillas, y los compara en 202106 contra BASE con la regla de meseta y un mínimo de 3 semillas a favor. Gana
+#   el promovido de mayor ganancia de meseta, o BASE. `RESULT.json` guarda parámetros, rondas y número de trial.
+    base=base_params(ctx["paths"])
+    candidates=[{"name":"BASE","params":base,"rounds":300,"trial":None}]
+    for t in top:
+        p=base_params(ctx["paths"])
+        tp=dict(t.params)
+        rounds=int(tp.pop("rounds"))
+        p.update(tp)
+        candidates.append({"name":f"TUNE_{t.number}","params":p,"rounds":rounds,"trial":t.number})
+
+    data=load_fold(ctx,features,TRAIN_EVAL,EVAL_MONTH,eval_bank)
+    wmap=RECENCY[s2["winner_policy"]]
+    scores_by={}
+    meta={}
+    base_id=fingerprint({
+        "stage":3,"plan":plan_doc(),"stage2":s2["identity"],
+        "winner_policy":s2["winner_policy"],"features":fingerprint(features)
+    })
+    for cand in candidates:
+        cid=fingerprint({"parent":base_id,"candidate":cand})
+        sc=train_seeds(
+            data,features,cand["params"],cand["rounds"],SEEDS5,wmap,
+            out/"confirm"/cand["name"],cid,cand["name"]
+        )
+        choice,curves,ens=summarize_scores(data["ids"],data["y_eval"],sc,SEEDS5)
+        scores_by[cand["name"]]={k:v.copy() for k,v in sc.items()}
+        meta[cand["name"]]={"identity":cid,"choice":choice,"params":cand["params"],"rounds":cand["rounds"],"trial":cand["trial"]}
+        if cand["name"]=="BASE": control_curves=curves
+        del sc,curves,ens
+        gc.collect()
+
+    base_scores=scores_by["BASE"]
+    rows=[];promoted=[]
+    for cand in candidates:
+        name=cand["name"];choice=meta[name]["choice"]
+        if name=="BASE":
+            paired={"mean":0.0,"median":0.0,"sd":0.0,"positive_fraction":0.0,"wins":0,"ties":5,"losses":0}
+            c_same=choice["ganancia_robusta"];passed=True
+        else:
+            _,curves,_=summarize_scores(data["ids"],data["y_eval"],scores_by[name],SEEDS5)
+            paired=paired_at_plateau(curves,control_curves,SEEDS5,choice["meseta_n"])
+            c_same=control_gain_at_ns(data["ids"],data["y_eval"],base_scores,SEEDS5,choice["meseta_n"])
+            passed=bool(
+                choice["ganancia_robusta"]>c_same and paired["mean"]>0 and
+                paired["median"]>0 and paired["wins"]>=3
+            )
+            if passed: promoted.append(name)
+        rows.append({
+            "candidate":name,"trial":cand["trial"],"rounds":cand["rounds"],"passed":passed,
+            "control_gain_same_plateau":float(c_same),
+            "delta_ensemble_same_plateau":float(choice["ganancia_robusta"]-c_same),
+            **{k:v for k,v in choice.items() if k!="meseta_gain"},
+            **{f"paired_{k}":v for k,v in paired.items() if k!="deltas"},
+        })
+    df=pd.DataFrame(rows);df.to_csv(out/"confirmation.csv",index=False)
+    if promoted:
+        winner=(
+            df[df.candidate.isin(promoted)]
+            .sort_values(["ganancia_robusta","delta_ensemble_same_plateau"],ascending=[False,False])
+            .iloc[0].candidate
+        )
+    else:
+        winner="BASE"
+    m=meta[winner]
+    r={
+        "status":"completed","identity":base_id,"winner":winner,
+        "params":m["params"],"rounds":m["rounds"],"trial":m["trial"],
+        "winner_policy":s2["winner_policy"],"representation":s1["winner"],
+        "quality_arm":s0["quality_arm"],"winner_features_file":s1["winner_features_file"],
+        "promoted":promoted,
+    }
+    write_json(result_path,r)
+    _gcs(
+        ["gcloud","storage","cp",str(result_path),str(out/"trials.csv"),str(out/"confirmation.csv"),REMOTE+"/"],
+        check=True
+    )
+    print("STAGE3 COMPLETO. Params:",winner,flush=True)
+    del data,data_may
+    gc.collect()
+    return r
+
+
+# [Anotación · líneas 548–612] `stage4`: entrena el candidato (variables, política, parámetros y rondas
+#   elegidos) con las 20 semillas sobre 202103–202104, reutilizando las 5 de la etapa 3, y evalúa en 202106. El
+#   control son los 20 puntajes de C3 del paso 2. Guarda la meseta del candidato, la comparación pareada,
+#   `n_final` (corte central de la meseta) y `promote_to_august` con un mínimo de 12 semillas a favor, que la
+#   versión 2 recalcula con 14.
+def stage4(ctx:dict,s0:dict,s1:dict,s2:dict,s3:dict)->dict:
+    out=stage_path(ctx,4,"confirm20")
+    result_path=out/"RESULT.json"
+    if result_path.is_file():
+        return load_json(result_path)
+
+    features=load_json(Path(s1["winner_features_file"]))["features"]
+    eval_bank=Path(s0["eval_bank"])
+    data=load_fold(ctx,features,TRAIN_EVAL,EVAL_MONTH,eval_bank)
+    wmap=RECENCY[s2["winner_policy"]]
+    identity=fingerprint({
+        "stage":4,"plan":plan_doc(),"stage3":s3["identity"],
+        "features":fingerprint(features),"params":s3["params"],
+        "rounds":s3["rounds"],"policy":s2["winner_policy"]
+    })
+
+    # Reutilizar las primeras 5 del candidato elegido en stage3.
+    s3out=stage_path(ctx,3,"tuning")
+    cdir=s3out/"confirm"/s3["winner"]
+    cp0=cdir/f"seed_{SEEDS5[0]}.npz"
+    with np.load(cp0,allow_pickle=False) as z:
+        oldid=str(z["identity"].item());oldlabel=str(z["label"].item())
+    _,_,reuse=read_scores_dir(cdir,oldid,oldlabel,SEEDS5)
+
+    scores=train_seeds(
+        data,features,s3["params"],int(s3["rounds"]),SEEDS20,wmap,
+        out/"candidate",identity,"SUPERFINAL",reuse_scores=reuse
+    )
+    choice,cand_curves,ens=summarize_scores(data["ids"],data["y_eval"],scores,SEEDS20)
+
+    ids_c,y_c,control=load_s3_control(ctx,SEEDS20)
+    require(np.array_equal(ids_c,data["ids"]) and np.array_equal(y_c,data["y_eval"]),
+            "Control S3 y candidato desalineados")
+    control_curves={s:gain_curve(ids_c,y_c,control[s]) for s in SEEDS20}
+    paired=paired_at_plateau(cand_curves,control_curves,SEEDS20,choice["meseta_n"])
+    c_same=control_gain_at_ns(ids_c,y_c,control,SEEDS20,choice["meseta_n"])
+    promote=bool(
+        choice["ganancia_robusta"]>c_same and paired["mean"]>0 and
+        paired["median"]>0 and paired["wins"]>=12
+    )
+    cmat=np.vstack([control[s] for s in SEEDS20])
+    ccurve=gain_curve(ids_c,y_c,cmat.mean(axis=0,dtype=np.float64))
+    cchoice=robust_choice(ccurve)
+
+    r={
+        "status":"completed","identity":identity,"promote_to_august":promote,
+        "candidate_choice":choice,"control_c3_choice":cchoice,
+        "control_gain_at_candidate_plateau":float(c_same),
+        "delta_ensemble_at_candidate_plateau":float(choice["ganancia_robusta"]-c_same),
+        "paired":{k:v for k,v in paired.items() if k!="deltas"},
+        "n_final":int(choice["n_robusto"]),
+        "representation":s1["winner"],"quality_arm":s0["quality_arm"],
+        "winner_policy":s2["winner_policy"],"params":s3["params"],
+        "rounds":int(s3["rounds"]),"winner_features_file":s1["winner_features_file"],
+    }
+    write_json(result_path,r)
+    pd.DataFrame([
+        {"seed":s,"delta_meseta":paired["deltas"][i]}
+        for i,s in enumerate(SEEDS20)
+    ]).to_csv(out/"deltas.csv",index=False)
+    _gcs(["gcloud","storage","cp",str(result_path),str(out/"deltas.csv"),REMOTE+"/"],check=True)
+    print("STAGE4 COMPLETO. PROMOTE=",promote,"N=",r["n_final"],flush=True)
+    del data,scores,ens,control
+    gc.collect()
+    return r
+
+
+# [Anotación · líneas 615–649] `final_blocks` obtiene del catálogo los bloques de las variables elegidas.
+#   `prepare_final_bank` genera (o valida) el banco final con esos bloques sobre el dataset de la etapa 0, con
+#   meses de salida 202103–202106 y 202108, y verifica que las definiciones coincidan con el banco original.
+def final_blocks(ctx:dict,features:list[str])->list[str]:
+    cat=pd.read_csv(ctx["paths"]["bank_orig"]/"catalogo_features.csv").set_index("feature",verify_integrity=True)
+    raw=set(ctx["schema"][:152])
+    derived=[f for f in features if f not in raw]
+    require(set(derived)<=set(cat.index),"Features final fuera de catálogo")
+    return sorted(cat.loc[derived,"block"].dropna().unique().tolist())
+
+
+def prepare_final_bank(ctx:dict,s0:dict,features:list[str])->Path:
+    p=ctx["paths"]
+    bank=p["out"]/"stage5_final"/"bank"
+    data=Path(s0["dataset"])
+    blocks=final_blocks(ctx,features)
+    config=load_json(p["stage"]/"config_screening.json")
+    months=FINAL_TRAIN+[SCORE_MONTH]
+    if (bank/"manifest.json").is_file():
+        m=load_json(bank/"manifest.json")
+        require(m.get("status")=="completed","Final bank incompleto")
+        require(m.get("input_sha256")==digest(data),"Final bank input distinto")
+        require(m.get("output_months")==months,"Final bank meses distintos")
+        require(m.get("blocks_requested")==blocks,"Final bank bloques distintos")
+        validate_catalog_compat(p["bank_orig"],bank,features)
+        return bank
+    if bank.exists() and any(bank.iterdir()):
+        q=bank.parent/("bank_incomplete_"+str(int(time.time())))
+        bank.rename(q)
+    add_fe_path(p)
+    from generar_fe import generate
+    print("STAGE5: generar banco final",blocks,flush=True)
+    generate(data,bank,config,blocks=blocks,months=months)
+    m=load_json(bank/"manifest.json")
+    require(m.get("status")=="completed" and m.get("input_sha256")==digest(data),
+            "Final bank no cerró")
+    validate_catalog_compat(p["bank_orig"],bank,features)
+    return bank
+
+
+# [Anotación · líneas 652–768] `stage5` de la versión 1: entrenamiento final con un `lgb.Dataset` compartido y
+#   exportación con prefijo `C1SF`. La versión 2 no la llama; usa `stage5_per_seed_safe`.
+def stage5(ctx:dict,s0:dict,s1:dict,s2:dict,s3:dict,s4:dict)->dict:
+    import lightgbm as lgb
+
+    out=stage_path(ctx,5,"final")
+    result_path=out/"RESULT.json"
+    if result_path.is_file():
+        return load_json(result_path)
+    if not s4["promote_to_august"]:
+        r={"status":"stopped_no_promotion","stage4_identity":s4["identity"],"no_submit":True}
+        write_json(result_path,r)
+        _gcs(["gcloud","storage","cp",str(result_path),REMOTE+"/stage5_RESULT.json"],check=True)
+        print("STAGE5 NO EJECUTADO: stage4 no promovió.",flush=True)
+        return r
+
+    features=load_json(Path(s1["winner_features_file"]))["features"]
+    bank=prepare_final_bank(ctx,s0,features)
+    add_fe_path(ctx["paths"])
+    from cargar_bloques import cargar_bloques
+    derived=split_derived(features,ctx)
+
+    trdf,_=cargar_bloques(bank,meses=FINAL_TRAIN,incluir_raw=True,features=derived)
+    labels=pd.read_parquet(ctx["paths"]["bank_orig"]/"etiquetas.parquet")
+    trlab=labels[labels.foto_mes.isin(FINAL_TRAIN)].reset_index(drop=True)
+    require(trdf[["numero_de_cliente","foto_mes"]].equals(trlab[["numero_de_cliente","foto_mes"]]),
+            "Final train labels desalineadas")
+    xtr=trdf[features]
+    ytr=trlab.clase_ternaria.eq("BAJA+2").to_numpy(np.int8)
+    months=trdf.foto_mes.to_numpy(np.int64)
+    keep,w=policy_weights(months,FINAL_RECENCY[s2["winner_policy"]])
+    xtr2=xtr.loc[keep].reset_index(drop=True)
+    ytr2=ytr[keep]
+    ds=lgb.Dataset(
+        xtr2,label=ytr2,weight=w,feature_name=features,free_raw_data=True,
+        params={"max_bin": int(s3["params"].get("max_bin",255))}
+    )
+    ds.construct()
+    del trdf,trlab,xtr,xtr2,ytr,ytr2,months,keep,w,labels
+    gc.collect()
+
+    scdf,_=cargar_bloques(bank,meses=[SCORE_MONTH],incluir_raw=True,features=derived)
+    require(len(scdf)==EXPECTED_ROWS[SCORE_MONTH],"Filas agosto inesperadas")
+    ids=scdf.numero_de_cliente.to_numpy(np.int64)
+    require(len(np.unique(ids))==len(ids),"IDs agosto duplicados")
+    xscore=scdf[features]
+    del scdf
+    gc.collect()
+
+    identity=fingerprint({
+        "stage":5,"plan":plan_doc(),"stage4":s4["identity"],
+        "data_sha":digest(Path(s0["dataset"])),"bank_manifest_sha":digest(bank/"manifest.json"),
+        "features":fingerprint(features),"params":s3["params"],"rounds":s3["rounds"],
+        "policy":s2["winner_policy"],"n":s4["n_final"]
+    })
+    modeldir=out/"models";modeldir.mkdir(exist_ok=True)
+    all_scores=[]
+    for i,seed in enumerate(SEEDS20,1):
+        cp=modeldir/f"seed_{seed}.npz";mp=modeldir/f"modelo_{seed}.txt"
+        if cp.is_file() and mp.is_file():
+            with np.load(cp,allow_pickle=False) as z:
+                require(str(z["identity"].item())==identity,f"Final cp otra identity {seed}")
+                require(int(z["seed"].item())==seed,f"Final cp otra seed {seed}")
+                require(np.array_equal(z["ids"],ids),f"Final IDs distintos {seed}")
+                require(str(z["model_sha256"].item())==digest(mp),f"Final modelo hash {seed}")
+                scores=np.asarray(z["scores"],dtype=np.float64).copy()
+            print(f"REUSAR FINAL {i}/20 seed={seed}",flush=True)
+        else:
+            require(not cp.exists() and not mp.exists(),f"Par final incompleto seed={seed}")
+            print(f"ENTRENAR FINAL {i}/20 seed={seed}",flush=True)
+            model=lgb.train(dict(s3["params"],seed=int(seed)),ds,num_boost_round=int(s3["rounds"]))
+            scores=np.asarray(model.predict(xscore,num_threads=THREADS),dtype=np.float64)
+            require(scores.shape==ids.shape and np.isfinite(scores).all(),"Scores final inválidos")
+            tmpm=mp.with_suffix(".tmp");model.save_model(str(tmpm));tmpm.replace(mp)
+            with cp.with_suffix(".tmp").open("wb") as fh:
+                np.savez_compressed(
+                    fh,identity=np.array(identity),seed=np.array(seed),ids=ids,scores=scores,
+                    model_sha256=np.array(digest(mp))
+                )
+            cp.with_suffix(".tmp").replace(cp)
+            _gcs(["gcloud","storage","cp",str(cp),str(mp),REMOTE+"/stage5_models/"],check=True)
+            del model
+            gc.collect()
+        all_scores.append(scores)
+
+    scoremat=np.vstack(all_scores)
+    ens=scoremat.mean(axis=0,dtype=np.float64)
+    n=int(s4["n_final"])
+    delivery=out/"delivery";delivery.mkdir(exist_ok=True)
+    prefix="C1SF"+identity[:12].upper()
+    csv=delivery/f"{prefix}ENS{n}.csv"
+    info=export_csv(csv,ids,ens,n)
+    manifest={
+        "status":"ready_not_submitted","run":RUN,"identity":identity,
+        "n":n,"file":info,"submit_message":f"submit {prefix}ENS{n}",
+        "representation":s1["winner"],"quality_arm":s0["quality_arm"],
+        "recency":s2["winner_policy"],"params":s3["params"],"rounds":s3["rounds"],
+        "stage4_identity":s4["identity"],
+    }
+    write_json(delivery/"MANIFEST.json",manifest)
+    (delivery/"mensaje_zulip.txt").write_text(manifest["submit_message"]+"\n",encoding="utf-8")
+    write_json(out/"LISTO.json",manifest)
+    _gcs([
+        "gcloud","storage","cp",str(csv),str(delivery/"MANIFEST.json"),
+        str(delivery/"mensaje_zulip.txt"),str(out/"LISTO.json"),REMOTE+"/final/"
+    ],check=True)
+
+    r={
+        "status":"ready_not_submitted","identity":identity,"n":n,
+        "csv":str(csv),"sha256":info["sha256"],
+        "submit_message":manifest["submit_message"]
+    }
+    write_json(result_path,r)
+    _gcs(["gcloud","storage","cp",str(result_path),REMOTE+"/stage5_RESULT.json"],check=True)
+    print("SUPERFINAL LISTO. NO ENVIADO.",flush=True)
+    print(manifest["submit_message"],flush=True)
+    del ds,xscore,scoremat,ens,all_scores
+    gc.collect()
+    return r
+
+
+# [Anotación · líneas 771–825] `run_all` y `main` de la versión 1 (`--all` o `--stage N`). El camino de la
+#   entrega entra por `superfinal100_v2.main`.
+def run_all(ctx:dict)->dict:
+    s0=stage0(ctx)
+    s1=stage1(ctx,s0)
+    s2=stage2(ctx,s0,s1)
+    s3=stage3(ctx,s0,s1,s2)
+    s4=stage4(ctx,s0,s1,s2,s3)
+    s5=stage5(ctx,s0,s1,s2,s3,s4)
+    return {"stage0":s0,"stage1":s1,"stage2":s2,"stage3":s3,"stage4":s4,"stage5":s5}
+
+
+def main()->None:
+    ap=argparse.ArgumentParser(description="SUPERFINAL100: última corrida adaptativa preespecificada")
+    ap.add_argument("--home",type=Path,default=Path.home())
+    ap.add_argument("--all",action="store_true")
+    ap.add_argument("--stage",type=int,choices=[0,1,2,3,4,5])
+    args=ap.parse_args()
+    require(args.all or args.stage is not None,"Usar --all o --stage N")
+
+    home=args.home.resolve()
+    ctx=preflight_base(home)
+    plan=plan_doc()
+    require(plan.get("run")==RUN and plan.get("stop_after_this_experiment") is True,
+            "Plan superfinal inesperado")
+    ctx["paths"]["out"].mkdir(parents=True,exist_ok=True)
+
+    lock=(ctx["paths"]["out"]/".lock").open("a")
+    try:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit("SUPERFINAL100 ya tiene otro proceso activo")
+
+    if args.all:
+        result=run_all(ctx)
+        print(json.dumps({
+            "stage4_promote":result["stage4"].get("promote_to_august"),
+            "stage5_status":result["stage5"].get("status"),
+            "stage5_submit":result["stage5"].get("submit_message"),
+        },ensure_ascii=False,indent=2))
+        return
+
+    s0=stage0(ctx)
+    if args.stage==0:return
+    s1=stage1(ctx,s0)
+    if args.stage==1:return
+    s2=stage2(ctx,s0,s1)
+    if args.stage==2:return
+    s3=stage3(ctx,s0,s1,s2)
+    if args.stage==3:return
+    s4=stage4(ctx,s0,s1,s2,s3)
+    if args.stage==4:return
+    stage5(ctx,s0,s1,s2,s3,s4)
+
+
+if __name__=="__main__":
+    main()

@@ -1,0 +1,695 @@
+#%% celda 1 [texto]
+# Crear la clase Target - `clase_ternaria`
+
+Partimos de `competencia_01_crudo.csv` (fotos **202103 a 202108**, sin target) y generamos
+`competencia_01.csv` con la columna adicional `clase_ternaria`, con las categorías
+**CONTINUA, BAJA+1 y BAJA+2** (más `NULL` cuando corresponde).
+
+Además de construir el target, producimos:
+
+1. la tabla de **cantidad de clientes por clase y por `foto_mes`**,
+2. un **análisis de sensibilidad** del tratamiento de clientes intermitentes (con y sin tratamiento),
+3. un **chequeo de consistencia** entre los `BAJA+2` de un mes y los `BAJA+1` del mes siguiente,
+4. el `.csv` final.
+
+#%% celda 2 [texto]
+## 0. Descarga del dataset y setup
+
+Una sola diferencia con respecto al archivo original `z101_target_sql.ipynb`: `dataset_path` se autodetecta, así el
+mismo notebook puede correr en **Colab** y en **local** (VS Code) sin tocar nada.
+
+* en Colab: `/content/drive/MyDrive/DMEyF/2026/notebooks/data/` (hay que montar el Drive antes)
+* en local: la carpeta `data/` del repo, es decir `../data/` respecto de `monday/`
+
+Si el dataset ya esta descargado, la celda no vuelve a bajarlo.
+
+#%% celda 3 [código]
+import os
+import sys
+import requests
+
+file_url = "https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv"
+dataset_filename = "competencia_01_crudo.csv"
+
+# Colab vs local: mismo notebook, distinta ubicacion del dataset
+EN_COLAB = "google.colab" in sys.modules or os.path.isdir("/content")
+
+if EN_COLAB:
+    dataset_path = "/content/drive/MyDrive/DMEyF/2026/notebooks/data/"
+else:
+    # El notebook vive en <repo>/monday/ y el dataset en <repo>/data/, pero el
+    # working directory depende del editor (VS Code lo controla con la opcion
+    # jupyter.notebookFileRoot). Buscamos data/ subiendo desde el cwd.
+    raiz = os.getcwd()
+    for _ in range(4):
+        if os.path.isdir(os.path.join(raiz, "data")) or os.path.isdir(os.path.join(raiz, ".git")):
+            break
+        raiz = os.path.dirname(raiz)
+    dataset_path = os.path.join(raiz, "data") + os.sep
+
+os.makedirs(dataset_path, exist_ok=True)
+print(f"dataset_path = {dataset_path}")
+
+file_path = os.path.join(dataset_path, dataset_filename)
+
+if os.path.exists(file_path):
+    print(f"Dataset cargado")
+else:
+    print(f"Falta el dataset, hay que descargarlo")
+    try:
+        response = requests.get(file_url, stream=True)
+        response.raise_for_status()
+
+        with open(file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f"Successfully downloaded '{dataset_filename}' to {dataset_path}.")
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading the file: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+#%% celda 4 [código]
+# %pip en lugar de %%bash
+%pip install --quiet jupysql duckdb-engine duckdb
+
+#%% celda 5 [código]
+import duckdb
+import pandas as pd
+
+%load_ext sql
+%config SqlMagic.autopandas = True
+%config SqlMagic.feedback = False
+%config SqlMagic.displaycon = False
+
+%sql duckdb:///
+
+#%% celda 6 [código]
+%%sql
+create or replace table competencia_01_crudo as
+select
+    *
+from read_csv_auto("{{dataset_path + dataset_filename}}")
+
+#%% celda 7 [código]
+%%sql
+-- control basico: deben ser 6 fotos, de 202103 a 202108
+select
+    foto_mes
+    , count(*) as cantidad
+    , count(distinct numero_de_cliente) as clientes
+from competencia_01_crudo
+group by foto_mes
+order by foto_mes
+
+#%% celda 8 [texto]
+## 1. Reglas definidas para construir el target
+
+**1.  Trabajamos con TODA la base, nunca filtrando por `cliente_vip`.** Hay que trabajar con toda la base de
+datos, son los Paquete Premium, y no tendria sentido modelar sobre los ~458 registros con
+`cliente_vip = 1` en lugar de los ~164 mil por mes. No se hace ningun filtro por
+atributo de cliente; la celda de control de la seccion 2 lo verifica mes a mes.
+
+**2. No se agrega NINGUNA informacion del futuro salvo el target.** 
+
+**3. 202108 no tiene clase, y es el mes con el que se predice.** Een 202107 hay que predecir a los que se van a ir en 202109, y el periodo 202108 es
+con el que hay que predecir para la primera competencia -- no tiene clase. Es exactamente lo que
+implementa la seccion 4.
+
+---
+
+## 1.1 Decisiones de criterio
+
+### Decision A - clientes intermitentes (`TRATAR_INTERMITENTES`)
+
+Hay clientes con huecos: estan, desaparecen un mes, y vuelven (`1 -> 0 -> 1`).
+Para la foto en la que todavia estan presentes hay dos lecturas posibles:
+
+| valor | regla | resultado para `1 -> 0 -> 1` |
+|---|---|---|
+| `True` (**default**) | el `CASE` evalua **`mes_2` primero**: si el cliente esta en `mes_2`, es `CONTINUA` | `CONTINUA` |
+| `False` | el `CASE` evalua **`mes_1` primero** (regla ingenua): si falta en `mes_1`, es `BAJA+1` | `BAJA+1` |
+
+Ambas se calculan siempre, en dos columnas distintas, para poder cuantificar el impacto
+(seccion 5). Solo una se exporta.
+
+### Decision B - el `BAJA+1` "parcial" de 202107 (`INCLUIR_BAJA1_PARCIAL_202107`)
+
+En 202107 se puede observar `mes_1` (=202108) pero no `mes_2` (=202109, no existe). Es decir:
+se puede afirmar `BAJA+1`, pero **no** se puede afirmar `CONTINUA` ni `BAJA+2`.
+El parametro **no** cambia la construccion del target (202107 se etiqueta siempre que se pueda);
+cambia solamente si ese mes entra o no al set de entrenamiento (seccion 7).
+
+#%% celda 9 [código]
+# ---------------------------------------------------------------------------
+# Decision A: tratamiento de clientes intermitentes (1 -> 0 -> 1)
+#   True  = prioriza la presencia futura (mes_2) => el intermitente es CONTINUA
+#   False = prioriza la ausencia (mes_1) => el intermitente es BAJA+1
+# Ver el analisis de sensibilidad de la seccion 5 antes de cambiarlo.
+TRATAR_INTERMITENTES = True
+
+# ---------------------------------------------------------------------------
+# Decision B: 202107 solo admite BAJA+1 (no hay 202109 para distinguir
+# CONTINUA de BAJA+2). Este flag NO afecta al target, solo al set de training.
+#   False = training hasta 202106 inclusive (unicos meses con las 3 clases observables)
+#   True  = suma los BAJA+1 de 202107, aceptando la asimetria de clases de ese mes
+INCLUIR_BAJA1_PARCIAL_202107 = False
+
+# Columna de target segun la Decision A
+COL_TARGET = "clase_ternaria_tratada" if TRATAR_INTERMITENTES else "clase_ternaria_ingenua"
+
+print(f"Criterio intermitentes : {'TRATADO (CONTINUA)' if TRATAR_INTERMITENTES else 'INGENUO (BAJA+1)'}")
+print(f"Columna de target      : {COL_TARGET}")
+print(f"202107 en training     : {INCLUIR_BAJA1_PARCIAL_202107}")
+
+#%% celda 10 [texto]
+## 2. Construccion del target
+
+1. `periodos` x `clientes` -> `todo`: el producto cartesiano, para que **la ausencia de un cliente
+   en un mes tambien sea una fila**.
+2. `mes_0`: 1 si el cliente esta en la foto, 0 si no (el `left join` deja `NULL` cuando no esta).
+3. `mes_1`, `mes_2`: `lead(mes_0, 1)` y `lead(mes_0, 2)` sobre la grilla completa. Como la grilla
+   esta completa, `lead` devuelve `NULL` **solo** al salirse del borde del dataset:
+   `mes_2` es `NULL` en 202107 y 202108, y `mes_1` es `NULL` en 202108.
+4. El `CASE`. Dos versiones, una por criterio.
+5. `where mes_0 = 1`: solo clasificamos las fotos en las que el cliente realmente esta.
+
+### Los bordes, explicitos
+
+| foto_mes | `mes_1` | `mes_2` | que se puede afirmar |
+|---|---|---|---|
+| 202103..202106 | observable | observable | las tres clases |
+| **202107** | observable (202108) | **no existe** (202109) | solo `BAJA+1`; `CONTINUA` y `BAJA+2` quedan `NULL` |
+| **202108** | **no existe** | **no existe** | nada: todo `NULL` |
+
+> En SQL `NULL = 0` **no** es verdadero, es `NULL`, y un `NULL` en un `CASE`
+> no dispara la rama. Por eso las ramas estan escritas de forma que un `mes_2` desconocido nunca
+> pueda caer en `CONTINUA` ni en `BAJA+2`, y se vaya al `else null`.
+
+#%% celda 11 [código]
+%%sql
+create or replace table competencia_01_ambos_criterios as
+with periodos as (
+    select distinct foto_mes
+    from competencia_01_crudo
+), clientes as (
+    select distinct numero_de_cliente
+    from competencia_01_crudo
+), todo as (
+    -- producto cartesiano: las ausencias tambien son filas
+    select numero_de_cliente, foto_mes
+    from clientes cross join periodos
+), presencias as (
+    select
+        c.*
+        , if(c.numero_de_cliente is null, 0, 1) as mes_0
+        , lead(mes_0, 1) over (partition by t.numero_de_cliente order by foto_mes) as mes_1
+        , lead(mes_0, 2) over (partition by t.numero_de_cliente order by foto_mes) as mes_2
+    from todo t
+    left join competencia_01_crudo c using (numero_de_cliente, foto_mes)
+), clasificado as (
+    select
+        * EXCLUDE (mes_0, mes_1, mes_2)
+        -- Criterio TRATADO: evalua mes_2 primero.
+        -- El intermitente (mes_1 = 0, mes_2 = 1) cae en CONTINUA.
+        , case
+            when mes_2 = 1               then 'CONTINUA'  -- presente en el subsiguiente
+            when mes_1 = 1 and mes_2 = 0 then 'BAJA+2'    -- esta el proximo, no el subsiguiente
+            when mes_1 = 0               then 'BAJA+1'    -- ya no esta el mes proximo
+            else null                                     -- futuro insuficiente (202107 / 202108)
+          end as clase_ternaria_tratada
+        -- Criterio INGENUO: evalua mes_1 primero.
+        -- El intermitente (mes_1 = 0, mes_2 = 1) cae en BAJA+1.
+        , case
+            when mes_1 = 0               then 'BAJA+1'
+            when mes_1 = 1 and mes_2 = 0 then 'BAJA+2'
+            when mes_1 = 1 and mes_2 = 1 then 'CONTINUA'
+            else null
+          end as clase_ternaria_ingenua
+    from presencias
+    where mes_0 = 1
+)
+select *
+from clasificado
+
+#%% celda 12 [texto]
+La tabla que se entrega lleva **una sola** columna `clase_ternaria`, con exactamente los tres
+valores de la consigna mas `NULL`. 
+
+#%% celda 13 [código]
+%%sql
+create or replace table competencia_01 as
+select
+    * EXCLUDE (clase_ternaria_tratada, clase_ternaria_ingenua)
+    , {{COL_TARGET}} as clase_ternaria
+from competencia_01_ambos_criterios
+
+#%% celda 14 [código]
+%%sql
+-- control: no debe aparecer ningun valor distinto de los tres de la consigna
+select
+    clase_ternaria
+    , count(*) as cantidad
+from competencia_01
+group by clase_ternaria
+order by cantidad desc
+
+#%% celda 15 [código]
+%%sql
+-- control: la cantidad de filas debe ser identica a la del crudo
+select
+    (select count(*) from competencia_01_crudo) as filas_crudo
+    , (select count(*) from competencia_01)     as filas_target
+    , (select count(*) from competencia_01_crudo)
+      = (select count(*) from competencia_01)   as coinciden
+
+#%% celda 16 [texto]
+### Control de las reglas 1 y 2 de la seccion 1
+
+Dos guardas que conviene mirar cada vez que se toque este notebook:
+
+* **anti-filtrado**: la cantidad de filas por `foto_mes` tiene que ser exactamente la del crudo. Si
+  bajara, en algun lado se colo un filtro (por `cliente_vip` o por lo que sea).
+* **anti-leakage**: la unica columna nueva respecto del crudo debe ser `clase_ternaria`. Si
+  aparecieran `mes_1` o `mes_2`, se estarian exportando variables construidas mirando el futuro.
+
+#%% celda 17 [código]
+%%sql
+-- Guarda anti-filtrado: ni un cliente de menos en ningun mes
+select
+    foto_mes
+    , c.filas as filas_crudo
+    , t.filas as filas_target
+    , if(c.filas = t.filas, 'OK', 'REVISAR - se perdieron registros') as control
+from (select foto_mes, count(*) as filas from competencia_01_crudo group by foto_mes) c
+full join (select foto_mes, count(*) as filas from competencia_01 group by foto_mes) t
+    using (foto_mes)
+order by foto_mes
+
+#%% celda 18 [código]
+%%sql
+-- Guarda anti-leakage: la unica columna agregada debe ser clase_ternaria
+with cols_crudo as (
+    select column_name
+    from information_schema.columns
+    where table_name = 'competencia_01_crudo'
+), cols_target as (
+    select column_name
+    from information_schema.columns
+    where table_name = 'competencia_01'
+), agregadas as (
+    select column_name from cols_target
+    except
+    select column_name from cols_crudo
+), perdidas as (
+    select column_name from cols_crudo
+    except
+    select column_name from cols_target
+)
+select
+    (select count(*) from cols_crudo)                  as columnas_crudo
+    , (select count(*) from cols_target)               as columnas_target
+    , (select string_agg(column_name, ', ') from agregadas) as columnas_agregadas
+    , (select count(*) from perdidas)                  as columnas_perdidas
+    , if((select string_agg(column_name, ', ') from agregadas) = 'clase_ternaria'
+         and (select count(*) from perdidas) = 0,
+         'OK - solo se agrego el target',
+         'REVISAR - hay columnas de mas o de menos')   as control
+
+#%% celda 19 [texto]
+## 3. Cantidad de clientes por clase y por `foto_mes`
+
+Esta es la tabla que pide la consigna.
+
+#%% celda 20 [código]
+%%sql
+PIVOT competencia_01
+on clase_ternaria
+USING count(numero_de_cliente)
+GROUP BY foto_mes
+ORDER BY foto_mes
+
+#%% celda 21 [texto]
+La misma tabla en formato explicito, agregando la columna de registros sin clase (los `NULL` de
+202107 / 202108). Es una columna de **reporte**, no una clase del dataset.
+
+#%% celda 22 [código]
+%%sql
+select
+    foto_mes
+    , count(*) filter (where clase_ternaria = 'BAJA+1')   as "BAJA+1"
+    , count(*) filter (where clase_ternaria = 'BAJA+2')   as "BAJA+2"
+    , count(*) filter (where clase_ternaria = 'CONTINUA') as "CONTINUA"
+    , count(*) filter (where clase_ternaria is null)      as "sin_clase (NULL)"
+    , count(*)                                            as total
+from competencia_01
+group by foto_mes
+order by foto_mes
+
+#%% celda 23 [texto]
+## 4. Verificacion de los bordes (202107 y 202108)
+
+Los dos controles que hay que mirar antes de dar por buena cualquier implementacion:
+
+* **202108 no puede tener ninguna clase.** No existen 202109 ni 202110.
+* **202107 no puede tener `CONTINUA` ni `BAJA+2`.** Requeririan 202109, que no existe.
+  Solo puede tener `BAJA+1`.
+
+Si alguna de estas dos condiciones falla, la logica esta mal: la query estaria "sabiendo" algo que
+el dataset no contiene.
+
+#%% celda 24 [código]
+%%sql
+select
+    foto_mes
+    , count(*) filter (where clase_ternaria is not null)  as clasificados
+    , count(*) filter (where clase_ternaria = 'CONTINUA') as continua
+    , count(*) filter (where clase_ternaria = 'BAJA+2')   as baja_mas_2
+    , count(*) filter (where clase_ternaria = 'BAJA+1')   as baja_mas_1
+    , case
+        when foto_mes = 202108
+             and count(*) filter (where clase_ternaria is not null) = 0
+            then 'OK - 202108 sin clase, como debe ser'
+        when foto_mes = 202107
+             and count(*) filter (where clase_ternaria in ('CONTINUA', 'BAJA+2')) = 0
+             and count(*) filter (where clase_ternaria = 'BAJA+1') > 0
+            then 'OK - 202107 solo BAJA+1'
+        when foto_mes <= 202106
+             and count(*) filter (where clase_ternaria is null) = 0
+            then 'OK - mes completo, sin nulos'
+        else 'REVISAR'
+      end as control
+from competencia_01
+group by foto_mes
+order by foto_mes
+
+#%% celda 25 [texto]
+## 5. Analisis de sensibilidad: clientes intermitentes
+
+No alcanza con elegir un criterio, hay que **cuantificar cuanto se
+mueven las cardinalidades con y sin tratamiento**.
+
+Las dos reglas difieren en **exactamente un caso**: `mes_1 = 0 and mes_2 = 1`. En todas las demas
+combinaciones dan lo mismo. Por lo tanto el efecto total del criterio es, por construccion, un
+trasvase de registros `BAJA+1 -> CONTINUA` y nada mas.
+
+> **Atencion con el conteo de intermitentes.** "Cliente intermitente" y "cliente cuya clase depende
+> del criterio" **no** son el mismo conjunto. Un cliente que desaparece **dos o mas meses** y vuelve
+> tiene `mes_1 = 0` *y* `mes_2 = 0`: los dos criterios lo llaman `BAJA+1` por igual, y sin embargo
+> reaparece. Con dos meses de horizonte esos casos son invisibles, no hay orden del `CASE` que los
+> arregle. La celda 5.e los separa.
+
+#%% celda 26 [código]
+%%sql
+-- 5.a Cuantos registros / clientes cambian de clase segun el criterio, y en que foto
+select
+    foto_mes
+    , count(*) as registros_afectados
+    , count(distinct numero_de_cliente) as clientes_afectados
+from competencia_01_ambos_criterios
+where clase_ternaria_tratada is distinct from clase_ternaria_ingenua
+group by foto_mes
+order by foto_mes
+
+#%% celda 27 [código]
+%%sql
+-- 5.b Cardinalidades por foto_mes bajo cada criterio, y el delta
+with tratado as (
+    select
+        foto_mes
+        , count(*) filter (where clase_ternaria_tratada = 'BAJA+1')   as baja1
+        , count(*) filter (where clase_ternaria_tratada = 'BAJA+2')   as baja2
+        , count(*) filter (where clase_ternaria_tratada = 'CONTINUA') as continua
+    from competencia_01_ambos_criterios
+    group by foto_mes
+), ingenuo as (
+    select
+        foto_mes
+        , count(*) filter (where clase_ternaria_ingenua = 'BAJA+1')   as baja1
+        , count(*) filter (where clase_ternaria_ingenua = 'BAJA+2')   as baja2
+        , count(*) filter (where clase_ternaria_ingenua = 'CONTINUA') as continua
+    from competencia_01_ambos_criterios
+    group by foto_mes
+)
+select
+    t.foto_mes
+    , i.baja1                 as baja1_ingenuo
+    , t.baja1                 as baja1_tratado
+    , t.baja1 - i.baja1       as delta_baja1
+    , i.baja2                 as baja2_ingenuo
+    , t.baja2                 as baja2_tratado
+    , t.baja2 - i.baja2       as delta_baja2
+    , i.continua              as continua_ingenuo
+    , t.continua              as continua_tratado
+    , t.continua - i.continua as delta_continua
+from tratado t
+join ingenuo i using (foto_mes)
+order by foto_mes
+
+#%% celda 28 [código]
+%%sql
+-- 5.c El detalle: historia completa de presencia de cada cliente afectado.
+-- Permite distinguir el patron corto (1 -> 0 -> 1) del largo (1 -> 1 -> 0 -> 1).
+with afectados as (
+    select distinct numero_de_cliente
+    from competencia_01_ambos_criterios
+    where clase_ternaria_tratada is distinct from clase_ternaria_ingenua
+), periodos as (
+    select distinct foto_mes from competencia_01_crudo
+), grilla as (
+    select numero_de_cliente, foto_mes
+    from afectados cross join periodos
+)
+select
+    g.numero_de_cliente
+    , string_agg(if(c.numero_de_cliente is null, '0', '1'), '' order by g.foto_mes)
+        as patron_202103_a_202108
+from grilla g
+left join competencia_01_crudo c using (numero_de_cliente, foto_mes)
+group by g.numero_de_cliente
+order by patron_202103_a_202108, g.numero_de_cliente
+
+#%% celda 29 [código]
+%%sql
+-- 5.d Resumen: cuantos clientes por forma de intermitencia
+with afectados as (
+    select distinct numero_de_cliente
+    from competencia_01_ambos_criterios
+    where clase_ternaria_tratada is distinct from clase_ternaria_ingenua
+), periodos as (
+    select distinct foto_mes from competencia_01_crudo
+), grilla as (
+    select numero_de_cliente, foto_mes
+    from afectados cross join periodos
+), patrones as (
+    select
+        g.numero_de_cliente
+        , string_agg(if(c.numero_de_cliente is null, '0', '1'), '' order by g.foto_mes) as patron
+    from grilla g
+    left join competencia_01_crudo c using (numero_de_cliente, foto_mes)
+    group by g.numero_de_cliente
+)
+select
+    patron
+    , count(*) as clientes
+from patrones
+group by patron
+order by clientes desc, patron
+
+#%% celda 30 [texto]
+### 5.e Todos los huecos, no solo los que cambian de clase
+
+Universo completo de clientes con al menos un hueco entre dos presencias, abierto por **largo del
+hueco**. Solo la primera fila (hueco de 1 mes) es sensible al criterio de la Decision A; el resto
+queda etiquetado `BAJA+1` bajo los dos criterios y aun asi reaparece.
+
+#%% celda 31 [código]
+%%sql
+with periodos as (
+    select distinct foto_mes from competencia_01_crudo
+), clientes as (
+    select distinct numero_de_cliente from competencia_01_crudo
+), grilla as (
+    select numero_de_cliente, foto_mes
+    from clientes cross join periodos
+), patrones as (
+    select
+        g.numero_de_cliente
+        , string_agg(if(c.numero_de_cliente is null, '0', '1'), '' order by g.foto_mes) as patron
+    from grilla g
+    left join competencia_01_crudo c using (numero_de_cliente, foto_mes)
+    group by g.numero_de_cliente
+)
+select
+    count(*) filter (where regexp_matches(patron, '1+0+1')) as con_hueco_total
+    , count(*) filter (where regexp_matches(patron, '101'))   as hueco_1_mes_sensible_al_criterio
+    , count(*) filter (where regexp_matches(patron, '1001'))  as hueco_2_meses
+    , count(*) filter (where regexp_matches(patron, '10001')) as hueco_3_meses
+    , count(*) filter (where regexp_matches(patron, '100001'))as hueco_4_meses
+    , count(*)                                                as clientes_totales
+from patrones
+
+#%% celda 32 [texto]
+**Tercera opcion, la de "ignorarlos":** sacar del dataset a los clientes con intermitencias en vez
+de decidir como etiquetarlos. La celda siguiente mide cuanto costaria.
+
+#%% celda 33 [código]
+%%sql
+-- 5.f Escenario "excluir intermitentes": cuantos registros se perderian por foto_mes
+with intermitentes as (
+    select distinct numero_de_cliente
+    from competencia_01_ambos_criterios
+    where clase_ternaria_tratada is distinct from clase_ternaria_ingenua
+)
+select
+    foto_mes
+    , count(*) filter (where clase_ternaria = 'BAJA+1')   as "BAJA+1"
+    , count(*) filter (where clase_ternaria = 'BAJA+2')   as "BAJA+2"
+    , count(*) filter (where clase_ternaria = 'CONTINUA') as "CONTINUA"
+    , count(*) filter (where numero_de_cliente in (select numero_de_cliente from intermitentes))
+        as registros_que_se_perderian
+from competencia_01
+group by foto_mes
+order by foto_mes
+
+#%% celda 34 [texto]
+## 6. Chequeo de consistencia: `BAJA+2` de un mes vs `BAJA+1` del mes siguiente
+
+Un `BAJA+2` en la foto `t` significa: presente en `t`, presente en `t+1`, ausente en `t+2`.
+Mirando a ese mismo cliente parado en la foto `t+1`, esta presente y su `mes_1` (= `t+2`) es 0,
+o sea es un `BAJA+1` en `t+1`.
+
+De ahi sale la relacion esperada:
+
+> **`BAJA+1(t+1) >= BAJA+2(t)`**, y la diferencia son los clientes que **no estaban** en `t`
+> (altas nuevas de `t+1`) y se van en `t+2`.
+
+Bajo el criterio **ingenuo** la desigualdad se cumple siempre, por construccion. Bajo el criterio
+**tratado** puede romperse hacia abajo por unos pocos registros: un intermitente que en `t+1` seria
+`BAJA+1` pasa a `CONTINUA` y se resta del lado izquierdo. Un desvio de esa magnitud (unidades) es
+esperable; un desvio grande seria sintoma de un bug.
+
+#%% celda 35 [código]
+%%sql
+with cardinalidad as (
+    select
+        foto_mes
+        , count(*) filter (where clase_ternaria = 'BAJA+2') as baja2
+        , count(*) filter (where clase_ternaria = 'BAJA+1') as baja1
+    from competencia_01
+    group by foto_mes
+)
+select
+    foto_mes
+    , baja2                                        as baja2_en_t
+    , lead(baja1) over (order by foto_mes)         as baja1_en_t_mas_1
+    , lead(baja1) over (order by foto_mes) - baja2 as diferencia
+from cardinalidad
+order by foto_mes
+
+#%% celda 36 [código]
+%%sql
+-- Verificacion a nivel cliente, no agregada: de los BAJA+2 de t,
+-- cuantos aparecen efectivamente como BAJA+1 en t+1
+with pares as (
+    select
+        numero_de_cliente
+        , foto_mes
+        , clase_ternaria
+        , lead(clase_ternaria) over (partition by numero_de_cliente order by foto_mes)
+            as clase_mes_siguiente
+    from competencia_01
+)
+select
+    foto_mes
+    , count(*)                                                              as baja2_en_t
+    , count(*) filter (where clase_mes_siguiente = 'BAJA+1')                as siguen_como_baja1
+    , count(*) filter (where clase_mes_siguiente is distinct from 'BAJA+1') as excepciones
+from pares
+where clase_ternaria = 'BAJA+2'
+group by foto_mes
+order by foto_mes
+
+#%% celda 37 [texto]
+## 7. Set de entrenamiento (Decision B)
+
+Un mes es "limpio" para entrenar solo si sus **tres** clases son observables.
+Eso vale hasta **202106**.
+
+* `INCLUIR_BAJA1_PARCIAL_202107 = False` (default): entrenamos hasta 202106.
+* `INCLUIR_BAJA1_PARCIAL_202107 = True`: sumamos los `BAJA+1` de 202107. Son etiquetas reales y
+  verificables, pero ese mes aporta **solo negativos**, con lo cual su distribucion de clases no es
+  comparable con la de los demas meses.
+
+En ninguno de los dos casos entra 202108: es el mes a predecir.
+
+#%% celda 38 [código]
+%%sql
+create or replace table competencia_01_training as
+select *
+from competencia_01
+where clase_ternaria is not null
+  and (foto_mes <= 202106 or {{INCLUIR_BAJA1_PARCIAL_202107}})
+
+#%% celda 39 [código]
+%%sql
+select
+    foto_mes
+    , count(*) filter (where clase_ternaria = 'BAJA+1')   as "BAJA+1"
+    , count(*) filter (where clase_ternaria = 'BAJA+2')   as "BAJA+2"
+    , count(*) filter (where clase_ternaria = 'CONTINUA') as "CONTINUA"
+    , count(*)                                            as total
+from competencia_01_training
+group by foto_mes
+order by foto_mes
+
+#%% celda 40 [texto]
+## 8. Guardar `competencia_01.csv`
+
+Se exporta la tabla completa (las 6 fotos, incluidos los `NULL` de 202107 y 202108). 
+
+#%% celda 41 [código]
+# Ojo: aca va %sql (line magic), no %%sql, porque no es un bloque sino una sola linea de comando.
+%sql COPY competencia_01 TO '{{dataset_path}}competencia_01.csv' (FORMAT CSV, HEADER)
+
+#%% celda 42 [texto]
+## 9. Decisiones que quedan abiertas
+
+1. **El patron largo `1 -> 1 -> 0 -> 1`.** Con el criterio tratado ese cliente recibe `BAJA+2` en
+   `t` y `CONTINUA` en `t+1`, lo cual es contraintuitivo (se "fue" y sigue). Con el criterio ingenuo
+   recibe `BAJA+2` y despues `BAJA+1`, una alternativa que se mencionó que es 
+   igualmente válida. Es decir, no hay un único criterio válido: se resuelve empiricamente cuando
+   corramos los primeros modelos.
+2. **Si la intermitencia es comportamiento real o error del dataset.** No sabemos por ahora cuáles son casos reales y cuáles errores. 
+3. **Los huecos de 2 meses o mas (celda 5.e).** Ningun criterio de ordenamiento del `CASE` los
+   distingue: con `mes_1 = 0` y `mes_2 = 0` el cliente es `BAJA+1` para las dos reglas, y aun asi
+   reaparece. Son ruido de etiqueta que el horizonte de dos meses no puede ver. Habria que decidir
+   aparte si se los excluye, y esa decision es independiente de la Decision A.
+4. **La asimetria interna del criterio tratado en 202107.** Si un intermitente puede volver, un
+   cliente presente en 202107 y ausente en 202108 podria reaparecer en 202109 y no ser `BAJA+1`.
+   Es decir: el `BAJA+1` de 202107 es estrictamente confiable solo bajo el criterio ingenuo. Dada
+   la magnitud del fenomeno (seccion 5.a) el impacto es de unidades, pero la inconsistencia existe
+   y es otra razon para el default `INCLUIR_BAJA1_PARCIAL_202107 = False`.
+5. **El "downgrade" de categoria como baja parcial.** Un cliente que baja de categoria sin irse del banco 
+   no es una baja para `clase_ternaria`, pero quizas si para el negocio. Queda anotado como linea exploratoria 
+   para cuando corramos modelos.
+
+---
+
+### Una anomalia de datos detectada de paso (no afecta al target)
+
+`cliente_vip` tiene un pico en **202106**: 921 registros con `cliente_vip = 1` (0,561%) contra
+423-458 (0,26-0,28%) en los otros cinco meses. Vuelve a la normalidad en 202107. 
+
+#%% celda 43 [código]
+%%sql
+-- Chequeo de consistencia longitudinal de cliente_vip.
+-- NO se usa para construir el target; queda como registro del hallazgo.
+select
+    foto_mes
+    , count(*) filter (where cliente_vip = 1) as vip
+    , count(*)                                as total
+    , round(100.0 * count(*) filter (where cliente_vip = 1) / count(*), 3) as pct_vip
+from competencia_01
+group by foto_mes
+order by foto_mes

@@ -1,0 +1,15 @@
+{
+  "experimento": 6011,
+  "nombre": "zulip_final_5015",
+  "modo": "final",
+  "fuente": "5015_prod_profesor_mar_jun",
+  "envios": [
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500
+  ],
+  "descripcion": "Archivos para el bot del modelo con las indicaciones del profesor (5015): 11.000 a 13.500 envios."
+}

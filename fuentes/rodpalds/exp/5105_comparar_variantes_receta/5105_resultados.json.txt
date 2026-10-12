@@ -1,0 +1,61 @@
+{
+  "resumen": [
+    {
+      "modelo": "muerte_conteo_3003",
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": 766,
+      "hiper": "4105 p23_4104",
+      "arboles": 580,
+      "meseta_M": 438.3,
+      "maximo_M": 454.3,
+      "envios_optimos": 13000,
+      "envios_agosto_p25_p50_p75": "12,842 / 13,243 / 13,544",
+      "dif_vs_receta_3002_M": 4.6,
+      "IC90_M": "[-4.0 ; 13.2]",
+      "pct_remuestreos_gana": "81%"
+    },
+    {
+      "modelo": "rank_luego_lag_3005",
+      "dataset": "ds3005_rank_luego_lag.parquet",
+      "variables": 766,
+      "hiper": "4105 p23_4104",
+      "arboles": 580,
+      "meseta_M": 435.3,
+      "maximo_M": 451.6,
+      "envios_optimos": 13500,
+      "envios_agosto_p25_p50_p75": "11,738 / 13,143 / 13,444",
+      "dif_vs_receta_3002_M": 1.4,
+      "IC90_M": "[-12.5 ; 15.7]",
+      "pct_remuestreos_gana": "56%"
+    },
+    {
+      "modelo": "muerte_flags_3004",
+      "dataset": "ds3004_flags.parquet",
+      "variables": 782,
+      "hiper": "4105 p23_4104",
+      "arboles": 580,
+      "meseta_M": 434.9,
+      "maximo_M": 448.8,
+      "envios_optimos": 14000,
+      "envios_agosto_p25_p50_p75": "13,444 / 13,744 / 13,945",
+      "dif_vs_receta_3002_M": 1.1,
+      "IC90_M": "[-7.8 ; 10.9]",
+      "pct_remuestreos_gana": "56%"
+    },
+    {
+      "modelo": "receta_3002",
+      "dataset": "ds3002_rank_total.parquet",
+      "variables": 760,
+      "hiper": "4105 p23_4104",
+      "arboles": 580,
+      "meseta_M": 433.9,
+      "maximo_M": 446.6,
+      "envios_optimos": 12000,
+      "envios_agosto_p25_p50_p75": "10,935 / 11,939 / 12,942",
+      "dif_vs_receta_3002_M": NaN,
+      "IC90_M": NaN,
+      "pct_remuestreos_gana": NaN
+    }
+  ],
+  "_minutos": 32.82
+}

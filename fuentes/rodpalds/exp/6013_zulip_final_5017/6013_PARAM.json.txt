@@ -1,0 +1,21 @@
+{
+  "experimento": 6013,
+  "nombre": "zulip_final_5017",
+  "descripcion": "Archivos para el bot de 5017 (proceso de muerte ampliado, hiperparametros de 4108): 11.000 a 13.500 envios.",
+  "modo": "final",
+  "fuente": "5017_prod_muerte_ampliada_bo4108",
+  "envios": [
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500
+  ],
+  "max_archivos": 20,
+  "clientes_esperados": 164647,
+  "_config": "6013_zulip_final_5017.json",
+  "_fecha_inicio": "2026-10-10 09:12:43",
+  "_script": "10_entrega_zulip.py",
+  "_git_commit": "sin_git"
+}

@@ -1,0 +1,693 @@
+#%% celda 1 [texto]
+# Réplica de la validación multisemilla de LAG-028
+
+Esta notebook conserva la evaluación multisemilla y la selección de los mejores cortes:
+
+1. carga el dataset y genera `ternaria`;
+2. lee el `BO_log.txt` de cada experimento configurado;
+3. selecciona los mejores `n` conjuntos de hiperparámetros;
+4. entrena cada conjunto con las `m` semillas del benchmark original;
+5. calcula las ganancias de cada corte y elige el mejor corte de cada modelo.
+
+Genera únicamente los dos archivos utilizados por la validación manual para construir el `.rds`:
+
+- `PARAM.rds`: configuración del benchmark, parámetros fijos y undersampling;
+- `mejor_corte_por_modelo.tsv`: hiperparámetros y métricas del mejor corte de cada modelo.
+
+La evaluación detallada y los promedios por corte se conservan en memoria para realizar la selección. No ejecuta una nueva optimización bayesiana.
+
+#%% celda 2 [texto]
+## Librerías
+
+Si falta algún paquete, instalarlo previamente en el entorno de R correspondiente.
+
+#%% celda 3 [código]
+library(data.table)
+library(here)
+library(primes)
+library(lightgbm)
+
+options(scipen = 999)
+
+#%% celda 4 [texto]
+## Configuración
+
+Ejecutar desde `entregas/bo`, con kernel R. El dataset se toma de `../dataset`.
+
+`benchmark_original` identifica la carpeta cuya documentación define la configuración a reproducir. Del `PARAM.rds` se recuperan los parámetros de entrada y las semillas de entrenamiento documentadas.
+
+El nombre de la BO se configura en `PARAM$experimentos_origen`, como en la notebook original. Debe coincidir con la carpeta del experimento que se quiere evaluar, dentro de `entregas/bo`.
+
+El dataset, los meses, los cortes, las cantidades y los parámetros fijos pertenecen al benchmark multisemilla. Los modelos y sus hiperparámetros se seleccionan desde el `BO_log.txt` de la BO indicada.
+
+La notebook conserva la generación original de semillas y comprueba que coincidan exactamente con las documentadas antes de continuar. Después vuelve a entrenar y calcular toda la validación con el código original.
+
+#%% celda 5 [código]
+# Ejecutar desde entregas/bo.
+root <- getwd()
+exp_folder <- root
+data_folder <- file.path(dirname(root), "dataset")
+
+benchmark_original <- "benchmark_multisemilla_lags20261009_200322"
+benchmark_replica <- "benchmark_multisemilla_lags20261009_200322-REPLICA"
+carpeta_salida <- file.path(exp_folder, benchmark_replica)
+
+if (dir.exists(carpeta_salida)) {
+  stop("La carpeta de salida ya existe: ", carpeta_salida)
+}
+
+# Recupera la configuración y las semillas documentadas del benchmark.
+configuracion_original <- readRDS(
+  file.path(exp_folder, benchmark_original, "PARAM.rds")
+)
+campos_configuracion <- c(
+  "dataset", "archivo_resultados", "semilla_primigenia",
+  "n_mejores", "m_semillas", "train_final", "future",
+  "semilla_kaggle", "cortes", "trainingstrategy", "lgbm", "semillas"
+)
+stopifnot(all(campos_configuracion %in% names(configuracion_original)))
+configuracion_original <- configuracion_original[campos_configuracion]
+
+dataset_file <- configuracion_original$dataset
+dataset_url <- file.path(data_folder, dataset_file)
+
+#%% celda 6 [código]
+
+
+PARAM <- list()
+# Ejemplo: c("HT4950-01", "HT4950-02")
+# PARAM$experimentos_origen <- c("PY495-01","PY495-02","PY4941", "PY495-01", "PY4942", "HT4941", "HT4942", "HT4940")
+PARAM$dataset <- dataset_file
+PARAM$experimentos_origen <- c('LAG-028-REPLICA')
+PARAM$archivo_resultados <- configuracion_original$archivo_resultados
+
+PARAM$semilla_primigenia <- configuracion_original$semilla_primigenia
+PARAM$n_mejores <- configuracion_original$n_mejores #cantidad de modelos a evaluar de cada experimento
+PARAM$m_semillas <- configuracion_original$m_semillas
+
+PARAM$train_final <- configuracion_original$train_final
+PARAM$future <- configuracion_original$future
+PARAM$semilla_kaggle <- configuracion_original$semilla_kaggle
+PARAM$cortes <- configuracion_original$cortes
+PARAM$trainingstrategy$undersampling <- configuracion_original$trainingstrategy$undersampling
+
+#%% celda 7 [código]
+# Parámetros fijos documentados. Los presentes en BO_log.txt los pisan.
+PARAM$lgbm$param_fijos <- configuracion_original$lgbm$param_fijos
+
+#%% celda 8 [texto]
+## Dataset y clase ternaria
+
+Se conserva la lógica de generación utilizada en z495.
+
+#%% celda 9 [código]
+
+if (!file.exists(dataset_url)) {
+  stop("No existe el dataset: ", dataset_url)
+}
+dataset <- fread(dataset_url)
+
+#%% celda 10 [código]
+
+
+dsimple <- dataset[, .(
+  pos = .I,
+  numero_de_cliente,
+  periodo0 = as.integer(foto_mes / 100) * 12 + foto_mes %% 100
+)]
+
+setorder(dsimple, numero_de_cliente, periodo0)
+
+periodo_ultimo <- dsimple[, max(periodo0)]
+periodo_anteultimo <- periodo_ultimo - 1L
+
+dsimple[, c("periodo1", "periodo2") :=
+  shift(periodo0, n = 1:2, fill = NA, type = "lead"),
+  by = numero_de_cliente
+]
+
+dsimple[periodo0 < periodo_anteultimo, ternaria := "CONTINUA"]
+
+dsimple[
+  periodo0 < periodo_ultimo &
+    (is.na(periodo1) | periodo0 + 1L < periodo1),
+  ternaria := "BAJA+1"
+]
+
+dsimple[
+  periodo0 < periodo_anteultimo & periodo0 + 1L == periodo1 &
+    (is.na(periodo2) | periodo0 + 2L < periodo2),
+  ternaria := "BAJA+2"
+]
+
+setorder(dsimple, pos)
+dataset[, ternaria := dsimple$ternaria]
+
+setorder(dataset, foto_mes, ternaria, numero_de_cliente)
+conteo_clases <- dataset[, .N, by = .(foto_mes, ternaria)]
+
+#%% celda 11 [código]
+dataset[, clase01 := fifelse(
+  ternaria %in% c("BAJA+2", "BAJA+1"),
+  1L,
+  0L
+)]
+
+dataset_train <- copy(dataset[foto_mes %in% PARAM$train_final])
+dfuture <- copy(dataset[foto_mes %in% PARAM$future])
+
+campos_buenos <- setdiff(
+  names(dataset_train),
+c(
+    "ternaria",
+    "ternaria_lag1",
+    "ternaria_lag2",
+    "clase01",
+    "fold",
+    "azar",
+    "training",
+    "cprestamos_personales",
+    "cprestamos_personales_lag1",
+    "cprestamos_personales_delta1",
+    "cprestamos_personales_lag2",
+    "cprestamos_personales_delta2",
+    "cprestamos_personales_lag_pond",
+    "cprestamos_personales_delta_lag_pond",
+    "cprestamos_personales_lag_pond2",
+    "cprestamos_personales_delta_lag_pond2",
+    "mprestamos_personales",
+    "mprestamos_personales_lag1",
+    "mprestamos_personales_delta1",
+    "mprestamos_personales_lag2",
+    "mprestamos_personales_delta2",
+    "mprestamos_personales_lag_pond",
+    "mprestamos_personales_delta_lag_pond",
+    "mprestamos_personales_lag_pond2",
+    "mprestamos_personales_delta_lag_pond2"
+  )
+)
+
+dtrain_final <- lgb.Dataset(
+  data = data.matrix(dataset_train[, ..campos_buenos]),
+  label = dataset_train[, clase01]
+)
+
+conteo_train_final <- dataset_train[, .N, by = ternaria]
+
+#%% celda 12 [texto]
+## Lectura de resultados de R o Python
+
+La función reconoce:
+
+- `metrica` en el log de z495/R;
+- `value` y columnas `params_*` en el log de Optuna/Python;
+- `y` en otros logs de R compatibles.
+
+#%% celda 13 [código]
+resolver_carpeta_experimento <- function(experimento) {
+  if (dir.exists(experimento)) {
+    return(normalizePath(experimento, mustWork = TRUE))
+  }
+
+  candidato <- file.path(exp_folder, experimento)
+  if (!dir.exists(candidato)) {
+    stop("No existe la carpeta del experimento: ", candidato)
+  }
+
+  normalizePath(candidato, mustWork = TRUE)
+}
+
+
+leer_mejores_resultados <- function(carpeta, archivo, n_mejores) {
+  ruta <- file.path(carpeta, archivo)
+  if (!file.exists(ruta)) {
+    stop("No existe el archivo de resultados: ", ruta)
+  }
+
+  tb <- fread(ruta)
+  tb[, fila_origen := .I]
+
+  if ("state" %in% names(tb)) {
+    tb <- tb[state == "COMPLETE"]
+  }
+
+  # Optuna escribe los hiperparámetros como params_nombre.
+  columnas_python <- grep("^params_", names(tb), value = TRUE)
+  for (columna in columnas_python) {
+    nombre_lgbm <- sub("^params_", "", columna)
+    if (!nombre_lgbm %in% names(tb)) {
+      setnames(tb, columna, nombre_lgbm)
+    }
+  }
+
+  candidatas_metrica <- c("metrica", "value", "y")
+  campo_metrica <- candidatas_metrica[candidatas_metrica %in% names(tb)][1]
+
+  if (is.na(campo_metrica)) {
+    stop("No se encontró una columna de métrica: metrica, value o y")
+  }
+
+  tb[, metrica_origen := as.numeric(get(campo_metrica))]
+  tb <- tb[is.finite(metrica_origen)]
+
+  if (nrow(tb) == 0L) {
+    stop("El archivo no contiene evaluaciones completas con una métrica válida")
+  }
+
+  setorder(tb, -metrica_origen)
+  tb <- head(tb, min(as.integer(n_mejores), nrow(tb)))
+  tb[, ranking_origen := .I]
+
+  if ("iter" %in% names(tb)) {
+    tb[, id_origen := as.character(iter)]
+  } else if ("number" %in% names(tb)) {
+    tb[, id_origen := as.character(number)]
+  } else {
+    tb[, id_origen := as.character(fila_origen)]
+  }
+
+  tb[]
+}
+
+#%% celda 14 [código]
+modelos_por_experimento <- lapply(
+  PARAM$experimentos_origen,
+  function(experimento) {
+    carpeta <- resolver_carpeta_experimento(experimento)
+
+    modelos <- leer_mejores_resultados(
+      carpeta = carpeta,
+      archivo = PARAM$archivo_resultados,
+      n_mejores = PARAM$n_mejores
+    )
+
+    modelos[, experimento_origen := experimento]
+    modelos
+  }
+)
+
+mejores_modelos <- rbindlist(
+  modelos_por_experimento,
+  use.names = TRUE,
+  fill = TRUE
+)
+
+mejores_modelos[, modelo_id := .I]
+
+columnas_parametros <- intersect(
+  names(PARAM$lgbm$param_fijos),
+  names(mejores_modelos)
+)
+
+columnas_mostrar <- unique(c(
+  "experimento_origen", "ranking_origen", "id_origen", "metrica_origen",
+  columnas_parametros
+))
+
+# Descomentar si se quieren inspeccionar los modelos seleccionados.
+# mejores_modelos[, ..columnas_mostrar]
+
+#%% celda 15 [texto]
+## Semillas
+
+Se generan semillas primas reproducibles con el código original y se comprueba que coincidan, en el mismo orden, con las semillas de entrenamiento documentadas en el benchmark original. Si difieren, la ejecución se detiene antes de entrenar.
+
+#%% celda 16 [código]
+primos <- generate_primes(100000, 1000000)
+
+if (PARAM$m_semillas > length(primos)) {
+  stop("m_semillas supera la cantidad de números primos disponibles")
+}
+
+set.seed(PARAM$semilla_primigenia, kind = "L'Ecuyer-CMRG")
+PARAM$semillas <- sample(
+  primos,
+  size = PARAM$m_semillas,
+  replace = FALSE
+)
+
+# Verifica las semillas contra las documentadas en el benchmark original.
+if (!identical(
+  as.integer(PARAM$semillas),
+  as.integer(configuracion_original$semillas)
+)) {
+  stop("Las semillas generadas no coinciden con las documentadas en el benchmark original")
+}
+
+invisible(PARAM$semillas)
+
+#%% celda 17 [texto]
+## Ganancia de Producción de z494
+
+Se conserva la división fija `Public`/`Private` de z494. La semilla Kaggle es independiente de las semillas usadas para entrenar los modelos.
+
+#%% celda 18 [código]
+particionar <- function(
+  data,
+  division,
+  agrupa = "",
+  campo = "fold",
+  start = 1L,
+  seed = NA
+) {
+  if (!is.na(seed)) {
+    set.seed(seed, kind = "L'Ecuyer-CMRG")
+  }
+
+  bloque <- unlist(mapply(
+    function(x, y) rep(y, x),
+    division,
+    seq(from = start, length.out = length(division))
+  ))
+
+  data[, (campo) := sample(
+    rep(bloque, ceiling(.N / length(bloque)))
+  )[1:.N], by = agrupa]
+}
+
+
+realidad_inicializar <- function(pfuture, pparam) {
+  drealidad <- pfuture[, .(
+    numero_de_cliente,
+    foto_mes,
+    ternaria
+  )]
+
+  particionar(
+    data = drealidad,
+    division = c(3L, 7L),
+    agrupa = "ternaria",
+    seed = pparam$semilla_kaggle
+  )
+
+  drealidad
+}
+
+
+realidad_evaluar <- function(prealidad, pprediccion) {
+  prealidad[
+    pprediccion,
+    on = c("numero_de_cliente", "foto_mes"),
+    predicted := i.Predicted
+  ]
+
+  tbl <- prealidad[, .(
+    qty = .N
+  ), by = .(fold, predicted, ternaria)]
+
+  res <- list(
+    public = tbl[
+      fold == 1L & predicted == 1L,
+      sum(qty * fifelse(ternaria == "BAJA+2", 1072500, -27500))
+    ] / 0.3,
+    private = tbl[
+      fold == 2L & predicted == 1L,
+      sum(qty * fifelse(ternaria == "BAJA+2", 1072500, -27500))
+    ] / 0.7,
+    total = tbl[
+      predicted == 1L,
+      sum(qty * fifelse(ternaria == "BAJA+2", 1072500, -27500))
+    ]
+  )
+
+  prealidad[, predicted := NULL]
+  res
+}
+
+
+drealidad <- realidad_inicializar(dfuture, PARAM)
+
+#%% celda 19 [texto]
+## Entrenamiento y evaluación de los mejores modelos
+
+Cada fila del log pisa los parámetros fijos correspondientes. Cada semilla cambia el entrenamiento de LightGBM, pero no los hiperparámetros del experimento.
+
+#%% celda 20 [código]
+extraer_parametros_modelo <- function(fila_modelo, semilla) {
+  disponibles <- intersect(
+    names(PARAM$lgbm$param_fijos),
+    names(fila_modelo)
+  )
+
+  parametros_log <- as.list(fila_modelo[, ..disponibles])
+  parametros_log <- parametros_log[vapply(
+    parametros_log,
+    function(valor) length(valor) == 1L && !is.na(valor),
+    logical(1)
+  )]
+
+  parametros <- modifyList(
+    PARAM$lgbm$param_fijos,
+    parametros_log
+  )
+
+  parametros$seed <- as.integer(semilla)
+
+  parametros_enteros <- intersect(
+    c(
+      "num_iterations", "num_leaves", "max_depth", "max_bin",
+      "max_drop", "early_stopping", "min_data_in_leaf"
+    ),
+    names(parametros)
+  )
+
+  parametros[parametros_enteros] <- lapply(
+    parametros[parametros_enteros],
+    as.integer
+  )
+
+  # Normalización de Producción de z494. En z495 permanece en cero.
+  parametros$min_data_in_leaf <- round(
+    parametros$min_data_in_leaf /
+      PARAM$trainingstrategy$undersampling
+  )
+
+  parametros
+}
+
+
+entrenar_y_predecir <- function(fila_modelo, semilla) {
+  parametros <- extraer_parametros_modelo(fila_modelo, semilla)
+
+  modelo <- lgb.train(
+    data = dtrain_final,
+    param = parametros
+  )
+
+  prediccion <- predict(
+    modelo,
+    data.matrix(dfuture[, ..campos_buenos])
+  )
+
+  rm(modelo)
+
+  prediccion
+}
+
+#%% celda 21 [código]
+total_entrenamientos <- nrow(mejores_modelos) * length(PARAM$semillas)
+
+resultados <- vector(
+  mode = "list",
+  length = total_entrenamientos * length(PARAM$cortes)
+)
+
+k <- 0L
+entrenamientos_completos <- 0L
+inicio_proceso <- Sys.time()
+
+cat("Entrenamientos totales:", total_entrenamientos, "\n")
+flush.console()
+
+for (modelo_id in seq_len(nrow(mejores_modelos))) {
+  cat("****MODELO:", modelo_id, "****** \n")
+  flush.console()
+  fila_modelo <- mejores_modelos[modelo_id]
+  experimento <- fila_modelo$experimento_origen
+  modelos_en_experimento <- mejores_modelos[
+    experimento_origen == experimento,
+    .N
+  ]
+
+  for (indice_semilla in seq_along(PARAM$semillas)) {
+    semilla <- PARAM$semillas[indice_semilla]
+    cat("****SEMILLA:", semilla, "****** \n")
+    flush.console()
+    inicio_entrenamiento <- Sys.time()
+
+    prediccion <- entrenar_y_predecir(
+      fila_modelo = fila_modelo,
+      semilla = semilla
+    )
+
+    tb_prediccion <- dfuture[, .(
+      numero_de_cliente,
+      foto_mes,
+      ternaria
+    )]
+
+    tb_prediccion[, prob := prediccion]
+    setorder(tb_prediccion, -prob)
+
+    for (envios in PARAM$cortes) {
+      k <- k + 1L
+
+      tb_prediccion[, Predicted := 0L]
+      tb_prediccion[seq_len(envios), Predicted := 1L]
+
+      ganancia <- realidad_evaluar(
+        prealidad = drealidad,
+        pprediccion = tb_prediccion
+      )
+
+      resultados[[k]] <- data.table(
+        modelo_id = modelo_id,
+        experimento_origen = experimento,
+        dataset_bench=dataset_file,
+        ranking_origen = fila_modelo$ranking_origen,
+        id_origen = fila_modelo$id_origen,
+        metrica_origen = fila_modelo$metrica_origen,
+        semilla = as.integer(semilla),
+        envios = as.integer(envios),
+        ganancia_total = ganancia$total,
+        ganancia_public_estimada = ganancia$public,
+        ganancia_private_estimada = ganancia$private
+      )
+    }
+
+    entrenamientos_completos <- entrenamientos_completos + 1L
+    porcentaje <- 100 * entrenamientos_completos / total_entrenamientos
+    minutos_transcurridos <- as.numeric(difftime(
+      Sys.time(), inicio_proceso, units = "mins"
+    ))
+    minutos_ultimo <- as.numeric(difftime(
+      Sys.time(), inicio_entrenamiento, units = "mins"
+    ))
+    minutos_restantes <-
+      minutos_transcurridos / entrenamientos_completos *
+      (total_entrenamientos - entrenamientos_completos)
+
+    cat(sprintf(
+      paste0(
+        "[%d/%d - %.1f%%] Experimento=%s | modelo=%d/%d | ",
+        "semilla=%d/%d | último=%.1f min | faltan~%.1f min\n"
+      ),
+      entrenamientos_completos,
+      total_entrenamientos,
+      porcentaje,
+      experimento,
+      fila_modelo$ranking_origen,
+      modelos_en_experimento,
+      indice_semilla,
+      length(PARAM$semillas),
+      minutos_ultimo,
+      minutos_restantes
+    ))
+    flush.console()
+
+    rm(prediccion, tb_prediccion)
+    gc(full = TRUE, verbose = FALSE)
+  }
+}
+
+resultados_detalle <- rbindlist(resultados)
+
+# Descomentar para imprimir el resultado individual de cada semilla y corte.
+# resultados_detalle[]
+
+#%% celda 22 [texto]
+## Promedio de ganancias
+
+`resumen_ganancias` muestra cada corte promediado sobre las `m` semillas. `mejor_corte_por_modelo` conserva el corte con mayor ganancia total promedio para cada conjunto de hiperparámetros.
+
+#%% celda 23 [código]
+resumen_metricas <- resultados_detalle[, .(
+  ganancia_total_promedio = mean(ganancia_total),
+  ganancia_total_sd = if (.N > 1L) sd(ganancia_total) else 0,
+  ganancia_total_min = min(ganancia_total),
+  ganancia_total_max = max(ganancia_total),
+  ganancia_public_promedio = mean(ganancia_public_estimada),
+  ganancia_private_promedio = mean(ganancia_private_estimada)
+), by = .(dataset_bench, modelo_id, envios)]
+
+info_modelos <- mejores_modelos[, c(
+  "experimento_origen",
+  "ranking_origen",
+  "id_origen",
+  "metrica_origen",
+  columnas_parametros
+), with = FALSE]
+
+info_modelos[, modelo_id := .I]
+
+resumen_ganancias <- merge(
+  info_modelos,
+  resumen_metricas,
+  by = "modelo_id"
+)
+
+setorder(resumen_ganancias, experimento_origen, ranking_origen, envios)
+
+# Descomentar para imprimir el resumen de todos los cortes.
+# resumen_ganancias[]
+
+#%% celda 24 [código]
+mejor_corte_por_modelo <- resumen_ganancias[
+  order(modelo_id, -ganancia_total_promedio),
+  .SD[1L],
+  by = modelo_id
+]
+
+setorder(
+  mejor_corte_por_modelo,
+  experimento_origen,
+  -ganancia_total_promedio
+)
+
+columnas_resumen <- intersect(c(
+  "ranking_origen",
+  "id_origen",
+  "metrica_origen",
+  "num_iterations",
+  "num_leaves",
+  "min_sum_hessian_in_leaf",
+  "envios",
+  "ganancia_total_promedio",
+  "ganancia_total_sd",
+  "ganancia_total_min",
+  "ganancia_total_max",
+  "ganancia_public_promedio",
+  "ganancia_private_promedio"
+), names(mejor_corte_por_modelo))
+
+for (experimento in PARAM$experimentos_origen) {
+  cat("\nExperimento:", experimento, "\n")
+  print(
+    mejor_corte_por_modelo[
+      experimento_origen == experimento,
+      ..columnas_resumen
+    ]
+  )
+  flush.console()
+}
+
+#%% celda 25 [texto]
+## Archivos para la validación manual
+
+Se guardan únicamente `PARAM.rds` y `mejor_corte_por_modelo.tsv` en `carpeta_salida`.
+
+#%% celda 26 [código]
+dir.create(carpeta_salida, recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(
+  PARAM,
+  file.path(carpeta_salida, "PARAM.rds")
+)
+
+fwrite(
+  mejor_corte_por_modelo,
+  file.path(carpeta_salida, "mejor_corte_por_modelo.tsv"),
+  sep = "\t"
+)
+
+cat("Archivos guardados en:", carpeta_salida, "\n")

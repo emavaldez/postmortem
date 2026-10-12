@@ -1,0 +1,61 @@
+# Z636 FULL END-TO-END REPRODUCTION: PASS
+
+Inicio: 2026-10-11T17:00:45.059857-03:00. Fin: 2026-10-11T20:05:11.172386-03:00.
+Tiempo total: 3 h 04 min 26 s (11065.923 segundos).
+
+Input de datos exclusivo: `data/competencia_01.csv`. Codigo exclusivo: `competencia_01_final/src/`. Salida nueva: `data/reproduccion_final_z636/`.
+
+Entorno: .venv actual, sin copia ni reinstalacion. Se habilitaron las ubicaciones ya instaladas de las bibliotecas LightGBM/PyArrow. No se leyeron ni reutilizaron artefactos predictivos historicos.
+
+Las copias temporales de preparacion del entorno y la primera salida parcial interrumpida por captura de consola se eliminaron antes de esta ejecucion. Esta ejecucion genero ambos parquet y realizo diez fits desde cero.
+
+El codigo y toda la documentacion del paquete permanecieron identicos a sus hashes iniciales. REPRODUCCION.md del paquete no se modifico por la ultima instruccion; este informe registra los resultados reales fuera del paquete.
+
+| Etapa | Segundos | Resultado |
+|---|---:|---|
+| 01_feature_engineering.py | 115.777 | PASS |
+| 02_train_lightgbm.py | 7266.237 | PASS |
+| 03_train_catboost.py | 3678.410 | PASS |
+| 04_build_final_c25.py | 3.421 | PASS |
+| 05_verify_submission.py | 1.292 | PASS |
+
+## Versiones
+
+Python 3.12.0.
+- numpy==2.5.2
+- pandas==3.0.5
+- scipy==1.18.1
+- scikit-learn==1.9.0
+- lightgbm==4.7.0
+- catboost==1.2.10
+- pyarrow==25.0.0
+- graphviz==0.21
+- matplotlib==3.11.1
+- plotly==7.0.0
+- six==1.17.0
+- python-dateutil==2.9.0.post0
+
+## Comandos
+
+Con el .venv auditado y las ubicaciones de bibliotecas instaladas habilitadas:
+
+```powershell
+.venv/Scripts/python.exe -B competencia_01_final/src/01_feature_engineering.py --output-dir data/reproduccion_final_z636 --input data/competencia_01.csv
+.venv/Scripts/python.exe -B competencia_01_final/src/02_train_lightgbm.py --output-dir data/reproduccion_final_z636
+.venv/Scripts/python.exe -B competencia_01_final/src/03_train_catboost.py --output-dir data/reproduccion_final_z636
+.venv/Scripts/python.exe -B competencia_01_final/src/04_build_final_c25.py --output-dir data/reproduccion_final_z636
+.venv/Scripts/python.exe -B competencia_01_final/src/05_verify_submission.py --output-dir data/reproduccion_final_z636
+```
+
+## Controles
+
+FULL457: `c3578882fcf1adf79df9c20c472864719672522fa2ee9283d4a9b1c0fe080c12`.
+FULL762: `1e9747955f214a8ddcb405af0e3a71d4a516f1818bf829c0d6c14ca0f934e8f6`.
+CSV: `00534f4c23bb87c5e0962ee615a0f81740cf1e2f3e64232c7af5bc83aae697a0`.
+12000 IDs unicos, sin header/index, todos August. Cinco scores finitos por familia, 164647 IDs por seed; ensemble igual a media aritmetica de cinco probabilidades.
+
+No se utilizo target August para entrenar, predecir ni verificar IDs. La ingenieria transporta el target y valida su preservacion, conforme al codigo auditado.
+
+La comparacion con los originales historicos no se realizo para respetar la ultima prohibicion de lectura de esos artefactos. La identidad byte a byte exigida del CSV queda demostrada por el hash oficial.
+
+No se modifico competencia_01_final/, .venv ni ningun artefacto historico. No se ejecutaron comandos git ni uploads.

@@ -1,0 +1,33 @@
+#%% celda 1 [código]
+require( "data.table" )
+
+#%% celda 2 [código]
+library(data.table)
+DIR_EXP <- path.expand("~/buckets/b1/exp")
+
+a <- fread(file.path(DIR_EXP, "HT4955-01", "prediccion_promedio.txt"))
+b <- fread(file.path(DIR_EXP, "HT4957-01", "prediccion_promedio.txt"))
+
+tb <- merge(a[, .(numero_de_cliente, pa = prob)],
+            b[, .(numero_de_cliente, pb = prob)],
+            by = "numero_de_cliente")
+stopifnot(nrow(tb) == nrow(a), nrow(tb) == nrow(b))
+
+# blend 50/50 por puestos
+tb[, score := (frank(pa) + frank(pb)) / 2]
+setorder(tb, -score)
+
+# carpeta para los archivos del blend
+dir_blend <- file.path(DIR_EXP, "BLEND-4955-4957")
+dir.create(dir_blend, showWarnings = FALSE)
+
+cortes_blend <- seq(10500, 14500, by = 500)
+
+for (corte in cortes_blend) {
+  archivo <- file.path(dir_blend, paste0("Intentoj_blend_", corte, ".csv"))
+  fwrite(tb[1:corte, .(numero_de_cliente)], archivo, col.names = FALSE)
+
+  chk <- fread(archivo, header = FALSE)
+  stopifnot(nrow(chk) == corte, anyDuplicated(chk$V1) == 0)
+  cat(corte, "OK\n")
+}

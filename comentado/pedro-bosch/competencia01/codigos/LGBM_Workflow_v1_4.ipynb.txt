@@ -1,0 +1,1067 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–23] Celda de texto con el plan de la versión 1.4: optimización con Optuna entrenando
+#   en abril y mayo y validando en junio; revalidación temporal de los 10 trials de mayor valor (abril→mayo y
+#   mayo→junio); validación pseudo público/privado de 5 trials partiendo junio en 25 %/75 %; aumento manual de
+#   algunos hiperparámetros para el entrenamiento con abril, mayo y junio; ensamble de semillas. Indica que se
+#   elimina ccajas_depositos por tener todo cero en mayo.
+#%% celda 1 [texto]
+# LGBM Workflow V1.4
+
+- Esta version optimiza abril+mayo y valida en junio. Busca obtener hiperparametros podados. <br>
+Workflow: <br>
+1) Optimización Optuna con rangos acotados entrenamiento abril+mayo validación en junio.
+2) Validación temporal con SSS, mejores 10 trials, 50-50
+    - Backtest A: Train Abril y Validación Mayo. Priorizar esta para eleccion.
+    - Backest B: Train Mayo y Validación Junio
+3) Elegir los 5 mejores trials previos y validarlos con pseudo-public-private particionando Junio en 25-75. 
+        - Probar primero 50 splits, si es rapido pasar a 500. 
+        - Calcular media de ganancia (total no por mes), desviacion, P10/P25, ranking medio, frecuencia de top-1/top-3, regret. Exponiendo tablas separadas para public y private
+        - El regret es max Gain_private_i - max_gain_private* ("¿qué tan peligroso sería confiar en mi leaderboard público?")
+
+- La idea es incorporar revalidacion temporal y particion publico-privado.
+- Se elimina ccajas_depositos por tener todo cero en mayo
+- Entrenamiento final varia.
+- Predicción y exportación: agosto.
+4) Aumento manual de algunos hiperparametros para entrenamiento definitivo abril+mayo+junio
+        -Podria ser min_sum_hessian_in_leaf, num_boost_round y algunos mas
+5) Ensamble de 10 semillas para modelo final. 
+        -Tambien podria hacerse ensamble de 2 o 3 mejores configuraciones x 6 semillas
+        
+
+# [Anotación · líneas 25–59] Importa pandas, numpy, seaborn, matplotlib, scipy, scikit-learn (árboles,
+#   particiones, random forest, imputación, AUC), lightgbm, joblib, optuna con sus gráficos, y utilidades de
+#   tiempo y pickle.
+#%% celda 2 [texto]
+## Librerias y Dataset
+
+#%% celda 3 [código]
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+
+from tqdm.notebook import tqdm
+
+from scipy.stats import gaussian_kde
+from scipy.stats import ks_2samp
+
+from sklearn.tree import DecisionTreeClassifier, plot_tree,  _tree
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import ShuffleSplit, StratifiedShuffleSplit
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import roc_auc_score
+
+import lightgbm as lgb
+
+
+from joblib import Parallel, delayed
+
+import optuna
+from optuna.visualization import plot_optimization_history, plot_param_importances, plot_slice, plot_contour
+
+from time import time
+from time import perf_counter
+
+import pickle
+
+# [Anotación · líneas 61–81] Tras una celda comentada, define las rutas de la VM (/home/ds/buckets/b1 y sus
+#   subcarpetas datasets, V1/modelos y V1/db), el archivo competencia_01_fe_v3.parquet, la ganancia por acierto
+#   (1.072.500) y el costo por estímulo (27.500), y lee el Parquet completo con pandas.
+#%% celda 4 [código]
+# from pathlib import Path
+
+# print("Directorio de trabajo:", Path.cwd())
+# print("Ruta que se intenta leer:",
+#       Path("buckets/b1/datasets/competencia_01_fe_v3.parquet").resolve())
+
+#%% celda 5 [código]
+base_path = '/home/ds/buckets/b1'
+dataset_path = base_path + '/datasets/'
+modelos_path = base_path + '/V1/modelos/'
+db_path = base_path + '/V1/db/'
+dataset_file = 'competencia_01_fe_v3.parquet'
+#buckets/b1/datasets/competencia_01_fe_v3.parquet
+
+# Métricas
+ganancia_acierto = 1_072_500
+costo_estimulo = 27_500
+
+# Dataframe
+data = pd.read_parquet(dataset_path + dataset_file)
+
+# [Anotación · líneas 83–94] Fija la semilla 12 para numpy y define una lista de 5 semillas (12, 2000, 2001,
+#   2003, 2007). Elimina del dataset todas las columnas cuyo nombre contiene 'ccajas_depositos'.
+#%% celda 6 [código]
+# Semillas
+semilla = 12
+np.random.seed(semilla)
+semillas = [12, 2000, 2001, 2003, 2007] 
+
+#%% celda 7 [código]
+# Se dropean columnas asociadas a ccajas_depositos
+data.drop(
+    columns=data.columns[data.columns.str.contains('ccajas_depositos', regex=False)],
+    inplace=True
+)
+
+# [Anotación · líneas 96–109] Crea clase_peso: 1,00002 para BAJA+2, 1,00001 para BAJA+1 y 1,0 para el resto;
+#   ese peso permite distinguir las clases al calcular la ganancia. Crea dos etiquetas binarias: clase_binaria1
+#   (1 sólo para BAJA+2) y clase_binaria2 (1 para BAJA+1 y BAJA+2).
+#%% celda 8 [texto]
+## Transformaciones Iniciales
+
+#%% celda 9 [código]
+data['clase_peso'] = 1.0
+
+data.loc[data['clase_ternaria'] == 'BAJA+2', 'clase_peso'] = 1.00002
+data.loc[data['clase_ternaria'] == 'BAJA+1', 'clase_peso'] = 1.00001 #este es un truco para poder distinguirlos y calcular correctamente la ganancia
+
+#%% celda 10 [código]
+data['clase_binaria1'] = 0
+data['clase_binaria2'] = 0
+data['clase_binaria1'] = np.where(data['clase_ternaria'] == 'BAJA+2', 1, 0)
+data['clase_binaria2'] = np.where(data['clase_ternaria'] == 'CONTINUA', 0, 1)
+
+# [Anotación · líneas 111–122] lgb_gan_eval es la métrica que recibe LightGBM: asigna 1.072.500 a las filas
+#   con peso 1,00002 (BAJA+2) y −27.500 al resto, ordena por probabilidad descendente, acumula y devuelve el
+#   máximo de la curva (con piso 0). La celda de texto indica que el target agrupa BAJA+1 y BAJA+2 y que la
+#   ganancia premia sólo BAJA+2.
+#%% celda 11 [código]
+# Funcion de ganancia que use cursada anterior
+def lgb_gan_eval(y_pred, data):
+    weight = data.get_weight()
+    ganancia = np.where(weight == 1.00002, ganancia_acierto, 0) - np.where(weight < 1.00002, costo_estimulo, 0)
+    ganancia = ganancia[np.argsort(-y_pred, kind="stable")]
+    ganancia = np.cumsum(ganancia)
+
+    return 'gan_eval', max(0.0, float(np.max(ganancia))), True
+
+#%% celda 12 [texto]
+El target de entrenamiento agrupa BAJA+1 y BAJA+2; la ganancia premia solo BAJA+2.
+
+# [Anotación · líneas 124–143] Define los meses de entrenamiento de la optimización (202104 y 202105) y el mes
+#   de validación (202106). La función de submuestreo de CONTINUA (fracción 0,30) queda comentada.
+#%% celda 13 [texto]
+## Deficiniones temporales
+Entrenamiento: abril y mayo completo
+
+Validación: junio completo.
+
+#%% celda 14 [código]
+# Definición temporal
+meses_train = [202104, 202105]
+mes_valid = 202106
+
+# fraccion_continua = 0.30
+
+# def muestrear_continua(df, fraccion=0.30, seed=12):
+#     bajas = df.loc[df["clase_ternaria"].isin(["BAJA+1", "BAJA+2"])]
+#     continua = df.loc[df["clase_ternaria"] == "CONTINUA"].sample(
+#         frac=fraccion,
+#         random_state=seed,
+#     )
+#     return pd.concat([bajas, continua]).sort_index()
+
+# [Anotación · líneas 145–167] Separa entrenamiento (202104 y 202105) y validación (202106). X_train quita
+#   clase_ternaria, clase_peso y las dos etiquetas binarias; las demás columnas, incluidas numero_de_cliente y
+#   foto_mes, quedan como variables. Arma etiquetas y pesos de cada parte e imprime los tamaños.
+#%% celda 15 [código]
+# Meses de entrenamiento y validación
+train_data = data[data['foto_mes'].isin(meses_train)]
+val_data = data[data['foto_mes'] == mes_valid]
+
+# # Aplicar una sola vez el muestreo sobre los dos meses combinados.
+# train_data = muestrear_continua(
+#     train_data_completo, fraccion_continua, semilla
+# )
+
+X_train = train_data.drop(['clase_ternaria', 'clase_peso', 'clase_binaria1', 'clase_binaria2'], axis=1)
+y_train_binaria1 = train_data['clase_binaria1']
+y_train_binaria2 = train_data['clase_binaria2']
+w_train = train_data['clase_peso']
+
+X_val = val_data.loc[:, X_train.columns]
+y_val_binaria1 = val_data['clase_binaria1']
+y_val_binaria2 = val_data['clase_binaria2']
+w_val = val_data['clase_peso']
+
+print(f'Meses de entrenamiento: {meses_train}')
+print(f'Registros de entrenamiento muestreados: {len(train_data):,}')
+print(f'Mes de validación: {mes_valid} | Registros: {len(val_data):,}')
+
+# [Anotación · líneas 169–182] Celda con notas en comentarios para un experimento posterior: dos folds
+#   temporales (hasta abril → mayo y hasta mayo → junio) y un learning rate mínimo de 0,05.
+#%% celda 16 [texto]
+### 1 ) Optimización 
+
+#%% celda 17 [código]
+# Para siguiente experimento, incorporar:
+# Fold 1
+# Train: hasta abril
+# Valid: mayo
+
+# Fold 2
+# Train: hasta mayo
+# Valid: junio
+
+# y poner learning rate minimo en 0.05
+
+# [Anotación · líneas 184–217] Inicio de objective: Optuna propone num_leaves (5 a 200, escala log),
+#   feature_fraction (0,2 a 0,4), bagging_fraction (0,2 a 0,6), min_gain_to_split (0,01 a 0,85) y
+#   min_sum_hessian_in_leaf (1 a 150, escala log). Quedan fijos learning_rate 0,005, max_bin 31,
+#   min_data_in_leaf 0, bagging_freq 1, feature_fraction_bynode 0,20, is_unbalance True, objetivo binario,
+#   métrica propia y seed 12.
+#%% celda 18 [código]
+#Optuna Version V1.4
+def objective(trial):
+
+    num_leaves = trial.suggest_int('num_leaves', 5, 200, log=True) #ver de reducir para corrida local
+    learning_rate = 0.005 #denicolay
+    # min_data_in_leaf = trial.suggest_int('min_data_in_leaf', 50, 3000) #se puede aumentar en entrenamiento final
+    feature_fraction = trial.suggest_float('feature_fraction', 0.2, 0.4) #poner por debajo de 0.5 para mayor velocidad
+    bagging_fraction = trial.suggest_float('bagging_fraction', 0.2, 0.6) #revisar
+    min_gain_to_split = trial.suggest_float('min_gain_to_split', 0.01, 0.85) #corta splits debiles
+    min_sum_hessian_in_leaf = trial.suggest_float('min_sum_hessian_in_leaf',  1.0, 150.0, log=True) #ver valores
+
+
+    params = { #considerar regularizacion para competencia 2
+        'objective': 'binary',
+        'metric': 'custom',
+        'boosting_type': 'gbdt',
+        'first_metric_only': True,
+        'boost_from_average': True,
+        'feature_pre_filter': False,
+        'max_bin': 31, #bajar a 31. Ver si conviene subir en entrenamiento final
+        'num_leaves': num_leaves,
+        'learning_rate': learning_rate,
+        'min_data_in_leaf': 0, #se fija en cero porque hessiano controla las hojas
+        'feature_fraction': feature_fraction,
+        'bagging_fraction': bagging_fraction,
+        'bagging_freq': 1,
+        'min_gain_to_split': min_gain_to_split,
+        'seed': semilla, #lo modifique a semilla despues de ultima ejecucion
+        'verbose': -1,
+        'feature_fraction_bynode': 0.20, # denicolay
+        'min_sum_hessian_in_leaf': min_sum_hessian_in_leaf,
+        'is_unbalance': True
+    }
+# [Anotación · líneas 218–253] Arma los datasets de LightGBM con clase_binaria2 y clase_peso y entrena hasta
+#   15.000 rondas con early stopping de 1.050 rondas (50 + 5 / learning_rate) sobre la ganancia en junio. Toma
+#   la ronda de mayor ganancia, la guarda en el trial como best_iter junto con los parámetros completos y
+#   devuelve esa ganancia.
+    train_dataset = lgb.Dataset(X_train,
+                              label=y_train_binaria2, # eligir la clase
+                              weight=w_train)
+    val_dataset = lgb.Dataset(X_val,
+                              label=y_val_binaria2,
+                              weight=w_val,
+                              reference=train_dataset)
+
+    # Para almacenar los resultados de evaluación
+    evals_result = {}
+
+    # Crear el callback para guardar resultados
+    record_eval = lgb.record_evaluation(evals_result)
+
+    # Entrenar modelo
+    model = lgb.train(
+        params,
+        train_dataset,
+        valid_sets=[val_dataset],
+        num_boost_round=15000, #para entrenamiento final, usar best_iteration * aumento% de dataset
+       callbacks=[
+            lgb.early_stopping(stopping_rounds=int(50 + 5 / learning_rate)),
+            record_eval],
+        feval=lgb_gan_eval,
+    )
+
+    # Acceder a los resultados de validación 
+    val_gan_history = evals_result['valid_0']['gan_eval']
+    max_gan = max(val_gan_history)
+    best_iter = val_gan_history.index(max_gan) + 1
+
+    # Guardamos cual es la mejor iteración del modelo y parametros
+    trial.set_user_attr("best_iter", best_iter)
+    trial.set_user_attr("params_completos", params.copy())
+
+    return max_gan
+
+# [Anotación · líneas 255–270] Crea (o carga, si ya existe) el estudio
+#   V1_4_train202104_202105_valid202106_full_4 en una base SQLite, con dirección maximizar y TPESampler con
+#   semilla 12 y 20 trials iniciales, y ejecuta 50 trials.
+
+
+Path(db_path).mkdir(parents=True, exist_ok=True)
+storage_name = "sqlite:///" + db_path + "optimization_lgbm_VM_V1_4.db"
+study_name = "V1_4_train202104_202105_valid202106_full_4"
+
+study = optuna.create_study(
+    direction="maximize",
+    study_name=study_name,
+    storage=storage_name,
+    sampler=optuna.samplers.TPESampler(seed=semilla, n_startup_trials=20),
+    load_if_exists=True,
+)
+
+#%% celda 19 [código]
+study.optimize(objective, n_trials=50)   #tarda 10min promedio
+
+# [Anotación · líneas 272–294] Pasa los trials a un DataFrame, muestra los 15 de mayor valor, imprime el trial
+#   de mayor valor con sus parámetros y grafica la historia de optimización, la importancia de hiperparámetros,
+#   los slices y los contornos.
+#%% celda 20 [código]
+# Guardar historial de trials
+df_trials = study.trials_dataframe()
+
+#%% celda 21 [código]
+# Ver historial de trials:
+df_trials.sort_values(by='value', ascending=False).head(15)
+
+#%% celda 22 [código]
+print(study.best_trial)
+print(study.best_params)
+
+#%% celda 23 [código]
+optuna.visualization.plot_optimization_history(study)
+
+#%% celda 24 [código]
+plot_param_importances(study)
+
+#%% celda 25 [código]
+plot_slice(study)
+
+#%% celda 26 [código]
+plot_contour(study)
+
+# [Anotación · líneas 296–328] Reentrena un modelo con los parámetros y el best_iter del trial de mayor valor
+#   sobre abril y mayo y muestra las 30 variables de mayor importancia por gain (tabla con gain y split, y
+#   gráfico). La celda de texto siguiente anota probar eliminando las últimas 700 columnas por importancia.
+#%% celda 27 [código]
+# Feature Importance
+best_trial = study.best_trial
+params = best_trial.user_attrs["params_completos"].copy()
+params.update(study.best_params)
+
+modelo_importancia = lgb.train(
+    params,
+    lgb.Dataset(X_train, label=y_train_binaria2, weight=w_train),
+    num_boost_round=int(best_trial.user_attrs["best_iter"]),
+)
+
+importancias = pd.DataFrame({
+    "variable": modelo_importancia.feature_name(),
+    "gain": modelo_importancia.feature_importance(importance_type="gain"),
+    "split": modelo_importancia.feature_importance(importance_type="split"),
+}).sort_values("gain", ascending=False)
+
+display(importancias.head(30))
+
+lgb.plot_importance(
+    modelo_importancia,
+    importance_type="gain",
+    max_num_features=30,
+    figsize=(10, 10),
+    title=f"Feature importance — Trial {best_trial.number}",
+    xlabel="Gain",
+    ylabel="Variable",
+)
+plt.show()
+
+#%% celda 28 [texto]
+Probar dropeando las ultimas 700 columnas for feature importance
+# [Anotación · líneas 329–357] Selecciona los 10 trials completos de mayor valor (top_trials), arma un
+#   diccionario de trials por número y guarda la lista de columnas del modelo. Fija 5 repeticiones y fracción de
+#   entrenamiento 0,5 para la revalidación; la celda de texto previa menciona 70 %.
+
+#%% celda 29 [texto]
+### 2) Revalidación temporal con SSS — preparación
+
+#%% celda 30 [texto]
+Se seleccionan los diez mejores trials de Optuna. Cada repetición entrena sobre el **70 %**
+del mes de origen, estratificando por las tres clases; el 30 % restante se descarta.
+El mes siguiente se evalúa completo. Los modelos conservan sus parámetros y `best_iter`,
+sin early stopping adicional. El dataset de entrenamiento se construye una vez por repetición. No se construyen datasets de validación.
+
+#%% celda 31 [código]
+# Selección de trials y definición de split y partición
+from time import perf_counter
+
+top_trials = sorted(
+    [t for t in study.trials
+     if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None],
+    key=lambda t: t.value,
+    reverse=True,
+)[:10]
+
+trials_por_numero = {
+    t.number: t for t in study.trials
+    if t.state == optuna.trial.TrialState.COMPLETE
+}
+columnas_modelo = X_train.columns.tolist()
+n_splits_temporal = 5
+fraccion_train_sss = 0.5
+
+
+# [Anotación · líneas 359–384] ganancias_individuales asigna 1.072.500 a BAJA+2 y −27.500 al resto.
+#   mejor_ganancia_ordenada recibe ganancias ya ordenadas y devuelve el máximo de la curva acumulada (incluido
+#   el caso de cero envíos) y su posición. resumen_ganancias agrega por trial media, desvío, P10, P25, mínimo,
+#   máximo y repeticiones, y ordena por media descendente y desvío ascendente.
+def ganancias_individuales(clases):
+    return np.where(
+        np.asarray(clases) == "BAJA+2", ganancia_acierto, -costo_estimulo
+    ).astype(np.float64)
+
+
+def mejor_ganancia_ordenada(ganancias):
+    curva = np.r_[0.0, np.cumsum(ganancias)]
+    corte = int(np.argmax(curva))
+    return float(curva[corte]), corte
+
+
+def resumen_ganancias(df):
+    return (
+        df.groupby("trial")
+        .agg(
+            ganancia_media=("ganancia", "mean"),
+            ganancia_std=("ganancia", "std"),
+            ganancia_p10=("ganancia", lambda x: x.quantile(0.10)),
+            ganancia_p25=("ganancia", lambda x: x.quantile(0.25)),
+            ganancia_min=("ganancia", "min"),
+            ganancia_max=("ganancia", "max"),
+            repeticiones=("ganancia", "size"),
+        )
+        .sort_values(["ganancia_media", "ganancia_std"], ascending=[False, True])
+    )
+
+
+# [Anotación · líneas 387–412] evaluar_backtest_sss toma el mes de origen y el mes de destino completos. Con
+#   StratifiedShuffleSplit (5 repeticiones, 50 % de entrenamiento, semilla 12, estratificado por clase_ternaria)
+#   arma en cada repetición un dataset de LightGBM con la muestra del mes de origen, etiqueta clase_binaria2 y
+#   peso clase_peso.
+def evaluar_backtest_sss(mes_origen, mes_destino, nombre):
+    origen = data.loc[data["foto_mes"] == mes_origen]
+    X_destino = data.loc[data["foto_mes"] == mes_destino, columnas_modelo]
+    ganancias_destino = ganancias_individuales(
+        data.loc[data["foto_mes"] == mes_destino, "clase_ternaria"]
+    )
+    sss = StratifiedShuffleSplit(
+        n_splits=n_splits_temporal,
+        train_size=fraccion_train_sss,
+        random_state=semilla,
+    )
+    resultados = []
+    for fold, (idx_train, _) in enumerate(
+        sss.split(origen, origen["clase_ternaria"]), start=1
+    ):
+        inicio_fold = perf_counter()
+        train_fold = origen.iloc[idx_train]
+        ds_train = lgb.Dataset(
+            train_fold.loc[:, columnas_modelo],
+            label=train_fold["clase_binaria2"],
+            weight=train_fold["clase_peso"],
+            params=top_trials[0].user_attrs["params_completos"].copy(),
+        )
+        ds_train.construct()
+        n_train = len(train_fold)
+        del train_fold
+
+# [Anotación · líneas 414–447] En cada repetición entrena los 10 trials con sus parámetros y su best_iter, sin
+#   early stopping, predice el mes de destino completo, ordena por probabilidad y registra la ganancia máxima de
+#   la curva y su corte. Devuelve el detalle por trial y repetición y el resumen por trial.
+        for trial in top_trials:
+            inicio_trial = perf_counter()
+            params_trial = trial.user_attrs["params_completos"].copy()
+            rondas = int(trial.user_attrs["best_iter"])
+            modelo = lgb.train(
+                params_trial, ds_train,
+                num_boost_round=rondas, keep_training_booster=True,
+            )
+            pred = modelo.predict(X_destino, num_iteration=rondas)
+            orden = np.argsort(-pred, kind="stable")
+            ganancia, corte = mejor_ganancia_ordenada(ganancias_destino[orden])
+            resultados.append({
+                "trial": trial.number, "fold": fold, "backtest": nombre,
+                "mes_train": mes_origen, "mes_valid": mes_destino,
+                "best_iter": rondas, "n_train": n_train,
+                "n_valid": len(X_destino), "ganancia": ganancia,
+                "mejor_corte": corte,
+            })
+            del modelo, pred, orden
+            print(
+                f"{nombre} | Repetición {fold}/{n_splits_temporal} | "
+                f"Trial {trial.number} | Ganancia: ${ganancia:,.0f} | "
+                f"{(perf_counter() - inicio_trial) / 60:.1f} min",
+                flush=True,
+            )
+
+        del ds_train
+        print(
+            f"{nombre} | Repetición {fold}/{n_splits_temporal} completada | "
+            f"{(perf_counter() - inicio_fold) / 60:.1f} min",
+            flush=True,
+        )
+    detalle = pd.DataFrame(resultados)
+    return detalle, resumen_ganancias(detalle)
+
+# [Anotación · líneas 449–467] Ejecuta el backtest A (entrena con muestras de 202104 y evalúa en 202105), que
+#   la celda de texto define como criterio principal, y el backtest B (202105 → 202106), y muestra el resumen y
+#   el detalle de cada uno.
+#%% celda 32 [texto]
+#### 2.A Abril -> Mayo - Criterio Principal
+Los cinco primeros de `resumen_A` son la propuesta
+inicial para el paso 3 (mayor media; menor desvío como desempate).
+
+#%% celda 33 [código]
+df_sss_A, resumen_A = evaluar_backtest_sss(202104, 202105, "A: abril → mayo")
+display(resumen_A.round(2))
+display(df_sss_A)
+
+#%% celda 34 [texto]
+#### 2.B Mayo -> Junio - Diagnóstico Complementario
+Este bloque puede ejecutarse independientemente de 2A, después de la preparación común.
+No modifica la selección de candidatos basada en A.
+
+#%% celda 35 [código]
+df_sss_B, resumen_B = evaluar_backtest_sss(202105, 202106, "B: mayo → junio")
+display(resumen_B.round(2))
+display(df_sss_B)
+
+# [Anotación · líneas 469–490] Une los resúmenes de A y B por trial y dibuja dos boxplots de ganancia por
+#   trial, en el orden del resumen A.
+#%% celda 36 [código]
+# Comparación: conservar el orden de preferencia del backtest A.
+comparacion_temporal = resumen_A.add_suffix("_A").join(
+    resumen_B.add_suffix("_B")
+)
+display(comparacion_temporal.round(2))
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 6), constrained_layout=True)
+orden_trials = resumen_A.index.tolist()
+for ax, detalle, titulo in [
+    (axes[0], df_sss_A, "A: abril → mayo"),
+    (axes[1], df_sss_B, "B: mayo → junio"),
+]:
+    valores = [detalle.loc[detalle["trial"] == t, "ganancia"] for t in orden_trials]
+    ax.boxplot(valores, vert=False, showmeans=True)
+    ax.set_yticks(np.arange(1, len(orden_trials) + 1))
+    ax.set_yticklabels([f"Trial {t}" for t in orden_trials])
+    ax.invert_yaxis()
+    ax.set_title(titulo)
+    ax.set_xlabel("Ganancia total ($)")
+    ax.grid(axis="x", alpha=0.2)
+plt.show()
+
+# [Anotación · líneas 492–519] Tras la celda de texto que define la métrica y el regret, toma como candidatos
+#   los 5 primeros trials del resumen A (la lista [55, 78, 53, 25, 80] queda comentada como alternativa) y fija
+#   la semilla 12.
+#%% celda 37 [texto]
+### 3. Pseudo público/privado en junio
+Editar `trials_evaluar` para indicar los números de trials deseados. Por defecto se proponen
+los cinco mejores de A. Cada candidato se entrena **una vez** con abril + mayo y predice junio.
+Las particiones posteriores reutilizan esas predicciones y los rankings precalculados.
+
+No se estratifica junio, mismas particiones
+para todos los trials. La métrica mantiene la convención anterior: máximo de la curva de ganancia
+en cada subconjunto, incluyendo cero envíos. Por tanto, es un diagnóstico de estabilidad del
+ranking de configuraciones con cortes óptimos retrospectivos; no simula un envío con corte fijo
+ni la transferencia del corte público al privado. Las ganancias son totales de cada subconjunto.
+
+Para cada partición `s`, se elige `t_publico = argmax_t G_publico(s,t)` y se calcula:
+
+`regret_seleccion(s) = max_t G_privado(s,t) - G_privado(s,t_publico)`.
+
+Las tablas por candidato incluyen además el regret contra el mejor candidato de su propio tablero.
+Los empates de ranking se resuelven por número de trial ascendente. Las frecuencias top-1/top-3
+son proporciones entre 0 y 1. El pseudo privado reutiliza junio, ya visto por Optuna;
+sus resultados no son una estimación independiente de agosto.
+
+#%% celda 38 [código]
+# Lista editable: reemplazar por los números de trials que quieras evaluar.
+trials_evaluar = resumen_A.head(5).index.astype(int).tolist()
+# trials_evaluar = [55, 78, 53, 25, 80]
+
+semilla_pp = semilla
+print("Trials para público/privado:", trials_evaluar)
+
+# [Anotación · líneas 521–539] Arma el entrenamiento con 202104 y 202105 completos y los datos de junio
+#   (variables, clases y ganancia individual), y construye un único dataset de LightGBM para todos los
+#   candidatos.
+#%% celda 39 [código]
+# Entrenar solo una vez por candidato; no repetir al pasar de 50 a 500 splits.
+train_pp = data.loc[data["foto_mes"].isin([202104, 202105])]
+X_train_pp = train_pp.loc[:, columnas_modelo]
+mascara_junio = data["foto_mes"] == 202106
+X_junio = data.loc[mascara_junio, columnas_modelo]
+clases_junio = data.loc[mascara_junio, "clase_ternaria"].to_numpy()
+ganancias_junio = ganancias_individuales(clases_junio)
+
+params_dataset_pp = trials_por_numero[trials_evaluar[0]].user_attrs["params_completos"].copy()
+params_dataset_pp["seed"] = semilla_pp
+ds_train_pp = lgb.Dataset(
+    X_train_pp,
+    label=train_pp["clase_binaria2"],
+    weight=train_pp["clase_peso"],
+    params=params_dataset_pp,
+)
+ds_train_pp.construct()
+del train_pp, X_train_pp
+
+# [Anotación · líneas 541–564] Para cada candidato entrena una vez con sus parámetros y su best_iter, predice
+#   junio y guarda las probabilidades, el orden descendente y las ganancias individuales en ese orden.
+predicciones_junio = {}
+ordenes_junio = {}
+ganancias_ordenadas_junio = {}
+for numero_trial in trials_evaluar:
+    inicio = perf_counter()
+    trial = trials_por_numero[numero_trial]
+    params_pp = trial.user_attrs["params_completos"].copy()
+    params_pp["seed"] = semilla_pp
+    rondas = int(trial.user_attrs["best_iter"])
+    modelo = lgb.train(
+        params_pp, ds_train_pp,
+        num_boost_round=rondas, keep_training_booster=True,
+    )
+    pred = modelo.predict(X_junio, num_iteration=rondas)
+    orden = np.argsort(-pred, kind="stable")
+    predicciones_junio[numero_trial] = pred
+    ordenes_junio[numero_trial] = orden
+    ganancias_ordenadas_junio[numero_trial] = ganancias_junio[orden]
+    del modelo
+    print(
+        f"Trial {numero_trial}: predicciones de junio guardadas | "
+        f"{(perf_counter() - inicio) / 60:.1f} min", flush=True,
+    )
+del ds_train_pp
+
+# [Anotación · líneas 566–610] Genera 1.000 particiones aleatorias de junio con ShuffleSplit (25 % público, 75
+#   % privado, semilla 12). En cada partición y para cada candidato calcula la ganancia máxima y el corte en la
+#   parte pública y en la privada, filtrando el ranking ya ordenado. Luego calcula por partición el ranking de
+#   cada trial en cada tablero, si quedó primero o entre los tres primeros y el regret contra el trial de mayor
+#   ganancia del tablero.
+#%% celda 40 [código]
+# Cambiar solamente este valor a 500 y volver a ejecutar desde esta celda.
+from sklearn.model_selection import ShuffleSplit
+
+n_splits_pp = 1000
+
+sss_pp = ShuffleSplit(
+    n_splits=n_splits_pp,
+    test_size=0.75,  # 25 % público y 75 % privado.
+    random_state=semilla,
+)
+
+resultados_pp = []
+inicio_pp = perf_counter()
+
+for split, (idx_public, idx_private) in enumerate(
+    sss_pp.split(X_junio), start=1
+):
+    es_publico = np.zeros(len(X_junio), dtype=bool)
+    es_publico[idx_public] = True
+    for numero_trial in trials_evaluar:
+        # Filtrar un ranking ya ordenado evita ordenar de nuevo en cada split.
+        mascara_ordenada = es_publico[ordenes_junio[numero_trial]]
+        ganancias_ordenadas = ganancias_ordenadas_junio[numero_trial]
+        gain_public, corte_public = mejor_ganancia_ordenada(
+            ganancias_ordenadas[mascara_ordenada]
+        )
+        gain_private, corte_private = mejor_ganancia_ordenada(
+            ganancias_ordenadas[~mascara_ordenada]
+        )
+        resultados_pp.append({
+            "split": split, "trial": numero_trial,
+            "gain_public": gain_public, "gain_private": gain_private,
+            "corte_public": corte_public, "corte_private": corte_private,
+            "n_public": len(idx_public), "n_private": len(idx_private),
+        })
+    # print(f"Público/privado: partición {split}/{n_splits_pp} completada", flush=True)
+
+df_pp = pd.DataFrame(resultados_pp).sort_values(["split", "trial"])
+for tablero in ["public", "private"]:
+    grupo = df_pp.groupby("split")[f"gain_{tablero}"]
+    df_pp[f"ranking_{tablero}"] = grupo.rank(ascending=False, method="first")
+    df_pp[f"top1_{tablero}"] = df_pp[f"ranking_{tablero}"].eq(1)
+    df_pp[f"top3_{tablero}"] = df_pp[f"ranking_{tablero}"].le(3)
+    df_pp[f"regret_{tablero}"] = grupo.transform("max") - df_pp[f"gain_{tablero}"]
+
+
+# [Anotación · líneas 613–636] resumir_tablero agrega por trial media, desvío, P10 y P25 de la ganancia,
+#   ranking medio, frecuencia de top-1 y top-3, regret medio y P90, ordenado por ranking medio. Muestra la tabla
+#   del 25 % público y la del 75 % privado.
+def resumir_tablero(tablero):
+    return (
+        df_pp.groupby("trial")
+        .agg(
+            ganancia_media=(f"gain_{tablero}", "mean"),
+            ganancia_std=(f"gain_{tablero}", "std"),
+            ganancia_p10=(f"gain_{tablero}", lambda x: x.quantile(0.10)),
+            ganancia_p25=(f"gain_{tablero}", lambda x: x.quantile(0.25)),
+            ranking_medio=(f"ranking_{tablero}", "mean"),
+            frecuencia_top1=(f"top1_{tablero}", "mean"),
+            frecuencia_top3=(f"top3_{tablero}", "mean"),
+            regret_medio=(f"regret_{tablero}", "mean"),
+            regret_p90=(f"regret_{tablero}", lambda x: x.quantile(0.90)),
+        )
+        .sort_values(["ranking_medio", "ganancia_media"], ascending=[True, False])
+    )
+
+
+resumen_public = resumir_tablero("public")
+resumen_private = resumir_tablero("private")
+print("PÚBLICO — ganancia total del 25 %")
+display(resumen_public.round(2))
+print("PRIVADO — ganancia total del 75 %")
+display(resumen_private.round(2))
+
+# [Anotación · líneas 638–660] Para cada partición toma el trial que quedó primero en el público y registra su
+#   ganancia y su regret en el privado. Resume media, desvío, mínimo, máximo, P10, P25 y P90, e imprime la
+#   frecuencia de particiones con regret positivo y el tiempo.
+# Regret de CONFIAR EN EL PÚBLICO: seguir al ganador público al tablero privado.
+df_regret = df_pp.loc[df_pp["top1_public"], [
+    "split", "trial", "gain_public", "gain_private", "ranking_private", "regret_private"
+]].rename(columns={
+    "trial": "trial_elegido_publico",
+    "gain_private": "ganancia_privada_elegido",
+    "regret_private": "regret_seleccion",
+}).copy()
+df_regret["mejor_ganancia_privada"] = (
+    df_regret["ganancia_privada_elegido"] + df_regret["regret_seleccion"]
+)
+resumen_regret = df_regret[["regret_seleccion", "ganancia_privada_elegido"]].agg(
+    ["mean", "std", "min", "max"]
+)
+resumen_regret.loc["P10"] = df_regret[["regret_seleccion", "ganancia_privada_elegido"]].quantile(0.10)
+resumen_regret.loc["P25"] = df_regret[["regret_seleccion", "ganancia_privada_elegido"]].quantile(0.25)
+resumen_regret.loc["P90"] = df_regret[["regret_seleccion", "ganancia_privada_elegido"]].quantile(0.90)
+
+print("REGRET — pérdida privada por elegir el ganador público")
+display(resumen_regret.round(2))
+display(df_regret)
+print(f"Frecuencia de regret positivo: {df_regret['regret_seleccion'].gt(0).mean():.1%}")
+print(f"Tiempo de particiones y resúmenes: {perf_counter() - inicio_pp:.1f} s")
+
+# [Anotación · líneas 662–694] Tras la celda de texto sobre los ajustes manuales, fija trial_elegido = 78
+#   (para la curva de referencia), los meses finales 202104, 202105 y 202106, los trials finales 78 y 25 y las 6
+#   semillas 1977, 1978, 2000, 2001, 2003 y 2007. Define los factores 1,5 para min_sum_hessian_in_leaf, 1,1 para
+#   las rondas y 1,5 para min_gain_to_split; el diccionario de ajustes adicionales queda vacío.
+#%% celda 41 [texto]
+### 4. Elección y ajustes manuales del entrenamiento definitivo
+La elección por defecto conserva la prioridad de A entre los trials de la lista evaluada.
+Las tablas público/privado sirven para revisar esa elección; no se selecciona automáticamente
+por el pseudo privado. Editar `trial_elegido` o `trials_finales` para otra decisión.
+
+Los factores comienzan en 1.0: los aumentos son manuales, no proporcionales automáticamente
+al tamaño de los datos. `ajustes_params_finales` permite cambiar otros parámetros de LightGBM.
+Las rondas se modifican en su variable específica. Los ajustes y el ensamble final no están
+revalidados por los resultados previos. El corte de exportación se mantiene manual.
+
+#%% celda 42 [código]
+# trial_elegido = int(resumen_A.loc[resumen_A.index.isin(trials_evaluar)].index[0])
+trial_elegido = 78 #trial individual para la curva de referencia posterior
+
+meses_train_final = [202104, 202105, 202106]
+trials_finales = [78, 25]
+semillas_finales = [1977, 1978, 2000, 2001, 2003, 2007]
+
+# Alternativa: dos o tres configuraciones, cada una con seis semillas.
+# trials_finales = resumen_A.loc[resumen_A.index.isin(trials_evaluar)].head(3).index.tolist()
+# semillas_finales = [12, 2000, 2001, 2003, 2007, 2011]
+
+factor_hessiano_final = 1.5    # Ejemplo: 1.25 aumenta el mínimo un 25 %. En version Abril-Junio utilice 1.5
+factor_rondas_final = 1.1      # Ejemplo: 1.20 aumenta las rondas un 20 %. En version Abril-Junio utilice 1.1
+factor_gain_final = 1.5   #En version Abril-Junio utilice 1.5
+num_boost_round_final = None  # Un entero fija las rondas para todos los trials.
+ajustes_params_finales = {
+    # "min_data_in_leaf": 500,
+    # "min_gain_to_split": 0.7,
+    # "learning_rate": 0.005,
+    # "min_sum_hessian_in_leaf": 100.0,  # Valor absoluto; prevalece sobre el factor.
+}
+
+# [Anotación · líneas 696–715] Para cada trial final copia sus parámetros completos, multiplica
+#   min_sum_hessian_in_leaf y min_gain_to_split por sus factores y calcula las rondas como best_iter × 1,1
+#   redondeado. Muestra la tabla de configuraciones, los meses, las semillas y la cantidad de modelos (2 × 6 =
+#   12).
+configuraciones_finales = []
+for numero_trial in trials_finales:
+    trial = trials_por_numero[numero_trial]
+    params_finales = trial.user_attrs["params_completos"].copy()
+    params_finales["min_sum_hessian_in_leaf"] *= factor_hessiano_final
+    params_finales["min_gain_to_split"] *= factor_gain_final
+    params_finales.update(ajustes_params_finales)
+    rondas = (
+        int(round(trial.user_attrs["best_iter"] * factor_rondas_final))
+        if num_boost_round_final is None else int(num_boost_round_final)
+    )
+    configuraciones_finales.append((numero_trial, params_finales, rondas))
+
+display(pd.DataFrame([
+    {"trial": numero, "rondas": rondas, **params}
+    for numero, params, rondas in configuraciones_finales
+]))
+print("Meses finales:", meses_train_final)
+print("Semillas:", semillas_finales)
+print("Cantidad de modelos:", len(trials_finales) * len(semillas_finales))
+
+# [Anotación · líneas 717–744] Con las predicciones de junio del trial 78 (entrenado con abril y mayo) dibuja
+#   con plotly la curva de ganancia acumulada por cantidad de envíos, marca el máximo e imprime ese corte y su
+#   ganancia.
+#%% celda 43 [texto]
+#### Curva de referencia del trial elegido
+Se reutilizan las predicciones de junio obtenidas entrenando con abril + mayo.
+Esta curva no corresponde al ensamble final ni evalúa un modelo entrenado con junio.
+El máximo orienta la elección manual del corte; no sustituye la validación del ensamble.
+
+#%% celda 44 [código]
+import plotly.graph_objects as go
+
+pred_val = predicciones_junio[trial_elegido]
+orden = ordenes_junio[trial_elegido]
+ganancia_acumulada = np.r_[0.0, np.cumsum(ganancias_junio[orden])]
+mejor_corte = int(np.argmax(ganancia_acumulada))
+mejor_ganancia = float(ganancia_acumulada[mejor_corte])
+limite = min(len(pred_val), max(20_000, int(np.ceil(mejor_corte * 1.10))))
+
+fig = go.Figure(go.Scatter(
+    x=np.arange(limite + 1), y=ganancia_acumulada[:limite + 1],
+    mode="lines", name="Ganancia acumulada",
+))
+fig.add_vline(x=mejor_corte, line_dash="dash", annotation_text=f"Máximo: {mejor_corte:,}")
+fig.update_layout(
+    title=f"Junio — trial {trial_elegido}, entrenado en abril + mayo (antes del ensamble)",
+    xaxis_title="Cantidad de envíos", yaxis_title="Ganancia total ($)",
+    template="plotly_white",
+)
+fig.show()
+print(f"Corte de referencia: {mejor_corte:,} | Ganancia: ${mejor_ganancia:,.0f}")
+
+# [Anotación · líneas 746–781] Arma el entrenamiento final con los meses 202104, 202105 y 202106 (etiqueta
+#   clase_binaria2, peso clase_peso), lee competencia_01_fe_v3_Ago.parquet, filtra 202108 y selecciona las
+#   mismas columnas del modelo. Define el nombre del ensamble (v1_4_ensamble_t78_25_202104_202105_202106) e
+#   inicializa el acumulador de probabilidades. La variable ejecucion_final (fecha y hora en UTC−3) se calcula y
+#   no interviene en el nombre.
+#%% celda 45 [texto]
+### 5. Ensamble final y predicción de agosto
+
+#%% celda 46 [texto]
+Se promedian los scores de todos los modelos con el mismo peso. Cada modelo se guarda en
+`modelos_path` y se libera después de predecir agosto; no se mantienen todos los árboles en RAM.
+Se conserva la ruta de agosto que estaba comentada en el borrador y se activa su lectura.
+El manifiesto guarda configuración, semillas, rondas y archivos para reconstruir el ensamble.
+
+#%% celda 47 [código]
+import json
+
+train_data_final = data.loc[data["foto_mes"].isin(meses_train_final)]
+X_train_final = train_data_final.loc[:, columnas_modelo]
+y_train_final = train_data_final["clase_binaria2"]
+w_train_final = train_data_final["clase_peso"]
+
+mes_prediccion = 202108
+datos_agosto = pd.read_parquet(
+    Path(dataset_path) / "competencia_01_fe_v3_Ago.parquet"
+)
+datos_agosto = datos_agosto.loc[datos_agosto["foto_mes"] == mes_prediccion]
+# Seleccionar las variables de entrenamiento también excluye ccajas_depositos de agosto.
+X_agosto = datos_agosto.loc[:, columnas_modelo]
+
+Path(modelos_path).mkdir(parents=True, exist_ok=True)
+periodo_final = "_".join(str(mes) for mes in meses_train_final)
+trials_texto = "_".join(str(t) for t in trials_finales)
+ejecucion_final = datetime.now(timezone(timedelta(hours=-3))).strftime("%Y%m%d_%H%M%S_%f")
+nombre_ensamble = (
+    f"v1_4_ensamble_t{trials_texto}_{periodo_final}"
+)
+
+proba_agosto = np.zeros(len(X_agosto), dtype=np.float64)
+registros_modelos = []
+total_modelos = len(configuraciones_finales) * len(semillas_finales)
+
+# [Anotación · líneas 783–815] Para cada configuración (2) y cada semilla (6): copia los parámetros con esa
+#   semilla, construye su propio dataset, entrena las rondas fijadas, suma la predicción de agosto al
+#   acumulador, guarda el modelo en un .txt y registra trial, semilla, rondas, árboles entrenados, peso 1/12,
+#   archivo y parámetros.
+for numero_trial, params_base, rondas in configuraciones_finales:
+    for seed in semillas_finales:
+        inicio = perf_counter()
+        params_modelo = params_base.copy()
+        params_modelo["seed"] = int(seed)
+
+        # Dataset propio: permite variar semillas de discretización y parámetros manuales.
+        dataset_final = lgb.Dataset(
+            X_train_final, label=y_train_final, weight=w_train_final,
+            params=params_modelo,
+        )
+        model_final = lgb.train(
+            params_modelo, dataset_final,
+            num_boost_round=rondas, keep_training_booster=True,
+        )
+        proba_agosto += model_final.predict(X_agosto, num_iteration=rondas)
+        archivo_modelo = Path(modelos_path) / (
+            f"{nombre_ensamble}_trial{numero_trial}_seed{seed}.txt" #nombre de archivo
+        )
+        model_final.save_model(str(archivo_modelo))
+        registros_modelos.append({
+            "trial": int(numero_trial), "seed": int(seed),
+            "rondas_solicitadas": rondas,
+            "arboles_entrenados": model_final.current_iteration(),
+            "peso_ensamble": 1 / total_modelos,
+            "archivo": str(archivo_modelo), "params": params_modelo,
+        })
+        del model_final, dataset_final
+        print(
+            f"Modelo {len(registros_modelos)}/{total_modelos} | "
+            f"Trial {numero_trial} | Semilla {seed} | "
+            f"{(perf_counter() - inicio) / 60:.1f} min", flush=True,
+        )
+
+# [Anotación · líneas 817–835] Divide el acumulado por 12, arma el ranking de agosto ordenado por probabilidad
+#   descendente y escribe el manifiesto JSON con el nombre del estudio, los meses de entrenamiento, la lista de
+#   columnas y el registro de cada modelo.
+proba_agosto /= total_modelos
+ranking_agosto = pd.DataFrame({
+    "numero_de_cliente": datos_agosto["numero_de_cliente"].to_numpy(),
+    "probabilidad": proba_agosto,
+}).sort_values("probabilidad", ascending=False, kind="stable").reset_index(drop=True)
+
+archivo_manifiesto = Path(modelos_path) / f"{nombre_ensamble}.json"
+archivo_manifiesto.write_text(
+    json.dumps({
+        "estudio": study.study_name,
+        "meses_train_final": meses_train_final,
+        "columnas": columnas_modelo,
+        "modelos": registros_modelos,
+    }, indent=2, ensure_ascii=False),
+    encoding="utf-8",
+)
+display(pd.DataFrame(registros_modelos).drop(columns="params"))
+print(f"Manifiesto: {archivo_manifiesto}")
+print(f"Clientes de agosto: {len(ranking_agosto):,}")
+
+# [Anotación · líneas 837–855] Define corte_manual = 11.175 y una lista de 19 cortes entre 10.000 y 15.000 que
+#   lo incluye, y la carpeta de salida V1/predicciones/V1.4/v1_4_ensemble78_25_full_1 dentro de la ruta de la
+#   VM.
+#%% celda 48 [texto]
+### 6. Exportación Agosto
+Se conserva exactamente la carpeta de salida del borrador, aunque su nombre haga referencia
+a V1.2/trial56. Los nombres de los archivos identifican el ensamble actual. Se conserva la
+convención de exportar solamente los IDs seleccionados, sin encabezado ni índice.
+`corte_manual` y la grilla de envíos se mantienen editables con los valores del borrador.
+
+#%% celda 49 [código]
+# Exportación: elegir manualmente el corte del ensamble de agosto.
+corte_manual=11175
+cortes = sorted(set([
+    10000, 10500,10700, 10800, 10900, 11000, 11100, 11200, 11300, 11400,
+    11500, 12000, 12500, 13000, 13500, 14000, 14500, 15000,
+    corte_manual,
+]))
+
+# Archivos separados de Desarrollo 1; nombre corto para evitar rutas largas.
+carpeta_salida = Path(base_path) / "V1" / "predicciones" / "V1.4" / "v1_4_ensemble78_25_full_1"  #CAMBIAR ULTIMO ARGUMENTO
+nombre_modelo = nombre_ensamble
+
+
+# [Anotación · líneas 858–905] exportar_cortes escribe, para cada corte, un CSV con los numero_de_cliente de
+#   los primeros N del ranking, sin encabezado ni índice. El nombre incluye el modelo, la cantidad de envíos y
+#   la fecha (UTC−3); el archivo se abre en modo de creación exclusiva y, si ya existe, se prueba con un sufijo
+#   numérico. Devuelve la tabla de archivos generados.
+def exportar_cortes(ranking, cortes, carpeta, nombre_modelo):
+    carpeta = Path(carpeta)
+    carpeta.mkdir(parents=True, exist_ok=True)
+
+    clientes = ranking["numero_de_cliente"]
+
+    # Hora de Argentina (UTC-3).
+    fecha = datetime.now(
+        timezone(timedelta(hours=-3))
+    ).strftime("%Y%m%d")
+
+    archivos = []
+
+    for n_envios in cortes:
+        seleccion = clientes.iloc[:n_envios].astype("int64")
+
+        nombre_base = (
+            f"{nombre_modelo}"
+            f"_{n_envios}_envios"
+            f"_{fecha}"
+        )
+
+        consecutivo = 0
+
+        while True:
+            sufijo = f"_{consecutivo}" if consecutivo else ""
+            archivo = carpeta / f"{nombre_base}{sufijo}.csv"
+
+            # Modo "x": crea el archivo solo si no existe.
+            try:
+                salida = archivo.open(
+                    mode="x", encoding="utf-8", newline=""
+                )
+            except FileExistsError:
+                consecutivo += 1
+                continue
+
+            with salida:
+                seleccion.to_csv(salida, index=False, header=False)
+
+            break
+
+        archivos.append({
+            "envios": n_envios,
+            "archivo": archivo.name,
+        })
+
+    return pd.DataFrame(archivos)
+
+
+# [Anotación · líneas 908–916] Exporta los 19 cortes del ranking de agosto y muestra la carpeta y los archivos
+#   generados.
+archivos_generados = exportar_cortes(
+    ranking=ranking_agosto,
+    cortes=cortes,
+    carpeta=carpeta_salida,
+    nombre_modelo=nombre_modelo,
+)
+
+print(f"Carpeta de salida: {carpeta_salida}")
+display(archivos_generados)
+
+# [Anotación · líneas 918–947] Exporta una segunda tanda con 6 cortes (11.125, 11.150, 11.175, 11.225, 11.250
+#   y 11.275) en una carpeta con el nombre del ensamble.
+#%% celda 50 [código]
+# Exportacion con cortes manuales:
+# Lista editable de cantidades de clientes a contactar.
+cortes_manuales = [
+    11125,
+    11150,
+    11175,
+    11225,
+    11250,
+    11275
+]
+
+carpeta_salida = (
+    Path(base_path)
+    / "V1"
+    / "predicciones"
+    / "V1.4"
+    / nombre_ensamble
+)
+
+archivos_generados = exportar_cortes(
+    ranking=ranking_agosto,
+    cortes=sorted(set(cortes_manuales)),
+    carpeta=carpeta_salida,
+    nombre_modelo=nombre_ensamble,
+)
+
+print(f"Ensamble: {nombre_ensamble}")
+print(f"Carpeta de salida: {carpeta_salida}")
+display(archivos_generados)

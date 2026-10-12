@@ -1,0 +1,49 @@
+{
+  "dataset": "ds3002_rank_total.parquet",
+  "clase": "clase_binaria2",
+  "escalar_min_data_in_leaf": true,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "modo": "produccion",
+  "meses_train": [
+    202104,
+    202105,
+    202106
+  ],
+  "mes_prediccion": 202108,
+  "experimento": 5012,
+  "nombre": "prod_rank_bo4105_con_lag2",
+  "variables": null,
+  "hiperparametros": {
+    "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+  },
+  "n_semillas": 50,
+  "descripcion": "Receta del profesor literal: ds3002 con lag1, lag2, delta1 y delta2 (lag2 vacio en las filas de abril, con datos en mayo, junio y agosto), eleccion de 4105 (p23 de 4104), 50 semillas. Train 202104-202106 -> 202108. Igual que 5011 pero con lag2.",
+  "usar_lag2": true
+}

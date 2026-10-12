@@ -1,0 +1,16 @@
+{
+  "archivo": "ds3003_rank_extra.parquet",
+  "columnas": 771,
+  "MB": 542,
+  "variables_originales": 152,
+  "claves": 16,
+  "nuevas": [
+    "n_apagados",
+    "n_apagados_delta1",
+    "n_apagados_delta2",
+    "n_dejo_de_usar",
+    "ctrx_quarter_rel_max3",
+    "mcaja_ahorro_rel_max3"
+  ],
+  "_minutos": 0.93
+}

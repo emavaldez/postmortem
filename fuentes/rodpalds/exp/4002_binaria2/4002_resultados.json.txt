@@ -1,0 +1,18 @@
+{
+  "minutos_total": 1.0,
+  "ranking": [
+    {
+      "dataset": "crudo",
+      "ganancia_media_M": 408.2,
+      "desvio_M": 8.0,
+      "corte_optimo": 15500
+    },
+    {
+      "dataset": "base",
+      "ganancia_media_M": 403.0,
+      "desvio_M": 10.5,
+      "corte_optimo": 14000
+    }
+  ],
+  "_minutos": 1.03
+}

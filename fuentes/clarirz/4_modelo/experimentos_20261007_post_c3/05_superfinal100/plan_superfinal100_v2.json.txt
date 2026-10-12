@@ -1,0 +1,89 @@
+{
+  "version": "superfinal100_v2",
+  "run": "c1superfinal100v2",
+  "goal_public_gain_millions": 100,
+  "reference_public_model": "C3_ENS11000",
+  "reference_public_gain_millions": 96.06,
+  "target": "BAJA+2_vs_resto",
+  "eval": {
+    "train": [202103, 202104],
+    "month": 202106
+  },
+  "final_score": 202108,
+  "gain": {
+    "hit": 1072500,
+    "cost": 27500,
+    "n_grid": {"min": 8000, "max": 15000, "step": 500},
+    "robust_window": 3
+  },
+  "lightgbm_dataset": {
+    "construct_per_seed": true,
+    "dataset_params": ["max_bin", "seed"],
+    "require_exact_s3_canary": true,
+    "canary_seed": 17,
+    "canary_tolerance": 0.0
+  },
+  "memory": {
+    "minimum_vm_total_gib": 56,
+    "recommended_machine_class": "64GiB RAM",
+    "final_execution": "dataframe_with_dataset_per_seed",
+    "estimate_formula": "(2*n_train+n_score)*n_features*8 + 8GiB",
+    "reserve_gib": 8,
+    "fail_before_final_if_insufficient": true
+  },
+  "seed_partitions": {
+    "representation_screen": [17, 101, 202],
+    "representation_confirm": [303, 404, 505, 606, 707],
+    "recency": [808, 909, 1001, 1102, 1203],
+    "tuning_revalidate": [1304, 1405, 1506, 1607, 1708],
+    "final_confirmation": [17, 101, 202, 303, 404, 505, 606, 707, 808, 909, 1001, 1102, 1203, 1304, 1405, 1506, 1607, 1708, 1809, 1910]
+  },
+  "quality_stage": "reuse_B1_predefined_rule",
+  "representation": {
+    "arms": [
+      "C3", "NOPREST", "C3_OBS", "NOPREST_OBS", "C3_RANK",
+      "NOPREST_RANK", "C3_STATE", "NOPREST_STATE",
+      "NOPREST_OBS_STATE", "NOPREST_RANK_OBS"
+    ],
+    "drop_raw": [
+      "cprestamos_personales", "cprestamos_prendarios", "cprestamos_hipotecarios"
+    ],
+    "blocks": {
+      "OBS": ["disponibilidad", "cobertura_panel"],
+      "RANK": ["ranks"],
+      "STATE": ["estado_numerico", "stocks_productos_deuda", "funciones"]
+    },
+    "screen_min_wins": 2,
+    "confirm_min_wins": 3
+  },
+  "recency": {
+    "policies": {
+      "EXPANDING": {"202103": 1.0, "202104": 1.0},
+      "RECENCY_050": {"202103": 0.5, "202104": 1.0},
+      "RECENCY_025": {"202103": 0.25, "202104": 1.0},
+      "RECENT_ONLY": {"202103": 0.0, "202104": 1.0}
+    }
+  },
+  "tuning": {
+    "trials": 20,
+    "seed": 17,
+    "train": [202103],
+    "eval": 202105,
+    "top_k": 3,
+    "must_revalidate_in_june": true
+  },
+  "confirmation": {
+    "paired_mean_gt": 0,
+    "paired_median_gt": 0,
+    "wins_min": 14,
+    "ensemble_robust_gain_gt_c3": true
+  },
+  "final": {
+    "single_submit": true,
+    "cutoff_source": "confirmation_robust_plateau_center",
+    "no_alt_n": true,
+    "audit_zero_fits_required": true
+  },
+  "no_leaderboard_selection": true,
+  "stop_after_this_experiment": true
+}

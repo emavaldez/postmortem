@@ -1,0 +1,12 @@
+
+===== 031 final M2 2026-10-09 14:11 | train (654066, 866) | 855 columnas (excluidas por PSI>0.2: 8: ['ccajas_depositos_d2', 'mpayroll_d2', 'cpayroll_trx_d2', 'Visa_mlimitecompra_d2', 'Master_mfinanciacion_limite_d2', 'mpayroll_lag2', 'Visa_mfinanciacion_limite_d2', 'cpayroll_trx_lag2']) | 10 semillas × 3 configs =====
+listo M1 top1 (10 semillas, 16 min)
+listo M1 top2 (10 semillas, 30 min)
+listo M1 top3 (10 semillas, 51 min)
+[031 final M2] terminado
+
+===== 031 final M2 2026-10-09 16:50 | train (654066, 866) | 855 columnas (excluidas por PSI>0.2: 8: ['ccajas_depositos_d2', 'mpayroll_d2', 'cpayroll_trx_d2', 'Visa_mlimitecompra_d2', 'Master_mfinanciacion_limite_d2', 'mpayroll_lag2', 'Visa_mfinanciacion_limite_d2', 'cpayroll_trx_lag2']) | 10 semillas × 3 configs | min_data: 50,65,80 =====
+listo M1 top1 (10 semillas, 15 min)
+listo M1 top2 (10 semillas, 30 min)
+listo M1 top3 (10 semillas, 49 min)
+[031 final M2] terminado

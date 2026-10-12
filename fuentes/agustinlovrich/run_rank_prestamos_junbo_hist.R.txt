@@ -1,0 +1,518 @@
+#!/usr/bin/env Rscript
+# =====================================================================================
+#  run_rank_prestamos_junbo_hist.R  —  = junbo + FE HISTORICO (tendencia y promedio de 3 meses
+#                           sobre los rankings). Pipeline de normalizacion por rango + semillerio,
+#                           BO de rangos AMPLIOS (num_leaves hasta 256, hessiano desde 0.0001).
+#                           La foto de junio se arma SIN los prestamos (feats_bo); el final SI los usa.
+#                           7 features por variable (rank, lag1, delta1, lag2, delta2, rank_tend3, rank_avg3).
+# -------------------------------------------------------------------------------------
+#  Normalizacion por rango con signo + exclusion de los prestamos de la BO (reincorporados al final).
+# -------------------------------------------------------------------------------------
+#  QUE HACE, de punta a punta y en UN solo script autocontenido y reproducible:
+#    - Lee el crudo, arma clase_ternaria y clase01.
+#    - dq1: ccajas_depositos = NA solo en 202105.
+#    - Normaliza por rango con signo (por variable y por mes) + retrovisores/diferencias 1 y 2
+#      + FE historico sobre los rankings (tendencia y promedio de 3 meses: rank_tend3, rank_avg3).
+#      Descarta los valores crudos: al arbol solo le llegan columnas transformadas.
+#    - BO (mlrMBO, AUC, train 202103+04 -> valida 202106, sin CV, us=1) SIN los 2 prestamos
+#      -> busca num_iterations, num_leaves, min_sum_hessian_in_leaf.
+#    - Reincorpora las columnas de los 2 prestamos y entrena el modelo FINAL (202103-06)
+#      con los hiperparametros de la BO, 40 semillas (primigenia 100193), sin undersampling.
+#    - FOTO EN JUNIO: modelo train 03+04 -> predice 202106 (con feats_bo, sin prestamos),
+#      curva de ganancia por corte (media/desvio, 10 semillas) para elegir el corte.
+#    - Promedia probabilidades, barre cortes y valida formato.
+#
+#  CRITERIOS DE METODOLOGIA:
+#    - BO SIEMPRE sin undersampling (desacoplada del us final).   - BO con 1 semilla (la primera del lote).
+#    - Prestamos fuera de la BO y reincorporados al final.        - Semillerio final de 40 semillas.
+#    - El corte se decide mirando la curva + la foto de junio.
+#    NO se hace: normalizar tambien los retrovisores, ni ensamble-de-ensambles dentro de este script.
+#
+#  DECISIONES PROPIAS:
+#    - Semilla primigenia 100193 (metodo catedra: criba de primos 1e5..1e6, set.seed, sample).
+#    - us = 1.0 (sin undersampling) en BO y en el train final.
+#    - Las columnas de los 2 prestamos NO entran a la BO pero SI al train final.
+#    - Retrovisores CALENDARIO-exactos: mismo cliente en periodo-1 / periodo-2 (NA si falta el mes).
+#
+#  Uso:   NTHREAD=8 DMEYF_CRUDO=~/crudo.csv Rscript run_rank_prestamos_junbo_hist.R > junbo_hist.log 2>&1
+#  Requiere: data.table, lightgbm y (para la BO) DiceKriging + mlrMBO + smoof + lhs + ParamHelpers.
+# =====================================================================================
+suppressMessages({ library(data.table); library(lightgbm); library(Rcpp) })
+options(scipen = 999)
+set_env_int <- function(name, def){ v <- Sys.getenv(name); if (nzchar(v)) as.integer(v) else as.integer(def) }
+
+# -------------------------------------------------------------------------------------
+#  FE HISTORICO (ventana): tendencia (pendiente por minimos cuadrados) y promedio sobre
+#  los ultimos `ventana` registros de cada cliente. Nucleo en C++ por velocidad.
+#  Requiere que el dataset este ordenado por (numero_de_cliente, foto_mes).
+# -------------------------------------------------------------------------------------
+cppFunction("NumericVector fhistC(NumericVector pcolumna, IntegerVector pdesde )
+{
+  double  x[100] ;
+  double  y[100] ;
+  int n = pcolumna.size();
+  NumericVector out( 5*n );
+  for(int i = 0; i < n; i++)
+  {
+    if( pdesde[i]-1 < i )  out[ i + 4*n ]  =  pcolumna[i-1] ;
+    else                   out[ i + 4*n ]  =  NA_REAL ;
+    int  libre    = 0 ;
+    int  xvalor   = 1 ;
+    for( int j= pdesde[i]-1;  j<=i; j++ )
+    {
+       double a = pcolumna[j] ;
+       if( !R_IsNA( a ) )
+       {
+          y[ libre ]= a ;
+          x[ libre ]= xvalor ;
+          libre++ ;
+       }
+       xvalor++ ;
+    }
+    if( libre > 1 )
+    {
+      double  xsum  = x[0] ;
+      double  ysum  = y[0] ;
+      double  xysum = xsum * ysum ;
+      double  xxsum = xsum * xsum ;
+      double  vmin  = y[0] ;
+      double  vmax  = y[0] ;
+      for( int h=1; h<libre; h++)
+      {
+        xsum  += x[h] ;
+        ysum  += y[h] ;
+        xysum += x[h]*y[h] ;
+        xxsum += x[h]*x[h] ;
+        if( y[h] < vmin )  vmin = y[h] ;
+        if( y[h] > vmax )  vmax = y[h] ;
+      }
+      out[ i ]  =  (libre*xysum - xsum*ysum)/(libre*xxsum -xsum*xsum) ;
+      out[ i + n ]    =  vmin ;
+      out[ i + 2*n ]  =  vmax ;
+      out[ i + 3*n ]  =  ysum / libre ;
+    }
+    else
+    {
+      out[ i       ]  =  NA_REAL ;
+      out[ i + n   ]  =  NA_REAL ;
+      out[ i + 2*n ]  =  NA_REAL ;
+      out[ i + 3*n ]  =  NA_REAL ;
+    }
+  }
+  return  out;
+}")
+
+# agrega <col>_tend<ventana> y/o <col>_avg<ventana> para cada col (dataset ordenado por cliente, mes)
+agrega_historico <- function(dataset, cols, ventana = 3L, tendencia = TRUE, promedio = TRUE){
+  last <- nrow(dataset)
+  vector_ids   <- dataset[["numero_de_cliente"]]
+  vector_desde <- seq(-ventana + 2L, last - ventana + 1L)
+  vector_desde[seq_len(ventana)] <- 1L
+  for (i in 2:last) if (vector_ids[i - 1L] != vector_ids[i]) vector_desde[i] <- i
+  for (i in 2:last) if (vector_desde[i] < vector_desde[i - 1L]) vector_desde[i] <- vector_desde[i - 1L]
+  for (campo in cols) {
+    nc <- fhistC(dataset[[campo]], vector_desde)
+    if (tendencia) set(dataset, j = paste0(campo, "_tend", ventana), value = nc[(0L*last + 1L):(1L*last)])
+    if (promedio)  set(dataset, j = paste0(campo, "_avg",  ventana), value = nc[(3L*last + 1L):(4L*last)])
+  }
+}
+
+# -------------------------------------------------------------------------------------
+#  PARAMETROS (todo lo que define el experimento vive aca)
+# -------------------------------------------------------------------------------------
+PRM <- list()
+PRM$primigenia   <- 100193L
+PRM$crudo        <- Sys.getenv("DMEYF_CRUDO", unset = "crudo.csv")
+PRM$salida       <- Sys.getenv("DMEYF_EXP",   unset = "exp_rank_prestamos_junbo_hist")
+PRM$bucket       <- Sys.getenv("GCS_BUCKET",  unset = "gs://agustin_lovrich_buckito2026")
+PRM$nthread      <- set_env_int("NTHREAD", parallel::detectCores())
+PRM$nseeds       <- set_env_int("NSEEDS", 40L)         # 40 semillas para la prediccion final (pool de 50; se usan las primeras NSEEDS)
+PRM$meses_train  <- c(202103L, 202104L, 202105L, 202106L)   # entrenamiento final
+PRM$mes_futuro   <- 202108L                                  # mes a predecir
+PRM$bo_train     <- c(202103L, 202104L)                      # BO: entrena
+PRM$bo_valid     <- 202106L                                  # BO: valida (sin CV)
+PRM$us           <- 1.0                                      # undersampling CONTINUA (1 = ninguno)
+PRM$prestamos    <- c("cprestamos_personales", "mprestamos_personales")  # se sacan antes de la BO
+PRM$dq_campo     <- "ccajas_depositos"
+PRM$dq_mes       <- 202105L
+PRM$k_modelo     <- 11000L
+PRM$cortes       <- seq(9000L, 13000L, by = 500L)
+# para elegir el corte, observar ademas los ENVIOS OPTIMOS EN JUNIO (mes 6, etiquetado)
+PRM$junio_train  <- c(202103L, 202104L)   # modelo de testeo: entrena 03+04
+PRM$junio_test   <- 202106L               # predice 202106 (tiene clase) -> curva de ganancia
+PRM$junio_nseeds <- 10L                   # 10 semillas para la curva de junio (diagnostico)
+
+# hiperparametros FIJOS de LightGBM (quedan congelados; la BO solo mueve los otros 3)
+PRM$fijos <- list(objective = "binary", metric = "auc", boosting = "gbdt",
+  boost_from_average = TRUE, feature_pre_filter = FALSE, force_row_wise = TRUE,
+  deterministic = TRUE, num_threads = PRM$nthread,          # reproducibilidad + usa NTHREAD
+  verbosity = -100L, max_bin = 31L, min_data_in_leaf = 0L,
+  feature_fraction = 0.50, feature_fraction_bynode = 0.20, learning_rate = 0.005)
+
+# BO: rangos de los 3 bayesianos + presupuesto
+PRM$bo <- list(activar = TRUE, diseno = 10L, iteraciones = 30L, tope_min = 120,
+  iter_min = 600L, iter_max = 3500L, hojas_min = 16L, hojas_max = 256L,   # tope alto de hojas: habilita arboles profundos
+  hess_min = 0.0001, hess_max = 0.03)                                     # piso bajo de hessiano: habilita hojas chicas
+# config de respaldo si la BO falla (valores profundos razonables)
+PRM$respaldo <- list(num_leaves = 44L, min_sum_hessian_in_leaf = 0.0068328532, num_iterations = 1920L)
+
+# anclas de control (aproximadas: avisan, no frenan salvo la clase)
+PRM$ancla_npos_03_05 <- 6083L     # positivos 202103-05 VERIFICADO en competencia_01. Solo AVISA.
+PRM$ancla_vars_bo    <- 150L      # 152 base - 2 prestamos
+PRM$ancla_cols_bo    <- 1050L     # 150 x 7 (rank, lag1, delta1, lag2, delta2, rank_tend3, rank_avg3)
+PRM$ancla_cols_final <- 1064L     # 152 x 7
+
+cat(sprintf("== rank_prestamos == nthread=%d nseeds=%d us=%.2f ==\n", PRM$nthread, PRM$nseeds, PRM$us))
+cat("R:", R.version.string, "| lightgbm", as.character(packageVersion("lightgbm")),
+    "| data.table", as.character(packageVersion("data.table")), "\n")
+
+# -------------------------------------------------------------------------------------
+#  SEMILLAS (metodo catedra con la primigenia 100193) + verificacion
+# -------------------------------------------------------------------------------------
+primos_en_rango <- function(a, b){ x <- rep(TRUE, b); x[1] <- FALSE
+  for (i in 2:floor(sqrt(b))) if (x[i]) x[seq(i*i, b, by = i)] <- FALSE
+  p <- which(x); p[p >= a] }
+set.seed(PRM$primigenia)
+semillas_pool <- sample(primos_en_rango(100000L, 1000000L), 50L)   # 50 semillas via criba + muestreo con la primigenia
+ctrl_semillas <- c(467473L,754373L,564671L,248189L,373721L,437243L,905161L,391619L,289841L,961159L,
+                   670639L,635021L,850207L,975433L,740939L,723103L,889519L,161599L,535219L,373193L)
+if (!all(semillas_pool[seq_len(20L)] == ctrl_semillas)) stop("el sorteo de semillas (primigenia 100193) NO es reproducible: reviso antes de seguir")
+if (PRM$nseeds > 50L) stop("NSEEDS > 50: ampliar el pool de semillas")
+SEMILLAS <- semillas_pool[seq_len(PRM$nseeds)]
+cat("semillas:", paste(SEMILLAS, collapse = " "), "\n")
+
+dir.create(PRM$salida, showWarnings = FALSE, recursive = TRUE)
+
+# -------------------------------------------------------------------------------------
+#  1) LECTURA DEL CRUDO + controles
+# -------------------------------------------------------------------------------------
+if (!file.exists(PRM$crudo)) stop("no encuentro el crudo en: ", PRM$crudo)
+cat("leyendo", PRM$crudo, "...\n"); ds <- fread(PRM$crudo)
+cat("filas:", nrow(ds), "| columnas:", ncol(ds), "\n")
+chr <- names(ds)[vapply(ds, is.character, logical(1))]
+chr <- setdiff(chr, "clase_ternaria")
+if (length(chr) > 0) stop("hay columnas de texto en el crudo: ", paste(chr, collapse = ", "))
+# control de meses: 202107 hace falta para los lags de 202108 y la clase de 202106
+faltan <- setdiff(c(202103L,202104L,202105L,202106L,202107L,202108L), unique(ds$foto_mes))
+if (length(faltan) > 0) stop("faltan meses en el crudo: ", paste(faltan, collapse = ", "))
+
+# -------------------------------------------------------------------------------------
+#  2) CLASE_TERNARIA (por cliente y mes calendario)
+#     BAJA+1: no esta el mes siguiente | BAJA+2: esta el siguiente pero no a +2 | CONTINUA: resto
+# -------------------------------------------------------------------------------------
+if (!"clase_ternaria" %in% names(ds)) {
+  ds[, periodo := as.integer(foto_mes/100L)*12L + foto_mes %% 100L]
+  cm_key <- as.numeric(ds$numero_de_cliente) * 1e5 + ds$periodo
+  if (anyDuplicated(cm_key) > 0) stop("hay mas de una fila por cliente y mes")
+  sigue1 <- (cm_key + 1) %in% cm_key       # el cliente reaparece al mes siguiente
+  sigue2 <- (cm_key + 2) %in% cm_key       # el cliente reaparece dos meses despues
+  pmax   <- max(ds$periodo)
+  ds[, clase_ternaria := NA_character_]
+  obs <- ds$periodo <= (pmax - 2L)        # solo donde el futuro es totalmente observable
+  ds[obs &  sigue1 &  sigue2, clase_ternaria := "CONTINUA"]
+  ds[obs &  sigue1 & !sigue2, clase_ternaria := "BAJA+2"]
+  ds[obs & !sigue1,           clase_ternaria := "BAJA+1"]
+  ds[, periodo := NULL]; rm(cm_key, sigue1, sigue2)
+}
+if (ds[foto_mes %in% PRM$meses_train & is.na(clase_ternaria), .N] > 0) stop("hay meses de train sin clase_ternaria")
+
+# -------------------------------------------------------------------------------------
+#  3) dq1 + clase01 + (se sacan los prestamos ANTES DE NADA)
+# -------------------------------------------------------------------------------------
+if (PRM$dq_campo %in% names(ds)) {
+  ds[foto_mes == PRM$dq_mes, (PRM$dq_campo) := NA]
+  cat("dq1:", PRM$dq_campo, "no-NA en", PRM$dq_mes, "=",
+      ds[foto_mes == PRM$dq_mes, sum(!is.na(get(PRM$dq_campo)))], "(debe ser 0)\n")
+}
+ds[, clase01 := as.integer(clase_ternaria %in% c("BAJA+1", "BAJA+2"))]
+npos <- ds[foto_mes %in% c(202103L,202104L,202105L) & clase01 == 1L, .N]
+cat("npos 202103-05 =", npos, "| ancla =", PRM$ancla_npos_03_05,
+    if (npos == PRM$ancla_npos_03_05) "-> OK\n" else "-> *** DIFIERE ***\n")
+if (npos != PRM$ancla_npos_03_05) cat("*** AVISO: npos difiere del ancla", PRM$ancla_npos_03_05, "-> revisar el dato/clase antes de interpretar (no freno) ***\n")
+
+# -------------------------------------------------------------------------------------
+#  4) NORMALIZACION POR RANGO CON SIGNO (una variable, dentro de cada mes) -> columnas _rank
+#     Mantiene el signo y deja el cero quieto: faltante -> faltante; cero -> cero;
+#     los valores > 0 se mapean al intervalo (0,1] segun su posicion relativa, y los < 0
+#     a [-1,0) segun la posicion de su modulo. Se aplica a las 152 variables base. Los 2
+#     prestamos se normalizan igual, pero sus columnas no entran a la BO y recien se suman
+#     al entrenamiento final (como la normalizacion es por variable, el numero no cambia).
+# -------------------------------------------------------------------------------------
+ranking_signado <- function(x){
+  out  <- rep(NA_real_, length(x))
+  hay  <- !is.na(x)
+  out[hay & x == 0] <- 0
+  pos <- hay & x > 0; if (any(pos)) out[pos] <-  frank(x[pos],  ties.method = "average") / sum(pos)
+  neg <- hay & x < 0; if (any(neg)) out[neg] <- -frank(-x[neg], ties.method = "average") / sum(neg)
+  out
+}
+no_feature <- c("numero_de_cliente", "foto_mes", "clase_ternaria", "clase01")
+base_vars  <- setdiff(names(ds), no_feature)
+cat("variables base:", length(base_vars), "(incluye los 2 prestamos)\n")
+
+setorder(ds, numero_de_cliente, foto_mes)
+cols_rk <- paste0(base_vars, "_rank")
+cat("normalizando por rango, mes a mes...\n")
+ds[, (cols_rk) := lapply(.SD, ranking_signado), by = foto_mes, .SDcols = base_vars]
+gc()
+
+# -------------------------------------------------------------------------------------
+#  5) RETROVISORES 1 y 2 y sus diferencias, sobre las columnas normalizadas
+#     retro_k = el mismo cliente k meses atras en el calendario (faltante si ese mes no esta)
+#     dif_k   = valor del mes - retro_k
+# -------------------------------------------------------------------------------------
+ds[, .periodo := as.integer(foto_mes/100L)*12L + foto_mes %% 100L]
+cli_mes <- as.numeric(ds$numero_de_cliente) * 1e5 + ds$.periodo   # identificador cliente+mes, exacto bajo 2^53
+if (anyDuplicated(cli_mes) > 0) stop("hay mas de una fila por cliente y mes (al calcular retrovisores)")
+prev1 <- match(cli_mes - 1, cli_mes)     # posicion del mes inmediato anterior del mismo cliente
+prev2 <- match(cli_mes - 2, cli_mes)     # posicion de dos meses atras
+ds[, .periodo := NULL]; rm(cli_mes)
+
+cat("retrovisores y diferencias...\n")
+for (k in seq_along(base_vars)) {
+  v  <- ds[[cols_rk[k]]]
+  set(ds, j = paste0(base_vars[k], "_lag1"),   value = v[prev1])
+  set(ds, j = paste0(base_vars[k], "_delta1"), value = v - v[prev1])
+  set(ds, j = paste0(base_vars[k], "_lag2"),   value = v[prev2])
+  set(ds, j = paste0(base_vars[k], "_delta2"), value = v - v[prev2])
+  if (k %% 25L == 0L) { cat("  ", k, "/", length(base_vars), "\n"); invisible(gc(verbose = FALSE)) }
+}
+rm(prev1, prev2); gc()
+
+# -------------------------------------------------------------------------------------
+#  5.5) FE HISTORICO: tendencia (pendiente 3 meses) y promedio (3 meses) sobre los rankings
+#       -> columnas <var>_rank_tend3 y <var>_rank_avg3 (ventana posicional por cliente)
+# -------------------------------------------------------------------------------------
+setorder(ds, numero_de_cliente, foto_mes)   # fhistC usa ventana posicional: requiere orden cliente, mes
+cat("FE historico (tend3 + avg3) sobre los rankings...\n")
+invisible(data.table::setalloccol(ds, ncol(ds) + 2L * length(cols_rk) + 64L))   # pre-aloca slots: set() dentro de la funcion no puede crecer el DT
+agrega_historico(ds, cols = cols_rk, ventana = 3L, tendencia = TRUE, promedio = TRUE)
+cat("  columnas historicas creadas:", 2L * length(cols_rk), "\n")
+invisible(gc(verbose = FALSE))
+
+# -------------------------------------------------------------------------------------
+#  6) Se descartan los valores crudos: al arbol solo le llegan las columnas transformadas.
+# -------------------------------------------------------------------------------------
+ds[, (base_vars) := NULL]
+feats_all  <- c(paste0(base_vars,"_rank"), paste0(base_vars,"_lag1"), paste0(base_vars,"_delta1"),
+                paste0(base_vars,"_lag2"), paste0(base_vars,"_delta2"),
+                paste0(base_vars,"_rank_tend3"), paste0(base_vars,"_rank_avg3"))   # 7 por variable
+feats_prest <- unlist(lapply(PRM$prestamos, function(v) paste0(v, c("_rank","_lag1","_delta1","_lag2","_delta2","_rank_tend3","_rank_avg3"))))
+feats_bo   <- setdiff(feats_all, feats_prest)   # BO: SIN los 2 prestamos
+stopifnot(all(feats_all %in% names(ds)))
+cat(sprintf("features totales: %d (ancla ~%d) | features BO: %d (ancla %d)\n",
+            length(feats_all), PRM$ancla_cols_final, length(feats_bo), PRM$ancla_cols_bo))
+
+# -------------------------------------------------------------------------------------
+#  Seleccion de filas (undersampling us; con us=1 entran todos los CONTINUA)
+# -------------------------------------------------------------------------------------
+set.seed(PRM$primigenia); azar <- runif(nrow(ds))
+es_pos <- ds$clase_ternaria %in% c("BAJA+1", "BAJA+2")
+r_train <- which(ds$foto_mes %in% PRM$meses_train & !is.na(ds$clase_ternaria) & (azar <= PRM$us | es_pos))
+r_boTr  <- which(ds$foto_mes %in% PRM$bo_train    & !is.na(ds$clase_ternaria))   # la BO SIEMPRE sin undersampling
+r_boVa  <- which(ds$foto_mes == PRM$bo_valid)
+r_fut   <- which(ds$foto_mes == PRM$mes_futuro)
+rm(azar, es_pos)
+
+y_train  <- ds$clase01[r_train]
+y_boTr   <- ds$clase01[r_boTr]
+y_boVa   <- ds$clase01[r_boVa]
+cl_boVa  <- ds$clase_ternaria[r_boVa]
+ids_fut  <- ds$numero_de_cliente[r_fut]
+if (anyDuplicated(ids_fut) > 0) stop("hay numero_de_cliente repetidos en 202108")
+
+mat_boTr <- as.matrix(ds[r_boTr, ..feats_bo])
+mat_boVa <- as.matrix(ds[r_boVa, ..feats_bo])
+cat(sprintf("BO: train %d filas (%d pos) -> valida %d (%d BAJA+2 reales)\n",
+            length(r_boTr), sum(y_boTr), length(r_boVa), sum(cl_boVa == "BAJA+2")))
+
+# =====================================================================================
+#  7) BAYESIAN OPTIMIZATION (mlrMBO, AUC, sin CV) -> num_iterations, num_leaves, hessiano
+# =====================================================================================
+f_cfg <- file.path(PRM$salida, "bo_mejor_config.csv")
+auc_mw <- function(p, y){ rr <- frank(p, ties.method = "average")   # AUC via estadistico de Mann-Whitney
+  n1 <- sum(y == 1L); n0 <- length(y) - n1
+  (sum(rr[y == 1L]) - n1*(n1+1)/2) / (n1*n0) }
+# ganancia: se LOGUEA junto al AUC en la BO (NO cambia la seleccion, que sigue por AUC). La usa tambien junio.
+GANA_B2 <- 1072500; GANA_NO <- -27500
+gan_corte <- function(prob, clase, k){ o <- order(-prob)[seq_len(k)]; sum(ifelse(clase[o] == "BAJA+2", GANA_B2, GANA_NO)) }
+f_evals <- file.path(PRM$salida, "bo_evaluaciones.csv")
+
+if (!file.exists(f_cfg)) {
+  if (!PRM$bo$activar) {
+    fwrite(data.table(fuente = "respaldo_profundo", num_leaves = PRM$respaldo$num_leaves,
+      min_sum_hessian_in_leaf = PRM$respaldo$min_sum_hessian_in_leaf,
+      num_iterations = PRM$respaldo$num_iterations, auc = NA_real_), f_cfg)
+  } else {
+    ok <- tryCatch({
+      for (pk in c("DiceKriging","mlrMBO","smoof","lhs","ParamHelpers")) {
+        if (!requireNamespace(pk, quietly = TRUE)) install.packages(pk, repos = "https://cloud.r-project.org")
+      }
+      suppressMessages({ library(DiceKriging); library(mlrMBO); library(smoof) })
+      dbo <- lgb.Dataset(mat_boTr, label = y_boTr, free_raw_data = FALSE,
+        params = list(max_bin = PRM$fijos$max_bin, min_data_in_leaf = 0L, feature_pre_filter = FALSE, verbosity = -100L))
+      t_bo <- Sys.time(); it <- 0L
+      if (file.exists(f_evals)) invisible(file.remove(f_evals))   # log limpio para esta BO
+      objetivo <- function(x){
+        it <<- it + 1L; t0 <- Sys.time()
+        pr <- PRM$fijos
+        pr$num_leaves <- as.integer(x$num_leaves)
+        pr$min_sum_hessian_in_leaf <- as.numeric(x$min_sum_hessian_in_leaf)
+        pr$seed <- SEMILLAS[1]   # la BO corre con 1 semilla (la primera del lote)
+        m  <- lgb.train(params = pr, data = dbo, nrounds = as.integer(x$num_iterations), verbose = -1L)
+        pv <- predict(m, mat_boVa)
+        a  <- auc_mw(pv, y_boVa)                                        # <- lo que OPTIMIZA la BO (sin cambios)
+        g_ref  <- gan_corte(pv, cl_boVa, PRM$k_modelo) / 1e6           # ganancia INFORMATIVA al corte de referencia
+        g_best <- max(sapply(PRM$cortes, function(k) gan_corte(pv, cl_boVa, k))) / 1e6   # mejor ganancia del barrido
+        seg <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+        fwrite(data.table(iter = it, num_iterations = as.integer(x$num_iterations), num_leaves = pr$num_leaves,
+                          min_sum_hessian_in_leaf = pr$min_sum_hessian_in_leaf, auc = a,
+                          gan_ref = g_ref, gan_best = g_best, segundos = round(seg, 1)),
+               f_evals, append = file.exists(f_evals), col.names = !file.exists(f_evals))
+        cat(sprintf("[BO %d] hojas %d | hess %.5f | arb %d -> AUC %.5f | gan@%d %.1fM | gan_best %.1fM\n",
+                    it, pr$num_leaves, pr$min_sum_hessian_in_leaf, as.integer(x$num_iterations), a, PRM$k_modelo, g_ref, g_best))
+        rm(m); invisible(gc(verbose = FALSE)); a
+      }
+      espacio <- makeParamSet(
+        makeIntegerParam("num_iterations",          lower = PRM$bo$iter_min, upper = PRM$bo$iter_max),
+        makeIntegerParam("num_leaves",              lower = PRM$bo$hojas_min, upper = PRM$bo$hojas_max),
+        makeNumericParam("min_sum_hessian_in_leaf", lower = PRM$bo$hess_min,  upper = PRM$bo$hess_max))
+      fun <- makeSingleObjectiveFunction(fn = objetivo, par.set = espacio,
+        minimize = FALSE, noisy = TRUE, has.simple.signature = FALSE)
+      ctrl <- makeMBOControl()
+      ctrl <- setMBOControlTermination(ctrl, iters = PRM$bo$iteraciones, time.budget = PRM$bo$tope_min * 60)
+      ctrl <- setMBOControlInfill(ctrl, crit = makeMBOInfillCritEI())
+      surr <- makeLearner("regr.km", predict.type = "se", covtype = "matern3_2", control = list(trace = FALSE))
+      set.seed(SEMILLAS[1]); dis <- ParamHelpers::generateDesign(n = PRM$bo$diseno, par.set = espacio, fun = lhs::maximinLHS)
+      cat("inicio BO:", format(Sys.time(), "%X"), "| tope", PRM$bo$tope_min, "min\n")
+      set.seed(SEMILLAS[1]); res <- mbo(fun = fun, design = dis, learner = surr, control = ctrl)
+      best <- res$x
+      fwrite(data.table(fuente = "BO_AUC", num_leaves = as.integer(best$num_leaves),
+        min_sum_hessian_in_leaf = as.numeric(best$min_sum_hessian_in_leaf),
+        num_iterations = as.integer(best$num_iterations), auc = res$y), f_cfg)
+      cat("BO lista en", round(as.numeric(difftime(Sys.time(), t_bo, units = "mins")),1), "min | mejor AUC", round(res$y,5), "\n")
+      if (file.exists(f_evals)) { ev <- fread(f_evals)
+        if (nrow(ev) >= 3L) cat(sprintf("** relacion AUC<->ganancia en la BO: cor(auc, gan_best) = %.3f (n=%d evals) | config elegida por AUC **\n",
+                                        suppressWarnings(cor(ev$auc, ev$gan_best)), nrow(ev))) }
+      rm(dbo); invisible(gc()); TRUE
+    }, error = function(e){ cat("*** la BO fallo:", conditionMessage(e), "-> uso config de respaldo ***\n"); FALSE })
+    if (!ok && !file.exists(f_cfg)) fwrite(data.table(fuente = "respaldo_BOfallo",
+      num_leaves = PRM$respaldo$num_leaves, min_sum_hessian_in_leaf = PRM$respaldo$min_sum_hessian_in_leaf,
+      num_iterations = PRM$respaldo$num_iterations, auc = NA_real_), f_cfg)
+  }
+} else cat("bo_mejor_config.csv ya existe: no repito la BO\n")
+
+cfg <- fread(f_cfg)
+HIP <- list(num_leaves = as.integer(cfg$num_leaves[1]),
+            min_sum_hessian_in_leaf = as.numeric(cfg$min_sum_hessian_in_leaf[1]),
+            num_iterations = as.integer(cfg$num_iterations[1]))
+cat(sprintf("hiperparametros finales [%s]: hojas %d | hess %.8f | arboles %d\n",
+            cfg$fuente[1], HIP$num_leaves, HIP$min_sum_hessian_in_leaf, HIP$num_iterations))
+rm(mat_boTr, mat_boVa); gc()
+
+# =====================================================================================
+#  7.5) ENVIOS OPTIMOS EN JUNIO: modelo de testeo, train 202103+04 -> predice 202106.
+#       FOTO JUNIO con feats_bo (1050, SIN prestamos). El FINAL de 202108 sigue con feats_all (1064).
+#       Da la curva de ganancia (media y desvio entre semillas) para ELEGIR el corte.
+# =====================================================================================
+sem_jun <- SEMILLAS[seq_len(min(PRM$junio_nseeds, PRM$nseeds))]   # GANA_B2/GANA_NO/gan_corte ya definidos arriba (BO)
+r_junTr <- which(ds$foto_mes %in% PRM$junio_train & !is.na(ds$clase_ternaria))   # 03+04 sin US
+r_junTe <- which(ds$foto_mes == PRM$junio_test)                                   # 202106
+mat_junTr <- as.matrix(ds[r_junTr, ..feats_bo]); y_junTr <- ds$clase01[r_junTr]   # FOTO JUNIO: SIN prestamos (1050 feats)
+mat_junTe <- as.matrix(ds[r_junTe, ..feats_bo]); cl_junTe <- ds$clase_ternaria[r_junTe]
+djun <- lgb.Dataset(mat_junTr, label = y_junTr, free_raw_data = FALSE,
+  params = list(max_bin = PRM$fijos$max_bin, min_data_in_leaf = 0L, feature_pre_filter = FALSE, verbosity = -100L))
+Pjun <- matrix(0, nrow(mat_junTe), length(sem_jun))
+cat("--- modelo de JUNIO (", length(sem_jun), "semillas) ---\n")
+for (j in seq_along(sem_jun)) {
+  pr <- c(PRM$fijos, list(num_leaves = HIP$num_leaves, min_sum_hessian_in_leaf = HIP$min_sum_hessian_in_leaf, seed = sem_jun[j]))
+  m  <- lgb.train(params = pr, data = djun, nrounds = HIP$num_iterations, verbose = -1L)
+  Pjun[, j] <- predict(m, mat_junTe)
+  cat("  [junio] semilla", sem_jun[j], "ok (", j, "/", length(sem_jun), ")\n"); rm(m); invisible(gc(verbose = FALSE))
+}
+G <- sapply(PRM$cortes, function(k) sapply(seq_along(sem_jun), function(j) gan_corte(Pjun[, j], cl_junTe, k)))
+curva <- data.table(corte = PRM$cortes,
+  gan_media    = colMeans(G) / 1e6,
+  gan_desvio   = (if (length(sem_jun) > 1) apply(G, 2, sd) else rep(0, length(PRM$cortes))) / 1e6,
+  gan_ensamble = sapply(PRM$cortes, function(k) gan_corte(rowMeans(Pjun), cl_junTe, k)) / 1e6)
+fwrite(curva, file.path(PRM$salida, "curva_junio_junbo_hist.csv"))
+opt <- curva[which.max(gan_ensamble)]
+cat("\n=== ENVIOS OPTIMOS EN JUNIO (202106) ===\n"); print(curva)
+cat(sprintf("corte optimo (ensamble): %d -> %.1f M | referencia corte 10500: %.1f M\n",
+            opt$corte, opt$gan_ensamble, curva[corte == 10500L, gan_ensamble]))
+tryCatch({
+  png(file.path(PRM$salida, "curva_junio_junbo_hist.png"), width = 1050, height = 650, res = 110)
+  plot(curva$corte, curva$gan_ensamble, type = "o", pch = 19, lwd = 2, col = "#1f6feb",
+       xlab = "corte (envios)", ylab = "ganancia junio (M $)", main = "Envios optimos en JUNIO (train 03+04 -> predice 06)")
+  points(opt$corte, opt$gan_ensamble, col = "red", pch = 19, cex = 1.6)
+  abline(v = 10500, lty = 3, col = "gray40"); grid(); dev.off()
+}, error = function(e) cat("(no se pudo graficar junio:", conditionMessage(e), ")\n"))
+rm(mat_junTr, mat_junTe, djun, Pjun); gc()
+
+# =====================================================================================
+#  8-9) ENTRENAMIENTO FINAL (202103-06, 1064 features con prestamos reincorporados)
+#       N semillas (NSEEDS, default 40), mismos hiperparametros, promedio de probabilidades.
+# =====================================================================================
+mat_train <- as.matrix(ds[r_train, ..feats_all])
+mat_fut   <- as.matrix(ds[r_fut,   ..feats_all])
+rm(ds); gc()
+dtrain <- lgb.Dataset(mat_train, label = y_train, free_raw_data = FALSE,
+  params = list(max_bin = PRM$fijos$max_bin, min_data_in_leaf = 0L, feature_pre_filter = FALSE, verbosity = -100L))
+cat(sprintf("train final: %d filas, %d features (prestamos reincorporados)\n", nrow(mat_train), ncol(mat_train)))
+
+dir_mod <- file.path(PRM$salida, "modelos"); dir.create(dir_mod, showWarnings = FALSE)
+P <- matrix(0, length(ids_fut), length(SEMILLAS))
+for (j in seq_along(SEMILLAS)) {
+  s <- SEMILLAS[j]
+  f_prob <- file.path(dir_mod, sprintf("prob_s%d.csv", s))
+  if (file.exists(f_prob)) { P[, j] <- fread(f_prob)$prob; cat("  semilla", s, "ya estaba\n"); next }
+  pr <- c(PRM$fijos, list(num_leaves = HIP$num_leaves, min_sum_hessian_in_leaf = HIP$min_sum_hessian_in_leaf, seed = s))
+  m  <- lgb.train(params = pr, data = dtrain, nrounds = HIP$num_iterations, verbose = -1L)
+  P[, j] <- predict(m, mat_fut)
+  fwrite(data.table(numero_de_cliente = ids_fut, prob = P[, j]), f_prob)
+  cat(sprintf("  semilla %d ok (%d/%d)\n", s, j, length(SEMILLAS))); rm(m); invisible(gc(verbose = FALSE))
+}
+
+# =====================================================================================
+#  10-12) ENSAMBLE (promedio de probabilidades) + barrido de cortes + por-modelo
+# =====================================================================================
+prob_ens <- rowMeans(P)
+pred <- data.table(numero_de_cliente = as.integer(ids_fut), prob = prob_ens)
+setorder(pred, -prob)
+fwrite(pred, file.path(PRM$salida, "predicciones_202108_junbo_hist.csv"))
+
+dir_ent <- file.path(PRM$salida, "entrega"); dir.create(dir_ent, showWarnings = FALSE)
+escribir <- function(ids, archivo) fwrite(data.table(as.integer(ids)), archivo, col.names = FALSE)
+for (k in PRM$cortes) {
+  dk <- file.path(dir_ent, sprintf("corte_%d", k)); dir.create(dk, showWarnings = FALSE)
+  for (j in seq_along(SEMILLAS)) {
+    env <- ids_fut[order(-P[, j])][seq_len(k)]
+    escribir(env, file.path(dk, sprintf("lovrich_s%d.csv", SEMILLAS[j])))
+  }
+  escribir(pred$numero_de_cliente[seq_len(k)], file.path(dk, "lovrich_ensamble.csv"))
+}
+cat("submits escritos en", dir_ent, "\n")
+
+# =====================================================================================
+#  13) VALIDACION DE FORMATO
+# =====================================================================================
+csvs <- list.files(dir_ent, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+mal <- 0L
+for (f in csvs) {
+  x <- readLines(f)
+  ok <- length(x) >= 8000 && length(x) <= 13000 && all(grepl("^[0-9]+$", x)) &&
+        !anyDuplicated(x) && all(as.integer(x) %in% ids_fut)
+  if (!ok) { cat("FORMATO MAL:", f, "\n"); mal <- mal + 1L }
+}
+if (mal > 0) stop(mal, " archivos no pasan la validacion de formato") else cat("formato OK en", length(csvs), "archivos\n")
+
+# -------------------------------------------------------------------------------------
+#  Subida opcional al bucket
+# -------------------------------------------------------------------------------------
+if (nzchar(PRM$bucket)) {
+  cat("subiendo al bucket...\n")
+  system(sprintf("gcloud storage cp --recursive %s %s/dmeyf_comp01/submits/rank_prestamos_junbo_hist/ >/dev/null 2>&1", dir_ent, PRM$bucket))
+  system(sprintf("gcloud storage cp %s %s/dmeyf_comp01/ >/dev/null 2>&1",
+                 file.path(PRM$salida, "predicciones_202108_junbo_hist.csv"), PRM$bucket))
+}
+cat("DONE_JUNBO_HIST\n")

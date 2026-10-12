@@ -1,0 +1,75 @@
+import json
+from pathlib import Path
+import unittest
+import numpy as np
+
+from cluster_aware_common import (
+    make_weights,gain_from_hits,paired_summary,choose_screen_winner
+)
+
+
+HERE=Path(__file__).resolve().parent
+
+class TestClusterAware(unittest.TestCase):
+
+    def test_frozen_plan_contract(self):
+        p=json.loads((HERE/"plan.json").read_text())
+        self.assertEqual(p["version"],"v1_frozen")
+        self.assertEqual(p["fixed_n"],13500)
+        self.assertTrue(p["c2_only_result_is_not_an_input"])
+        self.assertTrue(p["stages"]["august"]["no_auto_submit"])
+        self.assertEqual(set(p["arms"]),{"CONTROL","C25_FOCUSED","DIFFICULTY_JUNE","BALANCED_CAPPED"})
+
+    def test_static_recipes_cover_all_clusters(self):
+        from cluster_aware_common import STATIC_RECIPES
+        for recipe in STATIC_RECIPES.values():
+            self.assertEqual(set(recipe),{1,2,3,4,5})
+
+    def test_runner_does_not_depend_on_c2_only(self):
+        src=(HERE/"run_cluster_aware.py").read_text()
+        self.assertNotIn("c1c2weighted",src)
+        self.assertIn('"cluster_labels_used_at_scoring":False',src)
+
+    def test_one_swap_gain(self):
+        self.assertEqual(gain_from_hits(101)-gain_from_hits(100),1_100_000)
+
+    def test_positive_mass_conserved_static(self):
+        y=np.array([1,1,1,1,1,0,0],dtype=np.int8)
+        pc=np.array([1,2,3,4,5,0,0],dtype=np.int8)
+        base=np.array([1,1,1,1,1,1,1],dtype=float)
+        w,d=make_weights(y,pc,base,"DIFFICULTY_JUNE")
+        self.assertAlmostEqual(d["positive_mass_before"],d["positive_mass_after"],places=12)
+        self.assertAlmostEqual(w[y==1].sum(),5.0,places=12)
+
+    def test_positive_mass_conserved_recency(self):
+        y=np.array([1,1,1,1,1,1,0],dtype=np.int8)
+        pc=np.array([1,2,3,4,5,2,0],dtype=np.int8)
+        base=np.array([.5,.5,.5,.5,.5,1,1],dtype=float)
+        w,d=make_weights(y,pc,base,"C25_FOCUSED")
+        self.assertAlmostEqual(w[y==1].sum(),base[y==1].sum(),places=12)
+
+    def test_balanced_capped_raw_bounds(self):
+        y=np.array([1]*10+[1]*5+[1]*2+[1]*1+[1]*1,dtype=np.int8)
+        pc=np.array([1]*10+[2]*5+[3]*2+[4]+[5],dtype=np.int8)
+        base=np.ones(len(y))
+        _,d=make_weights(y,pc,base,"BALANCED_CAPPED")
+        raw=list(d["raw_recipe"].values())
+        self.assertTrue(all(.5 <= x <= 4.0 for x in raw))
+
+    def test_choose_winner_requires_pass(self):
+        rows=[
+            {"arm":"CONTROL","passed":True,"ensemble_gain":10,"delta_c25_captured":0,"paired_median":0},
+            {"arm":"A","passed":False,"ensemble_gain":99,"delta_c25_captured":9,"paired_median":9},
+            {"arm":"B","passed":True,"ensemble_gain":20,"delta_c25_captured":1,"paired_median":1},
+        ]
+        self.assertEqual(choose_screen_winner(rows),"B")
+
+    def test_paired(self):
+        p=paired_summary([3,5,7],[2,5,4])
+        self.assertEqual(p["wins"],2)
+        self.assertEqual(p["ties"],1)
+        self.assertGreater(p["median"],0)
+
+
+if __name__=="__main__":
+    unittest.main()

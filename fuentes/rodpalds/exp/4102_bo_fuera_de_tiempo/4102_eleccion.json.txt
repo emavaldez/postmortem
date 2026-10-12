@@ -1,0 +1,29 @@
+{
+  "origen": "4102 prueba_117",
+  "params": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "max_bin": 31,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "deterministic": true,
+    "force_row_wise": true,
+    "verbose": -1,
+    "learning_rate": 0.0841955833978562,
+    "num_leaves": 81,
+    "min_data_in_leaf": 3994,
+    "feature_fraction": 0.20103345480390813,
+    "bagging_fraction": 0.23230822267251724,
+    "lambda_l1": 0.0013403511313236994,
+    "lambda_l2": 0.005891768464365107
+  },
+  "arboles": 181,
+  "fraccion_mes_referencia": 1.0,
+  "variables": "4003_canaritos/4003_variables_p95.txt",
+  "evidencia": {
+    "meseta_B_elegido_M": 418.2,
+    "meseta_B_z601_M": 384.0,
+    "mejor_retador": "prueba_117",
+    "semillas_ganadas_por_el_mejor_retador": "10/10"
+  }
+}

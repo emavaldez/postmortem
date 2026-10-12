@@ -1,0 +1,13 @@
+{
+  "pruebas": 150,
+  "eleccion": "4105 p23_4104",
+  "evidencia": {
+    "meseta_B_elegido_M": 427.2,
+    "referencia": "p23_4104",
+    "meseta_B_referencia_M": 427.2,
+    "meseta_B_z601_M": 372.6,
+    "mejor_retador_segun_A": "prueba_88",
+    "semillas_ganadas_por_el_retador": "0/20"
+  },
+  "_minutos": 46.96
+}

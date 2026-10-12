@@ -1,0 +1,21 @@
+{
+  "experimento": 6011,
+  "nombre": "zulip_final_5015",
+  "descripcion": "Archivos para el bot del modelo con las indicaciones del profesor (5015): 11.000 a 13.500 envios.",
+  "modo": "final",
+  "fuente": "5015_prod_profesor_mar_jun",
+  "envios": [
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500
+  ],
+  "max_archivos": 20,
+  "clientes_esperados": 164647,
+  "_config": "6011_zulip_final_5015.json",
+  "_fecha_inicio": "2026-10-10 02:42:19",
+  "_script": "10_entrega_zulip.py",
+  "_git_commit": "sin_git"
+}

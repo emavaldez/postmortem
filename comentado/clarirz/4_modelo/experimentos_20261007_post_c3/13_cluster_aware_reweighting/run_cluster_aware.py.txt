@@ -1,0 +1,679 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–25] Importaciones; agrega al camino de importación su carpeta y la de
+#   `05_superfinal100` y carga `cluster_aware_common` (A), `super_common` (C), `run_superfinal100` (V1) y
+#   `superfinal100_v2` (V2).
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import fcntl
+import gc
+import json
+import os
+from pathlib import Path
+import sys
+
+import numpy as np
+import pandas as pd
+
+HERE=Path(__file__).resolve().parent
+SF_CODE=HERE.parent/"05_superfinal100"
+if str(HERE) not in sys.path:
+    sys.path.insert(0,str(HERE))
+if str(SF_CODE) not in sys.path:
+    sys.path.insert(0,str(SF_CODE))
+
+import cluster_aware_common as A
+import super_common as C
+import run_superfinal100 as V1
+import superfinal100_v2 as V2
+
+# [Anotación · líneas 27–44] Corrida `c1clusteraware01`, plan `plan.json`, las 20 semillas, las de la prueba
+#   de mayo (17, 101, 202) y las de la primera confirmación (808, 909, 1001, 1102, 1203). `_source_identity`
+#   devuelve la identidad de SUPERFINAL escrita en el plan o, con la variable de entorno `CLAW2_REPLICA=1`, la
+#   de `AUDITORIA_FINAL.json` de la corrida presente. `CODE_SHA` es el hash del propio script.
+RUN="c1clusteraware01"
+PLAN=A.load_json(HERE/"plan.json")
+SEEDS20=[17,101,202,303,404,505,606,707,808,909,1001,1102,1203,1304,1405,1506,1607,1708,1809,1910]
+SCREEN_SEEDS=[17,101,202]
+CONFIRM5_SEEDS=[808,909,1001,1102,1203]
+def _source_identity() -> str:
+    """Identidad del SUPERFINAL padre. Historica por defecto; con CLAW2_REPLICA=1 se toma la de la
+    corrida de SUPERFINAL presente en $HOME (su AUDITORIA_FINAL.json), para replicar en otra maquina."""
+    hist=PLAN["source_superfinal"]["identity"]
+    if os.environ.get("CLAW2_REPLICA")!="1":
+        return hist
+    audit=A.load_json(Path(os.environ.get("CLAW2_HOME",Path.home()))/"c1superfinal100v2/AUDITORIA_FINAL.json")
+    A.require(audit.get("status")=="AUDIT_OK","Modo replica: SUPERFINAL sin AUDIT_OK")
+    return str(audit["identity"])
+
+
+SOURCE_IDENTITY=_source_identity()
+CODE_SHA=A.digest(Path(__file__))
+
+
+# [Anotación · líneas 47–66] `positive_cluster_vector` asigna a cada fila BAJA+2 el grupo de su cliente (0
+#   para las demás) y se detiene si algún BAJA+2 no tiene grupo. `base_weight_vector` traduce el peso por mes a
+#   un peso por fila.
+def positive_cluster_vector(ids,y,cluster_by_id: dict[int,int]) -> np.ndarray:
+    ids=np.asarray(ids,dtype=np.int64)
+    y=np.asarray(y,dtype=np.int8)
+    out=np.zeros(len(ids),dtype=np.int8)
+    pos=np.flatnonzero(y==1)
+    missing=[]
+    for i in pos:
+        k=cluster_by_id.get(int(ids[i]))
+        if k is None:
+            missing.append(int(ids[i]))
+        else:
+            out[i]=int(k)
+    A.require(not missing,f"BAJA+2 sin cluster: {missing[:10]} (n={len(missing)})")
+    A.require(np.all(np.isin(out[pos],A.CLUSTERS)),"Cluster positivo fuera de 1..5")
+    return out
+
+
+def base_weight_vector(months: np.ndarray,weights_by_month: dict[int,float]) -> np.ndarray:
+    months=np.asarray(months,dtype=np.int64)
+    return np.asarray([float(weights_by_month.get(int(m),0.0)) for m in months],dtype=np.float64)
+
+
+# [Anotación · líneas 69–76] `load_cluster_map` lee el CSV de grupos y exige las columnas `numero_de_cliente`
+#   y `cluster_ref`, sin clientes repetidos y con los grupos 1 a 5 presentes.
+def load_cluster_map(path: Path) -> tuple[pd.DataFrame,dict[int,int]]:
+    z=pd.read_csv(path)
+    A.require({"numero_de_cliente","cluster_ref"}<=set(z.columns),"CSV clusters incompleto")
+    A.require(not z.numero_de_cliente.duplicated().any(),"CSV clusters con IDs duplicados")
+    z["numero_de_cliente"]=z.numero_de_cliente.astype("int64")
+    z["cluster_ref"]=z.cluster_ref.astype("int8")
+    A.require(set(z.cluster_ref.unique())==set(A.CLUSTERS),"Clusters esperados 1..5 no presentes")
+    return z,{int(r.numero_de_cliente):int(r.cluster_ref) for r in z.itertuples(index=False)}
+
+
+# [Anotación · líneas 79–99] `source` lee los resultados de las seis etapas de SUPERFINAL y su auditoría,
+#   exige `AUDIT_OK`, la identidad esperada, que la etapa 4 haya promovido y que su corte sea 13.500, y devuelve
+#   la lista de variables, los parámetros, las rondas y la política de pesos por mes.
+def source(home: Path) -> dict:
+    sf=home/"c1superfinal100v2"
+    audit=A.load_json(sf/"AUDITORIA_FINAL.json")
+    s0=A.load_json(sf/"stage0_quality/RESULT.json")
+    s1=A.load_json(sf/"stage1_representation/RESULT.json")
+    s2=A.load_json(sf/"stage2_recency/RESULT.json")
+    s3=A.load_json(sf/"stage3_tuning/RESULT.json")
+    s4=A.load_json(sf/"stage4_confirm20/RESULT.json")
+    s5=A.load_json(sf/"stage5_final/RESULT.json")
+    A.require(audit.get("status")=="AUDIT_OK","SUPERFINAL sin AUDIT_OK")
+    A.require(audit.get("identity")==SOURCE_IDENTITY,"Identity audit distinta al plan")
+    A.require(s5.get("identity")==SOURCE_IDENTITY,"Identity Stage5 distinta al plan")
+    A.require(s4.get("promote_to_august") is True,"SUPERFINAL Stage4 no promovio")
+    A.require(int(s4.get("n_final"))==A.N_FIXED==int(s5.get("n")),"N fuente no es 13500")
+    features=A.load_json(Path(s1["winner_features_file"]))["features"]
+    A.require(len(features)>0,"Sin features fuente")
+    return {
+        "root":sf,"audit":audit,"s0":s0,"s1":s1,"s2":s2,"s3":s3,"s4":s4,"s5":s5,
+        "features":features,"params":dict(s3["params"]),"rounds":int(s3["rounds"]),
+        "policy":str(s2["winner_policy"]),
+    }
+
+
+# [Anotación · líneas 102–115] `load_sf_control` lee los puntajes de 202106 del candidato de la etapa 4 de
+#   SUPERFINAL para las semillas pedidas y valida que clientes y clase coincidan.
+def load_sf_control(sf: Path,seeds: list[int],ids: np.ndarray,y: np.ndarray) -> dict[int,np.ndarray]:
+    out={}
+    root=sf/"stage4_confirm20/candidate"
+    for seed in seeds:
+        cp=root/f"seed_{seed}.npz"
+        A.require(cp.is_file(),f"Falta control SF seed={seed}")
+        with np.load(cp,allow_pickle=False) as z:
+            zid=np.asarray(z["ids"],dtype=np.int64)
+            zy=np.asarray(z["y"],dtype=np.int8)
+            sc=np.asarray(z["scores"],dtype=np.float64)
+        A.require(np.array_equal(zid,ids) and np.array_equal(zy,y),f"Control SF desalineado seed={seed}")
+        A.require(np.isfinite(sc).all(),f"Control SF no finito seed={seed}")
+        out[seed]=sc.copy()
+    return out
+
+
+# [Anotación · líneas 118–189] `train_scores` calcula los pesos por fila del brazo con `make_weights`,
+#   descarta filas de peso 0 y, para cada semilla, reutiliza el `.npz`, copia un puntaje heredado o entrena un
+#   LightGBM con dataset propio de la semilla (parámetros y rondas de SUPERFINAL); guarda puntajes, brazo,
+#   semilla y el detalle de pesos.
+def train_scores(
+    data: dict,
+    train_ids: np.ndarray,
+    pc_train: np.ndarray,
+    arm: str,
+    base_weights: np.ndarray,
+    features: list[str],
+    params: dict,
+    rounds: int,
+    seeds: list[int],
+    out_dir: Path,
+    identity: str,
+    reuse_scores: dict[int,np.ndarray]|None=None,
+) -> tuple[dict[int,np.ndarray],dict]:
+    import lightgbm as lgb
+
+    reuse_scores=reuse_scores or {}
+    weights,weight_detail=A.make_weights(data["y_train"],pc_train,base_weights,arm)
+    keep=weights>0
+    A.require(keep.any(),"Pesos dejaron train vacio")
+    x=(
+        data["x_train"] if bool(np.all(keep))
+        else data["x_train"].loc[keep].reset_index(drop=True)
+    )
+    y=np.asarray(data["y_train"],dtype=np.int8)[keep]
+    w=weights[keep]
+    ids_eval=np.asarray(data["ids"],dtype=np.int64)
+    y_eval=np.asarray(data["y_eval"],dtype=np.int8)
+
+    out_dir.mkdir(parents=True,exist_ok=True)
+    result={}
+    for i,seed in enumerate(seeds,1):
+        cp=out_dir/f"seed_{seed}.npz"
+        if cp.is_file():
+            with np.load(cp,allow_pickle=False) as z:
+                A.require(str(z["identity"].item())==identity,f"CP identity seed={seed}")
+                A.require(str(z["arm"].item())==arm,f"CP arm seed={seed}")
+                A.require(int(z["seed"].item())==seed,f"CP seed interno {seed}")
+                A.require(np.array_equal(z["ids"],ids_eval) and np.array_equal(z["y"],y_eval),
+                          f"CP keys seed={seed}")
+                sc=np.asarray(z["scores"],dtype=np.float64)
+            A.require(np.isfinite(sc).all(),"CP scores no finitos")
+            result[seed]=sc.copy()
+            print(f"REUSAR {arm} {i}/{len(seeds)} seed={seed}",flush=True)
+            continue
+
+        if seed in reuse_scores:
+            sc=np.asarray(reuse_scores[seed],dtype=np.float64)
+            A.require(sc.shape==ids_eval.shape and np.isfinite(sc).all(),"Reuse score invalido")
+            reused=True
+            print(f"COPIAR {arm} {i}/{len(seeds)} seed={seed}",flush=True)
+        else:
+            print(f"ENTRENAR {arm} {i}/{len(seeds)} seed={seed}",flush=True)
+            ds,seed_params=V2.dataset_for_seed(x,y,w,features,params,seed)
+            model=lgb.train(seed_params,ds,num_boost_round=int(rounds))
+            sc=np.asarray(model.predict(data["x_eval"],num_threads=C.THREADS),dtype=np.float64)
+            A.require(sc.shape==ids_eval.shape and np.isfinite(sc).all(),"Scores nuevos invalidos")
+            del model,ds
+            gc.collect()
+            reused=False
+
+        tmp=cp.with_suffix(".tmp")
+        with tmp.open("wb") as fh:
+            np.savez_compressed(
+                fh,identity=np.array(identity),arm=np.array(arm),seed=np.array(seed),
+                ids=ids_eval,y=y_eval,scores=sc,reused=np.array(reused),
+                weight_detail=np.array(json.dumps(weight_detail,sort_keys=True))
+            )
+        tmp.replace(cp)
+        result[seed]=sc.copy()
+
+    return result,weight_detail
+
+
+# [Anotación · líneas 192–230] `evaluate` calcula las métricas en el corte 13.500 por semilla y para el
+#   promedio de semillas. `comparison_row` arma la fila de comparación contra el control: diferencias de
+#   ganancia, de BAJA+2 incluidos y de incluidos por grupo, resumen pareado, y `passed` si la ganancia y los
+#   incluidos de los grupos 2 y 5 aumentan, la mediana pareada es positiva y se alcanza el mínimo de semillas a
+#   favor.
+def evaluate(ids,y,pc_eval,score_by_seed,seeds) -> tuple[dict,list[dict],np.ndarray]:
+    rows=[]
+    for seed in seeds:
+        m=A.topn_metrics(ids,y,score_by_seed[seed],pc_eval,A.N_FIXED)
+        rows.append({"seed":seed,**m})
+    ens=np.vstack([score_by_seed[s] for s in seeds]).mean(axis=0,dtype=np.float64)
+    em=A.topn_metrics(ids,y,ens,pc_eval,A.N_FIXED)
+    return em,rows,ens
+
+
+def comparison_row(arm,cand,ctrl,cand_seed_rows,ctrl_seed_rows,min_wins) -> dict:
+    pair=A.paired_summary(
+        [r["gain"] for r in cand_seed_rows],
+        [r["gain"] for r in ctrl_seed_rows],
+    )
+    row={
+        "arm":arm,
+        "ensemble_gain":int(cand["gain"]),
+        "control_gain":int(ctrl["gain"]),
+        "delta_gain":int(cand["gain"]-ctrl["gain"]),
+        "ensemble_hits":int(cand["hits"]),
+        "control_hits":int(ctrl["hits"]),
+        "delta_hits":int(cand["hits"]-ctrl["hits"]),
+        "ensemble_c25_captured":int(cand["c25_captured"]),
+        "control_c25_captured":int(ctrl["c25_captured"]),
+        "delta_c25_captured":int(cand["c25_captured"]-ctrl["c25_captured"]),
+        "paired_mean":pair["mean"],"paired_median":pair["median"],
+        "paired_sd":pair["sd"],"paired_wins":pair["wins"],
+        "paired_ties":pair["ties"],"paired_losses":pair["losses"],
+    }
+    for k in A.CLUSTERS:
+        row[f"c{k}_captured"]=int(cand[f"c{k}_captured"])
+        row[f"control_c{k}_captured"]=int(ctrl[f"c{k}_captured"])
+        row[f"delta_c{k}_captured"]=int(cand[f"c{k}_captured"]-ctrl[f"c{k}_captured"])
+    row["passed"]=bool(
+        arm!="CONTROL" and row["delta_gain"]>0 and row["delta_c25_captured"]>0
+        and row["paired_median"]>0 and row["paired_wins"]>=min_wins
+    )
+    return row
+
+
+# [Anotación · líneas 233–272] `preflight` registra los hashes del CSV de grupos, del plan y del código (y, si
+#   ya hay un preflight guardado, exige que no hayan cambiado). Verifica que haya 4.067 clientes BAJA+2 en
+#   202103–202106 y que el CSV de grupos contenga exactamente esos clientes; guarda tamaños de grupo, cantidad
+#   de variables, parámetros, rondas, política y corte fijo.
+def preflight(home: Path,cluster_path: Path) -> dict:
+    out=home/RUN/"stage0_preflight"
+    rp=out/"RESULT.json"
+    A.require(cluster_path.is_file(),f"Falta CSV clusters: {cluster_path}")
+    current_inputs={
+        "cluster_sha256":A.digest(cluster_path),
+        "plan_sha256":A.digest(HERE/"plan.json"),
+        "runner_sha256":CODE_SHA,
+        "common_sha256":A.digest(HERE/"cluster_aware_common.py"),
+    }
+    if rp.is_file():
+        old=A.load_json(rp)
+        A.require(old.get("status")=="PREFLIGHT_OK","Preflight cacheado inválido")
+        A.require(old.get("source_identity")==SOURCE_IDENTITY,"Fuente cambió desde preflight")
+        for key,value in current_inputs.items():
+            A.require(old.get(key)==value,f"Input cambió después del preflight: {key}")
+        return old
+    src=source(home)
+    clusters,cmap=load_cluster_map(cluster_path)
+    labels=pd.read_parquet(home/"c1m1femasiva03_s3/resultados_s1/fe_bank_dev/etiquetas.parquet")
+    mature=labels[labels.foto_mes.isin([202103,202104,202105,202106])]
+    b2=mature[mature.clase_ternaria.eq("BAJA+2")]
+    A.require(len(b2)==4067 and b2.numero_de_cliente.nunique()==4067,"Cohorte BAJA+2 madura inesperada")
+    got=set(b2.numero_de_cliente.astype("int64"))
+    have=set(clusters.numero_de_cliente.astype("int64"))
+    A.require(got==have,"reference_labels no coincide exactamente con BAJA+2 marzo-junio")
+    counts=clusters.cluster_ref.value_counts().sort_index().to_dict()
+    result={
+        "status":"PREFLIGHT_OK","run":RUN,"source_identity":SOURCE_IDENTITY,
+        "cluster_file":str(cluster_path),**current_inputs,
+        "n_cluster_labels":int(len(clusters)),
+        "cluster_counts":{str(int(k)):int(v) for k,v in counts.items()},
+        "features_sha256":A.fingerprint(src["features"]),
+        "n_features":len(src["features"]),
+        "params":src["params"],"rounds":src["rounds"],"policy":src["policy"],
+        "fixed_n":A.N_FIXED,
+        "methodological_status":"DIAGNOSTIC_INFORMED_COMPETITIVE_NOT_INDEPENDENT_TEMPORAL_VALIDATION",
+    }
+    A.write_json(rp,result)
+    return result
+
+
+# [Anotación · líneas 275–332] `stage1_screen` (prueba de mayo): entrena con 202103 y evalúa en 202105 los
+#   cuatro brazos (CONTROL, C25_FOCUSED, DIFFICULTY_JUNE y BALANCED_CAPPED) con 3 semillas y peso base 1.
+#   Compara cada brazo con CONTROL con un mínimo de 2 semillas a favor y elige, entre los que pasan, el de mayor
+#   ganancia del promedio de semillas. Escribe `comparison.csv`, `seed_metrics.csv`, `weight_details.json` y
+#   `RESULT.json`.
+def stage1_screen(home: Path,cluster_path: Path) -> dict:
+    root=home/RUN/"stage1_screen"
+    rp=root/"RESULT.json"
+    if rp.is_file():
+        return A.load_json(rp)
+    src=source(home)
+    ctx=C.preflight_base(home)
+    _,cmap=load_cluster_map(cluster_path)
+    data=C.load_fold(ctx,src["features"],[202103],202105,Path(src["s0"]["eval_bank"]))
+    labels=pd.read_parquet(ctx["paths"]["bank_orig"]/"etiquetas.parquet")
+    trlab=labels[labels.foto_mes.eq(202103)].reset_index(drop=True)
+    A.require(len(trlab)==len(data["y_train"]),"Screen train labels desalineadas")
+    train_ids=trlab.numero_de_cliente.to_numpy(np.int64)
+    pc_train=positive_cluster_vector(train_ids,data["y_train"],cmap)
+    pc_eval=positive_cluster_vector(data["ids"],data["y_eval"],cmap)
+    base=np.ones(len(train_ids),dtype=np.float64)
+
+    stage_identity=A.fingerprint({
+        "run":RUN,"stage":1,"plan":PLAN,"source":SOURCE_IDENTITY,"code_sha":CODE_SHA,
+        "features":A.fingerprint(src["features"]),"params":src["params"],"rounds":src["rounds"],
+        "train":[202103],"eval":202105,"seeds":SCREEN_SEEDS,
+    })
+    all_scores={}
+    weight_details={}
+    metrics={}
+    seedrows={}
+    for arm in A.ARMS:
+        aid=A.fingerprint({"parent":stage_identity,"arm":arm})
+        sc,wd=train_scores(
+            data,train_ids,pc_train,arm,base,src["features"],src["params"],src["rounds"],
+            SCREEN_SEEDS,root/"scores"/arm,aid
+        )
+        em,sr,_=evaluate(data["ids"],data["y_eval"],pc_eval,sc,SCREEN_SEEDS)
+        all_scores[arm]=sc; weight_details[arm]=wd; metrics[arm]=em; seedrows[arm]=sr
+
+    control=metrics["CONTROL"]; cseed=seedrows["CONTROL"]
+    rows=[]
+    for arm in A.ARMS:
+        if arm=="CONTROL":
+            row=comparison_row("CONTROL",control,control,cseed,cseed,2)
+            row["passed"]=True
+        else:
+            row=comparison_row(arm,metrics[arm],control,seedrows[arm],cseed,2)
+        rows.append(row)
+    winner=A.choose_screen_winner(rows)
+    frame=pd.DataFrame(rows)
+    frame.to_csv(root/"comparison.csv",index=False)
+    pd.DataFrame([
+        {"arm":arm,**r} for arm in A.ARMS for r in seedrows[arm]
+    ]).to_csv(root/"seed_metrics.csv",index=False)
+    A.write_json(root/"weight_details.json",weight_details)
+    result={
+        "status":"SCREEN_PASS" if winner else "STOP_NO_SCREEN_WINNER",
+        "identity":stage_identity,"winner":winner,"fixed_n":A.N_FIXED,
+        "seeds":SCREEN_SEEDS,"rows":rows,"weight_details":weight_details,
+    }
+    A.write_json(rp,result)
+    return result
+
+
+# [Anotación · líneas 335–394] `stage2_confirm5`: con 202103–202104 y evaluación en 202106, primero entrena
+#   CONTROL con la semilla 808 y exige puntajes idénticos a los de SUPERFINAL. Después entrena el brazo ganador
+#   con 5 semillas y lo compara con los puntajes de SUPERFINAL de esas semillas (mínimo 3 a favor). Si la prueba
+#   de mayo no tuvo ganador, no entrena.
+def stage2_confirm5(home: Path,cluster_path: Path,s1: dict) -> dict:
+    root=home/RUN/"stage2_confirm5"
+    rp=root/"RESULT.json"
+    if rp.is_file():
+        return A.load_json(rp)
+    if s1.get("winner") is None:
+        r={"status":"SKIPPED_SCREEN_FAIL","winner":None}
+        A.write_json(rp,r); return r
+
+    src=source(home); ctx=C.preflight_base(home); _,cmap=load_cluster_map(cluster_path)
+    data=C.load_fold(ctx,src["features"],[202103,202104],202106,Path(src["s0"]["eval_bank"]))
+    labels=pd.read_parquet(ctx["paths"]["bank_orig"]/"etiquetas.parquet")
+    trlab=labels[labels.foto_mes.isin([202103,202104])].reset_index(drop=True)
+    A.require(len(trlab)==len(data["y_train"]),"Confirm5 train labels desalineadas")
+    train_ids=trlab.numero_de_cliente.to_numpy(np.int64)
+    pc_train=positive_cluster_vector(train_ids,data["y_train"],cmap)
+    pc_eval=positive_cluster_vector(data["ids"],data["y_eval"],cmap)
+    base=base_weight_vector(data["train_months"],V1.RECENCY[src["policy"]])
+    winner=str(s1["winner"])
+
+    # Canary exacto: CONTROL seed 808 por el nuevo camino de pesos.
+    cid=A.fingerprint({
+        "run":RUN,"stage":"canary","source":SOURCE_IDENTITY,"seed":808,"code_sha":CODE_SHA,
+        "features":A.fingerprint(src["features"]),"params":src["params"],
+        "rounds":src["rounds"],"policy":src["policy"],
+    })
+    csc,_=train_scores(
+        data,train_ids,pc_train,"CONTROL",base,src["features"],src["params"],src["rounds"],
+        [808],root/"canary_control",cid
+    )
+    sf808=load_sf_control(src["root"],[808],data["ids"],data["y_eval"])[808]
+    max_abs=float(np.max(np.abs(csc[808]-sf808)))
+    exact=bool(np.array_equal(csc[808],sf808))
+    A.require(exact and max_abs==0.0,f"CANARY CONTROL NO EXACTO max_abs={max_abs}")
+    canary={"status":"CANARY_EXACT_OK","seed":808,"array_equal":exact,"max_abs":max_abs}
+    A.write_json(root/"CANARY.json",canary)
+
+    identity=A.fingerprint({
+        "run":RUN,"stage":2,"plan":PLAN,"screen_identity":s1["identity"],"code_sha":CODE_SHA,
+        "winner":winner,"source":SOURCE_IDENTITY,"seeds":CONFIRM5_SEEDS,
+    })
+    candidate,wd=train_scores(
+        data,train_ids,pc_train,winner,base,src["features"],src["params"],src["rounds"],
+        CONFIRM5_SEEDS,root/"candidate",identity
+    )
+    control=load_sf_control(src["root"],CONFIRM5_SEEDS,data["ids"],data["y_eval"])
+    cm,csr,_=evaluate(data["ids"],data["y_eval"],pc_eval,candidate,CONFIRM5_SEEDS)
+    bm,bsr,_=evaluate(data["ids"],data["y_eval"],pc_eval,control,CONFIRM5_SEEDS)
+    row=comparison_row(winner,cm,bm,csr,bsr,3)
+    pd.DataFrame([row]).to_csv(root/"comparison.csv",index=False)
+    pd.DataFrame([{"kind":"candidate",**r} for r in csr]+[{"kind":"control",**r} for r in bsr]).to_csv(
+        root/"seed_metrics.csv",index=False
+    )
+    result={
+        "status":"CONFIRM5_PASS" if row["passed"] else "STOP_CONFIRM5_FAIL",
+        "identity":identity,"winner":winner,"canary":canary,"comparison":row,
+        "weight_detail":wd,"fixed_n":A.N_FIXED,"seeds":CONFIRM5_SEEDS,
+    }
+    A.write_json(rp,result)
+    return result
+
+
+# [Anotación · líneas 397–408] `read_candidate_scores` lee los puntajes del candidato de la etapa anterior
+#   validando identidad, brazo y claves.
+def read_candidate_scores(root: Path,identity: str,arm: str,seeds: list[int],ids,y) -> dict[int,np.ndarray]:
+    out={}
+    for seed in seeds:
+        cp=root/f"seed_{seed}.npz"
+        A.require(cp.is_file(),f"Falta candidato previo {cp}")
+        with np.load(cp,allow_pickle=False) as z:
+            A.require(str(z["identity"].item())==identity and str(z["arm"].item())==arm,
+                      f"Candidato previo metadata seed={seed}")
+            A.require(np.array_equal(z["ids"],ids) and np.array_equal(z["y"],y),
+                      f"Candidato previo keys seed={seed}")
+            out[seed]=np.asarray(z["scores"],dtype=np.float64).copy()
+    return out
+
+
+# [Anotación · líneas 411–462] `stage3_confirm20`: entrena el brazo ganador con las 20 semillas (reutiliza las
+#   5 anteriores) y compara en 202106 contra los 20 puntajes de SUPERFINAL. Pasa si el promedio de semillas
+#   incluye al menos 2 BAJA+2 más, al menos 1 más de los grupos 2 y 5, la diferencia pareada media y mediana son
+#   positivas y gana en al menos 14 semillas.
+def stage3_confirm20(home: Path,cluster_path: Path,s1: dict,s2: dict) -> dict:
+    root=home/RUN/"stage3_confirm20"
+    rp=root/"RESULT.json"
+    if rp.is_file():
+        return A.load_json(rp)
+    if s2.get("status")!="CONFIRM5_PASS":
+        r={"status":"SKIPPED_CONFIRM5_FAIL","winner":s1.get("winner")}
+        A.write_json(rp,r); return r
+
+    src=source(home); ctx=C.preflight_base(home); _,cmap=load_cluster_map(cluster_path)
+    data=C.load_fold(ctx,src["features"],[202103,202104],202106,Path(src["s0"]["eval_bank"]))
+    labels=pd.read_parquet(ctx["paths"]["bank_orig"]/"etiquetas.parquet")
+    trlab=labels[labels.foto_mes.isin([202103,202104])].reset_index(drop=True)
+    train_ids=trlab.numero_de_cliente.to_numpy(np.int64)
+    A.require(len(train_ids)==len(data["y_train"]),"Confirm20 train labels desalineadas")
+    pc_train=positive_cluster_vector(train_ids,data["y_train"],cmap)
+    pc_eval=positive_cluster_vector(data["ids"],data["y_eval"],cmap)
+    base=base_weight_vector(data["train_months"],V1.RECENCY[src["policy"]])
+    winner=str(s1["winner"])
+
+    reuse=read_candidate_scores(
+        home/RUN/"stage2_confirm5/candidate",s2["identity"],winner,
+        CONFIRM5_SEEDS,data["ids"],data["y_eval"]
+    )
+    identity=A.fingerprint({
+        "run":RUN,"stage":3,"plan":PLAN,"confirm5_identity":s2["identity"],"code_sha":CODE_SHA,
+        "winner":winner,"source":SOURCE_IDENTITY,"seeds":SEEDS20,
+    })
+    candidate,wd=train_scores(
+        data,train_ids,pc_train,winner,base,src["features"],src["params"],src["rounds"],
+        SEEDS20,root/"candidate",identity,reuse_scores=reuse
+    )
+    control=load_sf_control(src["root"],SEEDS20,data["ids"],data["y_eval"])
+    cm,csr,_=evaluate(data["ids"],data["y_eval"],pc_eval,candidate,SEEDS20)
+    bm,bsr,_=evaluate(data["ids"],data["y_eval"],pc_eval,control,SEEDS20)
+    row=comparison_row(winner,cm,bm,csr,bsr,14)
+    pair=A.paired_summary([r["gain"] for r in csr],[r["gain"] for r in bsr])
+    row["passed"]=bool(
+        row["delta_hits"]>=2 and row["delta_c25_captured"]>=1
+        and pair["mean"]>0 and pair["median"]>0 and pair["wins"]>=14
+    )
+    pd.DataFrame([row]).to_csv(root/"comparison.csv",index=False)
+    pd.DataFrame([{"kind":"candidate",**r} for r in csr]+[{"kind":"control",**r} for r in bsr]).to_csv(
+        root/"seed_metrics.csv",index=False
+    )
+    result={
+        "status":"CONFIRM20_PASS" if row["passed"] else "STOP_CONFIRM20_FAIL",
+        "identity":identity,"winner":winner,"comparison":row,"paired":pair,
+        "weight_detail":wd,"fixed_n":A.N_FIXED,"seeds":SEEDS20,
+    }
+    A.write_json(rp,result)
+    return result
+
+
+# [Anotación · líneas 465–509] `stage4_august` (sólo si la etapa anterior pasó): carga del banco final de
+#   SUPERFINAL las filas de 202103–202106 con las variables elegidas, arma la clase binaria BAJA+2, asigna grupo
+#   a los positivos, aplica el peso por mes de la política y calcula los pesos por fila del brazo ganador. Carga
+#   las 164.647 filas de 202108 y calcula la identidad de la etapa.
+def stage4_august(home: Path,cluster_path: Path,s1: dict,s3: dict) -> dict:
+    import lightgbm as lgb
+
+    root=home/RUN/"stage4_august"
+    rp=root/"RESULT.json"
+    if rp.is_file():
+        return A.load_json(rp)
+    if s3.get("status")!="CONFIRM20_PASS":
+        r={"status":"SKIPPED_CONFIRM20_FAIL","winner":s1.get("winner"),"no_submit":True}
+        A.write_json(rp,r); return r
+
+    src=source(home); ctx=C.preflight_base(home); _,cmap=load_cluster_map(cluster_path)
+    features=src["features"]; winner=str(s1["winner"])
+    bank=src["root"]/"stage5_final/bank"
+    A.require((bank/"manifest.json").is_file(),"Falta banco final SUPERFINAL")
+    C.add_fe_path(ctx["paths"])
+    from cargar_bloques import cargar_bloques
+    derived=C.split_derived(features,ctx)
+
+    trdf,_=cargar_bloques(bank,meses=[202103,202104,202105,202106],incluir_raw=True,features=derived)
+    labels=pd.read_parquet(ctx["paths"]["bank_orig"]/"etiquetas.parquet")
+    trlab=labels[labels.foto_mes.isin([202103,202104,202105,202106])].reset_index(drop=True)
+    A.require(trdf[["numero_de_cliente","foto_mes"]].equals(trlab[["numero_de_cliente","foto_mes"]]),
+              "Final train keys desalineadas")
+    train_ids=trdf.numero_de_cliente.to_numpy(np.int64)
+    y=trlab.clase_ternaria.eq("BAJA+2").to_numpy(np.int8)
+    months=trdf.foto_mes.to_numpy(np.int64)
+    pc=positive_cluster_vector(train_ids,y,cmap)
+    base=base_weight_vector(months,V1.FINAL_RECENCY[src["policy"]])
+    weights,wd=A.make_weights(y,pc,base,winner)
+    keep=weights>0
+    x=trdf[features] if bool(np.all(keep)) else trdf.loc[keep,features].reset_index(drop=True)
+    yfit=y[keep]; wfit=weights[keep]
+
+    scdf,_=cargar_bloques(bank,meses=[202108],incluir_raw=True,features=derived)
+    ids=scdf.numero_de_cliente.to_numpy(np.int64)
+    A.require(len(ids)==164647 and len(np.unique(ids))==len(ids),"IDs agosto invalidos")
+    xscore=scdf[features]
+
+    identity=A.fingerprint({
+        "run":RUN,"stage":4,"plan":PLAN,"confirm20_identity":s3["identity"],"code_sha":CODE_SHA,
+        "winner":winner,"source":SOURCE_IDENTITY,"features":A.fingerprint(features),
+        "params":src["params"],"rounds":src["rounds"],"policy":src["policy"],
+        "weight_detail":wd,"n":A.N_FIXED,
+    })
+# [Anotación · líneas 510–541] Para cada una de las 20 semillas reutiliza el par modelo y `.npz` válido o
+#   entrena un LightGBM con dataset propio, los parámetros y rondas de SUPERFINAL y los pesos por fila; puntúa
+#   202108 y guarda el modelo en texto y el `.npz` con su hash y el detalle de pesos.
+    modeldir=root/"models"; modeldir.mkdir(parents=True,exist_ok=True)
+    scores=[]
+    for i,seed in enumerate(SEEDS20,1):
+        cp=modeldir/f"seed_{seed}.npz"; mp=modeldir/f"modelo_{seed}.txt"
+        if cp.is_file() and mp.is_file():
+            with np.load(cp,allow_pickle=False) as z:
+                A.require(str(z["identity"].item())==identity and int(z["seed"].item())==seed,
+                          f"Final CP metadata seed={seed}")
+                A.require(np.array_equal(z["ids"],ids),f"Final CP IDs seed={seed}")
+                A.require(str(z["model_sha256"].item())==A.digest(mp),f"Final model hash seed={seed}")
+                sc=np.asarray(z["scores"],dtype=np.float64)
+            print(f"REUSAR FINAL {i}/20 seed={seed}",flush=True)
+        else:
+            A.require(not cp.exists() and not mp.exists(),f"Par final parcial seed={seed}")
+            print(f"ENTRENAR FINAL {i}/20 seed={seed}",flush=True)
+            ds,seed_params=V2.dataset_for_seed(x,yfit,wfit,features,src["params"],seed)
+            model=lgb.train(seed_params,ds,num_boost_round=int(src["rounds"]))
+            sc=np.asarray(model.predict(xscore,num_threads=C.THREADS),dtype=np.float64)
+            A.require(sc.shape==ids.shape and np.isfinite(sc).all(),"Scores final invalidos")
+            tmpm=mp.with_suffix(".tmp")
+            model.save_model(str(tmpm)); tmpm.replace(mp)
+            tmp=cp.with_suffix(".tmp")
+            with tmp.open("wb") as fh:
+                np.savez_compressed(
+                    fh,identity=np.array(identity),arm=np.array(winner),seed=np.array(seed),
+                    ids=ids,scores=sc,model_sha256=np.array(A.digest(mp)),
+                    weight_detail=np.array(json.dumps(wd,sort_keys=True))
+                )
+            tmp.replace(cp)
+            del model,ds
+            gc.collect()
+        scores.append(sc.copy())
+
+# [Anotación · líneas 543–568] Promedia los 20 vectores de puntajes y exporta los 13.500 clientes de mayor
+#   promedio a `C1CLAW<10 caracteres de la identidad>ENS13500.csv`. Escribe `MANIFEST.json` (identidad, brazo,
+#   parámetros, rondas, política y detalle de pesos), `mensaje_zulip.txt`, `LISTO.json` y `RESULT.json` con
+#   estado `READY_NOT_SUBMITTED` y `automatic_submit` en falso.
+    ensemble=np.vstack(scores).mean(axis=0,dtype=np.float64)
+    delivery=root/"delivery"; delivery.mkdir(parents=True,exist_ok=True)
+    prefix="C1CLAW"+identity[:10].upper()
+    csv=delivery/f"{prefix}ENS{A.N_FIXED}.csv"
+    info=C.export_csv(csv,ids,ensemble,A.N_FIXED)
+    manifest={
+        "status":"READY_NOT_SUBMITTED","run":RUN,"identity":identity,
+        "parent_superfinal_identity":SOURCE_IDENTITY,"arm":winner,
+        "n_models":20,"n_august":164647,"n":A.N_FIXED,
+        "file":info,"submit_message":f"submit {prefix}ENS{A.N_FIXED}",
+        "params":src["params"],"rounds":src["rounds"],"policy":src["policy"],
+        "weight_detail":wd,
+        "cluster_labels_used_at_scoring":False,
+        "cluster_labels_used_only_for_historical_positive_weights":True,
+        "automatic_submit":False,
+    }
+    A.write_json(delivery/"MANIFEST.json",manifest)
+    (delivery/"mensaje_zulip.txt").write_text(manifest["submit_message"]+"\n",encoding="utf-8")
+    A.write_json(root/"LISTO.json",manifest)
+    result={
+        "status":"READY_NOT_SUBMITTED","identity":identity,"arm":winner,
+        "n":A.N_FIXED,"csv":str(csv),"sha256":info["sha256"],
+        "submit_message":manifest["submit_message"],"automatic_submit":False,
+    }
+    A.write_json(rp,result)
+    return result
+
+
+# [Anotación · líneas 571–617] `run_all` y `main`: `--home`, `--labels-cluster` (CSV de grupos) y `--phase`
+#   (preflight, screen, confirm5, confirm20, august o all). Toma un candado de archivo y ejecuta las etapas en
+#   orden hasta la fase pedida, imprimiendo su resultado.
+def run_all(home: Path,cluster_path: Path) -> dict:
+    s0=preflight(home,cluster_path)
+    s1=stage1_screen(home,cluster_path)
+    s2=stage2_confirm5(home,cluster_path,s1)
+    s3=stage3_confirm20(home,cluster_path,s1,s2)
+    s4=stage4_august(home,cluster_path,s1,s3)
+    return {"stage0":s0,"stage1":s1,"stage2":s2,"stage3":s3,"stage4":s4}
+
+
+def main():
+    ap=argparse.ArgumentParser(description="Cluster-aware positive reweighting sobre SUPERFINAL")
+    ap.add_argument("--home",type=Path,default=Path.home())
+    ap.add_argument("--labels-cluster",type=Path,default=HERE.parent/"10_diagnostico_0fits/reference_labels_z501.csv")
+    ap.add_argument("--phase",choices=["preflight","screen","confirm5","confirm20","august","all"],default="all")
+    args=ap.parse_args()
+    home=args.home.resolve(); cluster_path=args.labels_cluster.resolve()
+    out=home/RUN; out.mkdir(parents=True,exist_ok=True)
+    lock=(out/".lock").open("a")
+    try:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(f"{RUN} ya tiene otro proceso activo")
+
+    s0=preflight(home,cluster_path)
+    if args.phase=="preflight":
+        print(json.dumps(s0,ensure_ascii=False,indent=2)); return
+    s1=stage1_screen(home,cluster_path)
+    if args.phase=="screen":
+        print(json.dumps(s1,ensure_ascii=False,indent=2)); return
+    s2=stage2_confirm5(home,cluster_path,s1)
+    if args.phase=="confirm5":
+        print(json.dumps(s2,ensure_ascii=False,indent=2)); return
+    s3=stage3_confirm20(home,cluster_path,s1,s2)
+    if args.phase=="confirm20":
+        print(json.dumps(s3,ensure_ascii=False,indent=2)); return
+    s4=stage4_august(home,cluster_path,s1,s3)
+    if args.phase=="august":
+        print(json.dumps(s4,ensure_ascii=False,indent=2)); return
+    print(json.dumps({
+        "screen_status":s1.get("status"),"screen_winner":s1.get("winner"),
+        "confirm5_status":s2.get("status"),"confirm20_status":s3.get("status"),
+        "august_status":s4.get("status"),"submit":s4.get("submit_message"),
+    },ensure_ascii=False,indent=2))
+
+
+if __name__=="__main__":
+    main()

@@ -1,0 +1,3 @@
+# 017 — modelo final intermedio: MIX6 multiclase + auxiliar de BAJA+1 + lag2 en M1
+`final.py` (docstring con el diseño). Las 6 configuraciones de 005 (`mejores_trials.json`) en multiclase con score P2/(1−P1_aux): el principal entrena con 202103–06 y el auxiliar binario de BAJA+1 con 202103–07 (202107 solo aporta BAJA+1); M1 incluye lag2/delta2/ratio2 de 50 variables; 30 semillas por configuración (180 + 180 modelos, ~4.5 h); rank medio de las 6. Public (k=11000): **99.14M**. Solapa 97.7% con `exp010_mc_h2` y 96.8% con `exp005_final_s30`.
+Es un **componente** del final (`exp031`, vía `exp024`): ver `../../REPRODUCIR.md`. Validado por partes (013, 014, 016), nunca junto; el lag2 de 202108 apunta a junio (aguinaldo).

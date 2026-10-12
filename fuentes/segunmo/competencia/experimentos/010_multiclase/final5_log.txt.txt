@@ -1,0 +1,10 @@
+
+===== final 5 semillas 2026-10-07 12:45 | semillas [852583, 771227, 676057, 482687, 399221] | k=11500 =====
+semilla 852583: exp010_seed852583_k11500.csv (6 min)
+semilla 771227: exp010_seed771227_k11500.csv (13 min)
+semilla 676057: exp010_seed676057_k11500.csv (20 min)
+semilla 482687: exp010_seed482687_k11500.csv (27 min)
+semilla 399221: exp010_seed399221_k11500.csv (33 min)
+solapamiento top-11500 entre semillas: min 93.3%, media 93.5%, max 93.7%
+solapamiento con exp010_mc_h2 (6 semillas): 852583: 95.8%, 771227: 95.7%, 676057: 95.5%, 482687: 95.6%, 399221: 95.6%
+[final5] terminado

@@ -1,0 +1,54 @@
+"""FULL457 y FULL762: meses calendario exactos, NaN y orden CSV preservados."""
+import csv
+import pyarrow as pa
+from common import *
+
+def main():
+    p=args(__doc__); p.add_argument('--input',type=Path,default=INPUT); opts=p.parse_args()
+    output=opts.output_dir
+    exigir(not output.exists(),'La carpeta de salida debe ser NUEVA')
+    exigir(sha256_archivo(opts.input)==EXPECTED_INPUT,'SHA256 fuente diferente al original validado')
+    with opts.input.open(encoding='utf-8-sig',newline='') as f: header=next(csv.reader(f))
+    exigir(len(header)==len(set(header)) and set(CLAVES+[TARGET]).issubset(header),'Encabezado inválido')
+    features=[c for c in header if c not in {*CLAVES,TARGET}]
+    full,full762=nombres_features(features)
+    base=pd.read_csv(opts.input,encoding='utf-8-sig',low_memory=False)
+    digest=auditar_fuente(base,features,full)
+    exigir(meses_atras(np.array([202105,202106,202201,202202]),2).tolist()
+           ==[202103,202104,202111,202112],'Aritmética lag2 incorrecta')
+    previous=predecesores(base)
+    previous2=predecesores(base,lag=2)
+    output.mkdir(parents=True)
+    import os
+    # Dos esquemas explícitos: CatBoost no recibe columnas lag2.
+    for size,name in [(457,PARQUET457),(762,PARQUET762)]:
+        pending=output/f'features_{size}.partial'
+        with pending.open('xb') as f:
+            writer=None
+            try:
+                for start in range(0,len(base),50000):
+                    end=min(start+50000,len(base))
+                    block=(generar_lote(base,features,full,previous,start,end) if size==457 else
+                           generar_lote_full762(base,features,full,full762,previous,previous2,start,end))
+                    table=pa.Table.from_pandas(block,preserve_index=False)
+                    if writer is None: writer=pq.ParquetWriter(f,table.schema,compression='snappy',version='2.6')
+                    writer.write_table(table,row_group_size=50000)
+            finally:
+                if writer is not None: writer.close()
+        if size==457:
+            verificar_parquet(pending,base,features,full,previous,50000)
+        else:
+            verificar_full762(pending,base,features,full,full762,previous,previous2,50000)
+        os.link(pending,output/name)
+        pending.unlink()
+    availability=[]
+    for month in [202104,202105,202106,202108]:
+        mask=base.foto_mes.eq(month)
+        rows=int(mask.sum()); count=int((mask & previous2.notna()).sum())
+        availability.append(dict(foto_mes=month,filas=rows,lag2_disponible=count,porcentaje=100*count/rows))
+    save_json(output/'feature_audit.json',dict(rows=len(base),FULL457_hash=digest,FULL762_hash=HASH_FULL762,
+              FULL457=full,FULL762=full762,input_sha256=EXPECTED_INPUT,
+              lag1='MES_CALENDARIO_ANTERIOR_EXACTO',lag2='DOS_MESES_CALENDARIO_ANTES_EXACTO',
+              validation='PASS',row_order='CSV original',lag2_availability=availability))
+
+if __name__=='__main__': main()

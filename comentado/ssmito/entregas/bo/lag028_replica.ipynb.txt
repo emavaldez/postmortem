@@ -1,0 +1,318 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–19] Presentación (réplica de la BO a partir de la configuración y los puntos iniciales
+#   del experimento original) y carga de librerías: cudf, numpy, pandas, yaml, lightgbm, optuna con GPSampler y
+#   train_test_split de scikit-learn.
+#%% celda 1 [texto]
+# Réplica de BO
+
+Configuración y puntos iniciales recuperados del experimento original.
+Ejecutar desde `entregas/bo`. Los resultados se guardan en una carpeta nueva.
+
+#%% celda 2 [código]
+import os
+import numpy as np
+import pandas as pd
+import yaml
+import lightgbm as lgb
+import optuna
+import cudf
+
+from sklearn.model_selection import train_test_split
+from optuna.samplers import GPSampler
+from optuna.distributions import IntDistribution
+from optuna.trial import TrialState
+
+# [Anotación · líneas 21–63] Define carpetas relativas a entregas/bo, el experimento de origen LAG-028, la
+#   carpeta de salida LAG-028-REPLICA, el dataset RANKS_LF_O2_K6_P4.csv y 25 columnas excluidas (ternaria con
+#   sus lags 1 y 2, clase01, fold, azar, training y las dos de préstamos personales con sufijos _lag1, _delta1,
+#   _lag2, _delta2, _lag_pond, _delta_lag_pond, _lag_pond2 y _delta_lag_pond2). Corta si origen y destino
+#   coinciden.
+#%% celda 3 [código]
+# Ejecutar con el directorio de trabajo en entregas/bo.
+BO_URL = os.getcwd()
+DATA_FOLDER = os.path.join(os.path.dirname(BO_URL), "dataset")
+
+experimento_original = "LAG-028"
+experiment_name = "LAG-028-REPLICA"
+dataset_file = "RANKS_LF_O2_K6_P4.csv"
+
+columnas_excluidas = {
+    "ternaria",
+    "ternaria_lag1",
+    "ternaria_lag2",
+    "clase01",
+    "fold",
+    "azar",
+    "training",
+    "cprestamos_personales",
+    "cprestamos_personales_lag1",
+    "cprestamos_personales_delta1",
+    "cprestamos_personales_lag2",
+    "cprestamos_personales_delta2",
+    "cprestamos_personales_lag_pond",
+    "cprestamos_personales_delta_lag_pond",
+    "cprestamos_personales_lag_pond2",
+    "cprestamos_personales_delta_lag_pond2",
+    "mprestamos_personales",
+    "mprestamos_personales_lag1",
+    "mprestamos_personales_delta1",
+    "mprestamos_personales_lag2",
+    "mprestamos_personales_delta2",
+    "mprestamos_personales_lag_pond",
+    "mprestamos_personales_delta_lag_pond",
+    "mprestamos_personales_lag_pond2",
+    "mprestamos_personales_delta_lag_pond2",
+}
+
+ORIGEN_URL = os.path.join(BO_URL, experimento_original)
+EXPERIMENT_URL = os.path.join(BO_URL, experiment_name)
+DATA_LAGS_URL = os.path.join(DATA_FOLDER, dataset_file)
+
+if os.path.abspath(ORIGEN_URL) == os.path.abspath(EXPERIMENT_URL):
+    raise ValueError("El destino debe ser distinto del experimento original.")
+
+# [Anotación · líneas 65–114] Lee PARAM.yml del experimento original y abre su estudio de Optuna
+#   (optuna_study.db). De los trials recupera la distribución de cada hiperparámetro (límites, tipo, paso y
+#   escala logarítmica) y los puntos que se habían encolado a mano (fixed_params). Actualiza PARAM con el nombre
+#   nuevo, el dataset, las exclusiones y los rangos, e imprime meses, métrica y cantidades de trials.
+#%% celda 4 [texto]
+## Configuración original
+
+#%% celda 5 [código]
+with open(os.path.join(ORIGEN_URL, "PARAM.yml"), encoding="utf-8") as archivo:
+    PARAM = yaml.safe_load(archivo)
+
+study_db_original = os.path.join(ORIGEN_URL, "optuna_study.db")
+study_original = optuna.load_study(
+    study_name=PARAM["experimento"],
+    storage=f"sqlite:///{study_db_original}",
+)
+
+# Recuperar límites, tipos, pasos y escala logarítmica.
+distribuciones = {}
+for trial in study_original.trials:
+    distribuciones.update(trial.distributions)
+
+rangos_bo = {
+    nombre: (distribucion.low, distribucion.high)
+    for nombre, distribucion in distribuciones.items()
+}
+
+# Puntos agregados a mano, en el mismo orden del estudio original.
+puntos_iniciales_bo = [
+    trial.system_attrs["fixed_params"].copy()
+    for trial in study_original.trials
+    if "fixed_params" in trial.system_attrs
+]
+
+PARAM["experimento"] = experiment_name
+PARAM["dataset"] = dataset_file
+PARAM["columnas_excluidas"] = sorted(columnas_excluidas)
+PARAM["rangos_bo"] = {nombre: list(rango) for nombre, rango in rangos_bo.items()}
+PARAM["out"]["lgbm"] = {}
+
+# Parámetros editables antes de ejecutar las celdas siguientes:
+# PARAM["train"], PARAM["training_pct"], PARAM["semilla_primigenia"]
+# PARAM["trainingstrategy"]["undersampling"]
+# PARAM["lgbm"]["param_fijos"]
+# PARAM["hyperparametertuning"]["n_startup_trials"]
+# PARAM["hyperparametertuning"]["iteraciones"]
+# rangos_bo, puntos_iniciales_bo
+
+n_startup_trials = PARAM["hyperparametertuning"]["n_startup_trials"]
+n_trials_total = PARAM["hyperparametertuning"]["iteraciones"]
+print("Meses:", PARAM["train"])
+print("Métrica:", PARAM["lgbm"]["param_fijos"]["metric"])
+print("Puntos manuales:", len(puntos_iniciales_bo))
+print("Inicialización:", n_startup_trials, "| Total:", n_trials_total)
+
+# [Anotación · líneas 116–161] Lee el CSV con cudf, se queda con los meses de PARAM['train'] (202103 y 202104
+#   en LAG-028/PARAM.yml; la lectura con pandas está comentada) y pasa a pandas. Parte las filas en fold 1 (70%)
+#   y fold 2 con train_test_split estratificado por ternaria y semilla 230047. Crea clase01 (BAJA+1 o BAJA+2 =
+#   1), un número al azar por fila y la marca training: filas del fold 1 que son baja o cuyo número al azar es
+#   menor o igual a 0,1 (undersampling).
+#%% celda 6 [texto]
+## Dataset y partición
+
+#%% celda 7 [código]
+# df = pd.read_csv(
+#     DATA_LAGS_URL,
+#     dtype={"numero_de_cliente": "int32", "foto_mes": "int32"},
+# )
+# dataset_train_cpu = df.loc[df["foto_mes"].isin(PARAM["train"])].reset_index(drop=True)
+# del df
+
+df = cudf.read_csv(
+    DATA_LAGS_URL,
+    dtype={"numero_de_cliente": "int32", "foto_mes": "int32"},
+)
+
+dataset_train_cpu = (
+    df.loc[df["foto_mes"].isin(PARAM["train"])]
+    .to_pandas()
+    .reset_index(drop=True)
+)
+del df
+
+indices_fold_1, indices_fold_2 = train_test_split(
+    np.arange(len(dataset_train_cpu)),
+    train_size=PARAM["training_pct"] / 100,
+    stratify=dataset_train_cpu["ternaria"],
+    random_state=PARAM["semilla_primigenia"],
+)
+
+dataset_train_cpu["fold"] = np.int8(2)
+dataset_train_cpu.loc[indices_fold_1, "fold"] = np.int8(1)
+dataset_train_cpu["clase01"] = (
+    dataset_train_cpu["ternaria"].isin(["BAJA+1", "BAJA+2"])
+    .astype(np.int8)
+)
+
+rng = np.random.default_rng(PARAM["semilla_primigenia"])
+dataset_train_cpu["azar"] = rng.random(len(dataset_train_cpu))
+dataset_train_cpu["training"] = (
+    dataset_train_cpu["fold"].eq(1)
+    & (
+        (dataset_train_cpu["azar"] <= PARAM["trainingstrategy"]["undersampling"])
+        | dataset_train_cpu["ternaria"].isin(["BAJA+1", "BAJA+2"])
+    )
+).astype(np.int8)
+
+# [Anotación · líneas 163–187] Arma la lista de columnas de entrada y dos lgb.Dataset: entrenamiento con las
+#   filas training == 1 y validación con todas las filas training == 0 (el fold 2 y las filas del fold 1 que el
+#   submuestreo dejó afuera). Imprime las cantidades.
+campos_buenos = [
+    columna for columna in dataset_train_cpu.columns
+    if columna not in columnas_excluidas
+]
+
+mask_training = dataset_train_cpu["training"].eq(1)
+# Igual que en z495: validation incluye todas las filas con training == 0.
+mask_validation = dataset_train_cpu["training"].eq(0)
+
+dtrain = lgb.Dataset(
+    data=dataset_train_cpu.loc[mask_training, campos_buenos],
+    label=dataset_train_cpu.loc[mask_training, "clase01"],
+    feature_name=campos_buenos,
+    free_raw_data=False,
+)
+dvalidate = lgb.Dataset(
+    data=dataset_train_cpu.loc[mask_validation, campos_buenos],
+    label=dataset_train_cpu.loc[mask_validation, "clase01"],
+    feature_name=campos_buenos,
+    free_raw_data=False,
+)
+
+print("Filas para training:", int(mask_training.sum()))
+print("Filas para validation:", int(mask_validation.sum()))
+print("Columnas:", len(campos_buenos))
+
+# [Anotación · líneas 189–222] Función objetivo: sugiere cada hiperparámetro con la distribución recuperada
+#   del estudio original, los combina con los parámetros fijos de PARAM.yml, entrena con num_iterations rondas
+#   evaluando sobre validación y devuelve el valor de average_precision que queda en best_score.
+#%% celda 8 [texto]
+## Función objetivo
+
+#%% celda 9 [código]
+def objective(trial):
+    parametros_variables = {}
+    for nombre, distribucion in distribuciones.items():
+        if isinstance(distribucion, IntDistribution):
+            parametros_variables[nombre] = trial.suggest_int(
+                nombre, *rangos_bo[nombre],
+                step=distribucion.step, log=distribucion.log,
+            )
+        else:
+            parametros_variables[nombre] = trial.suggest_float(
+                nombre, *rangos_bo[nombre],
+                step=distribucion.step, log=distribucion.log,
+            )
+
+    parametros_completos = {
+        **PARAM["lgbm"]["param_fijos"],
+        **parametros_variables,
+    }
+    num_boost_round = int(parametros_completos.pop("num_iterations"))
+
+    modelo = lgb.train(
+        params=parametros_completos,
+        train_set=dtrain,
+        num_boost_round=num_boost_round,
+        valid_sets=[dvalidate],
+        valid_names=["val"],
+    )
+
+    metrica = PARAM["lgbm"]["param_fijos"]["metric"]
+    return float(modelo.best_score["val"][metrica])
+
+# [Anotación · líneas 224–249] Crea la carpeta de salida y un estudio nuevo con GPSampler (semilla 230047,
+#   n_startup_trials de PARAM.yml, objetivo no determinístico), guardado en SQLite y con la misma dirección que
+#   el original. Si el estudio está vacío encola los puntos manuales. Escribe PARAM.yml en la carpeta nueva.
+#%% celda 10 [texto]
+## Nueva BO
+
+#%% celda 11 [código]
+os.makedirs(EXPERIMENT_URL, exist_ok=True)
+
+sampler = GPSampler(
+    seed=PARAM["semilla_primigenia"],
+    n_startup_trials=n_startup_trials,
+    deterministic_objective=False,
+)
+study_db_url = os.path.join(EXPERIMENT_URL, "optuna_study.db")
+study = optuna.create_study(
+    study_name=experiment_name,
+    direction=study_original.direction,
+    sampler=sampler,
+    storage=f"sqlite:///{study_db_url}",
+    load_if_exists=True,
+)
+
+if not study.trials:
+    for punto in puntos_iniciales_bo:
+        study.enqueue_trial(punto)
+
+with open(os.path.join(EXPERIMENT_URL, "PARAM.yml"), "w", encoding="utf-8") as archivo:
+    yaml.safe_dump(PARAM, archivo, sort_keys=False, allow_unicode=True)
+
+# [Anotación · líneas 251–265] Cuenta los trials completos y ejecuta los que faltan hasta el total configurado
+#   (60 iteraciones, 30 de inicio, en LAG-028/PARAM.yml).
+#%% celda 12 [código]
+trials_completos = sum(
+    trial.state == TrialState.COMPLETE for trial in study.trials
+)
+trials_restantes = max(0, n_trials_total - trials_completos)
+
+print("Trials completos:", trials_completos)
+print("Trials restantes:", trials_restantes)
+
+if trials_restantes > 0:
+    study.optimize(
+        objective,
+        n_trials=trials_restantes,
+        show_progress_bar=True,
+    )
+
+# [Anotación · líneas 267–285] Exporta los trials a BO_log.txt, ordenados de mayor a menor métrica y separados
+#   por tabulador, y agrega a PARAM.yml los hiperparámetros del trial de mayor métrica y su valor.
+#%% celda 13 [texto]
+## Resultados
+
+#%% celda 14 [código]
+tb_bayesiana = study.trials_dataframe()
+tb_bayesiana["iter"] = np.arange(1, len(tb_bayesiana) + 1)
+tb_bayesiana = (
+    tb_bayesiana.sort_values("value", ascending=False, na_position="last")
+    .reset_index(drop=True)
+)
+tb_bayesiana.to_csv(
+    os.path.join(EXPERIMENT_URL, "BO_log.txt"), sep="\t", index=False,
+)
+
+PARAM["out"]["lgbm"]["mejores_hiperparametros"] = dict(study.best_trial.params)
+PARAM["out"]["lgbm"]["y"] = float(study.best_value)
+
+with open(os.path.join(EXPERIMENT_URL, "PARAM.yml"), "w", encoding="utf-8") as archivo:
+    yaml.safe_dump(PARAM, archivo, sort_keys=False, allow_unicode=True)

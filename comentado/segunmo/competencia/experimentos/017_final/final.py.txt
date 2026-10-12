@@ -1,0 +1,141 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–11] Docstring con el diseño: 6 configuraciones de 005, modelo principal multiclase con
+#   202103–202106, auxiliar binario de BAJA+1 con 202103–202107, puntaje P2 / (1 − P1 del auxiliar), promedio
+#   por semillas y luego promedio de ranks.
+"""017 — MODELO FINAL de la Primera Competencia (un solo archivo).
+Pipeline (todo validado en 010/013/014, ver LOG.md):
+  - 6 configuraciones de 005 (3 mejores trials de Optuna de M0 y de M1, cada una con su r e hiperparámetros), `ccajas_depositos`=NA en 202105.
+  - Principal MULTICLASE (CONTINUA/BAJA+1/BAJA+2), train 202103–202106: BAJA+1 y BAJA+2 completos + fracción r de CONTINUA. Da P(BAJA+2).
+  - Auxiliar BINARIO de BAJA+1 (resto submuestreado con la misma r), train 202103–202107 (202107 solo aporta BAJA+1, que se conoce porque vemos 202108).
+  - Score por modelo = P2_principal / (1 − P1_auxiliar); se promedia sobre semillas por configuración y luego se promedian los RANKS de las 6 configuraciones.
+  - Se envían los k clientes con mayor score (k a elegir con 015; por defecto 11500).
+Opciones: --semillas N (30: las 5 propias + derivadas, como en 005/final30), --k, --lag2 (suma lag2/delta2/ratio2 de las 50 variables a las configuraciones M1; solo si 016 lo avala).
+Cada (configuración, semilla) se guarda en tmp/ y se salta si ya existe, así que se puede cortar y reanudar.
+Uso (raíz del repo): caffeinate -i venv/bin/python competencia/experimentos/017_final/final.py --semillas 30 --k 11500 [--lag2]
+Seguimiento:        tail -f competencia/experimentos/017_final/log.txt"""
+# [Anotación · líneas 12–38] Imports; activa CORREGIR_CCAJAS; rutas de log y tmp, mapa de clases y nombres de
+#   las 150 columnas lag2, d2 y r2 de las 50 variables.
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from scipy.stats import rankdata
+
+AQUI = Path(__file__).resolve().parent
+A005 = AQUI.parents[0] / "005_optuna"
+sys.path.insert(0, str(AQUI.parents[1] / "src")); sys.path.insert(0, str(AQUI.parents[0] / "004_seleccion_variables")); sys.path.insert(0, str(A005))
+import config  # noqa: E402
+config.CORREGIR_CCAJAS = True
+from config import ID_COL, MES_SCORING, SEMILLAS, TARGET_COL  # noqa: E402
+from historia import agregar_historia_n  # noqa: E402
+from modelos import guardar_modelo, verificar_orden_cache  # noqa: E402
+from optuna_run import es_hist  # noqa: E402
+from pool import VARS, cargar  # noqa: E402
+from submit import guardar_submit, top_k_ids  # noqa: E402
+from validacion import PARAMS_BASE, xy  # noqa: E402
+
+LOG, TMP = AQUI / "log.txt", AQUI / "tmp"
+CLASES = {"CONTINUA": 0, "BAJA+1": 1, "BAJA+2": 2}
+COLS_LAG2 = [f"{v}_{s}2" for v in VARS for s in ("lag", "d", "r")]
+
+
+# [Anotación · líneas 41–56] configs_desde_json() lee mejores_trials.json y devuelve, por configuración, r,
+#   cantidad de rondas y los parámetros de PARAMS_BASE pisados por los del trial. escribir() imprime y agrega al
+#   log.
+def configs_desde_json() -> dict:
+    """{(conjunto, 'topN'): (r, rondas, params)} desde `005_optuna/mejores_trials.json` (versionado). Antes se leían de la base SQLite de Optuna
+    (artifacts/, no versionada): ambas fuentes dan valores idénticos (verificado el 2026-10-08), pero el JSON permite reproducir sin repetir las 8 h de Optuna."""
+    js = json.loads((A005 / "mejores_trials.json").read_text())
+    out = {}
+    for clave, d in js.items():
+        c, n = clave.split("_")
+        out[(c, n)] = (d["r"], d["num_boost_round"], {**PARAMS_BASE, **{k: v for k, v in d.items() if k not in ("r", "num_boost_round")}})
+    return out
+
+
+def escribir(msg):
+    print(msg, flush=True)
+    with open(LOG, "a") as f:
+        f.write(msg + "\n")
+
+
+# [Anotación · líneas 58–70] Argumentos --semillas (30), --k (11.500) y --lag2. Carga con el pool
+#   202103–202106 (principal), 202107 sin filtrar por clase (mes extra del auxiliar) y 202108 (a puntuar); con
+#   --lag2 agrega a los tres lag2, delta2 y ratio2 de las 50 variables.
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("--semillas", type=int, default=30); ap.add_argument("--k", type=int, default=11500)
+    ap.add_argument("--lag2", action="store_true"); args = ap.parse_args()
+    semillas = config.semillas(args.semillas)                       # semillas explícitas en config.py (5 propias + derivadas)
+    semillas = semillas[:args.semillas]
+    TAG = "conlag2" if args.lag2 else "sinlag2"        # antes el sufijo era lag0/lag1 (valor del flag) y confundía
+    TMP.mkdir(exist_ok=True)
+    cfg = configs_desde_json()
+    dt = cargar([202103, 202104, 202105, 202106], negocio=True).copy()                   # principal: meses con BAJA+2 conocido
+    dx = cargar([202107], solo_con_target=False, negocio=True).copy()                    # mes extra del auxiliar: solo BAJA+1 conocido
+    score = cargar([MES_SCORING], solo_con_target=False, negocio=True).copy()
+    if args.lag2:
+        dt, dx, score = (agregar_historia_n(d, VARS, 2) for d in (dt, dx, score))
+# [Anotación · líneas 71–79] Define las columnas: M0 son las no históricas (178 según el log) y M1 las de
+#   top150_final.txt más, con --lag2, las 150 de lag2 (300). Arma la etiqueta de tres clases, une 202103–202107
+#   para el auxiliar con etiqueta 1 si la clase es BAJA+1, escribe el encabezado del log y verifica el orden de
+#   la caché.
+    Xt0, _ = xy(dt)
+    cols = {"M0": [c for c in Xt0.columns if not es_hist(c) and c in dt.columns and not c.endswith(("_lag2", "_d2", "_r2"))],
+            "M1": (A005 / "sel" / "top150_final.txt").read_text().split() + (COLS_LAG2 if args.lag2 else [])}
+    y3 = dt[TARGET_COL].map(CLASES).values
+    da = pd.concat([dt, dx], ignore_index=True)                                          # auxiliar: 202103–07
+    y1 = (da[TARGET_COL] == "BAJA+1").astype(int).values
+    escribir(f"\n===== final 017 {time.strftime('%Y-%m-%d %H:%M')} | principal {dt.shape} | auxiliar {da.shape} (BAJA+1: {y1.sum()}) | score {score.shape} | "
+             f"{len(semillas)} semillas x {len(cfg)} configs | k={args.k} | lag2={args.lag2} | M0 {len(cols['M0'])} cols, M1 {len(cols['M1'])} cols =====")
+    verificar_orden_cache(TMP, score[ID_COL].values)                     # no mezclar predicciones cacheadas con otro orden de filas
+# [Anotación · líneas 80–97] Para cada configuración y semilla sin caché: entrena el multiclase con todas las
+#   filas BAJA+1 y BAJA+2 y una fracción r de CONTINUA y toma P(BAJA+2) sobre 202108; entrena el auxiliar
+#   binario con los BAJA+1 y una fracción r del resto (sorteo con semilla + 1) y toma P(BAJA+1); guarda ambos
+#   modelos con sus huellas y el puntaje P2 / (1 − P1) en un .npy. Promedia los puntajes entre semillas.
+    t0, S = time.time(), {}
+    for (c, nombre), (r, rondas, params) in cfg.items():
+        ps = []
+        for s in semillas:
+            f = TMP / f"score_{c}_{nombre}_{s}_{TAG}.npy"
+            if not f.exists():
+                keep = (y3 >= 1) | (np.random.RandomState(s).rand(len(y3)) < r)
+                mc = lgb.train({**params, "objective": "multiclass", "num_class": 3, "seed": s}, lgb.Dataset(dt.loc[keep, cols[c]], label=y3[keep]), num_boost_round=rondas)
+                p2 = mc.predict(score[cols[c]])[:, 2]
+                ka = (y1 == 1) | (np.random.RandomState(s + 1).rand(len(y1)) < r)
+                aux = lgb.train({**params, "seed": s}, lgb.Dataset(da.loc[ka, cols[c]], label=y1[ka]), num_boost_round=rondas)
+                p1 = aux.predict(score[cols[c]])
+                guardar_modelo(mc, f"017_{TAG}_principal_{c}_{nombre}_{s}", p2)      # modelos en artifacts/ (no versionado) + huellas en el manifiesto
+                guardar_modelo(aux, f"017_{TAG}_auxiliar_{c}_{nombre}_{s}", p1)
+                np.save(f, p2 / np.clip(1 - p1, 1e-6, None))
+            ps.append(np.load(f))
+        S[f"{c}_{nombre}"] = np.mean(ps, axis=0)
+        escribir(f"listo {c} {nombre} ({len(semillas)} semillas, {(time.time()-t0)/60:.0f} min)")
+# [Anotación · líneas 98–109] Convierte el puntaje de cada configuración en rank dividido por la cantidad de
+#   clientes y promedia los 6; guarda tmp/scores_202108_<TAG>.csv, que lee la mezcla final. Toma los k primeros
+#   y, si el archivo exp017_final_... ya existe, informa si es idéntico; si no, lo escribe.
+    ids = score[ID_COL].values
+    rk = np.mean([rankdata(p) / len(p) for p in S.values()], axis=0)
+    pd.DataFrame({ID_COL: ids, "rank": rk, **S}).to_csv(TMP / f"scores_202108_{TAG}.csv", index=False)
+    nombre = f"exp017_final_s{len(semillas)}_k{args.k}" + ("_lag2" if args.lag2 else "")
+    sub = AQUI.parents[1] / "submissions"
+    top = top_k_ids(ids, rk, args.k)
+    if (sub / f"{nombre}.csv").exists():       # reproducibilidad: si el archivo ya existe, se compara en vez de fallar
+        previo = np.loadtxt(sub / f"{nombre}.csv", dtype=np.int64)
+        escribir(f"{nombre}.csv ya existía: " + ("IDÉNTICO al regenerado (mismo conjunto y mismo orden)" if np.array_equal(previo, top) else
+                 f"DISTINTO (mismo conjunto: {set(previo) == set(top)})"))
+    else:
+        escribir(guardar_submit(top, nombre).name)
+# [Anotación · líneas 110–114] Informa el solapamiento del top-k con dos envíos anteriores, si sus archivos
+#   existen.
+    for previo in ("exp010_mc_h2_k11500", "exp005_final_s30_k11500"):
+        f = sub / f"{previo}.csv"
+        if f.exists():
+            escribir(f"solapamiento top-{args.k} con {previo}: {len(set(top_k_ids(ids, rk, args.k)) & set(np.loadtxt(f, dtype=np.int64))) / args.k:.1%}")
+    escribir("[final 017] terminado")

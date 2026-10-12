@@ -1,0 +1,100 @@
+{
+  "experimento": 4103,
+  "nombre": "bo_fuera_de_tiempo_ampliada",
+  "descripcion": "Como 4102 pero con rangos ampliados donde 4102 quedo en el borde (learning_rate hasta 0.3, min_data_in_leaf hasta 20000, bagging_fraction desde 0.05, num_leaves hasta 256), otra semilla del sampler, mas exploracion al azar y la prueba 117 de 4102 como referencia. Eleccion por mitad A, comparacion en mitad B contra la mejor referencia.",
+  "reanudar": false,
+  "dataset": "ds3001_crudo.parquet",
+  "variables": "4003_canaritos/4003_variables_p95.txt",
+  "mes_train": 202104,
+  "mes_test": 202106,
+  "clase": "clase_binaria2",
+  "semilla_mitades": 571369,
+  "n_trials": 200,
+  "n_startup_trials": 50,
+  "max_boost_round": 3000,
+  "espacio": {
+    "learning_rate": [
+      0.005,
+      0.3,
+      "log"
+    ],
+    "num_leaves": [
+      8,
+      256,
+      "log"
+    ],
+    "min_data_in_leaf": [
+      50,
+      20000,
+      "log"
+    ],
+    "feature_fraction": [
+      0.05,
+      1.0,
+      "lineal"
+    ],
+    "bagging_fraction": [
+      0.05,
+      1.0,
+      "lineal"
+    ],
+    "lambda_l1": [
+      0.001,
+      10.0,
+      "log"
+    ],
+    "lambda_l2": [
+      0.001,
+      100.0,
+      "log"
+    ]
+  },
+  "lgbm_fijos": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "metric": "None",
+    "max_bin": 31,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "first_metric_only": true,
+    "deterministic": true,
+    "force_row_wise": true,
+    "verbose": -1
+  },
+  "semilla_sampler": 849571,
+  "referencias_extra": [
+    {
+      "nombre": "p117_4102",
+      "params": {
+        "learning_rate": 0.0842,
+        "num_leaves": 81,
+        "min_data_in_leaf": 3994,
+        "feature_fraction": 0.201,
+        "bagging_fraction": 0.2323,
+        "lambda_l1": 0.0013,
+        "lambda_l2": 0.0059
+      },
+      "arboles": 181
+    }
+  ],
+  "top_confirmar": 5,
+  "semillas_confirmacion": 10,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "regla_minimo_semillas_ganadas": 7,
+  "meseta_mes_completo": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "_config": "4103_bo_ampliada.json",
+  "_fecha_inicio": "2026-10-07 02:26:45",
+  "_script": "08_bo_fuera_de_tiempo.py",
+  "_git_commit": "sin_git"
+}

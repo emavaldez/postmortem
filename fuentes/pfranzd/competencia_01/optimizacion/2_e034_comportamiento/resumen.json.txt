@@ -1,0 +1,141 @@
+{
+  "estudio": "e034_comportamiento_22a62abc_ce600411",
+  "objetivo": "auc",
+  "n_trials": 60,
+  "n_completos": 34,
+  "n_podados": 26,
+  "top": [
+    {
+      "trial": 53,
+      "valor": 0.8982028011838237,
+      "params": {
+        "learning_rate": 0.010299773032810123,
+        "num_leaves": 60,
+        "min_data_in_leaf": 309,
+        "feature_fraction": 0.14595549574275657,
+        "num_iterations": 700
+      }
+    },
+    {
+      "trial": 52,
+      "valor": 0.8981715923101778,
+      "params": {
+        "learning_rate": 0.011824774275462245,
+        "num_leaves": 97,
+        "min_data_in_leaf": 320,
+        "feature_fraction": 0.15101757962910115,
+        "num_iterations": 715
+      }
+    },
+    {
+      "trial": 15,
+      "valor": 0.8977711612685968,
+      "params": {
+        "learning_rate": 0.010685968122036848,
+        "num_leaves": 62,
+        "min_data_in_leaf": 664,
+        "feature_fraction": 0.34650225919559974,
+        "num_iterations": 889
+      }
+    },
+    {
+      "trial": 31,
+      "valor": 0.8977323820335019,
+      "params": {
+        "learning_rate": 0.012284904814827163,
+        "num_leaves": 96,
+        "min_data_in_leaf": 264,
+        "feature_fraction": 0.1702632715647959,
+        "num_iterations": 792
+      }
+    },
+    {
+      "trial": 14,
+      "valor": 0.8976606710723816,
+      "params": {
+        "learning_rate": 0.00821753902853084,
+        "num_leaves": 49,
+        "min_data_in_leaf": 431,
+        "feature_fraction": 0.22469874811660645,
+        "num_iterations": 895
+      }
+    },
+    {
+      "trial": 24,
+      "valor": 0.8976521012889034,
+      "params": {
+        "learning_rate": 0.015411591956355353,
+        "num_leaves": 141,
+        "min_data_in_leaf": 436,
+        "feature_fraction": 0.19051249765483,
+        "num_iterations": 740
+      }
+    },
+    {
+      "trial": 32,
+      "valor": 0.8976239062718137,
+      "params": {
+        "learning_rate": 0.010010251095852412,
+        "num_leaves": 115,
+        "min_data_in_leaf": 203,
+        "feature_fraction": 0.14154079492983618,
+        "num_iterations": 773
+      }
+    },
+    {
+      "trial": 21,
+      "valor": 0.8974404800041735,
+      "params": {
+        "learning_rate": 0.012150745319066687,
+        "num_leaves": 93,
+        "min_data_in_leaf": 765,
+        "feature_fraction": 0.1747537732659807,
+        "num_iterations": 832
+      }
+    },
+    {
+      "trial": 51,
+      "valor": 0.8974269001730978,
+      "params": {
+        "learning_rate": 0.012017846675294442,
+        "num_leaves": 91,
+        "min_data_in_leaf": 698,
+        "feature_fraction": 0.17322258430993906,
+        "num_iterations": 852
+      }
+    },
+    {
+      "trial": 16,
+      "valor": 0.8974078533914445,
+      "params": {
+        "learning_rate": 0.01533771215101484,
+        "num_leaves": 104,
+        "min_data_in_leaf": 686,
+        "feature_fraction": 0.19785487059053372,
+        "num_iterations": 877
+      }
+    },
+    {
+      "trial": 57,
+      "valor": 0.897406648430964,
+      "params": {
+        "learning_rate": 0.011859341725522774,
+        "num_leaves": 76,
+        "min_data_in_leaf": 143,
+        "feature_fraction": 0.2191152828323255,
+        "num_iterations": 619
+      }
+    },
+    {
+      "trial": 44,
+      "valor": 0.8972790060424125,
+      "params": {
+        "learning_rate": 0.010948699489444243,
+        "num_leaves": 56,
+        "min_data_in_leaf": 656,
+        "feature_fraction": 0.16607951264165186,
+        "num_iterations": 686
+      }
+    }
+  ]
+}

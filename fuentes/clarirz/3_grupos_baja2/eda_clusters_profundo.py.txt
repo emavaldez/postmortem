@@ -1,0 +1,293 @@
+"""
+EDA profundo de clusters BAJA+2.
+
+Esto es EDA/characterización, no selección de k ni prueba causal.
+Reproduce z501 y después estudia variables originales, comparación con
+CONTINUA y tiempo relativo a BAJA+2 / último mes activo.
+"""
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import duckdb
+from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestClassifier
+
+ID="numero_de_cliente"; MES="foto_mes"; TARGET="clase_ternaria"
+GRUPO="grupo"; CLUSTER="cluster"; RAIZ="_sin_split"
+SEED=214363; N_TREES=300; MIN_LEAF=50; K=5
+
+VARS=[
+ "active_quarter","internet","cproductos","ctrx_quarter",
+ "chomebanking_transacciones","mcaja_ahorro","mcuentas_saldo","mpasivos_margen",
+ "ctarjeta_debito_transacciones","ctarjeta_visa","ctarjeta_visa_transacciones",
+ "mtarjeta_visa_consumo","ctarjeta_visa_debitos_automaticos",
+ "mtarjeta_visa_debitos_automaticos","mttarjeta_visa_debitos_automaticos",
+ "ctarjeta_master","ctarjeta_master_transacciones","mtarjeta_master_consumo",
+ "cpayroll_trx","mpayroll","cpagomiscuentas","matm",
+ "ctransferencias_recibidas","mtransferencias_recibidas",
+ "ctransferencias_emitidas","mtransferencias_emitidas","ccajas_transacciones",
+ "cdescubierto_preacordado","cprestamos_personales","mprestamos_personales",
+ "Visa_mfinanciacion_limite","Master_status","Visa_status",
+]
+NOMINAL={"Master_status","Visa_status"}
+TRANSITION_VARS=[
+ "ctrx_quarter","chomebanking_transacciones","mcaja_ahorro",
+ "ctarjeta_debito_transacciones","ctarjeta_visa_transacciones",
+ "mtarjeta_visa_consumo","ctarjeta_visa_debitos_automaticos",
+ "mtarjeta_visa_debitos_automaticos","mttarjeta_visa_debitos_automaticos",
+ "mpayroll","cpayroll_trx","cpagomiscuentas","matm",
+ "ctransferencias_recibidas","ctransferencias_emitidas",
+ "cprestamos_personales","mprestamos_personales","ccajas_transacciones",
+]
+
+def month_ord(x):
+    x=pd.to_numeric(x, errors="coerce")
+    return (x//100).astype("Int64")*12 + (x%100).astype("Int64")
+
+def load_full(data):
+    return duckdb.connect().execute(
+        f"SELECT * FROM read_parquet('{data.as_posix()}')"
+        if data.suffix.lower()==".parquet"
+        else f"SELECT * FROM read_csv('{data.as_posix()}', sample_size=-1)"
+    ).df()
+
+def build_z501_sample(full):
+    churn_ids=full.loc[full[TARGET].eq("BAJA+2"),ID].drop_duplicates()
+    n_months=full[MES].nunique()
+    faithful=full.groupby(ID,sort=False).agg(
+        n_rows=(MES,"size"),
+        any_baja=(TARGET,lambda s:s.isin(["BAJA+1","BAJA+2"]).any())
+    )
+    fid=faithful.index[(faithful.n_rows.eq(n_months)) & (~faithful.any_baja)]
+    ids_df=pd.DataFrame({ID:fid.to_numpy(dtype=np.int64)})
+    con=duckdb.connect(); con.register("ids_df",ids_df)
+    fs=con.execute(
+        f"SELECT {ID} FROM ids_df ORDER BY hash({ID}+{SEED}) LIMIT {len(churn_ids)}"
+    ).df()[ID]
+    a=full[full[ID].isin(churn_ids)].copy(); a[GRUPO]=1
+    b=full[full[ID].isin(fs)].copy(); b[GRUPO]=0
+    return pd.concat([a,b],ignore_index=True).sort_values([ID,MES])
+
+def numeric_features(df):
+    excl={ID,MES,TARGET,GRUPO}
+    return [c for c in df.columns if c not in excl and pd.api.types.is_numeric_dtype(df[c])]
+
+def last_split_feature(est):
+    t=est.tree_; out=np.full(t.node_count,-1,dtype=np.int64)
+    internal=np.flatnonzero(t.children_left!=-1)
+    out[t.children_left[internal]]=t.feature[internal]
+    out[t.children_right[internal]]=t.feature[internal]
+    return out
+
+def leaf_profile(rf,X,ids,features):
+    leaves=rf.apply(X); nfeat=len(features); codes=np.empty_like(leaves)
+    for j,est in enumerate(rf.estimators_):
+        codes[:,j]=last_split_feature(est)[leaves[:,j]]
+    codes[codes<0]=nfeat
+    idx,uid=pd.factorize(ids)
+    C=np.zeros((len(uid),nfeat+1),dtype=np.int64)
+    np.add.at(C,(np.repeat(idx,leaves.shape[1]),codes.ravel()),1)
+    C=pd.DataFrame(C,index=pd.Index(uid,name=ID),columns=features+[RAIZ])
+    P=C.drop(columns=[RAIZ]); P=P.loc[:,P.sum(axis=0)>0]
+    return P.div(P.sum(axis=1),axis=0)
+
+def reproduce_clusters(sample):
+    feats=numeric_features(sample)
+    X=sample[feats].to_numpy(dtype=np.float32)
+    y=sample[GRUPO].to_numpy(); ids=sample[ID].to_numpy()
+    rf=RandomForestClassifier(
+      n_estimators=N_TREES,min_samples_leaf=MIN_LEAF,max_features="sqrt",
+      class_weight="balanced",oob_score=True,n_jobs=-1,random_state=SEED
+    ).fit(X,y)
+    P=leaf_profile(rf,X,ids,feats)
+    churn_ids=pd.Index(sample.loc[sample[GRUPO].eq(1),ID].unique())
+    Pc=P.loc[churn_ids]
+    km=KMeans(n_clusters=K,n_init=20,random_state=SEED).fit(Pc.values)
+    order=pd.Series(km.labels_).value_counts().index.tolist()
+    remap={old:new+1 for new,old in enumerate(order)}
+    labels=pd.Series([remap[z] for z in km.labels_],index=Pc.index,name=CLUSTER)
+    global_share=Pc.mean(); rows=[]
+    for c,sub in Pc.groupby(labels):
+        sh=sub.mean()
+        tab=pd.DataFrame({"share_cluster":sh,"share_global":global_share})
+        tab["lift"]=tab.share_cluster/tab.share_global.replace(0,np.nan)
+        tab=tab[tab.share_cluster>=0.5/Pc.shape[1]].sort_values("lift",ascending=False).head(10)
+        for rank,(v,r) in enumerate(tab.iterrows(),1):
+            rows.append({CLUSTER:c,"rank":rank,"variable":v,**r.to_dict()})
+    return rf,labels,pd.DataFrame(rows)
+
+def prepare_history(full,labels):
+    d=full[full[ID].isin(labels.index)].copy().merge(labels,left_on=ID,right_index=True)
+    b2=d.loc[d[TARGET].eq("BAJA+2")].groupby(ID)[MES].min().rename("mes_baja2")
+    last=d.groupby(ID)[MES].max().rename("mes_ultimo_activo")
+    d=d.merge(b2,on=ID).merge(last,on=ID)
+    d["rel_baja2"]=(month_ord(d[MES])-month_ord(d.mes_baja2)).astype("Int64")
+    d["rel_ultimo_activo"]=(month_ord(d[MES])-month_ord(d.mes_ultimo_activo)).astype("Int64")
+    return d
+
+def describe_numeric(x):
+    x=pd.to_numeric(x,errors="coerce"); obs=x.dropna(); pos=obs[obs>0]
+    return dict(
+      n=len(x),n_obs=len(obs),pct_missing=100*x.isna().mean(),
+      pct_zero_obs=100*(obs.eq(0).mean() if len(obs) else np.nan),
+      pct_positive_obs=100*(obs.gt(0).mean() if len(obs) else np.nan),
+      mean=obs.mean() if len(obs) else np.nan,
+      median=obs.median() if len(obs) else np.nan,
+      q25=obs.quantile(.25) if len(obs) else np.nan,
+      q75=obs.quantile(.75) if len(obs) else np.nan,
+      median_positive=pos.median() if len(pos) else np.nan,
+    )
+
+def profile_table(d,by,vars_):
+    rows=[]
+    for keys,g in d.groupby(by,dropna=False):
+        if not isinstance(keys,tuple): keys=(keys,)
+        base=dict(zip(by,keys))
+        for v in vars_:
+            if v not in g.columns: continue
+            if v in NOMINAL:
+                row={**base,"variable":v,"n":len(g),"n_obs":g[v].notna().sum(),
+                     "pct_missing":100*g[v].isna().mean(),"pct_zero_obs":np.nan,
+                     "pct_positive_obs":np.nan,"mean":np.nan,"median":np.nan,
+                     "q25":np.nan,"q75":np.nan,"median_positive":np.nan}
+            else:
+                row={**base,"variable":v,**describe_numeric(g[v])}
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+def nominal_distribution(d,by,vars_):
+    rows=[]
+    for v in vars_:
+        if v not in d.columns: continue
+        z=d.groupby(by,dropna=False)[v].value_counts(dropna=False,normalize=True).rename("share").reset_index()
+        z["variable"]=v; rows.append(z)
+    return pd.concat(rows,ignore_index=True) if rows else pd.DataFrame()
+
+def transitions(d,from_rel,to_rel):
+    vars_=[v for v in TRANSITION_VARS if v in d.columns]
+    a=d[d.rel_baja2.eq(from_rel)][[ID,CLUSTER]+vars_].set_index(ID)
+    b=d[d.rel_baja2.eq(to_rel)][[ID,CLUSTER]+vars_].set_index(ID)
+    ids=a.index.intersection(b.index); a=a.loc[ids]; b=b.loc[ids]; rows=[]
+    for c in sorted(d[CLUSTER].unique()):
+        idx=a.index[a[CLUSTER].eq(c)]
+        for v in vars_:
+            x=a.loc[idx,v]; y=b.loc[idx,v]; valid=x.notna()&y.notna()
+            x=x[valid]; y=y[valid]; prev=x>0; nprev=int(prev.sum())
+            p0=int(((x>0)&y.eq(0)).sum()); zz=int((x.eq(0)&y.eq(0)).sum())
+            zp=int((x.eq(0)&y.gt(0)).sum()); pp=(x>0)&(y>0)
+            rows.append({
+              CLUSTER:c,"variable":v,"from_rel":from_rel,"to_rel":to_rel,
+              "n_pairs":len(x),"n_prev_positive":nprev,"n_positive_to_zero":p0,
+              "pct_positive_to_zero":100*p0/nprev if nprev else np.nan,
+              "n_zero_to_zero":zz,"n_zero_to_positive":zp,
+              "median_delta_among_stay_positive":(y[pp]-x[pp]).median() if pp.any() else np.nan
+            })
+    return pd.DataFrame(rows)
+
+def continua_benchmark(full,hist):
+    cont=full[full[TARGET].eq("CONTINUA")]; rows=[]
+    dh=hist[hist.rel_baja2.between(-3,0)]
+    for (c,rel,mes),g in dh.groupby([CLUSTER,"rel_baja2",MES]):
+        ref=cont[cont[MES].eq(mes)]
+        if ref.empty: continue
+        for v in VARS:
+            if v not in g.columns or v not in ref.columns or v in NOMINAL: continue
+            a=pd.to_numeric(g[v],errors="coerce").dropna()
+            b=pd.to_numeric(ref[v],errors="coerce").dropna()
+            if not len(a) or not len(b): continue
+            rows.append({
+              CLUSTER:c,"rel_baja2":int(rel),MES:mes,"variable":v,
+              "cluster_n":len(a),"continua_n":len(b),
+              "cluster_median":a.median(),"continua_median":b.median(),
+              "cluster_pct_zero":100*a.eq(0).mean(),"continua_pct_zero":100*b.eq(0).mean(),
+              "cluster_median_positive":a[a>0].median() if (a>0).any() else np.nan,
+              "continua_median_positive":b[b>0].median() if (b>0).any() else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+def c1_matched_visa(full,hist):
+    cont=full[full[TARGET].eq("CONTINUA")]; out=[]
+    for rel in [-1,0]:
+      c1=hist[(hist[CLUSTER].eq(1))&hist.rel_baja2.eq(rel)].copy()
+      for mes,a in c1.groupby(MES):
+        b=cont[cont[MES].eq(mes)].copy()
+        if a.empty or b.empty: continue
+        for v in ["ctarjeta_visa_transacciones","mtarjeta_visa_consumo"]:
+            vals=pd.to_numeric(b[v],errors="coerce")
+            b[f"_pct_{v}"]=vals.rank(pct=True,method="average")
+            sorted_b=np.sort(vals.dropna().to_numpy())
+            av=pd.to_numeric(a[v],errors="coerce")
+            a[f"_pct_{v}"]=av.apply(lambda x: np.searchsorted(sorted_b,x,side="right")/len(sorted_b) if pd.notna(x) and len(sorted_b) else np.nan)
+        for df in (a,b):
+            df["_bin_trx"]=np.minimum((df["_pct_ctarjeta_visa_transacciones"]*10).fillna(-1).astype(int),9)
+            df["_bin_amt"]=np.minimum((df["_pct_mtarjeta_visa_consumo"]*10).fillna(-1).astype(int),9)
+        parts=[]
+        for (bt,ba),ga in a.groupby(["_bin_trx","_bin_amt"]):
+            gb=b[b._bin_trx.eq(bt)&b._bin_amt.eq(ba)]
+            if not gb.empty: parts.append(gb.sample(n=len(ga),replace=len(gb)<len(ga),random_state=SEED))
+        if not parts: continue
+        bm=pd.concat(parts,ignore_index=True)
+        for v in [x for x in VARS if x not in NOMINAL and x not in {"ctarjeta_visa_transacciones","mtarjeta_visa_consumo"}]:
+            if v not in a.columns or v not in bm.columns: continue
+            xa=pd.to_numeric(a[v],errors="coerce").dropna(); xb=pd.to_numeric(bm[v],errors="coerce").dropna()
+            if not len(xa) or not len(xb): continue
+            out.append({
+              "rel_baja2":rel,MES:mes,"variable":v,"c1_n":len(xa),"matched_continua_n":len(xb),
+              "c1_median":xa.median(),"matched_continua_median":xb.median(),
+              "c1_pct_zero":100*xa.eq(0).mean(),"matched_continua_pct_zero":100*xb.eq(0).mean(),
+              "c1_median_positive":xa[xa>0].median() if (xa>0).any() else np.nan,
+              "matched_continua_median_positive":xb[xb>0].median() if (xb>0).any() else np.nan,
+            })
+    return pd.DataFrame(out)
+
+def pairwise_at_event(hist):
+    rows=[]
+    for rel in [-1,0]:
+      d=hist[hist.rel_baja2.eq(rel)]
+      for v in [x for x in VARS if x not in NOMINAL and x in d.columns]:
+        vals=pd.to_numeric(d[v],errors="coerce"); iqr=vals.quantile(.75)-vals.quantile(.25)
+        for a in range(1,K+1):
+          xa=pd.to_numeric(d.loc[d[CLUSTER].eq(a),v],errors="coerce").dropna()
+          for b in range(a+1,K+1):
+            xb=pd.to_numeric(d.loc[d[CLUSTER].eq(b),v],errors="coerce").dropna()
+            if not len(xa) or not len(xb): continue
+            rows.append({
+              "rel_baja2":rel,"cluster_a":a,"cluster_b":b,"variable":v,
+              "median_a":xa.median(),"median_b":xb.median(),
+              "std_median_diff_iqr":(xa.median()-xb.median())/iqr if pd.notna(iqr) and iqr!=0 else np.nan,
+              "pct_zero_a":100*xa.eq(0).mean(),"pct_zero_b":100*xb.eq(0).mean()
+            })
+    return pd.DataFrame(rows)
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument("--data",type=Path,required=True)
+    ap.add_argument("--out",type=Path,default=Path("resultados_eda_clusters")); args=ap.parse_args()
+    args.out.mkdir(parents=True,exist_ok=True)
+    print("1/8 leyendo datos"); full=load_full(args.data)
+    print("2/8 reproduciendo z501"); sample=build_z501_sample(full); rf,labels,defs=reproduce_clusters(sample)
+    pd.DataFrame({CLUSTER:labels.value_counts().sort_index().index,"n_clientes":labels.value_counts().sort_index().values}).to_csv(args.out/"01_cluster_sizes.csv",index=False)
+    defs.to_csv(args.out/"02_defining_features.csv",index=False)
+    print("Clusters reproducidos:")
+    print(labels.value_counts().sort_index().to_string())
+    print("Top 3 atributos por cluster:")
+    print(defs[defs["rank"]<=3][[CLUSTER,"rank","variable","lift"]].to_string(index=False))
+    print("3/8 historia"); hist=prepare_history(full,labels)
+    present=list(dict.fromkeys([v for v in VARS if v in hist.columns]))
+    print("4/8 perfiles")
+    profile_table(hist[hist.rel_baja2.eq(0)],[CLUSTER],present).to_csv(args.out/"03_raw_profile_at_baja2.csv",index=False)
+    profile_table(hist[hist.rel_baja2.between(-3,1)],[CLUSTER,"rel_baja2"],present).to_csv(args.out/"04_profile_relative_to_baja2.csv",index=False)
+    profile_table(hist[hist.rel_ultimo_activo.between(-3,0)],[CLUSTER,"rel_ultimo_activo"],present).to_csv(args.out/"05_profile_relative_to_last_active.csv",index=False)
+    nominal_distribution(hist[hist.rel_baja2.between(-3,1)],[CLUSTER,"rel_baja2"],[v for v in NOMINAL if v in hist.columns]).to_csv(args.out/"05b_status_distribution.csv",index=False)
+    print("5/8 transiciones")
+    pd.concat([transitions(hist,a,b) for a,b in [(-3,-2),(-2,-1),(-1,0),(0,1)]],ignore_index=True).to_csv(args.out/"06_transitions_relative_to_baja2.csv",index=False)
+    print("6/8 CONTINUA"); continua_benchmark(full,hist).to_csv(args.out/"07_cluster_vs_continua_same_month.csv",index=False)
+    print("7/8 C1 matched"); c1_matched_visa(full,hist).to_csv(args.out/"08_c1_vs_continua_matched_visa.csv",index=False)
+    print("8/8 contrastes"); pairwise_at_event(hist).to_csv(args.out/"09_pairwise_cluster_contrasts.csv",index=False)
+    pd.DataFrame({"variable":present}).to_csv(args.out/"10_selected_variables.csv",index=False)
+    pd.DataFrame({"metric":["rf_oob","n_churn","n_sample_rows"],"value":[rf.oob_score_,len(labels),len(sample)]}).to_csv(args.out/"00_run_metadata.csv",index=False)
+    print(f"RF OOB={rf.oob_score_:.4f} (NO es validación de clusters)")
+    print("Listo",args.out)
+
+if __name__=="__main__": main()

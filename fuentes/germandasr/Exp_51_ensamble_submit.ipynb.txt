@@ -1,0 +1,61 @@
+#%% celda 1 [texto]
+# **Exp_51 -- Ensamble y seleccion de corte (genera el CSV final submiteado)**
+
+Este notebook toma `probabilidades_20_semillas.txt` (generado por `Exp_51_entrega_final.ipynb`, o el que se provee junto a esta carpeta como atajo) y produce el archivo final de 1 columna que fue subido al bot de la competencia.
+
+**No hace falta reentrenar nada para correr este notebook** -- alcanza con tener el archivo de probabilidades en la misma carpeta.
+
+#%% celda 2 [código]
+library(data.table)
+options(scipen = 999)
+
+#%% celda 3 [texto]
+## Parametros
+
+#%% celda 4 [código]
+# archivo de probabilidades agrupadas (20 semillas), generado por Exp_51_entrega_final.ipynb
+ARCHIVO_PROBABILIDADES <- "probabilidades_20_semillas.txt"
+
+# CORTE elegido como entrega final -- cuantos clientes se envian, ordenados por probabilidad desc.
+CORTE_FINAL <- 11100   # <-- EDITAR ACA con el corte definitivo que se decida
+
+ARCHIVO_SALIDA <- "entrega_final.csv"
+
+#%% celda 5 [texto]
+## Lectura de probabilidades y armado del ensamble
+
+#%% celda 6 [código]
+tb <- fread(ARCHIVO_PROBABILIDADES)
+
+# las columnas de probabilidad son todas menos numero_de_cliente y foto_mes
+cols_prob <- setdiff(colnames(tb), c("numero_de_cliente", "foto_mes"))
+cat("Cantidad de semillas/modelos en el ensamble:", length(cols_prob), "\n")
+
+# ensamble = promedio simple de probabilidades (sin ponderar)
+tb[, prob_ensamble := rowMeans(.SD), .SDcols = cols_prob]
+
+#%% celda 7 [texto]
+## Ranking por probabilidad y seleccion del corte
+
+#%% celda 8 [código]
+setorder(tb, -prob_ensamble)
+
+stopifnot(CORTE_FINAL <= nrow(tb))
+
+clientes_entrega <- as.integer(tb[1:CORTE_FINAL, numero_de_cliente])
+cat("Clientes seleccionados:", length(clientes_entrega), "de", nrow(tb), "totales\n")
+
+#%% celda 9 [texto]
+## Exportacion del CSV final (1 columna, sin header -- formato exigido por el bot)
+
+#%% celda 10 [código]
+fwrite(
+  data.table(numero_de_cliente = clientes_entrega),
+  file = ARCHIVO_SALIDA,
+  col.names = FALSE
+)
+
+cat("Archivo final generado:", ARCHIVO_SALIDA, "con", length(clientes_entrega), "clientes\n")
+
+#%% celda 11 [código]
+El ensemble mejor obtenido es de 11100 clientes.

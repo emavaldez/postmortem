@@ -1,0 +1,122 @@
+"""
+01_entrenar_08_L22.py — DMEyF, 1ra competencia, L22: entrenamiento FINAL con 03, 04, 05 y 06 reales para predecir 08.
+
+Usa el dataset y los hiperparámetros de L20 (etapa 1, clase real). No hay bayesiana ni clase artificial.
+Entrena MUCHOS modelos, uno por semilla, con TODAS las columnas (incluidas las variables de préstamos, que se
+excluyeron solo para evaluar en 06), y guarda la predicción sobre 08 de cada modelo apenas termina.
+
+SE PUEDE INTERRUMPIR EN CUALQUIER MOMENTO (kill o corte de la VM): cada predicción se guarda de forma atómica y al
+relanzar el mismo comando se retoma con la primera semilla que falte. Solo se pierde el modelo en curso.
+Para ensamblar lo disponible en cualquier momento (también mientras sigue corriendo este script):
+    python 02_ensamblar_08_L22.py
+
+VARIAS VM EN PARALELO: cada VM debe usar un rango de semillas distinto y su propio --volumen, por ejemplo
+    VM 1:  bash correr_L22.sh                                          (semillas 0 a 199, volumen L22)
+    VM 2:  bash correr_L22.sh --volumen L22b --desde 200               (semillas 200 a 399, volumen L22b)
+Después se ensamblan juntas: python 02_ensamblar_08_L22.py --otros L22b
+
+Uso (desde ~/dmeyf):
+    nohup bash correr_L22.sh > /dev/null 2>&1 &         # recomendado
+    # o directamente: nohup python 01_entrenar_08_L22.py > L22_modelos.log 2>&1 &
+
+Salidas en ~/dmeyf/exp/L22/ (y copia en gs://luisdsuarez_buckito2026/exp/L22/):
+    hiperparametros_origen.json    copia de los hiperparámetros de L20 que se usaron
+    config.json, ids_08.npy        (orden de los clientes de 08 al que corresponden todas las predicciones)
+    pred_08/prob_<semilla>.npy     probabilidad de BAJA para los clientes de 08, un archivo por modelo
+    L22_pred_08_ens_<n>modelos.parquet   ensamble (numero_de_cliente, prob_ens), lo genera 02_ensamblar_08_L22.py
+"""
+import argparse
+import json
+import os
+import shutil
+import time
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+import comun_L22 as cm
+from comun_L22 import log
+
+MESES_TRAIN = [202103, 202104, 202105, 202106]
+MES_PRED = 202108
+MAX_SEMILLAS = 1000                 # lista ordenada de semillas; el script se detiene al llegar a --n_semillas
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--volumen", default=cm.VOLUMEN)
+    ap.add_argument("--dir_base", default=os.path.expanduser("~/dmeyf"))
+    ap.add_argument("--dataset", default=None, help="por defecto ~/dmeyf/datasets/L20_dataset.parquet")
+    ap.add_argument("--hiperparametros", default=None, help="por defecto ~/dmeyf/exp/L20/L20_e1_hiperparametros.json")
+    ap.add_argument("--n_semillas", type=int, default=200, help="cantidad de semillas de este rango (tope de modelos; se puede interrumpir antes)")
+    ap.add_argument("--desde", type=int, default=0,
+                    help="posición inicial en la lista ordenada de semillas. Este rango usa las posiciones [desde, desde + n_semillas). "
+                         "Para una segunda VM: --desde 200 (con el tope por defecto de 200 de la primera) y otro --volumen")
+    ap.add_argument("--sin_bucket", action="store_true")
+    a = ap.parse_args()
+
+    ruta_pq = a.dataset or os.path.join(a.dir_base, "datasets", "L20_dataset.parquet")
+    ruta_hp = a.hiperparametros or os.path.join(a.dir_base, "exp", "L20", "L20_e1_hiperparametros.json")
+    dir_exp = cm.preparar(a.volumen, a.dir_base, [__file__])
+    sync = lambda: cm.sync(dir_exp, a.volumen, not a.sin_bucket)
+
+    with open(ruta_hp) as fh:
+        mejores = json.load(fh)["mejores_hiperparametros"]
+    assert set(mejores) == {"num_iterations", "num_leaves", "min_sum_hessian_in_leaf"}, mejores
+    shutil.copy(ruta_hp, os.path.join(dir_exp, "hiperparametros_origen.json"))
+    assert a.desde >= 0 and a.desde + a.n_semillas <= MAX_SEMILLAS, f"el rango debe caber en las {MAX_SEMILLAS} semillas disponibles"
+    semillas = cm.semillas_n(MAX_SEMILLAS)[a.desde:a.desde + a.n_semillas]
+    with open(os.path.join(dir_exp, "config.json"), "w") as fh:
+        json.dump(dict(dataset=ruta_pq, hiperparametros=ruta_hp, mejores_hiperparametros=mejores,
+                       params_fijos=cm.PARAMS_FIJOS, meses_entrenamiento=MESES_TRAIN, mes_prediccion=MES_PRED,
+                       rango_semillas=dict(desde=a.desde, hasta_sin_incluir=a.desde + a.n_semillas,
+                                           primera=semillas[0], ultima=semillas[-1]),
+                       primeras_semillas=semillas[:25], n_semillas_tope=a.n_semillas,
+                       versiones=dict(lightgbm=lgb.__version__, pandas=pd.__version__)), fh, indent=1)
+    log(f"=== {a.volumen}: hiperparámetros de {ruta_hp}: {mejores}")
+    log(f"=== semillas: posiciones {a.desde} a {a.desde + a.n_semillas - 1} de la lista fija (de {semillas[0]} a {semillas[-1]})")
+    log(f"=== cargando meses {MESES_TRAIN + [MES_PRED]} de {ruta_pq}")
+    D = cm.cargar(ruta_pq, MESES_TRAIN + [MES_PRED])
+    X, mes, yb, cols = D["X"], D["mes"], D["yb"], D["cols"]
+    tr, fut = np.isin(mes, MESES_TRAIN), mes == MES_PRED
+    assert not np.isnan(yb[tr]).any(), "faltan clases reales en los meses de entrenamiento"
+    assert fut.sum() > 0
+    log(f"  entrenamiento: {tr.sum():,} filas, {yb[tr].mean():.3%} positivos, {len(cols)} features (TODAS, con préstamos) "
+        f"| a predecir: {fut.sum():,} clientes de {MES_PRED}")
+
+    # los clientes de 08, en el orden al que corresponden todas las predicciones; protege contra mezclar corridas
+    ruta_ids = os.path.join(dir_exp, "ids_08.npy")
+    if os.path.exists(ruta_ids):
+        assert np.array_equal(np.load(ruta_ids), D["ids"][fut]), "ids_08.npy no coincide: ¿otro dataset? No mezclar corridas"
+    else:
+        cm.guardar_atomico(lambda r: np.save(open(r, "wb"), D["ids"][fut]), ruta_ids)
+
+    dir_p = os.path.join(dir_exp, "pred_08")
+    os.makedirs(dir_p, exist_ok=True)
+    ruta = lambda sd: os.path.join(dir_p, f"prob_{sd}.npy")
+    pend = [sd for sd in semillas if not os.path.exists(ruta(sd))]
+    log(f"  modelos ya guardados: {len(semillas) - len(pend)} | pendientes hasta el tope de {len(semillas)}: {len(pend)}")
+    if pend:
+        dtr = lgb.Dataset(X[tr], yb[tr], feature_name=cols, params=cm.PARAMS_DATASET).construct()
+        X08 = X[fut]
+        del X, D["X"]
+        hechos, t_ini = len(semillas) - len(pend), time.time()
+        for i, sd in enumerate(pend, 1):
+            t = time.time()
+            m = cm.entrenar(mejores, sd, dtr)
+            pr = m.predict(X08).astype("float64")
+            cm.guardar_atomico(lambda r: np.save(open(r, "wb"), pr), ruta(sd))
+            del m
+            cm.gc.collect()
+            log(f"  modelo {hechos + i} (semilla {sd}): {time.time() - t:.0f}s | en esta corrida: {i} modelos, "
+                f"{(time.time() - t_ini) / i / 60:.1f} min por modelo")
+            sync()
+    log("tope de modelos alcanzado; ensamblando")
+    cm.ensamblar_08(dir_exp, a.volumen, cm.semillas_n(MAX_SEMILLAS))
+    sync()
+    log("listo")
+
+
+if __name__ == "__main__":
+    main()

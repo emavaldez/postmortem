@@ -1,0 +1,8 @@
+{
+  "archivo": "ds3006_muerte_ampliada.parquet",
+  "columnas": 799,
+  "MB": 567,
+  "nuevas": 34,
+  "lista_ampliada": 43,
+  "_minutos": 0.95
+}

@@ -1,0 +1,187 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–37] Importaciones, corrida y semillas. `expected_ids` devuelve los n clientes de mayor
+#   puntaje ordenados de menor a mayor; `read_csv_ids` lee un CSV de una columna y valida formato y ausencia de
+#   repetidos.
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import re
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+import sys
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import super_common as C
+
+RUN = "c1superfinal100v2"
+SEEDS = [17,101,202,303,404,505,606,707,808,909,1001,1102,1203,1304,1405,1506,1607,1708,1809,1910]
+
+
+def require(ok: bool, msg: str) -> None:
+    if not ok:
+        raise RuntimeError(msg)
+
+
+def expected_ids(ids: np.ndarray, scores: np.ndarray, n: int) -> np.ndarray:
+    order = np.lexsort((ids, -scores))
+    return np.sort(ids[order[:n]])
+
+
+def read_csv_ids(path: Path) -> np.ndarray:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    require(lines and all(re.fullmatch(r"[1-9][0-9]*", x) for x in lines),
+            f"CSV formato inválido: {path}")
+    arr = np.asarray([int(x) for x in lines], dtype=np.int64)
+    require(len(np.unique(arr)) == len(arr), f"CSV duplicados: {path}")
+    return arr
+
+
+# [Anotación · líneas 40–66] `main` lee los resultados de las etapas 4 y 5. Si la etapa 5 se detuvo sin
+#   promoción, verifica que no exista ningún CSV y escribe `AUDITORIA_FINAL.json` con estado `AUDIT_STOP_OK`.
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Auditor 0-fits SUPERFINAL100 v2")
+    parser.add_argument("--home", type=Path, default=Path.home())
+    args = parser.parse_args()
+    home = args.home.resolve()
+    root = home / RUN
+    stage4 = C.load_json(root / "stage4_confirm20/RESULT.json")
+    stage5 = C.load_json(root / "stage5_final/RESULT.json")
+
+    if stage5.get("status") == "stopped_no_promotion":
+        require(stage4.get("promote_to_august") is False,
+                "Stage5 dice stop pero Stage4 promovió")
+        delivery = root / "stage5_final/delivery"
+        csvs = list(delivery.glob("*.csv")) if delivery.exists() else []
+        require(not csvs, "Hay CSV aunque no hubo promoción")
+        audit = {
+            "status": "AUDIT_STOP_OK",
+            "run": RUN,
+            "stage4_identity": stage4["identity"],
+            "promote_to_august": False,
+            "submit_generated": False,
+            "promotion_rule_v2": stage4.get("promotion_rule_v2"),
+        }
+        C.write_json(root / "AUDITORIA_FINAL.json", audit)
+        print("AUDIT_STOP_OK")
+        print("No hubo promoción; no existe submit final.")
+        return
+
+# [Anotación · líneas 68–74] Exige estado `ready_not_submitted`, promoción con al menos 14 semillas a favor,
+#   el mismo N que la etapa 4 y que N esté en la grilla 8.000–15.000 de a 500.
+    require(stage5.get("status") == "ready_not_submitted", "Stage5 no está listo")
+    require(stage4.get("promote_to_august") is True, "Stage5 listo sin promoción")
+    require(stage4.get("paired", {}).get("wins", 0) >= 14, "Promoción con menos de 14 wins")
+    identity = stage5["identity"]
+    n = int(stage5["n"])
+    require(n == int(stage4["n_final"]), "N final distinto de Stage4")
+    require(8000 <= n <= 15000 and n % 500 == 0, "N fuera de grilla")
+
+# [Anotación · líneas 76–113] Para cada semilla verifica el par modelo y `.npz` (identidad, semilla, hash del
+#   modelo), que los puntajes sean finitos y estén en [0, 1] y que los 164.647 clientes coincidan; arma la
+#   matriz de 20 × 164.647 y la promedia.
+    model_dir = root / "stage5_final/models"
+    ids0 = None
+    score_rows = []
+    model_rows = []
+    for seed in SEEDS:
+        cp = model_dir / f"seed_{seed}.npz"
+        model_path = model_dir / f"modelo_{seed}.txt"
+        require(cp.is_file() and model_path.is_file(), f"Falta par seed={seed}")
+        with np.load(cp, allow_pickle=False) as z:
+            require(str(z["identity"].item()) == identity, f"Identity seed={seed}")
+            require(int(z["seed"].item()) == seed, f"Seed incorrecta {seed}")
+            ids = np.asarray(z["ids"], dtype=np.int64)
+            scores = np.asarray(z["scores"], dtype=np.float64)
+            require(str(z["model_sha256"].item()) == C.digest(model_path),
+                    f"Hash modelo/checkpoint seed={seed}")
+        require(scores.shape == ids.shape and np.isfinite(scores).all(),
+                f"Scores inválidos seed={seed}")
+        require(((scores >= 0) & (scores <= 1)).all(),
+                f"Scores fuera de rango seed={seed}")
+        if ids0 is None:
+            ids0 = ids.copy()
+            require(len(ids0) == 164647, "Cantidad agosto inesperada")
+            require(len(np.unique(ids0)) == len(ids0), "IDs duplicados")
+        else:
+            require(np.array_equal(ids0, ids), f"IDs distintos seed={seed}")
+        score_rows.append(scores.copy())
+        model_rows.append({
+            "seed": seed,
+            "checkpoint_sha256": C.digest(cp),
+            "model_sha256": C.digest(model_path),
+            "n_scores": len(scores),
+            "score_min": float(scores.min()),
+            "score_max": float(scores.max()),
+        })
+
+    matrix = np.vstack(score_rows)
+    require(matrix.shape == (20, 164647), "Matriz de scores incompleta")
+    ensemble = matrix.mean(axis=0, dtype=np.float64)
+
+# [Anotación · líneas 115–142] Verifica manifiesto y `LISTO.json`, que haya un solo CSV con el nombre y el
+#   SHA-256 registrados, que sus clientes sean exactamente los N de mayor promedio, el mensaje de envío y el
+#   resultado del canary.
+    delivery = root / "stage5_final/delivery"
+    manifest = C.load_json(delivery / "MANIFEST.json")
+    listo = C.load_json(root / "stage5_final/LISTO.json")
+    require(manifest["identity"] == identity and listo["identity"] == identity,
+            "Manifest/LISTO de otra identity")
+    require(int(manifest["n"]) == n and int(listo["n"]) == n,
+            "N de manifiesto distinto")
+    require(manifest.get("status") == "ready_not_submitted", "Manifest no listo")
+    require(manifest.get("execution") == "dataframe_64GiB_dataset_per_seed_gc",
+            "Modo de ejecución inesperado")
+
+    csvs = sorted(delivery.glob("*.csv"))
+    require(len(csvs) == 1, f"Debe existir un solo CSV; hay {len(csvs)}")
+    csv_path = csvs[0]
+    require(csv_path.name == manifest["file"]["file"], "Nombre CSV distinto")
+    require(C.digest(csv_path) == manifest["file"]["sha256"], "SHA CSV distinto")
+    got = read_csv_ids(csv_path)
+    require(len(got) == n, f"CSV tiene {len(got)} filas; esperaba {n}")
+    exp = expected_ids(ids0, ensemble, n)
+    require(np.array_equal(got, exp), "CSV no corresponde al ensemble top-N")
+
+    message = (delivery / "mensaje_zulip.txt").read_text(encoding="utf-8").strip()
+    require(message == manifest["submit_message"], "Mensaje Zulip distinto")
+    require(message.startswith("submit C1SF2"), "Prefijo submit inesperado")
+
+    canary = C.load_json(root / "canary_s3_exact/RESULT.json")
+    require(canary.get("status") == "passed" and canary.get("max_abs") == 0.0,
+            "Canary S3 no exacto")
+
+# [Anotación · líneas 144–169] Escribe `AUDITORIA_FINAL.json` con estado `AUDIT_OK`, la identidad, el CSV, su
+#   hash y los hashes por semilla, e imprime el resumen.
+    audit = {
+        "status": "AUDIT_OK",
+        "run": RUN,
+        "identity": identity,
+        "n_models": 20,
+        "n_august": 164647,
+        "n_final": n,
+        "csv": csv_path.name,
+        "csv_sha256": C.digest(csv_path),
+        "submit_message": message,
+        "canary_s3_max_abs": canary["max_abs"],
+        "stage4_wins": stage4["paired"]["wins"],
+        "models": model_rows,
+    }
+    C.write_json(root / "AUDITORIA_FINAL.json", audit)
+    print("AUDIT_OK")
+    print(f"identity={identity}")
+    print("modelos=20")
+    print("agosto=164647")
+    print(f"N={n}")
+    print(f"CSV={csv_path}")
+    print(message)
+
+
+if __name__ == "__main__":
+    main()

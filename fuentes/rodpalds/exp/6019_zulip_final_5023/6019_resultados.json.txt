@@ -1,0 +1,7 @@
+{
+  "archivos": [
+    "Z6019_5023_e12500_semillerio.csv"
+  ],
+  "cuerpo": "submit 6019zulipfinal5023",
+  "_minutos": 0.0
+}

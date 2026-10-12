@@ -1,0 +1,6 @@
+pandas==3.0.6
+numpy==2.5.3
+lightgbm==4.7.0
+optuna==5.0.0
+duckdb==1.5.5
+ipykernel==7.3.0

@@ -1,0 +1,7 @@
+{
+  "archivo": "ds3002_rank_total.parquet",
+  "columnas": 765,
+  "MB": 537,
+  "variables_originales": 152,
+  "_minutos": 0.88
+}

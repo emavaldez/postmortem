@@ -1,0 +1,78 @@
+{
+  "nombre": "tres_meses_v1_hess",
+  "pregunta": "tres_meses_v4 sobre el dataset v1 y con el techo de min_sum_hessian_in_leaf subido de 10 a 100: en tres_meses_v4 el mejor trial eligio 9.8 y el top 5 quedo entre 4.2 y 9.8, contra el borde. v1 en vez de v4 por replicabilidad: los canaritos solo sumaron 3 columnas, y v4 obliga a correr FE v2 + canaritos + armado de v4. Train 202103-202105 -> test 202106, gap 1 con exclusion. Cambian dos cosas a la vez (dataset y rango) por falta de tiempo.",
+  "timestamp": "2026-10-11T12:59:56",
+  "carpeta": "experimentos\\20261011_0840_tres_meses_v1_hess",
+  "git_commit": "f212c4b",
+  "meses_train": [
+    202103,
+    202104,
+    202105
+  ],
+  "estrategia_meses": "apilado",
+  "mes_test": 202106,
+  "n_features": 261,
+  "top_n": 3,
+  "configs": [
+    {
+      "trial": 18,
+      "auc_cv": 0.9298727263992016,
+      "num_iterations": 2375,
+      "params": {
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "num_leaves": 36,
+        "min_sum_hessian_in_leaf": 19.22195270528995
+      }
+    },
+    {
+      "trial": 34,
+      "auc_cv": 0.9298584052497011,
+      "num_iterations": 3760,
+      "params": {
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "num_leaves": 25,
+        "min_sum_hessian_in_leaf": 17.60535766103993
+      }
+    },
+    {
+      "trial": 38,
+      "auc_cv": 0.929564807487532,
+      "num_iterations": 3627,
+      "params": {
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "num_leaves": 34,
+        "min_sum_hessian_in_leaf": 17.38417162213993
+      }
+    }
+  ],
+  "auc_cv": 0.9298727263992016,
+  "medicion_valida": true,
+  "gap": 1,
+  "excluir_positivos_del_train": true,
+  "ganancia_ensemble": 422400000.0,
+  "corte_optimo": 10160,
+  "ganancia_media_modelo": 422310166.6666667,
+  "sd_modelo": 2633392.2763144085,
+  "n_modelos": 15,
+  "segundos": 15549,
+  "versiones": {
+    "python": "3.10.19",
+    "lightgbm": "4.7.0",
+    "optuna": "5.0.0",
+    "pandas": "2.3.3",
+    "numpy": "2.2.5",
+    "scikit-learn": "1.7.2"
+  }
+}

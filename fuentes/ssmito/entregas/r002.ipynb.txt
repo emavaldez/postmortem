@@ -1,0 +1,332 @@
+#%% celda 1 [texto]
+# PSEUDOETIQUETAS
+
+#%% celda 2 [texto]
+# Librerias
+
+#%% celda 3 [código]
+# cargo las librerias que necesito
+require("data.table")
+require("lightgbm")
+library(data.table)
+
+#%% celda 4 [texto]
+# URLS
+
+Ejecutar con el directorio de trabajo en `entregas/`.
+
+#%% celda 5 [código]
+carpeta_entregas <- getwd()
+data_folder <- file.path(carpeta_entregas, "dataset")
+carpeta_parametros <- file.path(carpeta_entregas, "parametros")
+carpeta_salida <- file.path(carpeta_entregas, "entregas")
+archivo_logging <- file.path(carpeta_entregas, "logging.csv")
+
+#%% celda 6 [texto]
+# Parametrizacion de la prueba
+
+Completar los dos IDs de `.rds`. Revisar dataset, meses, semillas, corte de julio y envios.
+
+#%% celda 7 [código]
+dataset_file <- "competencia_01_ternaria_lf_k6_perdida4.csv"
+
+# Primer modelo: genera las probabilidades para las etiquetas de julio.
+train_julio <- c(202103, 202104, 202105, 202106)
+mes_julio <- 202107
+SEED_JULIO <- 230047  # misma semilla que la primera BO
+id_rds_julio <- 52  # completar: parametros/<id_rds_julio>.rds
+prob_corte <- 0.0035446538114082874  # corte elegido por la segunda BO; editable
+
+# Modelo final: utiliza las etiquetas de julio para predecir agosto.
+train_final <- c(202103, 202104, 202105, 202106, 202107)
+future <- 202108
+SEEDS <- c(230047, 230059, 230063, 230077, 230081)
+id_rds <- 53  # completar: parametros/<id_rds>.rds de la segunda BO
+envios <- 10500  # cantidad de clientes con Predicted = 1
+
+#%% celda 8 [código]
+# Mismas exclusiones que en la BO que generó las probabilidades de julio.
+
+columnas_excluir <- c(
+    "ternaria",
+    'ternaria_lag1',
+    "clase01",
+    "fold",
+    "azar",
+    "training",
+    'cprestamos_personales',
+    'mprestamos_personales',
+    'cprestamos_personales_lag1',
+    'mprestamos_personales_lag1',
+    'cprestamos_personales_delta1',
+    'mprestamos_personales_delta1'
+)
+
+if (anyNA(c(future, id_rds, envios))) {
+  stop("Completar future, id_rds y envios en esta celda.")
+}
+
+#%% celda 9 [texto]
+# LEEMOS DATASET
+
+#%% celda 10 [código]
+dataset_url <- file.path(data_folder, dataset_file)
+dataset <- fread(dataset_url)
+
+# Se conserva el orden del CSV, igual que en la BO.
+dataset[, .N, list(foto_mes, ternaria)]
+
+#%% celda 11 [texto]
+# Parametros
+
+Los dos `.rds` deben estar copiados en `parametros/`. Se usan los HP guardados,
+sin volver a ajustar `min_data_in_leaf`.
+
+#%% celda 12 [código]
+parametros_julio <- readRDS(
+  file.path(carpeta_parametros, paste0(id_rds_julio, ".rds"))
+)
+parametros <- readRDS(
+  file.path(carpeta_parametros, paste0(id_rds, ".rds"))
+)
+
+#%% celda 13 [texto]
+# Dataset train y prediccion
+
+#%% celda 14 [código]
+dataset[, clase01 := ifelse(ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+campos_buenos <- setdiff(colnames(dataset), columnas_excluir)
+
+dataset_train <- dataset[foto_mes %in% train_final]
+dfuture <- dataset[foto_mes %in% future]
+
+if (length(future) != 1L || nrow(dataset_train) == 0L ||
+    nrow(dfuture) == 0L || envios < 1L || envios > nrow(dfuture) ||
+    envios != as.integer(envios)) {
+  stop("Revisar meses y envios: se requiere un mes a predecir y filas en ambos datasets.")
+}
+
+dataset_train[, .N, list(foto_mes, ternaria)]
+
+#%% celda 15 [texto]
+# Primer modelo: probabilidades y etiquetas de julio
+
+Se entrena con las etiquetas reales y la semilla del primer modelo de la BO.
+La probabilidad corresponde a BAJA+1 o BAJA+2. Se conservan las BAJA+1 reales de julio;
+en los demás clientes se asigna BAJA+2 si `prob >= prob_corte`, y CONTINUA en el resto.
+Las probabilidades y las etiquetas generadas permanecen en memoria.
+
+#%% celda 16 [código]
+dataset_train_julio <- dataset[foto_mes %in% train_julio]
+dataset_julio <- dataset[foto_mes == mes_julio]
+
+if ("num_iterations" %in% names(parametros_julio)) {
+  params_julio <- parametros_julio
+} else {
+  params_julio <- parametros_julio[[as.character(SEED_JULIO)]]
+}
+params_julio$seed <- SEED_JULIO
+
+dtrain_julio <- lgb.Dataset(
+  data= data.matrix(dataset_train_julio[, campos_buenos, with= FALSE]),
+  label= dataset_train_julio[, clase01]
+)
+modelo_julio <- lgb.train(
+  data= dtrain_julio,
+  param= params_julio
+)
+
+prob_julio <- predict(
+  modelo_julio,
+  data.matrix(dataset_julio[, campos_buenos, with= FALSE])
+)
+baja1_julio <- dataset_julio$ternaria %in% "BAJA+1"
+etiquetas_julio <- ifelse(
+  baja1_julio,
+  "BAJA+1",
+  ifelse(prob_julio >= prob_corte, "BAJA+2", "CONTINUA")
+)
+cantidad_baja2_julio <- sum(etiquetas_julio == "BAJA+2")
+
+dataset[foto_mes == mes_julio, ternaria := etiquetas_julio]
+dataset[, clase01 := ifelse(ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+# El modelo final utiliza las etiquetas recién generadas para julio.
+dataset_train <- dataset[foto_mes %in% train_final]
+
+cat("BAJA+1 reales conservadas en julio:", sum(baja1_julio), "\n")
+cat("BAJA+2 estimadas en julio:", cantidad_baja2_julio, "\n")
+dataset_train[, .N, list(foto_mes, ternaria)]
+
+#%% celda 17 [texto]
+# Modelo final: entreno y genero salidas
+
+#%% celda 18 [código]
+if (file.exists(archivo_logging)) {
+  historico <- fread(archivo_logging)
+  id_prueba <- max(historico$id_prueba) + 1L
+} else {
+  id_prueba <- 1L
+}
+
+dir.create(carpeta_salida, recursive= TRUE, showWarnings= FALSE)
+archivos_salida <- character(length(SEEDS))
+predicciones_por_semilla <- setNames(vector("list", length(SEEDS)), as.character(SEEDS))
+
+for (i in seq_along(SEEDS)) {
+  # El .rds puede contener parametros individuales o una lista por semilla.
+  if ("num_iterations" %in% names(parametros)) {
+    params_semilla <- parametros
+  } else {
+    params_semilla <- parametros[[as.character(SEEDS[i])]]
+    if (is.null(params_semilla)) {
+      stop("El .rds no contiene parametros para la semilla ", SEEDS[i])
+    }
+  }
+  params_semilla$seed <- SEEDS[i]
+
+  dtrain_final <- lgb.Dataset(
+    data= data.matrix(dataset_train[, campos_buenos, with= FALSE]),
+    label= dataset_train[, clase01]
+  )
+
+  modelo_final <- lgb.train(
+    data= dtrain_final,
+    param= params_semilla
+  )
+
+  prediccion <- predict(
+    modelo_final,
+    data.matrix(dfuture[, campos_buenos, with= FALSE])
+  )
+
+  tb_prediccion <- dfuture[, list(numero_de_cliente)]
+  tb_prediccion[, prob := prediccion]
+  setorder(tb_prediccion, -prob)
+  predicciones_por_semilla[[as.character(SEEDS[i])]] <- copy(tb_prediccion)
+  tb_prediccion[, Predicted := 0L]
+  tb_prediccion[1:envios, Predicted := 1L]
+
+  # archivos_salida[i] <- paste0("r002_", SEEDS[i], ".csv")
+  archivos_salida[i] <- paste0("r002_", SEEDS[i],"_", id_prueba, ".csv")
+
+  fwrite(
+    tb_prediccion[Predicted == 1L, list(numero_de_cliente)],
+    file.path(carpeta_salida, archivos_salida[i]),
+    sep= ",",
+    col.names= FALSE
+  )
+
+  cat("Semilla=", SEEDS[i], " Archivo=", archivos_salida[i], "\n", sep= "")
+}
+
+#%% celda 19 [texto]
+# Envios adicionales — opcional, sin reentrenar
+
+Completar la nueva cantidad y ejecutar solamente cuando se quiera otro corte.
+Antes de ejecutar, registrar el juego anterior en el logging para obtener un nuevo ID.
+Después, completar y guardar la documentación del nuevo juego con las mismas celdas de abajo.
+
+#%% celda 20 [código]
+# cortamos aca
+# papa
+
+envios <- 12500  # completar con la nueva cantidad de envios
+
+if (file.exists(archivo_logging)) {
+  historico <- fread(archivo_logging)
+  id_prueba <- max(historico$id_prueba) + 1L
+} else {
+  id_prueba <- 1L
+}
+
+archivos_salida <- character(length(SEEDS))
+
+for (i in seq_along(SEEDS)) {
+  tb_prediccion <- copy(predicciones_por_semilla[[as.character(SEEDS[i])]])
+  tb_prediccion[, Predicted := 0L]
+  tb_prediccion[1:envios, Predicted := 1L]
+
+  archivos_salida[i] <- paste0("r002_", SEEDS[i], "_", id_prueba, ".csv")
+  fwrite(
+    tb_prediccion[Predicted == 1L, list(numero_de_cliente)],
+    file.path(carpeta_salida, archivos_salida[i]),
+    sep= ",",
+    col.names= FALSE
+  )
+
+  cat("Semilla=", SEEDS[i], " Archivo=", archivos_salida[i], "\n", sep= "")
+}
+
+#%% celda 21 [texto]
+# Documentacion de la prueba
+
+Una fila por ejecucion, con todas las semillas usadas. Completar la nota y los resultados
+de Kaggle como texto. Cuando lleguen los resultados, ejecutar las dos celdas de esta seccion:
+actualizan la misma fila y conservan las pruebas anteriores.
+
+#%% celda 22 [código]
+#lets stop here
+pepe
+
+#%% celda 23 [código]
+nota <- "e8_r subiendo la cantidad de envios a 12.5 k"
+resultado_competencia_mean <- "91.9820"  # score de Kaggle o referencia a un problema con la entrega
+resultado_competencia_std <- "4.2977"
+ref_submit <- "e10_r"
+
+#%% celda 24 [código]
+# Se documenta el paso de julio en nota, conservando las columnas del logging.
+nota_registro <- paste0(
+  nota, " | BAJA+2 estimadas para ", mes_julio,
+  "; id_rds_julio=", id_rds_julio,
+  "; meses_entrenamiento_julio=", paste(train_julio, collapse = ","),
+  "; seed_julio=", SEED_JULIO, "; prob_corte=", sprintf("%.17g", prob_corte),
+  # "; BAJA+1 reales=", sum(baja1_julio), "; BAJA+2 estimadas=", cantidad_baja2_julio
+  "; BAJA+1 reales=", 1103, "; BAJA+2 estimadas=", 14888
+)
+
+
+registro_prueba <- data.table(
+  id_prueba = id_prueba,
+  ref_submit = ref_submit,
+  notebook = "r002.ipynb",
+  dataset = dataset_file,
+  seeds = paste(SEEDS, collapse = ","),
+  cantidad_registros_totales = nrow(dataset),
+  cantidad_registros_entrenamiento = nrow(dataset_train),
+  cantidad_registros_prediccion = nrow(dfuture),
+  meses_entrenamiento = paste(train_final, collapse = ","),
+  meses_prediccion = paste(future, collapse = ","),
+  columnas_excluidas = paste(columnas_excluir, collapse = ","),
+  "bajas" = "1+2",                                       #baja+1 y baja+2 o solo baja+2
+  id_rds = id_rds,
+  envios = envios,
+  archivos = paste(archivos_salida, collapse = ","),
+  nota = nota_registro,
+  resultado_competencia_mean = resultado_competencia_mean,
+  resultado_competencia_std = resultado_competencia_std
+)
+
+if (file.exists(archivo_logging)) {
+  historico <- fread(
+    archivo_logging,
+    colClasses = list(character = c("nota", "resultado_competencia_mean", "resultado_competencia_std"))
+  )
+  fila <- which(historico$id_prueba == id_prueba)
+
+  if (length(fila) > 0L) {
+    historico[fila, (names(registro_prueba)) := registro_prueba]
+    fwrite(historico, archivo_logging)
+  } else {
+    fwrite(registro_prueba, archivo_logging, append = TRUE, col.names = FALSE)
+  }
+} else {
+  fwrite(registro_prueba, archivo_logging)
+}
+
+#%% celda 25 [código]
+
+# registro_prueba
+tail(fread(archivo_logging), 10)

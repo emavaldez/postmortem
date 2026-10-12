@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""B1: variables rotas / drift sobre C3 con modelos congelados.
+
+No reentrena. Reutiliza los 20 modelos Q0 que reprodujeron C3 exactamente,
+genera cuatro representaciones corregidas de junio y maximiza ganancia robusta
+sobre N=8000..15000. No usa agosto ni genera submits.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import gc
+import hashlib
+import importlib.metadata
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+
+def _gcs(cmd, check=True, **kw):
+    """Respaldo opcional a Cloud Storage. Se omite cuando el bucket es el placeholder de publicacion."""
+    if any("REEMPLAZAR_CON_BUCKET_PROPIO" in str(a) or "BUCKET_PRIVADO_NO_PUBLICADO" in str(a) for a in cmd):
+        return None
+    return subprocess.run(cmd, check=check, **kw)
+
+
+RUN = "c1b1rotas01"
+DATA_SHA = "59231e670a1342ad6f689ad7edc7ece047fc9f7115c6d7845e6c72fa3bbd95bb"
+SEEDS = [17,101,202,303,404,505,606,707,808,909,1001,1102,1203,1304,1405,1506,1607,1708,1809,1910]
+TRAIN = [202103, 202104]
+EVAL = 202106
+EXPECTED_ROWS = {202103:162900,202104:163284,202105:163768,202106:164114,202107:164348,202108:164647}
+N_GRID = list(range(8000, 15001, 500))
+GAIN_HIT = 1_072_500
+COST = 27_500
+REPRO_TOL = 1e-12
+THREADS = 6
+BLOCKS = ["historia_numerica", "transiciones_numericas", "recencia", "categoricas", "historia_relaciones", "tarjetas", "ratios"]
+REMOTE = "gs://REEMPLAZAR_CON_BUCKET_PROPIO/corridas/" + RUN
+
+NEW_ARMS = {
+    "B1_VISA": [("Visa_fultimo_cierre", 202106)],
+    "B1_MASTER": [("Master_fultimo_cierre", 202106)],
+    "B1_FECHAS": [("Visa_fultimo_cierre", 202106), ("Master_fultimo_cierre", 202106)],
+    "B1_ALL3": [
+        ("ccajas_depositos", 202105),
+        ("Visa_fultimo_cierre", 202106),
+        ("Master_fultimo_cierre", 202106),
+    ],
+}
+ALL_ARMS = ["C3_ORIG", "Q0_CCAJAS"] + list(NEW_ARMS)
+
+
+def require(ok: bool, msg: str) -> None:
+    if not ok:
+        raise RuntimeError(msg)
+
+
+def digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fingerprint(obj) -> str:
+    return hashlib.sha256(
+        json.dumps(obj, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+    ).hexdigest()
+
+
+def load_json(path: Path):
+    require(path.is_file(), f"Falta {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(obj, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def paths(home: Path) -> dict[str, Path]:
+    stage = home / "c1m1femasiva03_s3/paquete_c1/experimentos_20261006_m1_fe_masiva"
+    return {
+        "stage": stage,
+        "pkg": stage.parent,
+        "fe": stage / "fe_amplia",
+        "s3": home / "c1m1femasiva03_s3/resultados_s3",
+        "bank_orig": home / "c1m1femasiva03_s3/resultados_s1/fe_bank_dev",
+        "data": home / "c1m1femasiva03/datos/competencia_01.parquet",
+        "q0": home / "c1q0ccajas06",
+        "out": home / RUN,
+    }
+
+
+def gain_curve(ids: np.ndarray, y: np.ndarray, scores: np.ndarray) -> dict[int, int]:
+    ids = np.asarray(ids, dtype=np.int64)
+    y = np.asarray(y, dtype=np.int8)
+    scores = np.asarray(scores, dtype=np.float64)
+    require(ids.shape == y.shape == scores.shape, "IDs/y/scores desalineados")
+    require(np.isfinite(scores).all(), "Scores no finitos")
+    order = np.lexsort((ids, -scores))
+    out = {}
+    for n in N_GRID:
+        z = y[order[:n]]
+        hits = int(z.sum())
+        out[n] = int(hits * GAIN_HIT - (n - hits) * COST)
+    return out
+
+
+def robust_choice(curve: dict[int, int]) -> dict:
+    """Mejor meseta de tres N consecutivos. Desempate: mayor mínimo y menor N."""
+    candidates = []
+    for n in N_GRID[1:-1]:
+        ns = [n - 500, n, n + 500]
+        vals = [int(curve[k]) for k in ns]
+        avg = float(np.mean(vals))
+        mn = int(min(vals))
+        candidates.append((avg, mn, -n, n, vals))
+    require(candidates, "Sin candidatos robustos")
+    avg, mn, _, n, vals = max(candidates)
+    peak_n = max(N_GRID, key=lambda k: (curve[k], -k))
+    return {
+        "n_robusto": int(n),
+        "ganancia_robusta": float(avg),
+        "ganancia_min_meseta": int(mn),
+        "meseta_n": [n - 500, n, n + 500],
+        "meseta_gain": vals,
+        "n_peak": int(peak_n),
+        "gain_peak": int(curve[peak_n]),
+    }
+
+
+def preflight(home: Path) -> dict:
+    p = paths(home)
+    for key in ["stage", "pkg", "fe", "s3", "bank_orig", "data", "q0"]:
+        require(p[key].exists(), f"Falta {key}: {p[key]}")
+    require(digest(p["data"]) == DATA_SHA, "Dataset original distinto")
+
+    schema_doc = load_json(p["s3"] / "C3_HIST_MAS_TARJETAS/features.json")
+    schema = schema_doc["features"]
+    derived = schema_doc["derived"]
+    require(len(schema) == 2062 and len(derived) == 1910, "Schema C3 inesperado")
+    require(schema[152:] == derived and len(set(schema)) == len(schema), "Schema C3 inválido")
+
+    q0_listo = load_json(p["q0"] / "LISTO.json")
+    require(q0_listo.get("status") == "completed", "Q0 validación no está cerrado")
+    q0_plan = load_json(p["q0"] / "PLAN_Q0.json")
+    q0_identity = fingerprint(q0_plan)
+    require(q0_listo.get("identity") == q0_identity, "LISTO Q0 y PLAN_Q0 no coinciden")
+    require(q0_plan.get("seeds") == SEEDS, "Semillas Q0 distintas")
+    require(q0_plan.get("rounds") == 300, "Rondas Q0 distintas")
+    require(q0_plan.get("train") == TRAIN and q0_plan.get("eval") == EVAL, "Fold Q0 distinto")
+    require(q0_plan.get("n_features") == 2062, "Features Q0 distintas")
+
+    source = pd.read_parquet(
+        p["data"],
+        columns=[
+            "numero_de_cliente", "foto_mes", "clase_ternaria",
+            "ccajas_depositos", "Visa_fultimo_cierre", "Master_fultimo_cierre",
+        ],
+    )
+    counts = {int(k): int(v) for k, v in source.groupby("foto_mes").size().items()}
+    require(counts == EXPECTED_ROWS, f"Conteos mensuales inesperados: {counts}")
+    require(not source[["numero_de_cliente", "foto_mes"]].duplicated().any(), "Claves duplicadas")
+    may = source.loc[source.foto_mes.eq(202105), "ccajas_depositos"]
+    require(may.notna().all() and (may.to_numpy(dtype=float) == 0).all(),
+            "ccajas_depositos@202105 ya no coincide con anomalía Q0")
+    for var in ["Visa_fultimo_cierre", "Master_fultimo_cierre"]:
+        june = source.loc[source.foto_mes.eq(202106), var]
+        require(june.notna().any(), f"{var}@202106 ya es completamente NA")
+    labels = source.loc[source.foto_mes.le(202106), "clase_ternaria"]
+    require(labels.notna().all() and set(labels.unique()) == {"BAJA+1","BAJA+2","CONTINUA"},
+            "Targets maduros inválidos")
+    del source, may, labels
+
+    # Validar los 20 modelos congelados y su reproducción C3.
+    for seed in SEEDS:
+        cp = p["q0"] / "modelos" / f"seed_{seed}.npz"
+        mp = p["q0"] / "modelos" / f"modelo_{seed}.txt"
+        require(cp.is_file() and mp.is_file(), f"Falta modelo Q0 seed={seed}")
+        with np.load(cp, allow_pickle=False) as z:
+            require(str(z["identity"].item()) == q0_identity, f"Identity Q0 incorrecta seed={seed}")
+            require(int(z["seed"].item()) == seed, f"Seed Q0 incorrecta {seed}")
+            require(float(z["max_abs_repro_original"].item()) <= REPRO_TOL,
+                    f"Q0 no reprodujo C3 seed={seed}")
+            require(str(z["model_sha256"].item()) == digest(mp),
+                    f"Hash modelo Q0 incorrecto seed={seed}")
+
+    env = {k: importlib.metadata.version(k) for k in ["numpy","pandas","pyarrow","lightgbm","PyYAML"]}
+    return {
+        "paths": p,
+        "schema": schema,
+        "derived": derived,
+        "q0_plan": q0_plan,
+        "q0_identity": q0_identity,
+        "environment": env,
+    }
+
+
+def make_plan(ctx: dict) -> dict:
+    p = ctx["paths"]
+    return {
+        "version": "b1_drift_v1",
+        "run": RUN,
+        "objective": "maximizar_ganancia_robusta_sin_refit",
+        "source_dataset_sha256": DATA_SHA,
+        "q0_identity": ctx["q0_identity"],
+        "q0_plan_sha256": digest(p["q0"] / "PLAN_Q0.json"),
+        "schema_sha256": digest(p["s3"] / "C3_HIST_MAS_TARJETAS/features.json"),
+        "n_features": len(ctx["schema"]),
+        "frozen_models": "c1q0ccajas06/modelos/modelo_<seed>.txt",
+        "reproduction_tolerance": REPRO_TOL,
+        "train": TRAIN,
+        "eval": EVAL,
+        "target": "BAJA+2_vs_resto",
+        "seeds": SEEDS,
+        "n_grid": N_GRID,
+        "gain_hit": GAIN_HIT,
+        "cost_nonhit": COST,
+        "arms": {
+            "C3_ORIG": [],
+            "Q0_CCAJAS": [["ccajas_depositos", 202105]],
+            **{k: [[v, m] for v, m in recipe] for k, recipe in NEW_ARMS.items()},
+        },
+        "selection": {
+            "robust_window_points": 3,
+            "primary": "ensemble_robust_gain",
+            "paired_delta_mean_gt": 0,
+            "paired_delta_median_gt": 0,
+            "positive_seed_fraction_gte": 0.60,
+            "require_robust_gain_gt_control": True,
+        },
+        "no_refit": True,
+        "no_august": True,
+        "no_submit": True,
+        "environment": ctx["environment"],
+    }
+
+
+def apply_recipe(df: pd.DataFrame, recipe: list[tuple[str, int]]) -> dict:
+    counts = {}
+    for var, month in recipe:
+        require(var in df.columns, f"Falta variable {var}")
+        mask = df.foto_mes.eq(month)
+        require(int(mask.sum()) == EXPECTED_ROWS[month], f"Filas inesperadas {var}@{month}")
+        before_na = int(df.loc[mask, var].isna().sum())
+        df.loc[mask, var] = np.nan
+        after_na = int(df.loc[mask, var].isna().sum())
+        require(after_na == EXPECTED_ROWS[month], f"No quedó NA {var}@{month}")
+        counts[f"{var}@{month}"] = {
+            "rows": EXPECTED_ROWS[month],
+            "na_before": before_na,
+            "na_after": after_na,
+            "new_na": after_na - before_na,
+        }
+    return counts
+
+
+def prepare_arm(ctx: dict, arm: str, recipe: list[tuple[str, int]], identity: str) -> None:
+    p = ctx["paths"]
+    root = p["out"] / "arms" / arm
+    root.mkdir(parents=True, exist_ok=True)
+    corrected = root / "dataset.parquet"
+    corr_meta = root / "correccion.json"
+    bank = root / "bank"
+
+    if corrected.exists() or corr_meta.exists():
+        require(corrected.is_file() and corr_meta.is_file(), f"Corrección parcial {arm}")
+        meta = load_json(corr_meta)
+        require(meta.get("identity") == identity and meta.get("arm") == arm, f"Metadata {arm} incompatible")
+        require(meta.get("sha256") == digest(corrected), f"Dataset {arm} alterado")
+    else:
+        print(f"PREPARE {arm}: crear dataset corregido", flush=True)
+        df = pd.read_parquet(p["data"])
+        require(len(df) == sum(EXPECTED_ROWS.values()), "Filas totales inesperadas")
+        changed = apply_recipe(df, recipe)
+        tmp = corrected.with_suffix(".parquet.tmp")
+        if tmp.exists():
+            tmp.unlink()
+        df.to_parquet(tmp, index=False)
+        del df
+        gc.collect()
+        tmp.replace(corrected)
+        write_json(corr_meta, {
+            "identity": identity,
+            "arm": arm,
+            "recipe": [[v,m] for v,m in recipe],
+            "changes": changed,
+            "source_sha256": DATA_SHA,
+            "sha256": digest(corrected),
+        })
+
+    config = load_json(p["stage"] / "config_screening.json")
+    if (bank / "manifest.json").is_file():
+        bm = load_json(bank / "manifest.json")
+        require(bm.get("status") == "completed", f"Banco incompleto {arm}")
+        require(bm.get("input_sha256") == digest(corrected), f"Banco {arm} usa otra entrada")
+        require(bm.get("output_months") == [EVAL], f"Banco {arm} no es junio")
+        return
+    if bank.exists() and any(bank.iterdir()):
+        quarantine = root / ("bank_incomplete_" + time.strftime("%Y%m%dT%H%M%S"))
+        bank.rename(quarantine)
+
+    sys.path.insert(0, str(p["fe"]))
+    from generar_fe import generate
+    print(f"PREPARE {arm}: generar junio C3", flush=True)
+    generate(corrected, bank, config, blocks=BLOCKS, months=[EVAL])
+    bm = load_json(bank / "manifest.json")
+    require(bm.get("status") == "completed", f"Banco {arm} no terminó")
+    require(bm.get("input_sha256") == digest(corrected), f"Banco {arm} input incorrecto")
+
+    orig = pd.read_csv(p["bank_orig"] / "catalogo_features.csv").set_index("feature", verify_integrity=True)
+    new = pd.read_csv(bank / "catalogo_features.csv").set_index("feature", verify_integrity=True)
+    derived = ctx["derived"]
+    require(set(derived) <= set(new.index), f"Banco {arm} no contiene C3")
+    for col in ["block","sources","formula","feature_kind","min_history"]:
+        require(
+            orig.loc[derived,col].fillna("").astype(str).tolist()
+            == new.loc[derived,col].fillna("").astype(str).tolist(),
+            f"Definición C3 cambió en {arm}:{col}",
+        )
+
+
+def prepare(ctx: dict) -> None:
+    p = ctx["paths"]
+    out = p["out"]
+    out.mkdir(parents=True, exist_ok=True)
+    plan = make_plan(ctx)
+    plan["runner_sha256"] = digest(Path(__file__))
+    identity = fingerprint(plan)
+    plan["identity"] = identity
+    plan_path = out / "PLAN_B1.json"
+    if plan_path.exists():
+        require(load_json(plan_path) == plan, "PLAN_B1 existente no coincide")
+    else:
+        write_json(plan_path, plan)
+
+    for arm, recipe in NEW_ARMS.items():
+        prepare_arm(ctx, arm, recipe, identity)
+
+    _gcs(
+        ["gcloud","storage","cp",str(plan_path),REMOTE + "/PLAN_B1.json"],
+        check=True,
+    )
+    print("B1 PREPARE OK. No se entrenó ni puntuó ningún modelo.", flush=True)
+
+
+def load_eval_arm(ctx: dict, arm: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    p = ctx["paths"]
+    sys.path.insert(0, str(p["fe"]))
+    from cargar_bloques import cargar_bloques
+
+    bank = p["out"] / "arms" / arm / "bank"
+    require((bank / "manifest.json").is_file(), f"Falta banco {arm}; ejecutar --prepare")
+    df, _ = cargar_bloques(bank, meses=[EVAL], incluir_raw=True, features=ctx["derived"])
+    require(df.shape[1] >= len(ctx["schema"]) + 2, f"Columnas insuficientes {arm}")
+    ids = df.numero_de_cliente.to_numpy(np.int64)
+    require(len(ids) == EXPECTED_ROWS[EVAL] and len(np.unique(ids)) == len(ids),
+            f"IDs inválidos {arm}")
+    x = df[ctx["schema"]]
+    # Etiqueta desde banco original, por mismas claves/orden.
+    labels = pd.read_parquet(p["bank_orig"] / "etiquetas.parquet")
+    labels = labels[labels.foto_mes.eq(EVAL)].reset_index(drop=True)
+    require(np.array_equal(labels.numero_de_cliente.to_numpy(np.int64), ids),
+            f"Etiquetas desalineadas {arm}")
+    y = labels.clase_ternaria.eq("BAJA+2").to_numpy(np.int8)
+    del df, labels
+    return x, ids, y
+
+
+def validate_q0_checkpoint(ctx: dict, seed: int) -> dict:
+    p = ctx["paths"]
+    cp = p["q0"] / "modelos" / f"seed_{seed}.npz"
+    mp = p["q0"] / "modelos" / f"modelo_{seed}.txt"
+    with np.load(cp, allow_pickle=False) as z:
+        require(str(z["identity"].item()) == ctx["q0_identity"], f"Q0 identity seed={seed}")
+        require(int(z["seed"].item()) == seed, f"Q0 seed incorrecta {seed}")
+        require(float(z["max_abs_repro_original"].item()) <= REPRO_TOL, f"Q0 repro falló {seed}")
+        require(str(z["model_sha256"].item()) == digest(mp), f"Modelo Q0 alterado {seed}")
+        out = {
+            "ids": np.asarray(z["ids"], dtype=np.int64).copy(),
+            "y": np.asarray(z["y"], dtype=np.int8).copy(),
+            "q0_scores": np.asarray(z["scores_corrected"], dtype=np.float64).copy(),
+        }
+    return out
+
+
+def score_new_arm(ctx: dict, arm: str, identity: str) -> None:
+    import lightgbm as lgb
+
+    p = ctx["paths"]
+    out_arm = p["out"] / "scores" / arm
+    out_arm.mkdir(parents=True, exist_ok=True)
+    x, ids, y = load_eval_arm(ctx, arm)
+
+    for i, seed in enumerate(SEEDS, 1):
+        cpout = out_arm / f"seed_{seed}.npz"
+        if cpout.is_file():
+            with np.load(cpout, allow_pickle=False) as z:
+                require(str(z["identity"].item()) == identity, f"Score {arm} seed={seed} de otro plan")
+                require(str(z["arm"].item()) == arm and int(z["seed"].item()) == seed,
+                        f"Score metadata inválida {arm}/{seed}")
+                require(np.array_equal(z["ids"], ids) and np.array_equal(z["y"], y),
+                        f"Score desalineado {arm}/{seed}")
+            print(f"REUSAR SCORE {arm} {i}/20 seed={seed}", flush=True)
+            continue
+
+        q = validate_q0_checkpoint(ctx, seed)
+        require(np.array_equal(q["ids"], ids) and np.array_equal(q["y"], y),
+                f"Frozen model keys distintas {arm}/{seed}")
+        model_file = p["q0"] / "modelos" / f"modelo_{seed}.txt"
+        print(f"SCORE {arm} {i}/20 seed={seed}", flush=True)
+        model = lgb.Booster(model_file=str(model_file))
+        scores = np.asarray(model.predict(x, num_threads=THREADS), dtype=np.float64)
+        require(scores.shape == ids.shape and np.isfinite(scores).all(), f"Scores inválidos {arm}/{seed}")
+        require(((scores >= 0) & (scores <= 1)).all(), f"Scores fuera de rango {arm}/{seed}")
+        tmp = cpout.with_suffix(".tmp")
+        with tmp.open("wb") as f:
+            np.savez_compressed(
+                f,
+                identity=np.array(identity),
+                arm=np.array(arm),
+                seed=np.array(seed),
+                ids=ids,
+                y=y,
+                scores=scores,
+                frozen_model_sha256=np.array(digest(model_file)),
+            )
+        tmp.replace(cpout)
+        del model, scores, q
+        gc.collect()
+
+    del x
+    gc.collect()
+
+
+def baseline_scores(ctx: dict) -> tuple[np.ndarray, np.ndarray, dict[str, dict[int, np.ndarray]]]:
+    p = ctx["paths"]
+    by_arm = {"C3_ORIG": {}, "Q0_CCAJAS": {}}
+    ids0 = None
+    y0 = None
+    for seed in SEEDS:
+        q = validate_q0_checkpoint(ctx, seed)
+        ids = q["ids"]; y = q["y"]
+        if ids0 is None:
+            ids0 = ids.copy(); y0 = y.copy()
+        else:
+            require(np.array_equal(ids0, ids) and np.array_equal(y0, y), "Q0 checkpoints desalineados")
+        by_arm["Q0_CCAJAS"][seed] = q["q0_scores"]
+
+        s3cp = p["s3"] / "C3_HIST_MAS_TARJETAS" / f"seed_{seed}.npz"
+        with np.load(s3cp, allow_pickle=False) as z:
+            require(np.array_equal(np.asarray(z["ids"], dtype=np.int64), ids0), f"S3 IDs seed={seed}")
+            require(np.array_equal(np.asarray(z["y"], dtype=np.int8), y0), f"S3 y seed={seed}")
+            sc = np.asarray(z["scores"], dtype=np.float64).copy()
+        require(np.isfinite(sc).all(), f"S3 score no finito {seed}")
+        by_arm["C3_ORIG"][seed] = sc
+    return ids0, y0, by_arm
+
+
+def load_new_scores(ctx: dict, identity: str, arm: str, ids: np.ndarray, y: np.ndarray) -> dict[int, np.ndarray]:
+    out = {}
+    for seed in SEEDS:
+        cp = ctx["paths"]["out"] / "scores" / arm / f"seed_{seed}.npz"
+        require(cp.is_file(), f"Falta score {arm}/{seed}")
+        with np.load(cp, allow_pickle=False) as z:
+            require(str(z["identity"].item()) == identity and str(z["arm"].item()) == arm, f"Identity score {arm}/{seed}")
+            require(int(z["seed"].item()) == seed, f"Seed score {arm}/{seed}")
+            require(np.array_equal(z["ids"], ids) and np.array_equal(z["y"], y), f"Keys score {arm}/{seed}")
+            sc = np.asarray(z["scores"], dtype=np.float64).copy()
+        require(np.isfinite(sc).all(), f"Score no finito {arm}/{seed}")
+        out[seed] = sc
+    return out
+
+
+def summarize(ctx: dict, identity: str) -> None:
+    p = ctx["paths"]
+    ids, y, scores = baseline_scores(ctx)
+    for arm in NEW_ARMS:
+        scores[arm] = load_new_scores(ctx, identity, arm, ids, y)
+
+    rows = []
+    ensemble_rows = []
+    choices = {}
+    seed_curves: dict[str, dict[int, dict[int, int]]] = {}
+
+    for arm in ALL_ARMS:
+        seed_curves[arm] = {}
+        for seed in SEEDS:
+            c = gain_curve(ids, y, scores[arm][seed])
+            seed_curves[arm][seed] = c
+            for n in N_GRID:
+                rows.append({"arm":arm, "seed":seed, "n":n, "gain":c[n]})
+
+        mat = np.vstack([scores[arm][s] for s in SEEDS])
+        ens = mat.mean(axis=0, dtype=np.float64)
+        curve = gain_curve(ids, y, ens)
+        choice = robust_choice(curve)
+        choices[arm] = choice
+        for n in N_GRID:
+            ensemble_rows.append({"arm":arm, "n":n, "gain":curve[n]})
+
+    pd.DataFrame(rows).to_csv(p["out"] / "curvas_por_seed.csv", index=False)
+    pd.DataFrame(ensemble_rows).to_csv(p["out"] / "ensemble_por_n.csv", index=False)
+
+    control = choices["C3_ORIG"]
+    summary_rows = []
+    delta_rows = []
+    for arm in ALL_ARMS:
+        ch = choices[arm]
+        ns = ch["meseta_n"]
+        if arm == "C3_ORIG":
+            d = np.zeros(len(SEEDS), dtype=float)
+        else:
+            d = np.asarray([
+                np.mean([seed_curves[arm][s][n] - seed_curves["C3_ORIG"][s][n] for n in ns])
+                for s in SEEDS
+            ], dtype=float)
+        for seed, val in zip(SEEDS, d):
+            delta_rows.append({"arm":arm, "seed":seed, "n_robusto":ch["n_robusto"], "delta_meseta_vs_c3":float(val)})
+
+        robust_delta_control = float(ch["ganancia_robusta"] - control["ganancia_robusta"])
+        passes = (
+            arm != "C3_ORIG"
+            and robust_delta_control > 0
+            and float(d.mean()) > 0
+            and float(np.median(d)) > 0
+            and float((d > 0).mean()) >= 0.60
+        )
+        summary_rows.append({
+            "arm": arm,
+            **ch,
+            "delta_robust_gain_vs_c3": robust_delta_control,
+            "paired_mean": float(d.mean()),
+            "paired_median": float(np.median(d)),
+            "paired_sd": float(d.std(ddof=1)) if arm != "C3_ORIG" else 0.0,
+            "positive_fraction": float((d > 0).mean()),
+            "wins": int((d > 0).sum()),
+            "ties": int((d == 0).sum()),
+            "losses": int((d < 0).sum()),
+            "promote": bool(passes),
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df["rank_gain"] = summary_df["ganancia_robusta"].rank(method="min", ascending=False).astype(int)
+    summary_df = summary_df.sort_values(["promote","ganancia_robusta","gain_peak"], ascending=[False,False,False])
+    summary_df.to_csv(p["out"] / "resumen_brazos.csv", index=False)
+    pd.DataFrame(delta_rows).to_csv(p["out"] / "deltas_pareados.csv", index=False)
+
+    promoted = summary_df.loc[summary_df.promote, "arm"].tolist()
+    best = promoted[0] if promoted else "C3_ORIG"
+    result = {
+        "status": "completed",
+        "identity": identity,
+        "objective": "maximizar_ganancia_robusta_sin_refit",
+        "control": "C3_ORIG",
+        "best_promoted_arm": best,
+        "promoted_arms": promoted,
+        "ranking": summary_df.to_dict(orient="records"),
+        "no_august": True,
+        "no_submit": True,
+        "no_refit": True,
+    }
+    write_json(p["out"] / "RESUMEN.json", result)
+
+    lines = [
+        "# B1 — resultado variables rotas",
+        "",
+        "Modelos congelados; cero refits. Selección por ganancia robusta de tres cortes.",
+        "",
+        "| brazo | N robusto | ganancia robusta | Δ robusto vs C3 | media pareada | mediana | wins/20 | promueve |",
+        "|---|---:|---:|---:|---:|---:|---:|:---:|",
+    ]
+    for r in summary_df.to_dict(orient="records"):
+        lines.append(
+            f"| {r['arm']} | {r['n_robusto']} | {r['ganancia_robusta']:.0f} | "
+            f"{r['delta_robust_gain_vs_c3']:.0f} | {r['paired_mean']:.0f} | "
+            f"{r['paired_median']:.0f} | {r['wins']} | {'SI' if r['promote'] else 'NO'} |"
+        )
+    lines += ["", f"**Mejor brazo promovido:** {best}", ""]
+    (p["out"] / "RESULTADOS.md").write_text("\n".join(lines), encoding="utf-8")
+
+    for name in ["PLAN_B1.json","curvas_por_seed.csv","ensemble_por_n.csv","resumen_brazos.csv","deltas_pareados.csv","RESUMEN.json","RESULTADOS.md"]:
+        _gcs(["gcloud","storage","cp",str(p["out"]/name),REMOTE+"/"+name], check=True)
+
+    listo = {
+        "status": "completed",
+        "identity": identity,
+        "best_promoted_arm": best,
+        "remote": REMOTE,
+    }
+    write_json(p["out"] / "LISTO.json", listo)
+    _gcs(["gcloud","storage","cp",str(p["out"]/"LISTO.json"),REMOTE+"/LISTO.json"], check=True)
+    print("B1 COMPLETADO. Mejor brazo:", best, flush=True)
+
+
+def execute(ctx: dict) -> None:
+    p = ctx["paths"]
+    plan = load_json(p["out"] / "PLAN_B1.json")
+    identity = plan["identity"]
+    require(plan == {**make_plan(ctx), "runner_sha256": plan["runner_sha256"], "identity": identity},
+            "PLAN_B1 incompatible con entorno/receta")
+    require(plan["runner_sha256"] == digest(Path(__file__)), "Runner B1 cambió desde prepare")
+    if (p["out"] / "LISTO.json").is_file():
+        done = load_json(p["out"] / "LISTO.json")
+        require(done.get("identity") == identity, "LISTO B1 de otra identidad")
+        print("B1 ya completado; no se repite.")
+        return
+
+    for arm in NEW_ARMS:
+        score_new_arm(ctx, arm, identity)
+    summarize(ctx, identity)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--preflight", action="store_true")
+    mode.add_argument("--prepare", action="store_true")
+    mode.add_argument("--execute", action="store_true")
+    ap.add_argument("--home", type=Path, default=Path.home())
+    args = ap.parse_args()
+
+    home = args.home.resolve()
+    ctx = preflight(home)
+    print(
+        f"PREFLIGHT B1 OK: features={len(ctx['schema'])}, "
+        f"modelos_congelados={len(SEEDS)}, brazos_nuevos={len(NEW_ARMS)}",
+        flush=True,
+    )
+    if args.preflight:
+        return
+
+    out = ctx["paths"]["out"]
+    out.mkdir(parents=True, exist_ok=True)
+    lockf = (out / ".lock").open("a")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit("B1 ya tiene otro proceso activo")
+
+    if args.prepare:
+        prepare(ctx)
+    elif args.execute:
+        execute(ctx)
+
+
+if __name__ == "__main__":
+    main()

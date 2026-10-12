@@ -1,0 +1,10 @@
+{
+  "lags": [1],
+  "windows": [2],
+  "relative_date_abs_limit": 365000,
+  "features_per_part": 64,
+  "storage_dtype": "float32",
+  "relations": true,
+  "rank_reference": "complete_contemporary_month",
+  "target_policy": "preserve_as_label_never_use_in_features"
+}

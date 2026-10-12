@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import unittest
+
+import numpy as np
+import pandas as pd
+
+HERE = Path(__file__).resolve().parent
+import sys
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import superfinal100_v2 as V2
+
+
+class TestSuperFinalV2(unittest.TestCase):
+    def test_plan_matches_runner(self):
+        plan = json.loads((HERE / "plan_superfinal100_v2.json").read_text())
+        self.assertEqual(plan["run"], V2.RUN)
+        self.assertTrue(plan["lightgbm_dataset"]["construct_per_seed"])
+        self.assertEqual(plan["confirmation"]["wins_min"], 14)
+        self.assertEqual(plan["memory"]["minimum_vm_total_gib"], 56)
+        self.assertTrue(plan["final"]["single_submit"])
+        self.assertTrue(plan["stop_after_this_experiment"])
+
+    def test_seed_partitions_are_separate(self):
+        self.assertTrue(set(V2.SCREEN_SEEDS).isdisjoint(V2.REP_CONFIRM_SEEDS))
+        self.assertTrue(set(V2.REP_CONFIRM_SEEDS).isdisjoint(V2.RECENCY_SEEDS))
+        self.assertTrue(set(V2.RECENCY_SEEDS).isdisjoint(V2.TUNE_CONFIRM_SEEDS))
+        self.assertEqual(len(V2.SCREEN_SEEDS), 3)
+        self.assertEqual(len(V2.REP_CONFIRM_SEEDS), 5)
+        self.assertEqual(len(V2.RECENCY_SEEDS), 5)
+        self.assertEqual(len(V2.TUNE_CONFIRM_SEEDS), 5)
+
+    def test_dataset_per_seed_matches_reference_path(self):
+        import lightgbm as lgb
+
+        rng = np.random.default_rng(17)
+        x = pd.DataFrame(
+            rng.normal(size=(5000, 12)),
+            columns=[f"x{i}" for i in range(12)],
+        )
+        y = (rng.random(5000) < 0.05).astype(np.int8)
+        params = {
+            "objective": "binary",
+            "metric": "binary_logloss",
+            "learning_rate": 0.03,
+            "num_leaves": 31,
+            "min_data_in_leaf": 20,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 1,
+            "max_bin": 63,
+            "bin_construct_sample_cnt": 700,
+            "verbosity": -1,
+            "force_col_wise": True,
+            "deterministic": True,
+            "num_threads": 1,
+            "seed": 17,
+        }
+        ref_ds = lgb.Dataset(x, label=y, free_raw_data=False)
+        ref = lgb.train(dict(params), ref_ds, num_boost_round=15)
+        p_ref = np.asarray(ref.predict(x), dtype=np.float64)
+
+        weights = np.ones(len(y), dtype=np.float64)
+        new_ds, new_params = V2.dataset_for_seed(
+            x, y, weights, list(x.columns), params, 17
+        )
+        new = lgb.train(new_params, new_ds, num_boost_round=15)
+        p_new = np.asarray(new.predict(x), dtype=np.float64)
+        self.assertTrue(np.array_equal(p_ref, p_new))
+
+    def test_strict_threshold_is_present(self):
+        source = (HERE / "superfinal100_v2.py").read_text()
+        self.assertIn('paired["wins"] >= 14', source)
+        self.assertIn("CANARY_S3_EXACT_OK", source)
+        self.assertIn("dataset_per_seed=SI", source)
+
+    def test_only_one_final_csv(self):
+        source = (HERE / "superfinal100_v2.py").read_text()
+        self.assertEqual(source.count("C.export_csv(csv_path, ids, ensemble, n_final)"), 1)
+        self.assertNotIn("ENS12000", source)
+        self.assertNotIn("ENS13000", source)
+        self.assertNotIn("ENS14500", source)
+
+    def test_memory_guard_formula(self):
+        n_train = 654066
+        n_score = 164647
+        n_features = 3780
+        estimate = ((2 * n_train + n_score) * n_features * 8) / V2.GIB + V2.RESERVE_GIB
+        self.assertAlmostEqual(estimate, 49.478161662817, places=9)
+        self.assertGreater(estimate, 32)
+        self.assertLess(estimate, 56)
+
+
+if __name__ == "__main__":
+    unittest.main()

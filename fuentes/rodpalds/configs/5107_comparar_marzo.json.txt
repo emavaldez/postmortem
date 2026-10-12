@@ -1,0 +1,32 @@
+{
+  "experimento": 5107,
+  "nombre": "comparar_marzo",
+  "descripcion": "¿Sirve sumar marzo al entrenamiento aunque no tenga lags? Misma receta completa (ds3003 con lag2) y mismos hiperparametros (p23 de 4104 via 4106; min_data_in_leaf x2 con dos meses), entrenando con abril solo contra marzo + abril. Mitad B de 202106 (x2), 30 semillas, bootstrap pareado. Es el analogo, en validacion, de entrenar el final con marzo a junio en lugar de abril a junio.",
+  "referencia": "solo_abril",
+  "n_semillas": 30,
+  "candidatos": {
+    "solo_abril": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4106_bo_receta_muerte/4106_eleccion.json"
+      },
+      "meses_train": [
+        202104
+      ]
+    },
+    "marzo_y_abril": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4106_bo_receta_muerte/4106_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ]
+    }
+  }
+}

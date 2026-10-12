@@ -1,0 +1,337 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–42] Presentación y carga de librerías, instalando las que falten: data.table, R.utils,
+#   primes, rlist, yaml, lightgbm, DiceKriging, mlrMBO, here y ggplot2.
+#%% celda 1 [texto]
+# Réplica de la validación manual — LAG-009 / RDS 40
+
+Ejecutar desde `entregas/bo`, con kernel R.
+
+La entrada es `benchmark_multisemilla_lags20260924_114539-r`. El dataset, los meses, las semillas y las columnas excluidas son los de la validación manual original que produjo el RDS 40; se configuran en esta notebook.
+
+Se conserva el código original que elige el mejor modelo del benchmark, construye sus parámetros, entrena y evalúa cada semilla. Se guardan `40.rds` y `validaciones_manuales_replica.csv` en `entregas/bo`.
+
+# Librerias
+
+#%% celda 2 [código]
+# cargo las librerias que necesito
+require("data.table")
+require("parallel")
+
+if(!require("R.utils")) install.packages("R.utils")
+require("R.utils")
+
+if( !require("primes") ) install.packages("primes")
+require("primes")
+
+if( !require("utils") ) install.packages("utils")
+require("utils")
+
+if( !require("rlist") ) install.packages("rlist")
+require("rlist")
+
+if( !require("yaml")) install.packages("yaml")
+require("yaml")
+
+if( !require("lightgbm") ) install.packages("lightgbm")
+require("lightgbm")
+
+if( !require("DiceKriging") ) install.packages("DiceKriging")
+require("DiceKriging")
+
+if( !require("mlrMBO") ) install.packages("mlrMBO")
+require("mlrMBO")
+
+library(here)
+require("ggplot2")
+
+# [Anotación · líneas 44–64] Rutas relativas a entregas/bo, dataset
+#   competencia_01_ternaria_lf_k6_perdida4.csv, archivo de registro validaciones_manuales_replica.csv, semillas
+#   230047, 230059, 230063, 230077 y 230081, e identificador 40-REPLICA.
+#%% celda 3 [texto]
+# URLS
+
+#%% celda 4 [código]
+# Ejecutar desde entregas/bo.
+root <- getwd()
+exp_folder <- root
+data_folder <- file.path(dirname(root), "dataset")
+
+dataset_file = 'competencia_01_ternaria_lf_k6_perdida4.csv'
+dataset_url <- file.path(data_folder, dataset_file)
+list.files(data_folder)
+
+carpeta_man_val <- root
+archivo_validaciones <- file.path(
+  carpeta_man_val,
+  "validaciones_manuales_replica.csv"
+)
+
+SEEDS <- c(230047, 230059, 230063, 230077, 230081)
+id_validacion <- '40-REPLICA'
+
+# [Anotación · líneas 66–118] Lee el dataset, lo ordena y cuenta filas por mes y clase; crea clase01 (BAJA+1 o
+#   BAJA+2 = 1) y define las columnas de entrada quitando 16 nombres (los mismos de p005).
+#%% celda 5 [texto]
+# LEEMOS DATASET
+
+#%% celda 6 [código]
+# leo el dataset
+dataset <- fread(dataset_url)
+
+#%% celda 7 [código]
+setorder( dataset, foto_mes, ternaria, numero_de_cliente)
+dataset[, .N, list(foto_mes, ternaria)]
+
+#%% celda 8 [código]
+# colnames(dataset)
+
+#%% celda 9 [texto]
+# CLASE01
+
+#%% celda 10 [código]
+dataset[, clase01 := ifelse(ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+#%% celda 11 [texto]
+# Columnas a usar
+
+#%% celda 12 [código]
+grep("prestamos_personales", colnames(dataset), value = TRUE, ignore.case = TRUE)
+grep("ternaria", colnames(dataset), value = TRUE, ignore.case = TRUE)
+
+#%% celda 13 [código]
+columnas_excluir <-
+c(
+    "ternaria",
+    "ternaria_lag1",
+    "clase01",
+    "fold",
+    "azar",
+    "training",
+    "cprestamos_personales",
+    "mprestamos_personales",
+    "cprestamos_personales_lag1",
+    "mprestamos_personales_lag1",
+    "cprestamos_personales_delta1",
+    "mprestamos_personales_delta1",
+    "cprestamos_personales_lag_pond",
+    "mprestamos_personales_lag_pond",
+    "cprestamos_personales_delta_lag_pond",
+    "mprestamos_personales_delta_lag_pond"
+  )
+
+#%% celda 14 [código]
+campos_buenos <- setdiff(
+  colnames(dataset),
+  columnas_excluir  
+)
+
+# [Anotación · líneas 120–144] Indica la carpeta del benchmark replicado
+#   (benchmark_multisemilla_lags20260924_114539-REPLICA) y los meses: entrenamiento 202103 y 202104, futuro
+#   202106.
+#%% celda 15 [texto]
+# Experimento
+
+#%% celda 16 [código]
+# Carpeta generada por la validación multisemilla replicada.
+carpeta_benchmarks <- exp_folder
+writeLines(list.files(carpeta_benchmarks, pattern = "benchmark"))
+
+#%% celda 17 [código]
+benchmark_base <- "benchmark_multisemilla_lags20260924_114539-REPLICA"
+
+#%% celda 18 [texto]
+## Parametros
+
+#%% celda 19 [código]
+
+carpeta_benchmark <-file.path(
+  carpeta_benchmarks,
+  benchmark_base
+)
+
+#%% celda 20 [código]
+train <- c(202103, 202104)
+train_final <- c(202103, 202104)
+future <- c(202106)
+
+# [Anotación · líneas 146–177] Lee PARAM.rds del benchmark y, de mejor_corte_por_modelo.tsv, la fila de mayor
+#   ganancia_total_promedio. Combina los parámetros fijos con los de esa fila, divide min_data_in_leaf por el
+#   undersampling y toma la lista de cortes.
+#%% celda 21 [código]
+
+# Configuración utilizada durante la validación
+PARAM_BENCH <- readRDS(
+  file.path(carpeta_benchmark, "PARAM.rds")
+)
+
+# Lee los mejores resultados y selecciona el de mayor ganancia promedio
+mejor_modelo <- data.table::fread(
+  file.path(carpeta_benchmark, "mejor_corte_por_modelo.tsv")
+)[which.max(ganancia_total_promedio)]
+
+# Identifica qué columnas de la fila corresponden a parámetros de LightGBM
+columnas_parametros <- intersect(
+  names(PARAM_BENCH$lgbm$param_fijos),
+  names(mejor_modelo)
+)
+
+# Combina los parámetros fijos con los del mejor modelo
+params_completos <- modifyList(
+  PARAM_BENCH$lgbm$param_fijos,
+  as.list(mejor_modelo[, ..columnas_parametros])
+)
+
+# Ajusta min_data_in_leaf según el undersampling usado
+params_completos$min_data_in_leaf <- round(
+  params_completos$min_data_in_leaf /
+    PARAM_BENCH$trainingstrategy$undersampling
+)
+
+#%% celda 22 [código]
+cortes <-PARAM_BENCH$cortes
+
+# [Anotación · líneas 179–188] Separa las filas de entrenamiento y las del mes futuro.
+#%% celda 23 [texto]
+## Dataset train y test
+
+#%% celda 24 [código]
+dataset_train <- dataset[foto_mes %in% train_final]
+dataset_train[,.N, list(foto_mes, ternaria)]
+
+#%% celda 25 [código]
+# aplico el modelo a los datos sin clase
+dfuture <- dataset[foto_mes %in% future]
+
+# [Anotación · líneas 190–241] Para cada semilla entrena un LightGBM con todos los datos de entrenamiento,
+#   predice el mes futuro, asigna 1.072.500 a cada BAJA+2 y -27.500 al resto, ordena por probabilidad y calcula
+#   la ganancia acumulada; guarda el máximo de la curva y los parámetros usados. Al final promedia los máximos
+#   de las 5 semillas.
+#%% celda 26 [texto]
+# Entreno
+
+#%% celda 27 [código]
+ganancias_semillas <- numeric(length(SEEDS))
+curvas_semillas <- vector("list", length(SEEDS))
+params_por_semilla <- setNames(vector("list", length(SEEDS)), as.character(SEEDS))
+
+for (i in seq_along(SEEDS)) {
+  params_semilla <- params_completos
+  params_semilla$seed <- SEEDS[i]
+  params_por_semilla[[i]] <- params_semilla
+
+  dtrain_final <- lgb.Dataset(
+    data= data.matrix(dataset_train[, campos_buenos, with= FALSE]),
+    label= dataset_train[, clase01]
+  )
+
+  modelo_final <- lgb.train(
+    data= dtrain_final,
+    param= params_semilla
+  )
+
+  # hago el predict en los datos del futuro, y calculo la ganancia
+
+  # aplico el modelo a los datos nuevos
+  prediccion <- predict(
+    modelo_final,
+    data.matrix(dfuture[, campos_buenos, with= FALSE])
+  )
+
+  # calculo la ganancia en los datos ddel futuro para todos los cortes
+  tb_prediccion <- dfuture[, list(numero_de_cliente, foto_mes,ternaria)]
+  tb_prediccion[, prob := prediccion ]
+  tb_prediccion[, gan := ifelse(ternaria == "BAJA+2", 1072500, -27500)]
+
+  # lgb.save(modelo_final, "modelo.txt" )
+  # Dibujo la curva de ganancia acumulada
+  setorder(tb_prediccion, -prob)
+  tb_prediccion[, ganancia_acumulada := cumsum(gan)]
+  tb_prediccion[, pos := sequence(.N)]
+
+  print(tb_prediccion|> head())
+
+  ganancias_semillas[i] <- max(tb_prediccion$ganancia_acumulada)
+  curvas_semillas[[i]] <- tb_prediccion[, list(
+    pos, ganancia_acumulada, seed = SEEDS[i]
+  )]
+}
+
+ganancia_promedio <- mean(ganancias_semillas)
+tb_curvas <- rbindlist(curvas_semillas)
+
+# [Anotación · líneas 243–261] Grafica la ganancia acumulada de cada semilla hasta la posición 30.000 e
+#   imprime, para cada corte, la ganancia de los primeros clientes de la tabla de la última semilla del ciclo.
+#%% celda 28 [código]
+# defino hasta donde muestra el grafico
+amostrar <- 30000
+# observamos la curva de ganancia
+gra <- ggplot(
+           data= tb_curvas[pos <= amostrar],
+           aes( x= pos, y= ganancia_acumulada, color= factor(seed))
+             ) + geom_line() + labs(color = "Seed")
+
+gra <- gra + theme(text = element_text(size = 16))
+
+options(repr.plot.width=16, repr.plot.height=9)
+print( gra )
+
+#%% celda 29 [código]
+for (envios in cortes) {
+  ganancia <- tb_prediccion[1:envios, sum(gan)]
+  cat( envios, "\t", ganancia, "\n")
+}
+
+# [Anotación · líneas 263–303] Agrega una fila a validaciones_manuales_replica.csv (identificador, ganancia
+#   promedio, semillas, dataset, cantidades de filas, meses, columnas excluidas y benchmark) y guarda la lista
+#   de parámetros por semilla en 40-REPLICA.rds.
+#%% celda 30 [texto]
+# Guardamos resultados
+
+#%% celda 31 [código]
+if (file.exists(archivo_validaciones)) {
+  validaciones_previas <- fread(archivo_validaciones)
+}
+
+registro_validacion <- data.table(
+  id_validacion = id_validacion,
+  ganancia = ganancia_promedio,
+  seeds = paste(SEEDS, collapse = ","),
+  dataset = dataset_file,
+  cantidad_registros_totales = nrow(dataset),
+  cantidad_registros_entrenamiento = nrow(dataset_train),
+  cantidad_registros_validacion = nrow(dfuture),
+  meses_entrenamiento = paste(train_final, collapse = ","),
+  meses_validacion = paste(future, collapse = ","),
+  columnas_excluidas = paste(columnas_excluir, collapse = ","),
+  benchmark_original = benchmark_base
+)
+
+# Incorpora seeds al histórico anterior si todavía no tiene esa columna.
+if (file.exists(archivo_validaciones) && !("seeds" %in% names(validaciones_previas))) {
+  validaciones_previas[, seeds := NA_character_]
+  setcolorder(validaciones_previas, names(registro_validacion))
+  fwrite(validaciones_previas, archivo_validaciones)
+}
+
+fwrite(
+  registro_validacion,
+  archivo_validaciones,
+  append = file.exists(archivo_validaciones),
+  col.names = !file.exists(archivo_validaciones)
+)
+
+# Guarda exactamente los parámetros enviados a lgb.train()
+saveRDS(
+  params_por_semilla,
+  file.path(carpeta_man_val, paste0(id_validacion, ".rds"))
+)
+
+# [Anotación · líneas 305–310] Lee y muestra el histórico de validaciones.
+#%% celda 32 [texto]
+# Historico
+
+#%% celda 33 [código]
+historico <- fread(archivo_validaciones)
+historico

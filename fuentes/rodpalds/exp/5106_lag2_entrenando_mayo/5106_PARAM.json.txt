@@ -1,0 +1,69 @@
+{
+  "experimento": 5106,
+  "nombre": "lag2_entrenando_mayo",
+  "descripcion": "Unica forma de medir lag2 con los datos disponibles: entrenar con 202105 (su lag2 es marzo) y medir en la mitad B de 202106 (a 1 mes, no a 2). Misma receta 3003 sin y con lag2/delta2. Solo sirve para comparar las dos entre si, no para comparar con otros experimentos.",
+  "mitades": "4102_bo_fuera_de_tiempo/4102_mitades_junio.csv",
+  "referencia": "muerte_conteo_sin_lag2",
+  "candidatos": {
+    "muerte_conteo_sin_lag2": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": false,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    },
+    "muerte_conteo_con_lag2": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    }
+  },
+  "mes_train": 202105,
+  "mes_test": 202106,
+  "clase": "clase_binaria2",
+  "n_semillas": 30,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    8000,
+    8500,
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000,
+    15500,
+    16000,
+    16500,
+    17000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "n_bootstrap": 1000,
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "clientes_agosto": 164647,
+  "_config": "5106_lag2_entrenando_mayo.json",
+  "_fecha_inicio": "2026-10-09 15:48:46",
+  "_script": "11_comparar_pipelines.py",
+  "_git_commit": "sin_git"
+}

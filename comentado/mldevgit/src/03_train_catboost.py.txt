@@ -1,0 +1,12 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–7] Importa args y train_family de common.py, lee --output-dir y ejecuta el
+#   entrenamiento de la familia 'catboost'; toda la lógica está en common.py.
+from common import args, train_family
+
+def main():
+    opts=args('5 seeds CatBoost FULL457 finales congeladas; sin features lag2').parse_args()
+    train_family(opts.output_dir,'catboost')
+
+if __name__=='__main__': main()

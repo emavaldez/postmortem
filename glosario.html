@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="es" data-raiz="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glosario · Postmortem Primera Competencia DMEyF 2026</title>
+<meta name="description" content="Glosario de la competencia con enlaces a ejemplos en el código.">
+<link rel="stylesheet" href="assets/estilo.css">
+<link rel="help" href="llms.txt" title="Guía para agentes">
+
+<script src="assets/app.js" defer></script>
+</head>
+<body>
+<header class="barra"><div class="barra-int"><a class="marca" href="index.html">Postmortem · Primera Competencia</a><nav aria-label="Secciones"><a href="index.html">Resumen</a><a href="index.html#entregas">Entregas</a><a href="comparar.html">Comparar</a><a href="fichas.html">Fichas</a><a href="tecnicas.html">Técnicas</a><a href="reproducibilidad.html">Reproducibilidad</a><a href="buscar.html">Buscar en el código</a><a href="glosario.html" aria-current="page">Glosario</a><a href="agentes.html">Para agentes</a></nav></div></header>
+<main>
+<h1>Glosario</h1>
+<p class="bajada">Los términos que aparecen en las entregas, definidos en una o dos frases, con enlaces a las entregas donde se puede ver cada cosa en el código.</p>
+<h2>La competencia</h2>
+<h3>BAJA+2, BAJA+1, CONTINUA</h3><p style="max-width:62rem">La clase de cada cliente en cada mes. BAJA+2: el cliente deja de aparecer dos meses después. BAJA+1: deja de aparecer el mes siguiente. CONTINUA: sigue. Lo que se premia es identificar los BAJA+2 del mes a predecir.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#clase-binaria_baja2">Clase binaria: positivo = BAJA+2 · 12 entregas</a><a class="chip si" href="tecnicas.html#clase-binaria_baja1_baja2">Clase binaria: positivo = BAJA+1 o BAJA+2 · 57 entregas</a><a class="chip si" href="tecnicas.html#clase-multiclase">Tres clases (CONTINUA, BAJA+1, BAJA+2) · 4 entregas</a></div>
+<h3>Ganancia</h3><p style="max-width:62rem">La métrica de la competencia: cada cliente BAJA+2 incluido en la lista suma un monto fijo y cada cliente incluido que no lo es resta un costo fijo.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#validacion-ganancia_como_metrica">Usa la ganancia de la competencia como métrica · 46 entregas</a></div>
+<h3>Corte o envíos</h3><p style="max-width:62rem">Cuántos clientes se incluyen en la lista que se entrega. Se puede fijar como cantidad, como umbral de probabilidad, o elegir mirando una curva de ganancia en meses con clase.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#corte-cantidad_fija">Envía una cantidad fija de clientes · 62 entregas</a><a class="chip si" href="tecnicas.html#corte-umbral_probabilidad">Corta por umbral de probabilidad · 2 entregas</a><a class="chip si" href="tecnicas.html#corte-elegido_en_validacion">El corte sale de una curva de ganancia en meses con clase · 22 entregas</a><a class="chip si" href="tecnicas.html#corte-varios_cortes">Genera archivos con varios cortes · 27 entregas</a></div>
+<h2>Datos</h2>
+<h3>Variables rotas</h3><p style="max-width:62rem">Variables que en algún mes vienen con valores que no corresponden (por ejemplo, todo en cero). Un tratamiento habitual es pasarlas a NA en ese mes.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#datos-variables_rotas_a_na">Variables rotas en algún mes pasadas a NA o corregidas · 51 entregas</a></div>
+<h3>Submuestreo</h3><p style="max-width:62rem">Entrenar con sólo una parte de los clientes CONTINUA (la clase mayoritaria) y todos los que se van.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#datos-submuestreo_continua">Submuestreo de la clase CONTINUA · 20 entregas</a></div>
+<h3>Drifting</h3><p style="max-width:62rem">Cambio en la distribución de una variable de un mes a otro. Entre los tratamientos que aparecen: reemplazar el valor por su posición (rank) dentro del mes, dejar el cero fijo y ordenar positivos y negativos por separado, o deflactar los montos.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#drifting-rank_por_mes">Rank o percentil de variables dentro de cada mes · 29 entregas</a><a class="chip si" href="tecnicas.html#drifting-rank_cero_fijo">Rank con cero fijo · 32 entregas</a><a class="chip si" href="tecnicas.html#drifting-deflacion">Deflación por IPC, dólar o UVA · 2 entregas</a><a class="chip si" href="tecnicas.html#drifting-estandarizacion_por_mes">Estandarización o normalización por mes · 3 entregas</a></div>
+<h2>Variables</h2>
+<h3>Lag y delta</h3><p style="max-width:62rem">Lag: el valor de una variable en un mes anterior del mismo cliente. Delta: la diferencia entre el valor actual y ese valor anterior.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#variables-lags">Lags · 60 entregas</a><a class="chip si" href="tecnicas.html#variables-deltas">Deltas (diferencia con meses anteriores) · 64 entregas</a></div>
+<h3>Tendencia y ventana</h3><p style="max-width:62rem">Resúmenes de los últimos meses de un cliente: pendiente de la recta que ajusta los valores (tendencia), promedio, mínimo y máximo de la ventana, y cocientes contra esos valores.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#variables-tendencias">Tendencias (pendiente en una ventana) · 21 entregas</a><a class="chip si" href="tecnicas.html#variables-promedios_ventana">Promedios móviles o de ventana · 23 entregas</a><a class="chip si" href="tecnicas.html#variables-min_max_ventana">Mínimos y máximos de ventana · 10 entregas</a><a class="chip si" href="tecnicas.html#variables-ratios_historia">Cocientes contra valores anteriores o contra la ventana · 19 entregas</a></div>
+<h3>Variables dentro del mes</h3><p style="max-width:62rem">Variables nuevas armadas con datos del mismo mes: sumas, cocientes y combinaciones de las originales.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#variables-intra_mes">Variables nuevas dentro del mes (sumas, cocientes, combinaciones) · 32 entregas</a></div>
+<h3>Canaritos</h3><p style="max-width:62rem">Variables de números al azar que se agregan al dataset. Si el modelo las usa tanto como a una variable real, esa variable real no aporta más que ruido; sirven para decidir cuáles quedarse.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#variables-canaritos">Canaritos (variables al azar para medir ruido) · 8 entregas</a><a class="chip si" href="tecnicas.html#variables-seleccion_por_importancia">Selección de variables por importancia · 10 entregas</a></div>
+<h2>Modelo</h2>
+<h3>Hiperparámetros y su búsqueda</h3><p style="max-width:62rem">Los valores que definen cómo aprende el modelo (cantidad de árboles, hojas, tasa de aprendizaje). Se pueden dejar fijos o buscar con optimización bayesiana, Optuna, grillas o al azar.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#hiperparametros-optimizacion_bayesiana">Optimización bayesiana (mlrMBO, mlr3mbo, bbotk, skopt u otra) · 20 entregas</a><a class="chip si" href="tecnicas.html#hiperparametros-optuna">Optuna · 31 entregas</a><a class="chip si" href="tecnicas.html#hiperparametros-grilla_o_azar">Búsqueda en grilla o al azar · 6 entregas</a><a class="chip si" href="tecnicas.html#hiperparametros-fijos">Hiperparámetros fijos escritos en el código · 27 entregas</a></div>
+<h3>Validación</h3><p style="max-width:62rem">Cómo se mide un modelo antes de entregar: en un mes posterior al de entrenamiento, con una partición al azar, con validación cruzada, o en varios meses.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#validacion-mes_futuro">Validación en un mes posterior al entrenamiento · 54 entregas</a><a class="chip si" href="tecnicas.html#validacion-particion_aleatoria">Partición aleatoria de entrenamiento y validación · 12 entregas</a><a class="chip si" href="tecnicas.html#validacion-validacion_cruzada">Validación cruzada · 10 entregas</a><a class="chip si" href="tecnicas.html#validacion-varios_meses_de_prueba">Prueba en más de un mes (backtesting) · 11 entregas</a></div>
+<h3>Semillerío</h3><p style="max-width:62rem">Entrenar el mismo modelo varias veces cambiando sólo la semilla y promediar las probabilidades.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#ensamble-semillerio">Promedio de varias semillas del mismo modelo · 62 entregas</a></div>
+<h3>Ensamble</h3><p style="max-width:62rem">Combinar las predicciones de modelos o configuraciones distintas, por promedio o entrenando otro modelo sobre sus salidas (stacking).</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#ensamble-modelos_distintos">Combina modelos o configuraciones distintas · 23 entregas</a><a class="chip si" href="tecnicas.html#ensamble-stacking">Stacking (un modelo sobre las salidas de otros) · 1 entregas</a></div>
+<h3>Reentrenar con todo</h3><p style="max-width:62rem">Después de elegir hiperparámetros y corte, volver a entrenar sumando los meses que se habían reservado para validar.</p>
+<div class="chips"><a class="chip si" href="tecnicas.html#final-reentrena_con_todo">El modelo final se reentrena sumando los meses usados para validar · 55 entregas</a></div>
+<footer class="pie">
+<p>Página armada el 2026-10-12 a partir de los repositorios públicos que cada alumno posteó como entrega de la Primera Competencia de DMEyF 2026 (UBA). Las descripciones y las anotaciones del código son lecturas automáticas hechas con asistencia de IA y revisadas por una segunda pasada automática; describen lo que el código hace, sin valorarlo, y pueden contener errores. El código y los textos de cada entrega pertenecen a sus autores y se muestran tal como estaban en el commit indicado en cada página.</p>
+<p>Para corregir una descripción o pedir que se retire una entrega: <a href="https://github.com/emavaldez/postmortem/issues">abrir un issue</a>. <a href="agentes.html">Versión para agentes</a> · <a href="llms.txt">llms.txt</a> · <a href="https://github.com/emavaldez/postmortem">repositorio de esta página</a>.</p>
+</footer>
+</main>
+</body>
+</html>

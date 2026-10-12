@@ -1,0 +1,62 @@
+{
+  "final_model": "Z636 C25 FULL762",
+  "public_gain_M": 98.615,
+  "submission_id": "1560-1791746981180245",
+  "public_metadata_source": "Registro de entrega informado por el autor; no usado por el pipeline",
+  "hash_FULL457": "c3578882fcf1adf79df9c20c472864719672522fa2ee9283d4a9b1c0fe080c12",
+  "hash_FULL762": "1e9747955f214a8ddcb405af0e3a71d4a516f1818bf829c0d6c14ca0f934e8f6",
+  "expected_final_csv_sha256": "00534f4c23bb87c5e0962ee615a0f81740cf1e2f3e64232c7af5bc83aae697a0",
+  "references": {
+    "FULL457": {
+      "reference": "Z621",
+      "source_code_sha256": "2b7d48160f2548007afe9b9830e23c8bf2fd4e4e65aad1509c71c4f8bd2fd109"
+    },
+    "FULL762": {
+      "reference": "Z633",
+      "source_code_sha256": "51814094cd36b671716c3f1a48b6e2d05266f3d636eeea9180f1aa5941039669"
+    },
+    "LightGBM_final": {
+      "reference": "Z636",
+      "source_code_sha256": "20a150c89dc59ffa48e4085b4ce2a4c5fd5e82feb5dcb0564ad47a6bdcd6c6e7"
+    },
+    "CatBoost_FULL457_original": {
+      "reference": "componente FULL457 original",
+      "source_code_sha256": "c99cc25949d957371fed92abf737db7ef61aaf2b44bc3933e42ee5e830f31dd1"
+    },
+    "C25_validation": {
+      "reference": "Z635",
+      "source_code_sha256": "c77d407c31eed2c05ca395b4d987855d3ad4a59aad70e8e5945c1fa0ccc5ad16"
+    },
+    "structural_transfer": {
+      "reference": "Z637",
+      "source_code_sha256": "f586b18c981556cc4167f0ce7626035223ca9b91623c89c3555bcbcf6c500b13"
+    }
+  },
+  "references_are_informational_only": true,
+  "historical_artifacts_required_by_pipeline": false,
+  "features_by_family": {
+    "lightgbm": 762,
+    "catboost": 457
+  },
+  "current_code_sha256": {
+    "src/01_feature_engineering.py": "2ffbcf39ab01f9cbd220e5b178668dcc62853cc1823ce41fcfd4158193509b9d",
+    "src/02_train_lightgbm.py": "3f2a410c6141d03551d9f4400c37ee77753c5616e2e458e80ad3afc340bc921b",
+    "src/03_train_catboost.py": "18649e66eab1717cf8cbc38723f48dce06414594a00783446dfc02bbb7a14c17",
+    "src/04_build_final_c25.py": "18711530e1d96ebd65e077ed96c691fe20a110296ac7948dbbaa7c7d9218f4fb",
+    "src/05_verify_submission.py": "f0e02796f044dba02a81f8ec007aea43b14491c6772b510abc40e5fbc0026c5a",
+    "src/common.py": "2755c999204707fe5d9315085ae0f587cd08432fa4d1e7b457f446866a50c3df"
+  },
+  "requirements_sha256": "8d035bbb1a5dba55223e6f4bfaf2c2ff241b7daa30fd70a7f2bbf593028c41df",
+  "full_reproduction_status": "NOT_EXECUTED",
+  "static_audit": {
+    "status": "PASS",
+    "fits": 0,
+    "full_reproduction_executed": false,
+    "source_and_feature_checks": "PASS",
+    "sensitive_information": "NONE",
+    "hidden_external_dependencies": "NONE",
+    "remaining_previous_model_references": 0,
+    "package_file_count": 12,
+    "git_ignore": "PASS"
+  }
+}

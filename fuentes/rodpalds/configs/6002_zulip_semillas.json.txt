@@ -1,0 +1,8 @@
+{
+  "experimento": 6002,
+  "nombre": "zulip_semillas_5007_e13000",
+  "modo": "semillas",
+  "fuente": "5007_prod_p117_por_semilla",
+  "envios": 13000,
+  "descripcion": "20 archivos para Zulip, uno por semilla del retador (5007), 13.000 envios: media y desvio en el publico."
+}

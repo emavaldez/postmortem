@@ -1,0 +1,40 @@
+"""
+02_ensamblar_08_L22.py — ensambla las predicciones sobre 08 disponibles hasta el momento (L22).
+
+Se puede correr en cualquier momento, incluso mientras 01_entrenar_08_L22.py sigue entrenando: solo lee los
+archivos pred_08/prob_<semilla>.npy ya terminados. Promedia las probabilidades de los modelos (promedio simple)
+y escribe L22_pred_08_ens_<n>modelos.parquet con numero_de_cliente (int64) y prob_ens.
+También muestra cuánto del top-N del ensamble ya está estabilizado con menos modelos.
+
+Uso (desde ~/dmeyf):
+    python 02_ensamblar_08_L22.py                  # todos los modelos disponibles
+    python 02_ensamblar_08_L22.py --n 30           # solo los primeros 30 (en el orden fijo de semillas)
+    python 02_ensamblar_08_L22.py --top 12000      # N de referencia para la estabilidad
+    python 02_ensamblar_08_L22.py --otros L22b     # suma las predicciones de otra VM (carpeta exp/L22b); sin semillas repetidas
+
+Para traer las predicciones de otra VM al bucket/VM actual:
+    gsutil -m rsync -r gs://luisdsuarez_buckito2026/exp/L22b ~/dmeyf/exp/L22b
+"""
+import argparse
+import os
+
+import comun_L22 as cm
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--volumen", default=cm.VOLUMEN)
+    ap.add_argument("--dir_base", default=os.path.expanduser("~/dmeyf"))
+    ap.add_argument("--n", type=int, default=None, help="usar solo los primeros n modelos disponibles")
+    ap.add_argument("--top", type=int, default=11000)
+    ap.add_argument("--otros", nargs="*", default=[], help="otros volúmenes (carpetas exp/<volumen>) con más predicciones")
+    ap.add_argument("--sin_bucket", action="store_true")
+    a = ap.parse_args()
+    dir_exp = os.path.join(a.dir_base, "exp", a.volumen)
+    otros = [os.path.join(a.dir_base, "exp", v) for v in a.otros]
+    cm.ensamblar_08(dir_exp, a.volumen, cm.semillas_n(1000), n=a.n, top=a.top, otros_dirs=otros)
+    cm.sync(dir_exp, a.volumen, not a.sin_bucket)
+
+
+if __name__ == "__main__":
+    main()

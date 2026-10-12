@@ -1,0 +1,44 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–9] Carga data.table y lee las dos predicciones promedio:
+#   ~/buckets/b1/exp/HT4955-01/prediccion_promedio.txt y ~/buckets/b1/exp/HT4957-01/prediccion_promedio.txt.
+#%% celda 1 [código]
+require( "data.table" )
+
+#%% celda 2 [código]
+library(data.table)
+DIR_EXP <- path.expand("~/buckets/b1/exp")
+
+a <- fread(file.path(DIR_EXP, "HT4955-01", "prediccion_promedio.txt"))
+b <- fread(file.path(DIR_EXP, "HT4957-01", "prediccion_promedio.txt"))
+
+# [Anotación · líneas 11–18] Une ambas tablas por numero_de_cliente (pa y pb son las probabilidades de cada
+#   experimento) y verifica que no se pierdan filas. Calcula score como el promedio de los puestos de pa y pb
+#   (frank, creciente con la probabilidad) y ordena de mayor a menor score.
+tb <- merge(a[, .(numero_de_cliente, pa = prob)],
+            b[, .(numero_de_cliente, pb = prob)],
+            by = "numero_de_cliente")
+stopifnot(nrow(tb) == nrow(a), nrow(tb) == nrow(b))
+
+# blend 50/50 por puestos
+tb[, score := (frank(pa) + frank(pb)) / 2]
+setorder(tb, -score)
+
+# [Anotación · líneas 20–33] Crea la carpeta BLEND-4955-4957 y, para cada corte de 10.500 a 14.500 cada 500,
+#   escribe Intentoj_blend_<corte>.csv con los primeros numero_de_cliente, sin encabezado. Relee cada archivo y
+#   verifica que tenga la cantidad de filas del corte y ningún cliente duplicado.
+# carpeta para los archivos del blend
+dir_blend <- file.path(DIR_EXP, "BLEND-4955-4957")
+dir.create(dir_blend, showWarnings = FALSE)
+
+cortes_blend <- seq(10500, 14500, by = 500)
+
+for (corte in cortes_blend) {
+  archivo <- file.path(dir_blend, paste0("Intentoj_blend_", corte, ".csv"))
+  fwrite(tb[1:corte, .(numero_de_cliente)], archivo, col.names = FALSE)
+
+  chk <- fread(archivo, header = FALSE)
+  stopifnot(nrow(chk) == corte, anyDuplicated(chk$V1) == 0)
+  cat(corte, "OK\n")
+}

@@ -1,0 +1,40 @@
+"""Z636 congelado: .75*rank_normalizado(LGBM FULL762)+.25*rank_normalizado(CatBoost FULL457)."""
+from common import *
+
+def main():
+    output=args(__doc__).parse_args().output_dir
+    dest=output/SUBMISSION_NAME
+    exigir(not dest.exists() and not (output/'ranking_c25.parquet').exists(),'Salida existente')
+    for family,size,digest in [('lightgbm',762,HASH_FULL762),('catboost',457,HASH_FULL457)]:
+        audit=json.loads((output/family/'auditoria.json').read_text(encoding='utf-8'))
+        exigir(audit['fits']==5 and audit['seeds']==SEEDS and audit['features']==size
+               and audit['feature_hash']==digest,'Familia/features incorrectas')
+    l=pd.read_parquet(output/'lightgbm/ranking_ensemble.parquet',engine='pyarrow')
+    c=pd.read_parquet(output/'catboost/ranking_ensemble.parquet',engine='pyarrow')
+    ids=l.numero_de_cliente.to_numpy()
+    exigir(len(ids)==164647 and l.numero_de_cliente.is_unique and c.numero_de_cliente.is_unique and np.array_equal(np.sort(ids),np.sort(c.numero_de_cliente)),'IDs entre familias inválidos')
+    c=c.set_index('numero_de_cliente').reindex(ids)
+    means=[]
+    for q in [l,c]:
+        cols=[f'p_seed_{s}' for s in SEEDS]
+        probabilities=[q[col].to_numpy() for col in cols]
+        exigir(all(np.isfinite(p).all() and ((p>=0)&(p<=1)).all() for p in probabilities),'Scores inválidos')
+        mean=np.mean(np.stack(probabilities),axis=0)
+        exigir(np.array_equal(mean,q.score.to_numpy()),'Ensemble no es media de 5 seeds')
+        means.append(mean)
+    ul,uc=[normalizar(p,ids) for p in means]
+    score=.75*ul+.25*uc
+    result=ranking(ids,score,dict(u_lgbm=ul,u_catboost=uc))
+    selected=result.numero_de_cliente.iloc[:12000].to_numpy()
+    exigir(len(np.unique(selected))==12000 and np.isin(selected,ids).all(),'Selección inválida')
+    save_parquet(output/'ranking_c25.parquet',result)
+    with dest.open('x',encoding='utf-8',newline='') as f:
+        pd.Series(selected).to_csv(f,header=False,index=False,lineterminator='\n')
+    digest=sha256_archivo(dest)
+    save_json(output/'final_audit.json',dict(model='Z636 C25 FULL762',SHA256=digest,expected=EXPECTED_CSV,
+              match=digest==EXPECTED_CSV,formula='.75*u_lgbm_FULL762+.25*u_catboost_FULL457',
+              target_August_used=False,features_LightGBM=762,features_CatBoost=457))
+    exigir(digest==EXPECTED_CSV,'CSV diferente del hash oficial: reproducción FAIL')
+    print('FINAL REPRODUCIBILITY: PASS')
+
+if __name__=='__main__': main()

@@ -1,0 +1,1271 @@
+#%% celda 1 [texto]
+# LightGBM  Optimizacion Bayesiana
+
+#%% celda 2 [texto]
+#### 2.1  Seteo del ambiente en Google Colab
+
+#%% celda 3 [texto]
+Conectar la virtual machine donde esta corriendo Google Colab con el  Google Drive, para poder tener persistencia de archivos
+
+#%% celda 4 [código]
+# # primero establecer el Runtime de Python 3
+# from google.colab import drive
+# drive.mount('/content/.drive')
+
+#%% celda 5 [código]
+# %%shell
+
+# mkdir -p "/content/.drive/My Drive/dmeyf"
+# mkdir -p "/content/buckets"
+# ln -sfn  "/content/.drive/My Drive/dmeyf" /content/buckets/b1
+
+
+# mkdir -p /content/buckets/b1/exp
+# mkdir -p /content/buckets/b1/datasets
+# mkdir -p /content/datasets
+
+
+# # defino funcion descargar()
+# descargar() {
+#   carpeta_destino="/content/buckets/b1/datasets/"
+#   url_origen="https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/"
+#   archivo="$1"
+
+#   if ! test -f "$carpeta_destino""$archivo"; then
+#     wget  "$url_origen""$archivo"  -O "$carpeta_destino""$archivo"
+#   fi
+
+#   if ! test -f  "/content/datasets/""$archivo"; then
+#     cp  "$carpeta_destino""$archivo"  "/content/datasets/""$archivo"
+#   fi;
+# }
+
+
+# # hago la descarga efectiva, llamando a descargar()
+# descargar  "competencia_01_crudo.csv"
+
+#%% celda 6 [texto]
+## Generacion de la clase_ternaria
+
+#%% celda 7 [texto]
+Esta parte se debe correr con el runtime en lenguaje **R** Ir al menu, Runtime -> Change Runtime Tipe -> Runtime type -> R
+
+#%% celda 8 [código]
+require( "data.table" )
+
+# leo el dataset
+dataset <- fread("/content/buckets/b1/datasets/competencia_01_crudo.csv.gz" )
+
+# calculo el periodo0 consecutivo
+dsimple <- dataset[, list(
+    "pos" = .I,
+    numero_de_cliente,
+    periodo0 = as.integer(foto_mes/100)*12 +  foto_mes%%100 ) ]
+
+
+# ordeno
+setorder( dsimple, numero_de_cliente, periodo0 )
+
+# calculo topes
+periodo_ultimo <- dsimple[, max(periodo0) ]
+periodo_anteultimo <- periodo_ultimo - 1
+
+
+# calculo los leads de orden 1 y 2
+dsimple[, c("periodo1", "periodo2") :=
+    shift(periodo0, n=1:2, fill=NA, type="lead"),  numero_de_cliente ]
+
+# assign most common class values = "CONTINUA"
+dsimple[ periodo0 < periodo_anteultimo, clase_ternaria := "CONTINUA" ]
+
+# calculo BAJA+1
+dsimple[ periodo0 < periodo_ultimo &
+    ( is.na(periodo1) | periodo0 + 1 < periodo1 ),
+    clase_ternaria := "BAJA+1" ]
+
+# calculo BAJA+2
+dsimple[ periodo0 < periodo_anteultimo & (periodo0+1 == periodo1 )
+    & ( is.na(periodo2) | periodo0 + 2 < periodo2 ),
+    clase_ternaria := "BAJA+2" ]
+
+
+# pego el resultado en el dataset original y grabo
+setorder( dsimple, pos )
+dataset[, clase_ternaria := dsimple$clase_ternaria ]
+
+fwrite( dataset,
+    file =  "/content/datasets/competencia_01.csv.gz",
+    sep = ","
+)
+
+#%% celda 9 [código]
+setorder( dataset, foto_mes, clase_ternaria, numero_de_cliente)
+dataset[, .N, list(foto_mes, clase_ternaria)]
+
+#%% celda 10 [texto]
+### 2.2.2 Generación de nuevas columnas
+
+#%% celda 11 [código]
+head(dataset)
+
+#%% celda 12 [código]
+colnames(dataset)
+
+#%% celda 13 [código]
+dataset[, .N, by = foto_mes]
+
+#%% celda 14 [código]
+str(dataset)
+
+#%% celda 15 [texto]
+Creo los LAG DE ORDEN 1 Y 2
+
+#%% celda 16 [código]
+
+#library(data.table)
+
+# 1. Trabajamos con una copia y guardamos el orden original
+base <- copy(dataset)
+base[, fila_original := .I]
+
+# 2. Convertimos foto_mes a un índice mensual consecutivo
+base[, periodo_idx := (foto_mes %/% 100) * 12 + foto_mes %% 100]
+
+# 3. Identificamos las columnas que queremos desplazar
+columnas <- setdiff(
+  names(dataset),
+  c("numero_de_cliente", "foto_mes","clase_ternaria")
+)
+
+# 4. Creamos las variables lag1
+lag1 <- base[, c("numero_de_cliente", "periodo_idx", columnas),
+             with = FALSE]
+
+setnames(lag1, columnas, paste0(columnas, "_lag1"))
+lag1[, periodo_idx := periodo_idx + 1L]
+
+# 5. Creamos las variables lag2
+lag2 <- base[, c("numero_de_cliente", "periodo_idx", columnas),
+             with = FALSE]
+
+setnames(lag2, columnas, paste0(columnas, "_lag2"))
+lag2[, periodo_idx := periodo_idx + 2L]
+
+# 6. Unimos los valores históricos con el dataset original
+resultado <- merge(
+  base, lag1,
+  by = c("numero_de_cliente", "periodo_idx"),
+  all.x = TRUE, sort = FALSE
+)
+
+resultado <- merge(
+  resultado, lag2,
+  by = c("numero_de_cliente", "periodo_idx"),
+  all.x = TRUE, sort = FALSE
+)
+
+# 7. Recuperamos el orden original
+setorder(resultado, fila_original)
+
+# 8. Quitamos las columnas auxiliares
+resultado[, c("fila_original", "periodo_idx") := NULL]
+
+# 9. Ordeno las columnas
+
+# Excluir columnas que no queremos desplazar
+columnas <- setdiff(
+  names(dataset),
+  c("numero_de_cliente", "foto_mes", "clase_ternaria")
+)
+
+# Orden intercalado: original, lag1, lag2
+orden_columnas <- c(
+  "numero_de_cliente",
+  "foto_mes",
+  unlist(lapply(columnas, function(col) {
+    c(col, paste0(col, "_lag1"), paste0(col, "_lag2"))
+  })),
+  "clase_ternaria"
+)
+
+# Aplicar el orden
+resultado <- resultado[, ..orden_columnas]
+
+# 9. Actualizamos el dataset
+dataset <- resultado
+
+#%% celda 17 [código]
+dim(dataset)
+
+#%% celda 18 [código]
+dataset[order(numero_de_cliente, foto_mes)][1:20]
+
+#%% celda 19 [texto]
+Creo los DELTA LAG de orden 1 y 2
+
+#%% celda 20 [código]
+
+# 1. Identificar las variables originales (excluyendo IDs, clase y lags)
+columnas <- setdiff(
+  names(dataset),
+  c("numero_de_cliente", "foto_mes", "clase_ternaria")
+)
+
+columnas <- columnas[!grepl("_(lag1|lag2|delta1|delta2)$", columnas)]
+
+# 2. Crear delta1 y delta2
+for (col in columnas) {
+  dataset[, paste0(col, "_delta1") :=
+            get(col) - get(paste0(col, "_lag1"))]
+
+  dataset[, paste0(col, "_delta2") :=
+            get(col) - get(paste0(col, "_lag2"))]
+}
+
+# 3. Ordenar las columnas
+orden_columnas <- c(
+  "numero_de_cliente",
+  "foto_mes",
+  unlist(lapply(columnas, function(col) {
+    c(
+      col,
+      paste0(col, "_lag1"),
+      paste0(col, "_lag2"),
+      paste0(col, "_delta1"),
+      paste0(col, "_delta2")
+    )
+  })),
+  "clase_ternaria"
+)
+
+# 4. Aplicar el orden
+dataset <- dataset[, ..orden_columnas]
+
+# 5. Verificar el resultado
+head(dataset[, 1:12, with = FALSE])
+
+#%% celda 21 [código]
+dataset[order(numero_de_cliente, foto_mes)][1:20]
+
+#%% celda 22 [código]
+# Reemplazo los 0 que están mal por NA en 202105 del campo ccajas_depositos
+
+dataset[foto_mes == 202105, ccajas_depositos := NA_real_]
+
+#%% celda 23 [código]
+# z_ctarjetas suma la cantidad de tarjetas de crédito visa y master
+
+dataset[, z_ctarjetas :=
+  fifelse(
+    is.na(ctarjeta_visa) & is.na(ctarjeta_master),
+    NA_real_,
+    fifelse(is.na(ctarjeta_visa), 0, ctarjeta_visa) +
+    fifelse(is.na(ctarjeta_master), 0, ctarjeta_master)
+  )
+]
+
+
+# z_ctarjetas_transacciones suma la cantidad de transcacciones de las tarjetas de crédito visa y master
+dataset[, z_ctarjetas_transacciones :=
+  fifelse(
+    is.na(ctarjeta_visa_transacciones) & is.na(ctarjeta_master_transacciones),
+    NA_real_,
+    fifelse(is.na(ctarjeta_visa_transacciones), 0, ctarjeta_visa_transacciones) +
+    fifelse(is.na(ctarjeta_master_transacciones), 0, ctarjeta_master_transacciones)
+  )
+]
+
+
+# z_mtarjetas_consumo suma llos montos de consumo de las tarjetas visa y master
+dataset[, z_mtarjetas_consumo :=
+  fifelse(
+    is.na(mtarjeta_visa_consumo) & is.na(mtarjeta_master_consumo),
+    NA_real_,
+    fifelse(is.na(mtarjeta_visa_consumo), 0, mtarjeta_visa_consumo) +
+    fifelse(is.na(mtarjeta_master_consumo), 0, mtarjeta_master_consumo)
+  )
+]
+
+#%% celda 24 [texto]
+Calculo los RANKINGS de todas las variables
+
+#%% celda 25 [código]
+
+# 1. Identificar todas las variables a transformar
+excluir <- c("numero_de_cliente", "foto_mes", "clase_ternaria")
+columnas <- setdiff(names(dataset), excluir)
+
+# 2. Ranking por mes, manteniendo el cero
+for (col in columnas) {
+
+  # Convertir la columna a double ANTES de modificarla
+  set(dataset, j = col, value = as.numeric(dataset[[col]]))
+
+  dataset[, (col) := {
+    x <- get(col)
+    resultado <- rep(NA_real_, .N)
+
+    # Ceros
+    resultado[!is.na(x) & x == 0] <- 0
+
+    # Positivos: de 0 a 1
+    pos <- which(!is.na(x) & x > 0)
+    if (length(pos) > 0) {
+      r <- frank(x[pos], ties.method = "dense")
+      resultado[pos] <- r / max(r)
+    }
+
+    # Negativos: de -1 a 0
+    neg <- which(!is.na(x) & x < 0)
+    if (length(neg) > 0) {
+      r <- frank(x[neg], ties.method = "dense")
+      resultado[neg] <- (r - max(r) - 1) / max(r)
+    }
+
+    resultado
+  }, by = foto_mes]
+}
+
+# 3. Comprobar el resultado
+head(dataset[, .(
+  foto_mes,
+  Master_Finiciomora,
+  Master_Finiciomora_lag1,
+  Master_Finiciomora_lag2,
+  Master_Finiciomora_delta1,
+  Master_Finiciomora_delta2
+)])
+
+#%% celda 26 [código]
+dataset[sample(.N, 20)]
+
+#%% celda 27 [código]
+dataset[numero_de_cliente == 63791172][order(foto_mes)]
+
+#%% celda 28 [texto]
+## 2.2 Optimizacion Hiperparámetros
+
+#%% celda 29 [texto]
+Esta parte se debe correr con el runtime en lenguaje R Ir al menu, Runtime -> Change Runtime Type -> Runtime type -> R
+
+#%% celda 30 [texto]
+### 2.2.1 Inicio
+
+#%% celda 31 [texto]
+limpio el ambiente de R
+
+#%% celda 32 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+#%% celda 33 [texto]
+### 2.2.2 Carga de Librerias
+
+#%% celda 34 [texto]
+Esta parte lleva  demasiados   minutos la primera vez en Google Colab
+<br> por suerte a partir del 15-septiembre empezaremos a trabajar con Google Cloud, en donde todas las librerias, de Python R y Julia ya estarán instaladas
+
+#%% celda 35 [código]
+# # instalo paquetes
+# install.packages( c("R.utils", "rlist" ) )
+
+#%% celda 36 [código]
+# # Librerias  modernas  para la Bayesian Optimization
+# install.packages( c("bbotk", "mlr3", "mlr3mbo", "mlr3learners", "DiceKriging") )
+
+#%% celda 37 [código]
+# # el LightGBM
+# install.packages(c("lightgbm"))
+
+#%% celda 38 [código]
+library(data.table)
+library(R.utils)
+library(rlist)
+library(bbotk)
+library(mlr3)
+library(mlr3mbo)
+library(mlr3learners)
+# library(paradox)
+library(DiceKriging)
+library(lightgbm)
+
+#%% celda 39 [texto]
+### 2.2.3 Definicion de Parametros
+
+#%% celda 40 [texto]
+aqui debe cargar SU semilla primigenia
+<br>recuerde cambiar el numero de experimento en cada corrida nueva
+
+#%% celda 41 [código]
+PARAM <- list()
+PARAM$experimento <- "HT4950-04"
+PARAM$semilla_primigenia <-  775777
+
+#%% celda 42 [código]
+# training y future
+PARAM$training_pct <- 70
+PARAM$train <- c(202103,202104)
+PARAM$validate <- c(202106)
+PARAM$train_final <- c(202103,202104,202105,202106)
+PARAM$future <- c(202108)
+PARAM$cortes <- seq(9000, 15000, by= 500)
+
+#%% celda 43 [código]
+# # un undersampling de 0.1  toma solo el 10% de los CONTINUA
+# # undersampling de 1.0  implica tomar TODOS los datos
+
+# PARAM$trainingstrategy$undersampling <- 1
+
+#%% celda 44 [código]
+PARAM$hyperparametertuning$iteraciones <- 10 # iteraciones bayesianas
+
+#%% celda 45 [código]
+# Parametros LightGBM
+
+# parametros fijos del LightGBM que se pisaran con la parte variable de la BO
+PARAM$lgbm$param_fijos <-  list(
+  boosting= "gbdt", # puede ir  dart  , ni pruebe random_forest
+  objective= "binary",
+  metric= "average_precision",
+  feature_pre_filter= FALSE,
+  first_metric_only= FALSE,
+  boost_from_average= TRUE,
+  force_row_wise= TRUE,
+  deterministic= TRUE,
+  verbosity= -100,
+
+  seed= PARAM$semilla_primigenia,
+
+  max_depth= -1L,
+  min_gain_to_split= 0,
+  lambda_l1= 0.0,
+  lambda_l2= 0.0,
+  max_bin= 31L,
+
+  bagging_fraction= 1.0,
+  pos_bagging_fraction= 1.0,
+  neg_bagging_fraction= 1.0,
+  is_unbalance= FALSE,
+  scale_pos_weight= 1.0,
+
+  drop_rate= 0.1,
+  max_drop= 50,
+  skip_drop= 0.5,
+
+  extra_trees= FALSE,
+
+  early_stopping= 0,
+  min_data_in_leaf= 0,     # fijo, esto es FUNDAMENTAL
+  feature_fraction= 0.50,  # fijo
+  learning_rate= 0.005,    # fijo
+
+  feature_fraction_bynode = 0.20, # lo agregué yo
+  
+
+  num_iterations= 20000,     # se modificara
+  num_leaves= 1024,          # se modificara
+  min_sum_hessian_in_leaf= 1e-06  # se modificara
+)
+
+#%% celda 46 [texto]
+Aqui se definen los hiperparámetros de LightGBM que participan de la Bayesian Optimization
+
+#%% celda 47 [código]
+# Aqui se cargan los bordes de los hiperparametros de la BO
+#  es vital entender que se optimiza min_sum_hessian_in_leaf y que  min_data_in_leaf se deja fijo en CERO
+# Instalar si todavía no está instalado
+if (!requireNamespace("paradox", quietly = TRUE)) {
+  install.packages("paradox")
+}
+
+# Cargar el paquete
+library(paradox)
+
+PARAM$hypeparametertuning$hs <- ps(
+  num_iterations= p_int(lower= 64L,  upper= 4096L),
+  num_leaves= p_int(lower= 16L,  upper= 2048L),
+  min_sum_hessian_in_leaf= p_dbl( lower=1e-06, upper=0.1)
+)
+
+#%% celda 48 [código]
+# logueo al archivo BO_log.txt
+loguear  <- function( preg, arch=NA, verbose=TRUE )
+{
+  t0 <- Sys.time()
+  reg <- copy( preg )
+  if( "feature_contri" %in%  names(reg) ) {
+    reg$feature_contri <- reg$feature_contri[1]
+  }
+  archivo <- arch
+  if( is.na(arch) ) archivo <- paste0( folder, substitute( reg), ext )
+
+
+  if( !file.exists( archivo ) )
+  {
+    # Escribo los titulos
+    linea  <- paste0( "fecha\t",
+                      paste( list.names(reg), collapse="\t" ), "\n" )
+
+    cat( linea, file=archivo )
+  }
+
+  # escribo el registro
+  linea  <- paste0( format(t0, "%Y%m%d.%H%M%S"),  "\t",     # la fecha y hora
+                    gsub( ", ", "\t", toString( reg ) ),  "\n" )
+
+  cat( linea, file=archivo, append=TRUE )  # grabo al archivo
+
+  if( verbose )  cat( linea )   # imprimo por pantalla
+}
+
+#%% celda 49 [texto]
+### 2.2.4  Preprocesamiento
+
+#%% celda 50 [código]
+# carpeta de trabajo
+
+setwd("/content/buckets/b1/exp")
+dir.create(PARAM$experimento, showWarnings=FALSE)
+setwd( paste0("/content/buckets/b1/exp/", PARAM$experimento))
+
+#%% celda 51 [código]
+dataset_bo <- dataset[
+  foto_mes %in% c(PARAM$train, PARAM$validate)
+]
+
+# Variable objetivo binaria
+dataset_bo[, clase01 :=
+  as.integer(clase_ternaria %in% c("BAJA+1", "BAJA+2"))
+]
+
+# Selección de registros:
+# training = 1 para marzo y abril
+# training = 0 para junio
+dataset_bo[, training :=
+  as.integer(foto_mes %in% PARAM$train)
+]
+
+#%% celda 52 [código]
+# Variables predictoras
+campos_buenos <- setdiff(
+  names(dataset_bo),
+  c("numero_de_cliente","clase_ternaria","clase01","fold","azar","training"  )
+)
+
+#%% celda 53 [texto]
+#### 2.2.4.1  Salsa Magica (dedicada a Laura Pasquini)
+
+Los EDAs que estan haciendo los alumnos de los lunes son pura falopa, y de la mala. El uso de Agentes de la IA solo les empera el daño cerebral, generan pedf larguisimos, que no te dan ganas de leerlos, carentes de insights y alma.
+<br>El unico EDA que tiene realmente sentido, en este caso, es comparar la distribución de cada variable del mes donde se entrena 202104 y el mes donde se va a aplicar el modelo 202106, buscando Data Drifting.
+<br>Aun con los reales datos del futuro, donde no se tiene la clase, SIEMPRE se puede analizar el Data Drifting.
+<br>Para las variables con distribuciones distintas se puede hacer:
+* Transformar la variable para hacerla homogenea entre los dos periodos
+* Eliminarla (es lo simple, que se eligió hacer en este caso)
+
+#%% celda 54 [texto]
+En esa exploracion gráfica del Data Drifting, se vio que estas variables cambian de distribucion entre 202104 y 202106, y se decidió brutalmente eliminarlas
+* cprestamos_personales
+* mprestamos_personales
+
+
+más adelantes, se utilizarán técnicas más inclusivas, y se preservaran dichas variables, transformadas.
+
+#%% celda 55 [código]
+campos_buenos <- setdiff(
+  campos_buenos,
+  c(
+    "cprestamos_personales",
+    "cprestamos_personales_lag1",
+    "cprestamos_personales_lag2",
+    "cprestamos_personales_delta1",
+    "cprestamos_personales_delta2",
+    "mprestamos_personales",
+    "mprestamos_personales_lag1",
+    "mprestamos_personales_lag2",
+    "mprestamos_personales_delta1",
+    "mprestamos_personales_delta2"
+  )
+)
+
+#%% celda 56 [texto]
+2.2.5 Configuracion Bayesian Optimization
+
+#%% celda 57 [código]
+giter <- 0
+
+if( file.exists("BO_log.txt") ){
+  tb_BO <- fread("BO_log.txt")
+  giter <- tb_BO[, max(iter)]
+}
+
+#%% celda 58 [código]
+# En el argumento x llegan los parametros de la bayesiana
+
+Estimar_lightgbm <- function(xs) {
+
+  flush.console()
+  giter <<- giter + 1
+
+  # x pisa (o agrega) a param_fijos
+  param_completo <- modifyList(PARAM$lgbm$param_fijos, xs)
+  xx <- copy(param_completo)
+
+  # entreno LightGBM
+  modelo <- lgb.train(
+    data= dtrain,
+    valids= list( "val"=dvalidate),
+    param= param_completo
+  )
+
+
+  # obtengo la ganancia
+  xx$iter <- giter
+  xx$metrica <- modelo$best_score
+
+  loguear( xx, "BO_log.txt")
+  set.seed(PARAM$semilla_primigenia, kind = "L'Ecuyer-CMRG")  # le reordeno a mlr3MBO
+
+  return( list( metrica = xx$metrica) )
+}
+
+#%% celda 59 [código]
+# Dataset de entrenamiento: marzo y abril en el formato que necesita LightGBM
+dtrain <- lgb.Dataset(
+  data = data.matrix(
+    dataset_bo[training == 1L, campos_buenos, with = FALSE]
+  ),
+  label = dataset_bo[training == 1L, clase01],
+  free_raw_data = FALSE
+)
+
+# Dataset de validación: junio en el formato que necesita LightGBM
+dvalidate <- lgb.Dataset(
+  data = data.matrix(
+    dataset_bo[foto_mes == PARAM$validate, campos_buenos, with = FALSE]
+  ),
+  label = dataset_bo[foto_mes == PARAM$validate, clase01],
+  free_raw_data = FALSE
+)
+
+#%% celda 60 [código]
+# Comprobar dimensiones
+nrow(dtrain)
+ncol(dtrain)
+
+nrow(dvalidate)
+ncol(dvalidate)
+
+#%% celda 61 [código]
+dataset_bo[, .N, by = foto_mes][order(foto_mes)]
+
+#%% celda 62 [código]
+dataset_bo[, .(
+  filas = .N,
+  positivos = sum(clase01 == 1L, na.rm = TRUE)
+), by = foto_mes][order(foto_mes)]
+
+#%% celda 63 [código]
+nrow(dtrain)
+nrow(dvalidate)
+
+#%% celda 64 [código]
+# Aqui comienza la configuracion de la Bayesian Optimization
+
+# en este archivo quedan la evolucion binaria de la BO
+kbayesiana <- "bayesiana.RDATA"
+
+funcion_optimizar <- Estimar_lightgbm # la funcion que voy a maximizar
+
+objective <- ObjectiveRFun$new(
+  fun= funcion_optimizar,
+  domain= PARAM$hypeparametertuning$hs,
+  codomain= ps(metrica = p_dbl(tags="maximize")),
+  id= "BO_lightgbm"
+)
+
+
+instance <- OptimInstanceBatchSingleCrit$new(
+  objective= objective,
+  terminator=  trm("evals", n_evals = PARAM$hyperparametertuning$iteraciones)
+)
+
+
+surrogate <- srlrn(lrn("regr.km",
+  optim.method = "BFGS",
+  nugget.estim = TRUE,
+  control= list(trace = FALSE)))
+
+acq_function  <- acqf("ei")                 # expected improvement
+
+acq_optimizer  <- acqo(
+  optimizer  = opt("random_search", batch_size= 1000),
+  terminator = trm("evals", n_evals= 1000)
+)
+
+optimizer <- opt("mbo",
+  loop_function = bayesopt_ego,
+  surrogate= surrogate,
+  acq_function= acq_function,
+  acq_optimizer= acq_optimizer
+)
+
+#%% celda 65 [texto]
+2.2.6 Corrida Bayesian Optimization
+
+#%% celda 66 [código]
+bayesiana_salida <- optimizer$optimize(instance)
+
+#%% celda 67 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+#%% celda 68 [texto]
+Luego de este punto, en la carpeta del experimento quedó el archivo BO_log.txt que posee todas las iteraciones de la Bayesian Optimization
+
+#%% celda 69 [texto]
+### Valido con el calculo de ganancia
+
+#%% celda 70 [código]
+# setwd("/content/buckets/b1/exp")
+# dir.create(PARAM$experimento, showWarnings= FALSE)
+# setwd( paste0("/content/buckets/b1/exp/", PARAM$experimento ))
+
+#%% celda 71 [código]
+ # # cergo los mejores hiperparametros, que son los de mayor metrica
+ # tb_bayesiana <- fread("BO_log.txt")
+ # setorder( tb_bayesiana, -metrica )
+ # PARAM$out$lgbm$mejores_hiperparametros <- as.list(tb_bayesiana[1])
+
+#%% celda 72 [código]
+# param_final <- modifyList(
+#     PARAM$lgbm$param_fijos,
+#     PARAM$out$lgbm$mejores_hiperparametros
+#   )
+
+#%% celda 73 [código]
+  # # entreno LightGBM
+  # modelo <- lgb.train(
+  #   data= dtrain,
+  #   valids= list( "val"=dvalidate),
+  #   param= param_final
+  # )
+
+#%% celda 74 [código]
+# # Dataset de junio
+# tb_prediccion <- copy(
+#   dataset_bo[
+#     foto_mes == PARAM$validate,
+#     c(
+#       "numero_de_cliente",
+#       "foto_mes",
+#       "clase_ternaria",
+#       campos_buenos
+#     ),
+#     with = FALSE
+#   ]
+# )
+
+# # Predecir probabilidades
+# prediccion_junio <- predict(
+#   modelo,
+#   data.matrix(
+#     tb_prediccion[, campos_buenos, with = FALSE]
+#   )
+# )
+
+# # Agregar probabilidades
+# tb_prediccion[, prob := as.numeric(prediccion_junio)]
+
+# # Verificar
+# head(tb_prediccion[, .(
+#   numero_de_cliente,
+#   foto_mes,
+#   clase_ternaria,
+#   prob
+# )])
+
+#%% celda 75 [código]
+# # Asignar la ganancia real según la clase
+# tb_prediccion[, gan := fifelse(
+#   clase_ternaria == "BAJA+2",
+#   1072500,
+#   -27500
+# )]
+
+# # Ordenar de mayor a menor probabilidad
+# setorder(tb_prediccion, -prob)
+
+# # Calcular la ganancia acumulada
+# tb_prediccion[, ganancia_acumulada := cumsum(gan)]
+# tb_prediccion[, pos := seq_len(.N)]
+
+# # Evaluar los cortes
+# for (envios in PARAM$cortes) {
+#   if (envios <= nrow(tb_prediccion)) {
+#     ganancia <- tb_prediccion[envios, ganancia_acumulada]
+#     cat(envios, "\t", ganancia, "\n")
+#   }
+# }
+
+#%% celda 76 [código]
+# plot(
+#   tb_prediccion$pos,
+#   tb_prediccion$ganancia_acumulada,
+#   type = "l",
+#   xlim = c(0, 20000),
+#   ylim = c(0, max(tb_prediccion$ganancia_acumulada, na.rm = TRUE)),
+#   xlab = "Cantidad de clientes enviados",
+#   ylab = "Ganancia acumulada",
+#   main = "Ganancia acumulada - Validación junio"
+# )
+
+# abline(h = 0, lty = 2)
+
+#%% celda 77 [código]
+# # Buscar la máxima ganancia acumulada
+# fila_max <- which.max(tb_prediccion$ganancia_acumulada)
+
+# cat("Máxima ganancia:", tb_prediccion$ganancia_acumulada[fila_max], "\n")
+# cat("Cantidad de envíos:", tb_prediccion$pos[fila_max], "\n")
+
+#%% celda 78 [código]
+# tb_prediccion[fila_max, .(
+#   envios = pos,
+#   ganancia_maxima = ganancia_acumulada
+# )]
+
+#%% celda 79 [texto]
+## 2.3  Produccion
+
+#%% celda 80 [texto]
+### Final Training
+Construyo el modelo final, que es uno solo, no hace ningun tipo de particion < training, validation, testing>]
+
+#%% celda 81 [código]
+setwd("/content/buckets/b1/exp")
+dir.create(PARAM$experimento, showWarnings= FALSE)
+setwd( paste0("/content/buckets/b1/exp/", PARAM$experimento ))
+
+#%% celda 82 [código]
+ # cergo los mejores hiperparametros, que son los de mayor metrica
+ tb_bayesiana <- fread("BO_log.txt")
+ setorder( tb_bayesiana, -metrica )
+ PARAM$out$lgbm$mejores_hiperparametros <- as.list(tb_bayesiana[1])
+
+#%% celda 83 [texto]
+#### Final Training Dataset
+
+Aqui esta la gran decision de en qué meses hago el Final Training
+<br> debo utilizar los mejores hiperparámetros que encontré en la  optimización bayesiana
+
+#%% celda 84 [código]
+# clase01
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+#%% celda 85 [código]
+dataset_train <- dataset[foto_mes %in% PARAM$train_final]
+dataset_train[,.N, list(foto_mes, clase_ternaria)]
+
+#%% celda 86 [texto]
+#### Final Training Hyperparameters
+
+#%% celda 87 [código]
+# aplico el modelo a los datos sin clase
+dfuture <- dataset[foto_mes %in% PARAM$future]
+
+#%% celda 88 [código]
+campos_buenos <- unique(c(
+  campos_buenos,
+  "cprestamos_personales",
+  "cprestamos_personales_lag1",
+  "cprestamos_personales_lag2",
+  "cprestamos_personales_delta1",
+  "cprestamos_personales_delta2",
+  "mprestamos_personales",
+  "mprestamos_personales_lag1",
+  "mprestamos_personales_lag2",
+  "mprestamos_personales_delta1",
+  "mprestamos_personales_delta2"
+))
+
+campos_buenos <- setdiff(campos_buenos, c("numero_de_cliente", "clase_ternaria", "clase01"))
+
+#%% celda 89 [código]
+# # Entreno el modelo sobre todo el periodo
+
+# dtrain_final <- lgb.Dataset(
+#   data= data.matrix(dataset_train[, campos_buenos, with= FALSE]),
+#   label= dataset_train[, clase01]
+# )
+
+# modelo_final <- lgb.train(
+#   data= dtrain_final,
+#   param= param_final
+# )
+
+#%% celda 90 [código]
+# # hago el predict en los datos del futuro, y calculo la ganancia
+
+# # aplico el modelo a los datos nuevos
+# prediccion <- predict(
+#   modelo_final,
+#   data.matrix(dfuture[, campos_buenos, with= FALSE])
+# )
+
+#%% celda 91 [código]
+# Las semillas
+semillas <- c(
+  765461, 765487, 765497, 765503, 765521,
+  384157, 414857, 503857, 697757, 735157,
+  775777, 333331, 555557, 111119, 799999,
+  600013, 620003, 640007, 660007, 680003
+)
+
+#%% celda 92 [código]
+# Preparar los datos una sola vez
+dtrain_final <- lgb.Dataset(
+  data = data.matrix(
+    dataset_train[, campos_buenos, with = FALSE]
+  ),
+  label = dataset_train[, clase01],
+  free_raw_data = FALSE
+)
+
+# Tabla para guardar las predicciones de los 20 modelos
+tb_predicciones <- dfuture[, .(numero_de_cliente, foto_mes)]
+
+#%% celda 93 [código]
+for (semilla in semillas) {
+
+  cat(
+    "\nEntrenando modelo con semilla:", semilla,
+    "|", format(Sys.time(), "%H:%M:%S"), "\n"
+  )
+  flush.console()
+  flush(stdout())
+
+  # Hiperparámetros optimizados + semilla de esta corrida
+  param_final <- modifyList(
+    PARAM$lgbm$param_fijos,
+    PARAM$out$lgbm$mejores_hiperparametros
+  )
+
+  param_final$seed <- semilla
+  param_final$bagging_seed <- semilla
+  param_final$feature_fraction_seed <- semilla
+  param_final$drop_seed <- semilla
+  param_final$data_random_seed <- semilla
+
+  # Entrenar modelo
+  modelo_final <- lgb.train(
+    data = dtrain_final,
+    param = param_final
+  )
+
+  # Guardar el modelo
+  lgb.save(
+    modelo_final,
+    paste0("modelo_semilla_", semilla, ".txt")
+  )
+
+  # Predecir agosto
+  prediccion <- predict(
+    modelo_final,
+    data.matrix(dfuture[, campos_buenos, with = FALSE])
+  )
+
+  # Guardar probabilidades de esta semilla
+  nombre_columna <- paste0("prob_", semilla)
+  tb_predicciones[, (nombre_columna) := as.numeric(prediccion)]
+
+  cat(
+    "FINALIZADO | Semilla:", semilla,
+    "| Hora:", format(Sys.time(), "%H:%M:%S"), "\n"
+  )
+  flush.console()
+  flush(stdout())
+
+  rm(modelo_final, prediccion)
+  gc()
+}
+
+# Guardar las predicciones en un solo archivo
+fwrite(tb_predicciones, "predicciones_agosto_20_semillas.csv")
+
+# Ver las primeras filas
+head(tb_predicciones)
+
+#%% celda 94 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+#%% celda 95 [texto]
+#### Leo archivos y veo las mejores particiones
+
+#%% celda 96 [código]
+# # Nombre del experimento
+# nombre_experimento <- PARAM$experimento
+
+# # Leer las predicciones
+# archivo_entrada <- "predicciones_agosto_20_semillas.csv"
+# tb_predicciones <- fread(archivo_entrada)
+
+# # Detectar las semillas disponibles
+# columnas_prob <- grep("^prob_", names(tb_predicciones), value = TRUE)
+
+# # Cortes: 9000, 9500, ..., 15000
+# cortes <- seq(9000, 15000, by = 500)
+
+# # Verificar que haya suficientes clientes
+# stopifnot(nrow(tb_predicciones) >= max(cortes))
+
+# # Convertir los números de cliente a texto sin notación científica
+# clientes <- format(
+#   tb_predicciones$numero_de_cliente,
+#   scientific = FALSE,
+#   trim = TRUE
+# )
+
+# # Generar los archivos para cada semilla y cada corte
+# for (columna in columnas_prob) {
+
+#   orden <- order(-tb_predicciones[[columna]], na.last = TRUE)
+#   clientes_ordenados <- clientes[orden]
+
+#   # Obtener el número de semilla
+#   numero_semilla <- sub("^prob_", "", columna)
+
+#   for (corte in cortes) {
+
+#     seleccion <- clientes_ordenados[seq_len(corte)]
+
+#     # Nombre variable según el experimento
+#     nombre_archivo <- paste0(
+#       nombre_experimento, "_",
+#       numero_semilla, "_",
+#       corte, ".csv"
+#     )
+
+#     fwrite(
+#       data.table(seleccion),
+#       file = nombre_archivo,
+#       col.names = FALSE,
+#       quote = FALSE,
+#       sep = ","
+#     )
+
+#     cat("Generado:", nombre_archivo, "\n")
+#   }
+# }
+
+# cat(
+#   "\nProceso terminado. Total de archivos generados:",
+#   length(columnas_prob) * length(cortes),
+#   "\n"
+# )
+
+#%% celda 97 [texto]
+zipeo los archivos y los guardo
+
+#%% celda 98 [código]
+# # Nombre del experimento
+# nombre_experimento <- PARAM$experimento
+
+# # Buscar los CSV correspondientes a este experimento
+# archivos <- list.files(
+#   path = ".",
+#   pattern = paste0(
+#     "^",
+#     nombre_experimento,
+#     "_[0-9]+_[0-9]+\\.csv$"
+#   ),
+#   full.names = TRUE
+# )
+
+# if (length(archivos) == 0) {
+#   stop("No se encontraron archivos CSV para el experimento ", nombre_experimento)
+# }
+
+# # Nombre variable del ZIP
+# archivo_zip <- paste0(
+#   nombre_experimento,
+#   "_listas_clientes.zip"
+# )
+
+# utils::zip(
+#   zipfile = archivo_zip,
+#   files = archivos,
+#   flags = "-j"
+# )
+
+# cat(
+#   "ZIP generado:", normalizePath(archivo_zip),
+#   "\nCantidad de CSV incluidos:", length(archivos),
+#   "\n"
+# )
+
+#%% celda 99 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+#%% celda 100 [texto]
+Genero ensambles con el promedio
+
+#%% celda 101 [código]
+# Nombre del experimento
+nombre_experimento <- PARAM$experimento
+
+# Leer las predicciones de las semillas
+tb_predicciones <- fread("predicciones_agosto_20_semillas.csv")
+
+# Detectar las columnas de probabilidades
+columnas_prob <- grep("^prob_", names(tb_predicciones), value = TRUE)
+
+# Verificar que existan probabilidades
+stopifnot(length(columnas_prob) > 0)
+stopifnot("numero_de_cliente" %in% names(tb_predicciones))
+
+# Calcular el promedio de probabilidades por cliente
+tb_predicciones[, prob_promedio := rowMeans(
+  as.matrix(.SD),
+  na.rm = TRUE
+), .SDcols = columnas_prob]
+
+# Ordenar de mayor a menor probabilidad promedio
+setorder(tb_predicciones, -prob_promedio)
+
+# Cortes: 9000, 9500, ..., 15000
+cortes <- seq(9000, 15000, by = 500)
+
+# Verificar que haya suficientes clientes
+stopifnot(nrow(tb_predicciones) >= max(cortes))
+
+# Convertir los números de cliente a texto sin notación científica
+clientes_ordenados <- format(
+  tb_predicciones$numero_de_cliente,
+  scientific = FALSE,
+  trim = TRUE
+)
+
+# Generar un CSV por cada corte
+for (corte in cortes) {
+
+  seleccion <- clientes_ordenados[seq_len(corte)]
+
+  nombre_archivo <- paste0(
+    nombre_experimento,
+    "_promedio_",
+    corte,
+    ".csv"
+  )
+
+  fwrite(
+    data.table(seleccion),
+    file = nombre_archivo,
+    col.names = FALSE,
+    quote = FALSE,
+    sep = ","
+  )
+
+  cat("Generado:", nombre_archivo, "\n")
+}
+
+# Guardar también todas las probabilidades promedio
+fwrite(
+  tb_predicciones,
+  paste0(nombre_experimento, "_predicciones_promedio.csv")
+)
+
+cat("\nProceso terminado.\n")
+cat("Semillas promediadas:", length(columnas_prob), "\n")
+cat("Archivos de cortes generados:", length(cortes), "\n")
+
+#%% celda 102 [código]
+# zipeo los ensambles
+
+#%% celda 103 [código]
+
+# nombre_experimento <- PARAM$experimento
+
+# archivos <- list.files(
+#   path = ".",
+#   pattern = paste0(
+#     "^",
+#     nombre_experimento,
+#     "_promedio_[0-9]+\\.csv$"
+#   ),
+#   full.names = TRUE
+# )
+
+# if (length(archivos) != 13) {
+#   stop("Se esperaban 13 archivos de cortes, pero se encontraron ", length(archivos))
+# }
+
+# archivo_zip <- paste0(
+#   nombre_experimento,
+#   "_promedio_listas_clientes.zip"
+# )
+
+# utils::zip(
+#   zipfile = archivo_zip,
+#   files = archivos,
+#   flags = "-j"
+# )
+
+# cat("ZIP generado:", normalizePath(archivo_zip), "\n")
+# cat("CSV incluidos:", length(archivos), "\n")
+
+#%% celda 104 [código]
+#Guardo una copia de la notebook que generó los archivos
+
+#%% celda 105 [código]
+# 1. Nombre del experimento
+nombre_experimento <- PARAM$experimento
+
+# 2. Carpeta donde está la notebook original
+carpeta_origen <- "/home/ds/buckets/b1/dmeyf2026/primera_competencia"
+
+# 3. Buscar la notebook original
+archivos_ipynb <- list.files(
+  path = carpeta_origen,
+  pattern = "\\.ipynb$",
+  full.names = TRUE
+)
+
+if (length(archivos_ipynb) != 1) {
+  stop(
+    "Se esperaba una sola notebook en ",
+    carpeta_origen,
+    ", pero se encontraron ",
+    length(archivos_ipynb),
+    "."
+  )
+}
+
+archivo_origen <- archivos_ipynb[1]
+
+# 4. Carpeta de destino del experimento
+carpeta_destino <- file.path(
+  "/content/buckets/b1/exp",
+  nombre_experimento
+)
+
+dir.create(
+  carpeta_destino,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# 5. Copiar la notebook con el nombre del experimento
+archivo_destino <- file.path(
+  carpeta_destino,
+  paste0(nombre_experimento, ".ipynb")
+)
+
+if (file.copy(
+  from = archivo_origen,
+  to = archivo_destino,
+  overwrite = TRUE
+)) {
+  cat("Notebook copiada correctamente.\n")
+  cat("Original:", archivo_origen, "\n")
+  cat("Destino:", archivo_destino, "\n")
+} else {
+  stop("No se pudo copiar la notebook.")
+}

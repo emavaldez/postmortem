@@ -1,0 +1,161 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–16] Docstring e imports: todo se evalúa en el mes de test y lo que tarda se guarda en
+#   modelos/<tag>/ y resultados/<tag>/ para reutilizarlo.
+"""Entrenamiento de LightGBM, evaluacion de los mejores trials y estabilidad por semillas.
+
+Todo se evalua en el mes de test del experimento. Las columnas de ganancia se llaman
+ganancia_<mes>; ganancia_promedio es el mismo valor (queda por compatibilidad con los
+resultados ya guardados).
+
+Todo lo que tarda se guarda en disco (modelos/<tag>/ y resultados/<tag>/) y se reutiliza si
+ya existe. Para forzar el recalculo, borrar el archivo o pasar recalcular=True.
+"""
+import lightgbm as lgb
+import pandas as pd
+
+from . import config
+from .metricas import ganancia_segun_metrica, ganancia_umbral
+from .optimizacion_optuna import ESPACIOS, armar_params
+from .undersampling import corregir_probabilidad, dataset_muestra
+
+
+# [Anotación · líneas 19–39] entrenar_o_cargar carga el modelo del archivo si existe; si no, lo entrena con
+#   lgb.train y lo guarda. csv_cacheado hace lo mismo con una tabla: la lee si existe o la calcula y la guarda.
+def entrenar_o_cargar(archivo, params, train_lgb, num_boost_round, recalcular=False):
+    """Carga el modelo de `archivo` si existe; si no, entrena y lo guarda."""
+    if archivo.exists() and not recalcular:
+        print('Modelo cargado desde', archivo)
+        return lgb.Booster(model_file=str(archivo))
+
+    model = lgb.train(params, train_lgb, num_boost_round=num_boost_round)
+    model.save_model(str(archivo))
+    print('Modelo entrenado y guardado en', archivo)
+    return model
+
+
+def csv_cacheado(archivo, calcular, recalcular=False):
+    """Lee `archivo` si existe; si no, ejecuta calcular() y guarda el resultado."""
+    if archivo.exists() and not recalcular:
+        print('Cargado desde', archivo)
+        return pd.read_csv(archivo)
+
+    df = calcular()
+    df.to_csv(archivo, index=False)
+    return df
+
+
+# [Anotación · líneas 42–66] cantidad_arboles (los fijos del espacio, o best_iter), datos_train (Dataset
+#   completo o la muestra de la semilla), predecir (probabilidades corregidas por el submuestreo),
+#   umbral_experimento (el ajustado sólo con métrica 'umbral_ajustado'; si no, 0.025) y ganancia_experimento
+#   (ganancia en el mes de test con la métrica del experimento y los BAJA+2 reales).
+def cantidad_arboles(experimento, best_iter):
+    """Arboles fijos si el espacio los define (it00: 250); si no, best_iter del trial."""
+    fijos = ESPACIOS[experimento.espacio]['arboles_fijos']
+    return fijos if fijos is not None else int(best_iter)
+
+
+def datos_train(particion, experimento, seed):
+    """Dataset de train para una semilla: completo, o la muestra de esa semilla si hay undersampling."""
+    return dataset_muestra(particion['train_lgb'], particion['y_train'], experimento.undersampling, seed)
+
+
+def predecir(model, X, experimento):
+    """Probabilidades del modelo, corregidas si se entreno con undersampling."""
+    return corregir_probabilidad(model.predict(X), experimento.undersampling)
+
+
+def umbral_experimento(particion, experimento):
+    """Umbral de decision: 0.025 salvo con METRICA_OPTUNA = 'umbral_ajustado' (0.025 / s)."""
+    return particion['umbral'] if experimento.metrica_optuna == 'umbral_ajustado' else config.UMBRAL
+
+
+def ganancia_experimento(y_pred, particion, experimento):
+    """Ganancia en el mes de test con la misma metrica con la que Optuna eligio (BAJA+2 reales)."""
+    return ganancia_segun_metrica(y_pred, particion['y_test'], experimento.metrica_optuna,
+                                  umbral_experimento(particion, experimento))
+
+
+# [Anotación · líneas 69–83] ganancias_por_mes entrena con el train y mide la ganancia en el mes de test.
+#   importancia devuelve las variables con cantidad de splits mayor a 0, ordenadas de mayor a menor.
+def ganancias_por_mes(params, num_boost_round, particiones, experimento):
+    """Entrena con el train y mide la ganancia en el mes de test."""
+    ganancias = {}
+    for mes, p in particiones.items():
+        model = lgb.train(params, datos_train(p, experimento, params['seed']), num_boost_round=num_boost_round)
+        ganancias[f'ganancia_{mes}'] = ganancia_experimento(predecir(model, p['X_test'], experimento), p, experimento)
+    ganancias['ganancia_promedio'] = sum(ganancias.values()) / len(particiones)
+    return ganancias
+
+
+def importancia(model, feature_names):
+    """Importancia (cantidad de splits) de las variables usadas por el modelo."""
+    importance_df = pd.DataFrame({'feature': feature_names, 'importance': model.feature_importance()})
+    importance_df = importance_df.sort_values('importance', ascending=False)
+    return importance_df[importance_df['importance'] > 0]
+
+
+# [Anotación · líneas 86–104] evaluar_top_trials entrena cada trial con todo el train y registra orden, número
+#   de trial, valor de Optuna, árboles, ganancia en el mes de test e hiperparámetros; la tabla se guarda en
+#   df_top<N>.csv.
+def evaluar_top_trials(trials, particiones, experimento, seed, recalcular=False):
+    """Entrena cada trial con todo su train y mide la ganancia en cada mes de test."""
+    def calcular():
+        resultados = []
+        for i, trial in enumerate(trials, start=1):
+            arboles = cantidad_arboles(experimento, trial.user_attrs.get('best_iter'))
+            params = armar_params(trial.params, seed, experimento.espacio)
+            resultados.append({
+                'orden': i,
+                'trial': trial.number,
+                'valor_optuna': trial.value,
+                'best_iter': arboles,
+                **ganancias_por_mes(params, arboles, particiones, experimento),
+                **trial.params,
+            })
+        return pd.DataFrame(resultados)
+
+    archivo = experimento.resultados_dir / f'df_top{len(trials)}.csv'
+    return csv_cacheado(archivo, calcular, recalcular)
+
+
+# [Anotación · líneas 107–122] evaluar_semillas reentrena cada modelo de la tabla anterior con cada semilla y
+#   registra la ganancia en el mes de test; la tabla se guarda en df_semillas_<N>semillas.csv.
+def evaluar_semillas(df_top, particiones, experimento, semillas, recalcular=False):
+    """Reentrena cada modelo de df_top con varias semillas y mide la ganancia en cada mes de test."""
+    def calcular():
+        rows = []
+        for _, fila in df_top.iterrows():
+            for seed in semillas:
+                params = armar_params(fila, seed, experimento.espacio)
+                rows.append({
+                    'trial': fila['trial'],
+                    'seed': seed,
+                    **ganancias_por_mes(params, int(fila['best_iter']), particiones, experimento),
+                })
+        return pd.DataFrame(rows)
+
+    archivo = experimento.resultados_dir / f'df_semillas_{len(semillas)}semillas.csv'
+    return csv_cacheado(archivo, calcular, recalcular)
+
+
+# [Anotación · líneas 125–140] estadisticas_semillas calcula por trial media, desvío, mínimo, máximo, mediana,
+#   q1 y q3 de la ganancia, ordenado por q1 descendente. elegir_por_semillas devuelve la fila del trial con
+#   mayor q1.
+def estadisticas_semillas(df_semillas, columna='ganancia_promedio'):
+    """Distribucion de la ganancia por modelo, ordenada por q1 (el borde de abajo de la caja)."""
+    g = df_semillas.groupby('trial')[columna]
+    return (
+        g.agg(['mean', 'std', 'min', 'max', 'median'])
+        .assign(q1=g.quantile(0.25), q3=g.quantile(0.75))
+        .sort_values('q1', ascending=False)
+    )
+
+
+def elegir_por_semillas(df_top, estadisticas):
+    """Fila de df_top del modelo con la caja mas alta y concentrada: el mayor q1 entre semillas.
+
+    Una caja solo tiene el borde de abajo alto si es alta y no se estira hacia abajo.
+    """
+    return df_top[df_top['trial'] == estadisticas['q1'].idxmax()].iloc[0]

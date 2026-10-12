@@ -1,0 +1,238 @@
+#%% celda 1 [código]
+from pathlib import Path
+
+dataset_path = Path("../data")
+dataset_filename = "competencia_01_crudo.csv"
+
+file_path = dataset_path / dataset_filename
+
+print(file_path)
+
+#%% celda 2 [código]
+print(file_path.exists())
+
+#%% celda 3 [código]
+import duckdb
+import pandas as pd
+
+#%% celda 4 [código]
+%load_ext sql
+
+#%% celda 5 [código]
+%config SqlMagic.autopandas = True
+%config SqlMagic.feedback = False
+%config SqlMagic.displaycon = False
+
+%sql duckdb:///
+
+#%% celda 6 [código]
+%sql duckdb:///
+
+#%% celda 7 [código]
+%%sql
+CREATE OR REPLACE TABLE competencia_01_crudo AS
+SELECT *
+FROM read_csv_auto('../data/competencia_01_crudo.csv');
+
+#%% celda 8 [código]
+%sql SELECT * FROM competencia_01_crudo LIMIT 5
+
+#%% celda 9 [código]
+%%sql
+
+SELECT
+    foto_mes,
+    COUNT(*) AS cantidad
+FROM competencia_01_crudo
+GROUP BY foto_mes
+ORDER BY foto_mes;
+
+#%% celda 10 [código]
+%%sql
+
+SELECT
+    numero_de_cliente,
+    foto_mes,
+    mrentabilidad
+FROM competencia_01_crudo
+WHERE numero_de_cliente = 12159854
+ORDER BY foto_mes;
+
+#%% celda 11 [código]
+%%sql
+
+SELECT
+    numero_de_cliente,
+    foto_mes,
+    mrentabilidad,
+    LEAD(mrentabilidad, 1) OVER (
+        PARTITION BY numero_de_cliente
+        ORDER BY foto_mes
+    ) AS mrentabilidad_mas_1,
+    LAG(mrentabilidad, 1) OVER (
+        PARTITION BY numero_de_cliente
+        ORDER BY foto_mes
+    ) AS mrentabilidad_menos_1,
+    LEAD(mrentabilidad, 2) OVER (
+        PARTITION BY numero_de_cliente
+        ORDER BY foto_mes
+    ) AS mrentabilidad_mas_2,
+    LAG(mrentabilidad, 2) OVER (
+        PARTITION BY numero_de_cliente
+        ORDER BY foto_mes
+    ) AS mrentabilidad_menos_2
+FROM competencia_01_crudo
+WHERE numero_de_cliente = 12159854
+ORDER BY foto_mes;
+
+#%% celda 12 [código]
+%%sql
+
+SELECT
+    numero_de_cliente,
+    foto_mes
+FROM competencia_01_crudo
+WHERE numero_de_cliente = 60112254
+ORDER BY foto_mes;
+
+#%% celda 13 [código]
+%%sql
+
+WITH periodos AS (
+    SELECT DISTINCT foto_mes
+    FROM competencia_01_crudo
+),
+clientes AS (
+    SELECT DISTINCT numero_de_cliente
+    FROM competencia_01_crudo
+)
+SELECT
+    numero_de_cliente,
+    foto_mes
+FROM clientes
+CROSS JOIN periodos
+WHERE numero_de_cliente = 60112254
+ORDER BY foto_mes;
+
+#%% celda 14 [código]
+%%sql
+
+WITH periodos AS (
+    SELECT DISTINCT foto_mes
+    FROM competencia_01_crudo
+),
+clientes AS (
+    SELECT DISTINCT numero_de_cliente
+    FROM competencia_01_crudo
+),
+todo AS (
+    SELECT
+        numero_de_cliente,
+        foto_mes
+    FROM clientes
+    CROSS JOIN periodos
+)
+SELECT
+    t.numero_de_cliente,
+    t.foto_mes,
+    IF(c.numero_de_cliente IS NULL, 0, 1) AS mes_0
+FROM todo t
+LEFT JOIN competencia_01_crudo c
+    USING (numero_de_cliente, foto_mes)
+WHERE t.numero_de_cliente = 60112254
+ORDER BY foto_mes;
+
+#%% celda 15 [código]
+%%sql
+
+CREATE OR REPLACE TABLE competencia_01 AS
+
+WITH periodos AS (
+    SELECT DISTINCT foto_mes
+    FROM competencia_01_crudo
+),
+clientes AS (
+    SELECT DISTINCT numero_de_cliente
+    FROM competencia_01_crudo
+),
+todo AS (
+    SELECT
+        numero_de_cliente,
+        foto_mes
+    FROM clientes
+    CROSS JOIN periodos
+),
+clase_ternaria AS (
+    SELECT
+        c.*,
+        IF(c.numero_de_cliente IS NULL, 0, 1) AS mes_0,
+        LEAD(mes_0, 1) OVER (
+            PARTITION BY t.numero_de_cliente
+            ORDER BY foto_mes
+        ) AS mes_1,
+        LEAD(mes_0, 2) OVER (
+            PARTITION BY t.numero_de_cliente
+            ORDER BY foto_mes
+        ) AS mes_2,
+        CASE
+            WHEN mes_1 = 1 AND mes_2 = 1 THEN 'CONTINUA'
+            WHEN mes_1 = 1 AND mes_2 = 0 THEN 'BAJA+2'
+            WHEN mes_1 = 0 AND mes_2 = 0 THEN 'BAJA+1'
+            ELSE NULL
+        END AS clase_ternaria
+    FROM todo t
+    LEFT JOIN competencia_01_crudo c
+        USING (numero_de_cliente, foto_mes)
+)
+SELECT
+    * EXCLUDE (mes_0, mes_1, mes_2)
+FROM clase_ternaria
+WHERE mes_0 = 1;
+
+#%% celda 16 [código]
+%%sql
+
+SELECT
+    numero_de_cliente,
+    foto_mes,
+    clase_ternaria
+FROM competencia_01
+WHERE numero_de_cliente = 60112254
+ORDER BY foto_mes;
+
+#%% celda 17 [código]
+%sql SELECT COUNT(*) AS cantidad FROM competencia_01
+
+#%% celda 18 [código]
+%%sql
+
+PIVOT competencia_01
+ON clase_ternaria
+USING COUNT(numero_de_cliente)
+GROUP BY foto_mes
+ORDER BY foto_mes;
+
+#%% celda 19 [código]
+%%sql
+
+PIVOT (
+    SELECT
+        foto_mes,
+        numero_de_cliente,
+        CASE
+            WHEN clase_ternaria IS NULL THEN 'SIN_TARGET'
+            ELSE clase_ternaria
+        END AS clase_ternaria
+    FROM competencia_01
+)
+ON clase_ternaria
+USING COUNT(numero_de_cliente)
+GROUP BY foto_mes
+ORDER BY foto_mes;
+
+#%% celda 20 [código]
+%%sql
+
+COPY competencia_01
+TO '../data/competencia_01.csv'
+(FORMAT CSV, HEADER);

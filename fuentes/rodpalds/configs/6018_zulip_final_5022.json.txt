@@ -1,0 +1,13 @@
+{
+  "experimento": 6018,
+  "nombre": "zulip_final_5022",
+  "sobrescribir": true,
+  "modo": "final",
+  "fuente": "5022_prod_p23_ds3007",
+  "envios": [
+    12000,
+    12500,
+    13000
+  ],
+  "descripcion": "Archivos para el bot de 5022 (prueba 23 sobre ds3007): 12.000, 12.500 y 13.000 envios."
+}

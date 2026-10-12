@@ -1,0 +1,236 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–35] Importa `numpy`, `polars` y `yaml`, el identificador del experimento y, del
+#   paquete `common`, los nombres y la escritura de modelos y predicciones de agosto, la lectura del dataset
+#   unido, la sincronización con GCS, las rutas de resultados, el entrenamiento y el generador de semillas.
+#!/usr/bin/env python3
+"""Train mar–jun, predict agosto; media rank×semilla (04py)."""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import polars as pl
+import yaml
+
+import _bootstrap  # noqa: F401
+from _bootstrap import EXPERIMENT_ID
+
+from common.agosto_artifacts import (
+    MODELO_LGB_PATRON,
+    PREDICCION_TSV_PATRON,
+    foto_mes_a_aniomesdia,
+    persist_model_and_upload,
+    persist_pred_tsv_and_upload,
+)
+from common.data import FOTO_MES_MAR_JUN, feature_matrix, read_joined
+from common.gcs_upload import pull_resultados_subdir, sync_resultados_subdir
+from pathlib import Path
+
+from common.layers import (
+    SUBDIR_AGOSTO,
+    SUBDIR_BO,
+    agosto_dir,
+    assert_param_experiment_id,
+    bo_dir,
+    resultados_dir,
+)
+from common.lgb_train import decode_min_sum_hessian, merge_tuned, train_full
+from common.partition import semillas_primos
+
+# [Anotación · líneas 37–39] Valores por defecto: 10 semillas, rank 3 de la BO y 202108 como mes a predecir.
+N_SEMILLAS_PRIMOS_DEFAULT = 10
+RANKS_BO_DEFAULT = (3,)
+FOTO_MES_PRED = 202108
+
+
+# [Anotación · líneas 42–52] Decide qué ranks usar: si existe la variable de entorno `COMPE1_AGOSTO_RANKS`, la
+#   separa por comas y la convierte a enteros; si no, lee `rank_ganador` de `ganador.yml` cuando ese archivo
+#   existe; si tampoco, devuelve el rank 3.
+def _ranks_desde_env_o_ganador(ganador_path: Path) -> list[int]:
+    raw = os.environ.get("COMPE1_AGOSTO_RANKS", "").strip()
+    if raw:
+        return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    if ganador_path.exists():
+        with ganador_path.open(encoding="utf-8") as f:
+            ganador = yaml.safe_load(f) or {}
+        rank_ganador = ganador.get("rank_ganador")
+        if rank_ganador is not None:
+            return [int(rank_ganador)]
+    return list(RANKS_BO_DEFAULT)
+
+
+# [Anotación · líneas 55–75] Ubica las carpetas de resultados y crea `agosto/`. En modo VM baja de GCS `bo/` y
+#   `estudio/top20_bo_semillas`. Lee `bo/PARAM.yml`, comprueba que pertenezca a este experimento y toma de ahí
+#   la lista de variables. Define los 4 hiperparámetros que se leen por rank: `num_iterations`, `num_leaves`,
+#   `min_data_in_leaf` y `min_sum_hessian_in_leaf`.
+def main() -> None:
+    res_dir = resultados_dir(EXPERIMENT_ID)
+    ht_dir = bo_dir(EXPERIMENT_ID)
+    top20_estudio = res_dir / "estudio" / "top20_bo_semillas"
+    out_dir = agosto_dir(EXPERIMENT_ID)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pull_resultados_subdir(EXPERIMENT_ID, SUBDIR_BO)
+    pull_resultados_subdir(EXPERIMENT_ID, "estudio/top20_bo_semillas")
+
+    with (ht_dir / "PARAM.yml").open(encoding="utf-8") as f:
+        param = yaml.safe_load(f)
+    assert_param_experiment_id(param, EXPERIMENT_ID)
+
+    campos_buenos = list(param["campos_buenos"])
+    hiperparams = (
+        "num_iterations",
+        "num_leaves",
+        "min_data_in_leaf",
+        "min_sum_hessian_in_leaf",
+    )
+
+# [Anotación · líneas 77–89] Carga la tabla de hiperparámetros candidatos: usa `top20_hiperparametros.tsv` si
+#   existe (lo escribe el script `4_`); si no, toma las primeras 20 filas de `BO_log.txt` y las numera como rank
+#   1 a 20. Termina con error si no hay ninguno de los dos archivos o si falta alguna columna.
+    top20_meta = top20_estudio / "top20_hiperparametros.tsv"
+    bo_log = ht_dir / "BO_log.txt"
+    if top20_meta.exists():
+        tb_top20 = pl.read_csv(top20_meta, separator="\t")
+    elif bo_log.exists():
+        tb_top20 = pl.read_csv(bo_log, separator="\t").head(20)
+        tb_top20 = tb_top20.with_columns(pl.arange(1, tb_top20.height + 1).alias("rank"))
+    else:
+        raise FileNotFoundError(f"No existe {top20_meta} ni {bo_log}")
+
+    faltantes = [c for c in ("rank", *hiperparams) if c not in tb_top20.columns]
+    if faltantes:
+        raise ValueError(f"tabla top-20 sin columnas: {faltantes}")
+
+# [Anotación · líneas 91–102] Filtra la tabla por los ranks elegidos y termina con error si alguno no aparece.
+#   Lee la cantidad de semillas de `COMPE1_N_SEMILLAS_PRIMOS` (10 por defecto) y las genera con
+#   `semillas_primos`, que toma una muestra de números primos entre 10.000 y 1.000.000 usando la semilla
+#   guardada en `PARAM.yml`. Imprime ranks y semillas.
+    ganador_path = top20_estudio / "ganador.yml"
+    ranks_usar = _ranks_desde_env_o_ganador(ganador_path)
+    tb_ranks = tb_top20.filter(pl.col("rank").is_in(ranks_usar))
+    if tb_ranks.height != len(ranks_usar):
+        raise ValueError(f"Ranks BO fuera de rango: {ranks_usar}")
+
+    n_semillas = int(
+        os.environ.get("COMPE1_N_SEMILLAS_PRIMOS", N_SEMILLAS_PRIMOS_DEFAULT)
+    )
+    semillas = semillas_primos(n_semillas, int(param["semilla_primigenia"]))
+    print("RANKS_BO:", ", ".join(str(r) for r in ranks_usar))
+    print("semillas_train:", ", ".join(str(s) for s in semillas))
+
+# [Anotación · líneas 104–121] Lee el dataset unido de las 8 capas para 202103, 202104, 202105, 202106 y
+#   202108. Las filas de 202103–202106 forman el entrenamiento y reciben `clase01` (1 si `clase_ternaria` es
+#   BAJA+1 o BAJA+2, 0 en otro caso); las de 202108 quedan para predecir. Termina con error si no hay filas de
+#   202108 e imprime la cantidad de filas de cada conjunto.
+    aniomesdia = foto_mes_a_aniomesdia(FOTO_MES_PRED)
+    meses_leer = tuple(sorted(set(FOTO_MES_MAR_JUN) | {FOTO_MES_PRED}))
+    dataset = read_joined(EXPERIMENT_ID, foto_mes=meses_leer)
+
+    train_df = dataset.filter(pl.col("foto_mes").is_in(list(FOTO_MES_MAR_JUN)))
+    train_df = train_df.with_columns(
+        pl.when(pl.col("clase_ternaria").is_in(["BAJA+1", "BAJA+2"]))
+        .then(1)
+        .otherwise(0)
+        .alias("clase01")
+    )
+    agosto_df = dataset.filter(pl.col("foto_mes") == FOTO_MES_PRED)
+    if agosto_df.is_empty():
+        raise ValueError(f"Sin filas para foto_mes={FOTO_MES_PRED}")
+
+    n_train = train_df.height
+    n_agosto = agosto_df.height
+    print(f"train filas={n_train} | agosto filas={n_agosto}")
+
+# [Anotación · líneas 123–131] Toma de `PARAM.yml` el valor de `undersampling` y los hiperparámetros fijos,
+#   inicializa en cero el acumulador de probabilidades (una posición por fila de 202108) y el contador de
+#   modelos, y convierte entrenamiento y agosto a matrices con las columnas de `campos_buenos`.
+    undersampling = float(param["trainingstrategy"]["undersampling"])
+    fixed = param["lgbm"]["param_fijos"]
+
+    prob_sum = np.zeros(n_agosto, dtype=np.float64)
+    n_modelos = 0
+
+    X_tr = feature_matrix(train_df, campos_buenos)
+    y_tr = train_df["clase01"].to_numpy()
+    X_ag = feature_matrix(agosto_df, campos_buenos)
+
+# [Anotación · líneas 133–157] Para cada rank superpone sus hiperparámetros a los fijos y pasa el resultado
+#   por `decode_min_sum_hessian`, que sólo cambia `min_sum_hessian_in_leaf` (10 elevado al valor) cuando es
+#   negativo. Para cada semilla divide `min_data_in_leaf` por `undersampling`, fija `seed`, entrena un LightGBM
+#   con todas las filas de 202103–202106 durante `num_iterations` rondas y sin conjunto de validación, guarda el
+#   modelo como `modelo_RR_<semilla>.txt`, predice 202108, suma las probabilidades al acumulador y escribe
+#   `modelo_RR_<semilla>_20210801.tsv` con cliente, mes y probabilidad.
+    for row in tb_ranks.iter_rows(named=True):
+        rank_id = int(row["rank"])
+        hp = {k: row[k] for k in hiperparams}
+        param_final = decode_min_sum_hessian(merge_tuned(fixed, hp))
+        print(f"\n=== rank_{rank_id:02d} ===")
+
+        for primo in semillas:
+            pnorm = dict(param_final)
+            pnorm["min_data_in_leaf"] = int(
+                round(float(param_final["min_data_in_leaf"]) / undersampling)
+            )
+            pnorm["seed"] = primo
+
+            model = train_full(X_tr, y_tr, pnorm, seed=primo)
+            persist_model_and_upload(model, out_dir, EXPERIMENT_ID, rank_id, primo)
+            pred = model.predict(X_ag)
+            n_modelos += 1
+            prob_sum += pred
+
+            tb_piece = agosto_df.select("numero_de_cliente", "foto_mes").with_columns(
+                pl.Series("prob", pred)
+            )
+            persist_pred_tsv_and_upload(
+                tb_piece, out_dir, EXPERIMENT_ID, rank_id, primo, aniomesdia
+            )
+
+# [Anotación · líneas 159–171] Comprueba que se hayan entrenado ranks × semillas modelos. Calcula la
+#   probabilidad media dividiendo el acumulador por la cantidad de modelos y la escribe en
+#   `prediccion_agosto_media.tsv`. Ordena de mayor a menor probabilidad, agrega la columna `orden` desde 1 y
+#   escribe `prediccion_agosto_media_ordenada.tsv`.
+    esperado = tb_ranks.height * len(semillas)
+    if n_modelos != esperado:
+        raise ValueError(f"Conteo de modelos inconsistente: {n_modelos} esperado={esperado}")
+
+    tb_media = agosto_df.select("numero_de_cliente", "foto_mes").with_columns(
+        (prob_sum / n_modelos).alias("prob")
+    )
+    tb_media.write_csv(out_dir / "prediccion_agosto_media.tsv", separator="\t")
+
+    tb_ordenada = tb_media.sort("prob", descending=True).with_columns(
+        pl.arange(1, tb_media.height + 1).alias("orden")
+    )
+    tb_ordenada.write_csv(out_dir / "prediccion_agosto_media_ordenada.tsv", separator="\t")
+
+# [Anotación · líneas 173–195] Escribe `agosto/meta.yml` con el experimento, los ranks, la cantidad y la lista
+#   de semillas, los meses de entrenamiento y de predicción, los patrones de nombres de archivo y las cantidades
+#   de filas. Sincroniza `agosto/` con GCS (sólo en modo VM) y define el punto de entrada.
+    meta = {
+        "experiment_id": EXPERIMENT_ID,
+        "ranks_bo": list(ranks_usar),
+        "n_semillas_primos": n_semillas,
+        "semillas_train": semillas,
+        "foto_mes_train": list(FOTO_MES_MAR_JUN),
+        "foto_mes_pred": FOTO_MES_PRED,
+        "aniomesdia_pred": aniomesdia,
+        "modelo_lgb_patron": MODELO_LGB_PATRON,
+        "prediccion_tsv_patron": PREDICCION_TSV_PATRON,
+        "n_train": n_train,
+        "n_agosto": n_agosto,
+        "n_predicciones_agregadas": tb_media.height,
+    }
+    with (out_dir / "meta.yml").open("w", encoding="utf-8") as f:
+        yaml.safe_dump(meta, f, sort_keys=False, allow_unicode=True)
+
+    sync_resultados_subdir(EXPERIMENT_ID, SUBDIR_AGOSTO)
+    print(f"\nFinalizado en {out_dir}")
+
+
+if __name__ == "__main__":
+    main()

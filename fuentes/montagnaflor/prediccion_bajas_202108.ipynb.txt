@@ -1,0 +1,741 @@
+#%% celda 1 [texto]
+# Predicción de bajas — Agosto 2021 (202108)
+
+**Objetivo:** entregar el listado de `numero_de_cliente` a los que se les envía la campaña de retención.
+Cada BAJA+2 contactado suma **$1.072.500** y cada envío que no es BAJA+2 cuesta **$27.500**.
+
+**Situación de los datos** (`competencia_01`):
+
+| foto_mes | clase | uso |
+|---|---|---|
+| 202103 – 202106 | completa | entrenamiento / validación |
+| 202107 | incompleta (los BAJA+2 todavía no se conocen) | **no se usa** |
+| 202108 | desconocida | mes a predecir |
+
+Entre el último mes con clase (junio) y agosto hay **2 meses**. Toda la validación imita esa distancia:
+optimizo con **marzo–abril** y mido en **junio**, que funciona como *holdout* y nunca entra en la optimización.
+
+**Estrategia contra el overfitting**
+1. Ganancia (no AUC) como métrica, suavizada para no premiar picos de suerte.
+2. Optimización bayesiana (Optuna) con cross validation sobre marzo–abril.
+3. Canaritos para descartar variables que no le ganan al ruido.
+4. Drifting: se excluyen variables cuya distribución en agosto cambió mucho respecto de junio.
+5. *Maldición del ganador*: no me quedo con el trial #1; evalúo el top-k con muchas semillas en junio y elijo por media y estabilidad.
+6. Corte por **cantidad de envíos**, no por probabilidad.
+7. Modelo final = promedio de varias semillas (semillerío).
+8. **Datos anómalos**: en junio los BAJA+2 tienen préstamos personales igual que los CONTINUA (22%, contra 8-12% en marzo-mayo); esas variables se ponen en NaN solo en junio, después del análisis de drift.
+9. `max_bin = 255` en el modelo final (31 en la optimización, por velocidad).
+
+#%% celda 2 [texto]
+## 0. Entorno
+
+#%% celda 3 [texto]
+La notebook corre igual en **Google Colab**, en una **VM de Google Cloud** o local. Hace falta:
+
+* el dataset original `competencia_01.csv`: local, en `data/` al lado de esta notebook; en Colab, en `MyDrive/dmeyf/data/`.
+* `orden_filas.csv.gz` (está en el repositorio): local, al lado de esta notebook; en Colab, en `MyDrive/dmeyf/`.
+
+La primera vez se genera `competencia_01_fe.parquet` (sección 1) y queda guardado para las siguientes corridas.
+Los resultados (incluida la base de Optuna, para poder retomar si se corta) quedan en `exp/` (en Colab, `MyDrive/dmeyf/exp/`).
+
+#%% celda 4 [código]
+import os
+import sys
+import shutil
+
+EN_COLAB = "google.colab" in sys.modules
+
+if EN_COLAB:
+    from google.colab import drive
+    drive.mount("/content/drive")
+    BASE = "/content/drive/MyDrive/dmeyf/"
+    !pip install -q optuna duckdb
+else:
+    # local o VM: la carpeta del repositorio (data/ y exp/ quedan al lado de esta notebook)
+    BASE = os.environ.get("DMEYF_BASE", "./")
+
+CARPETA_DATOS = BASE + "data/"
+ARCHIVO_CSV = CARPETA_DATOS + "competencia_01.csv"
+ARCHIVO_DATOS = CARPETA_DATOS + "competencia_01_fe.parquet"
+# orden de filas de la corrida que generó la entrega final (ver README): el undersampling depende del orden
+ARCHIVO_ORDEN = BASE + "orden_filas.csv.gz"
+os.makedirs(CARPETA_DATOS, exist_ok=True)
+print("Datos:", ARCHIVO_DATOS)
+
+#%% celda 5 [texto]
+## 1. Feature engineering: `competencia_01.csv` → `competencia_01_fe.parquet`
+
+#%% celda 6 [texto]
+Con funciones de ventana de DuckDB (técnicas del z402), sobre el dataset **completo** (el ranking dentro de cada mes compara al cliente contra toda la cartera de ese mes):
+
+1. **Tendencia contra el propio pasado del cliente**: delta de 1 y 2 meses, ratio contra la media de los últimos 3 meses y pendiente de los últimos 3 meses.
+2. **Ranking dentro del mes** de los montos en pesos (contra el drifting por inflación).
+3. **"Apagó el producto"**: lo tenía el mes anterior y ahora no; cantidad de productos apagados y meses sin payroll.
+
+Solo se ejecuta si el parquet no existe. El archivo se escribe ordenado por `foto_mes, numero_de_cliente`, porque el undersampling depende del orden de las filas.
+
+#%% celda 7 [código]
+import time
+import duckdb
+
+CAMPOS_TENDENCIA = [
+    "mpayroll", "cpayroll_trx",
+    "mtarjeta_visa_consumo", "ctarjeta_visa_transacciones", "mttarjeta_visa_debitos_automaticos",
+    "tc_consumo_total",
+    "cproductos", "ctrx_quarter", "active_quarter", "internet", "cdescubierto_preacordado",
+    "chomebanking_transacciones", "cmobile_app_trx",
+    "mcuentas_saldo", "mcaja_ahorro", "mprestamos_personales", "mplazo_fijo_pesos",
+]
+CAMPOS_RANK = [
+    "mpayroll", "mtarjeta_visa_consumo", "mttarjeta_visa_debitos_automaticos", "tc_consumo_total",
+    "mcuentas_saldo", "mcaja_ahorro", "mprestamos_personales", "mplazo_fijo_pesos",
+    "mrentabilidad", "mcomisiones", "matm", "mtransferencias_emitidas", "mtransferencias_recibidas",
+]
+CAMPOS_APAGO = [
+    "cpayroll_trx", "cdescubierto_preacordado", "ctarjeta_visa_debitos_automaticos",
+    "ctarjeta_master_debitos_automaticos", "ccuenta_debitos_automaticos", "cprestamos_personales",
+    "cplazo_fijo",
+]
+
+
+def query_feature_engineering(csv, out):
+    sel = []
+    for c in CAMPOS_TENDENCIA:
+        sel += [
+            f"{c} - lag({c}, 1) over w AS delta_1_{c}",
+            f"{c} - lag({c}, 2) over w AS delta_2_{c}",
+            f"{c} / nullif(avg({c}) over w3, 0) AS ratio_media3_{c}",
+            f"regr_slope({c}, mes_idx) over w3 AS slope_3_{c}",
+        ]
+    for c in CAMPOS_RANK:
+        sel.append(f"percent_rank() over (partition by foto_mes order by {c}) AS rank_mes_{c}")
+    flags = [f"(coalesce(lag({c}, 1) over w, 0) > 0 AND coalesce({c}, 0) = 0)::INT" for c in CAMPOS_APAGO]
+    sel += [f"{f} AS flag_apago_{c}" for c, f in zip(CAMPOS_APAGO, flags)]
+    sel.append(" + ".join(flags) + " AS n_productos_apagados")
+    sel.append("sum((coalesce(cpayroll_trx, 0) = 0)::INT) over w3 AS meses_sin_payroll_3")
+    columnas = ",\n               ".join(sel)
+    return f"""
+    COPY (
+        WITH base AS (
+            SELECT *,
+                   (foto_mes // 100) * 12 + (foto_mes % 100) AS mes_idx,
+                   coalesce(Visa_mconsumototal, 0) + coalesce(Master_mconsumototal, 0) AS tc_consumo_total,
+                   tc_consumo_total / nullif(coalesce(Visa_mlimitecompra, 0) + coalesce(Master_mlimitecompra, 0), 0)
+                       AS tc_uso_limite,
+                   mtransferencias_emitidas / nullif(mtransferencias_recibidas, 0) AS ratio_transf_emitidas_recibidas
+            FROM read_csv('{csv}', sample_size = -1)
+        )
+        SELECT * EXCLUDE (mes_idx),
+               {columnas}
+        FROM base
+        WINDOW w  AS (PARTITION BY numero_de_cliente ORDER BY foto_mes),
+               w3 AS (PARTITION BY numero_de_cliente ORDER BY foto_mes ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+        ORDER BY foto_mes, numero_de_cliente
+    ) TO '{out}' (FORMAT parquet)
+    """
+
+
+if os.path.exists(ARCHIVO_DATOS):
+    print("Ya existe", ARCHIVO_DATOS, "-> no se regenera")
+else:
+    csv = ARCHIVO_CSV
+    if EN_COLAB:
+        # leer del disco de la VM es mucho más rápido que leer de Drive
+        shutil.copy(ARCHIVO_CSV, "/content/competencia_01.csv")
+        csv = "/content/competencia_01.csv"
+    t0 = time.time()
+    temporal = ARCHIVO_DATOS + ".tmp"  # se renombra al terminar: un corte no deja un parquet incompleto
+    con = duckdb.connect()
+    # pocos hilos y disco como respaldo: alcanza con ~2 GB de RAM libres
+    con.execute("SET memory_limit = '2GB'")
+    con.execute("SET threads = 2")
+    con.execute(f"SET temp_directory = '{CARPETA_DATOS}duckdb_tmp'")
+    con.execute("SET preserve_insertion_order = false")
+    con.execute(query_feature_engineering(csv, temporal))
+    con.close()
+    os.replace(temporal, ARCHIVO_DATOS)
+    print(f"Generado {ARCHIVO_DATOS} en {time.time() - t0:.0f}s")
+
+if EN_COLAB:
+    # leer del disco de la VM es mucho más rápido que leer de Drive
+    shutil.copy(ARCHIVO_DATOS, "/content/competencia_01_fe.parquet")
+    ARCHIVO_DATOS = "/content/competencia_01_fe.parquet"
+
+#%% celda 8 [código]
+import json
+import warnings
+import time
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import matplotlib.pyplot as plt
+
+import lightgbm as lgb
+import optuna
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+# aviso inofensivo de sklearn que el Random Forest repite miles de veces
+warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*")
+print("lightgbm", lgb.__version__, "| optuna", optuna.__version__)
+
+#%% celda 9 [texto]
+### Parámetros del experimento
+Todo lo que se puede tocar está acá. **Cambiar `semilla_primigenia` por la propia.**
+
+#%% celda 10 [código]
+PARAM = {
+    "experimento": "final_202108",
+    "semilla_primigenia": 14072024,        # <-- CAMBIAR por tu semilla
+
+    # ventanas temporales (todas respetan los 2 meses de distancia)
+    "meses_optim": [202103, 202104],       # donde se optimizan hiperparámetros
+    "mes_holdout": 202106,                 # validación final, nunca entra en la BO
+    "meses_final": [202103, 202104, 202105, 202106],
+    "mes_futuro": 202108,
+
+    # target: entrenar con BAJA+1 y BAJA+2 como positivos (z601), medir ganancia solo con BAJA+2
+    "positivos": ["BAJA+1", "BAJA+2"],
+
+    # fracción de CONTINUA que se conserva (acelera mucho; la ganancia se corrige por este factor)
+    "undersampling": 0.25,
+
+    # drifting
+    "psi_max": 0.25,                       # PSI junio vs agosto por encima de esto -> se excluye
+    "excluir_manual": [],                  # variables a sacar a mano
+    # Variables que se ponen en NaN en un mes puntual con datos anómalos (se aplica después del drift).
+    # En junio los BAJA+2 tienen préstamos personales como los CONTINUA (22%), cuando en mar-may tienen 8-12%.
+    "anular_en_mes": {202106: ["prestamos_personales"]},
+
+    # canaritos
+    "usar_canaritos": True,
+    "n_canaritos": 20,
+
+    # Random Forest
+    "rf_trials": 25,
+    "rf_arboles_bo": 100,
+    "rf_arboles_final": 500,
+
+    # LightGBM
+    "lgbm_trials": 100,
+    "nfold": 5,
+    "max_arboles": 3000,
+    # max_bin del modelo final: la BO y la evaluación en junio usan 31 (rápido); el modelo final usa 255
+    # (más detalle en los montos: +1,8M en junio y mejor en el público).
+    "max_bin_final": 255,
+    "early_stopping": 100,
+
+    # maldición del ganador y semillerío
+    "top_k": 5,
+    "n_semillas_eval": 10,                 # semillas por trial en junio (20 si hay tiempo)
+    "n_semillas_final": 20,
+    "cortes": list(range(4000, 20001, 500)),
+    "trial_elegido": None,                 # None = automático; o un número de trial para forzarlo
+}
+
+GANANCIA_ACIERTO = 1_072_500
+COSTO_ESTIMULO = 27_500
+
+CARPETA_EXP = BASE + "exp/" + PARAM["experimento"] + "/"
+os.makedirs(CARPETA_EXP, exist_ok=True)
+
+rng = np.random.default_rng(PARAM["semilla_primigenia"])
+SEMILLAS = rng.choice(np.arange(100_000, 1_000_000), size=50, replace=False).tolist()
+print("Carpeta del experimento:", CARPETA_EXP)
+
+#%% celda 11 [texto]
+## 2. Datos
+
+#%% celda 12 [texto]
+Se cargan solo los meses necesarios y los `float64` pasan a `float32` (mitad de memoria).
+La clase se codifica como 0 = CONTINUA, 1 = BAJA+1, 2 = BAJA+2. Agosto queda en -1 porque su clase es desconocida
+(en el archivo figura como CONTINUA, pero eso es un artefacto de cómo se construyó el target).
+
+#%% celda 13 [código]
+meses_cargar = sorted(set(PARAM["meses_final"] + [PARAM["mes_futuro"]]))
+tabla = pq.read_table(ARCHIVO_DATOS, filters=[("foto_mes", "in", meses_cargar)])
+# float64 -> float32 antes de pasar a pandas: mismo resultado, mitad de memoria en el pico
+tabla = tabla.cast(pa.schema([pa.field(f.name, pa.float32() if f.type == pa.float64() else f.type) for f in tabla.schema]))
+data = tabla.to_pandas()
+del tabla
+# las enteras con nulos llegan a pandas como float64: también a float32
+cols_f64 = data.select_dtypes("float64").columns
+data = data.astype({c: "float32" for c in cols_f64})
+
+# Se aplica el orden de filas de la corrida original. El parquet de esa corrida se generó sin orden fijo
+# (DuckDB en paralelo) y el undersampling sortea los CONTINUA según el orden de las filas: con este
+# archivo (solo foto_mes y numero_de_cliente, sin información de la clase) se replica la misma muestra.
+if os.path.exists(ARCHIVO_ORDEN):
+    orden = pd.read_csv(ARCHIVO_ORDEN)
+    orden = orden[orden["foto_mes"].isin(meses_cargar)]
+    posiciones = pd.MultiIndex.from_frame(data[["foto_mes", "numero_de_cliente"]]).get_indexer(
+        pd.MultiIndex.from_frame(orden))
+    assert len(posiciones) == len(data) and (posiciones >= 0).all(), "el archivo de orden no coincide con los datos"
+    data = data.iloc[posiciones].reset_index(drop=True)
+    print("Orden de filas aplicado desde", ARCHIVO_ORDEN)
+
+data["clase"] = data["clase_ternaria"].map({"CONTINUA": 0, "BAJA+1": 1, "BAJA+2": 2}).astype("int8")
+data.loc[data["foto_mes"] == PARAM["mes_futuro"], "clase"] = -1
+
+CODIGOS_POSITIVOS = [{"BAJA+1": 1, "BAJA+2": 2}[c] for c in PARAM["positivos"]]
+
+print(f"{data.shape[0]:,} filas x {data.shape[1]} columnas, {data.memory_usage().sum() / 1e9:.2f} GB")
+pd.crosstab(data["foto_mes"], data["clase_ternaria"])
+
+#%% celda 14 [texto]
+## 3. Drifting y calidad de datos: junio vs agosto
+
+#%% celda 15 [texto]
+Como en z701: PSI por variable y cambio en el porcentaje de nulos, comparando el último mes con clase (junio)
+contra el mes a predecir (agosto). Si una variable cambió mucho, lo que el modelo aprendió de ella no aplica en agosto.
+
+Referencia usual del PSI: < 0.1 estable, 0.1–0.25 moderado, > 0.25 drift fuerte.
+
+#%% celda 16 [código]
+def psi(referencia, actual, buckets=10, eps=1e-4):
+    ref_nn, act_nn = referencia.dropna(), actual.dropna()
+    if ref_nn.nunique() <= 1:
+        return 0.0
+    cortes = np.unique(np.quantile(ref_nn, np.linspace(0, 1, buckets + 1)))
+    cortes = np.concatenate([[-np.inf], cortes[1:-1], [np.inf]])
+    # el último bin son los nulos
+    e = np.append(np.histogram(ref_nn, cortes)[0], referencia.isna().sum()) / len(referencia)
+    a = np.append(np.histogram(act_nn, cortes)[0], actual.isna().sum()) / len(actual)
+    e, a = np.maximum(e, eps), np.maximum(a, eps)
+    return float(np.sum((a - e) * np.log(a / e)))
+
+
+NO_FEATURES = ["numero_de_cliente", "foto_mes", "clase_ternaria", "clase"]
+campos = [c for c in data.columns if c not in NO_FEATURES]
+
+ref = data[data["foto_mes"] == PARAM["mes_holdout"]]
+act = data[data["foto_mes"] == PARAM["mes_futuro"]]
+
+tb_drift = pd.DataFrame({
+    "psi": [psi(ref[c], act[c]) for c in campos],
+    "nulos_jun_%": [100 * ref[c].isna().mean() for c in campos],
+    "nulos_ago_%": [100 * act[c].isna().mean() for c in campos],
+}, index=campos)
+tb_drift["dif_nulos_pp"] = tb_drift["nulos_ago_%"] - tb_drift["nulos_jun_%"]
+tb_drift = tb_drift.sort_values("psi", ascending=False)
+del ref, act
+
+tb_drift.to_csv(CARPETA_EXP + "drift_jun_ago.csv")
+tb_drift.head(25).round(3)
+
+#%% celda 17 [código]
+excluir_drift = tb_drift.index[(tb_drift["psi"] > PARAM["psi_max"]) | (tb_drift["dif_nulos_pp"].abs() > 20)].tolist()
+print("Excluidas por drift:", excluir_drift)
+
+campos_buenos = [c for c in campos if c not in excluir_drift + PARAM["excluir_manual"]]
+print(f"Quedan {len(campos_buenos)} variables")
+
+#%% celda 18 [código]
+# anulación por mes: después del drift, para que estas variables no queden excluidas por tener 100% de nulos en ese mes
+for mes, patrones in PARAM.get("anular_en_mes", {}).items():
+    cols = [c for c in campos if any(p in c for p in patrones)]
+    data[cols] = data[cols].astype("float32")  # las enteras no admiten NaN
+    data.loc[data["foto_mes"] == int(mes), cols] = np.nan
+    print(f"{mes}: {len(cols)} variables en NaN ->", cols)
+
+#%% celda 19 [texto]
+## 4. Funciones de ganancia y de armado de datasets
+
+#%% celda 20 [texto]
+* **Ganancia suavizada**: ordeno por probabilidad, acumulo la ganancia y tomo el máximo de la *media móvil* de esa curva.
+  El máximo crudo premia picos de suerte; la versión suavizada es la que conviene optimizar.
+* **Undersampling**: si me quedo con el 25% de los CONTINUA, cada CONTINUA de validación "pesa" 4 envíos perdidos,
+  así la ganancia sigue siendo comparable con la del mes completo.
+* **Truco del peso**: LightGBM solo le pasa a la métrica `label` y `weight`. Como entreno con BAJA+1 y BAJA+2 como
+  positivos, codifico la clase ternaria en el peso (`1 + 0.00001 * clase`), lo que prácticamente no altera el entrenamiento.
+
+#%% celda 21 [código]
+def curva_ganancia(y_pred, clase, peso_neg=1.0):
+    # ganancia acumulada al enviar a los N clientes de mayor probabilidad, para N = 1..len
+    orden = np.argsort(-y_pred, kind="stable")
+    c = clase[orden]
+    g = np.where(c == 2, GANANCIA_ACIERTO, -COSTO_ESTIMULO * np.where(c == 0, peso_neg, 1.0))
+    return np.cumsum(g)
+
+
+def ganancia_suavizada(y_pred, clase, peso_neg=1.0, ventana=401):
+    acum = curva_ganancia(y_pred, clase, peso_neg)
+    if len(acum) > ventana:
+        acum = np.convolve(acum, np.ones(ventana) / ventana, mode="valid")
+    return acum.max()
+
+
+def submuestrear(df, frac, semilla):
+    # conserva todas las bajas y una fracción de los CONTINUA
+    azar = np.random.default_rng(semilla).random(len(df))
+    return df[(df["clase"] > 0) | (azar < frac)]
+
+
+def etiqueta(df):
+    return df["clase"].isin(CODIGOS_POSITIVOS).astype("int8").values
+
+
+def dataset_lgb(df, campos):
+    return lgb.Dataset(
+        df[campos], label=etiqueta(df),
+        weight=1 + 1e-5 * df["clase"].values,
+        free_raw_data=False,
+    )
+
+
+PESO_NEG = 1 / PARAM["undersampling"]
+N_MESES_OPTIM = len(PARAM["meses_optim"])
+
+
+def feval_ganancia(y_pred, dataset):
+    clase = np.rint((dataset.get_weight() - 1) * 1e5).astype(int)
+    # x nfold: cada fold de validación es 1/nfold de los datos; / meses: ganancia por mes
+    gan = ganancia_suavizada(y_pred, clase, PESO_NEG) * PARAM["nfold"] / N_MESES_OPTIM
+    return "ganancia", gan, True
+
+
+d_optim = submuestrear(data[data["foto_mes"].isin(PARAM["meses_optim"])], PARAM["undersampling"], SEMILLAS[0])
+d_hold = data[data["foto_mes"] == PARAM["mes_holdout"]]
+clase_hold = d_hold["clase"].values
+
+print(f"Optimización: {len(d_optim):,} filas (undersampling {PARAM['undersampling']})")
+print(f"Holdout {PARAM['mes_holdout']}: {len(d_hold):,} filas, {int((clase_hold == 2).sum())} BAJA+2")
+
+#%% celda 22 [texto]
+## 5. Canaritos: ¿qué variables le ganan al ruido?
+
+#%% celda 23 [texto]
+Agrego variables de ruido puro (como en z401) y entreno un LightGBM *regularizado* (si es muy permisivo,
+sobreajusta y el ruido termina con mucha importancia).
+Toda variable con menos importancia que el mejor canarito no aporta más que el azar y se descarta.
+Si descarta demasiadas, revisar la lista o poner `usar_canaritos = False`.
+
+#%% celda 24 [código]
+if PARAM["usar_canaritos"]:
+    rng_c = np.random.default_rng(SEMILLAS[1])
+    canaritos = [f"canarito_{i}" for i in range(PARAM["n_canaritos"])]
+    ruido = pd.DataFrame(rng_c.random((len(d_optim), len(canaritos)), dtype="float32"),
+                         columns=canaritos, index=d_optim.index)
+    X_c = pd.concat([d_optim[campos_buenos], ruido], axis=1)
+
+    params_canaritos = {
+        "objective": "binary", "verbosity": -1, "seed": SEMILLAS[1],
+        "learning_rate": 0.05, "num_leaves": 16, "min_data_in_leaf": 1000,
+        "feature_fraction": 0.5, "max_bin": 31,
+    }
+    m_c = lgb.train(params_canaritos, lgb.Dataset(X_c, label=etiqueta(d_optim)), num_boost_round=200)
+
+    imp = pd.Series(m_c.feature_importance("gain"), index=X_c.columns).sort_values(ascending=False)
+    umbral = imp[canaritos].max()
+    descartadas = [c for c in campos_buenos if imp[c] <= umbral]
+    print(f"Mejor canarito en el puesto {imp.index.get_loc(imp[canaritos].idxmax()) + 1} de {len(imp)}")
+    print(f"Descartadas por canaritos ({len(descartadas)}):", descartadas)
+
+    campos_buenos = [c for c in campos_buenos if c not in descartadas]
+    imp.to_csv(CARPETA_EXP + "importancia_canaritos.csv")
+    del X_c, m_c
+
+print(f"Variables finales: {len(campos_buenos)}")
+
+#%% celda 25 [texto]
+## 6. Random Forest: línea base
+
+#%% celda 26 [texto]
+Optimización bayesiana con 3-fold CV estratificado sobre marzo–abril, con pocos árboles para que sea rápida (z401).
+Luego entreno el mejor con más árboles y mido en junio. Es el piso que LightGBM tiene que superar.
+Random Forest de sklearn no acepta nulos en todas las versiones: los imputo con -999.
+
+#%% celda 27 [código]
+X_rf = d_optim[campos_buenos].fillna(-999).values
+y_rf = etiqueta(d_optim)
+clase_rf = d_optim["clase"].values
+
+
+def objetivo_rf(trial):
+    params = {
+        "max_depth": trial.suggest_int("max_depth", 4, 30),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 1000, log=True),
+        "max_features": trial.suggest_float("max_features", 0.05, 0.7),
+        "max_samples": trial.suggest_float("max_samples", 0.3, 1.0),
+    }
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEMILLAS[2])
+    ganancias = []
+    for tr, te in skf.split(X_rf, clase_rf):
+        rf = RandomForestClassifier(n_estimators=PARAM["rf_arboles_bo"], n_jobs=-1,
+                                    random_state=SEMILLAS[3], **params)
+        rf.fit(X_rf[tr], y_rf[tr])
+        pred = rf.predict_proba(X_rf[te])[:, 1]
+        ganancias.append(ganancia_suavizada(pred, clase_rf[te], PESO_NEG))
+    return np.mean(ganancias) * 3 / N_MESES_OPTIM
+
+
+estudio_rf = optuna.create_study(
+    study_name="rf", direction="maximize",
+    storage=f"sqlite:///{CARPETA_EXP}optuna.db", load_if_exists=True,
+    sampler=optuna.samplers.TPESampler(seed=SEMILLAS[4]),
+)
+faltan = PARAM["rf_trials"] - len(estudio_rf.trials)
+t0 = time.time()
+if faltan > 0:
+    estudio_rf.optimize(objetivo_rf, n_trials=faltan)
+print(f"{time.time() - t0:.0f}s | mejor ganancia CV: {estudio_rf.best_value:,.0f}", estudio_rf.best_params)
+
+#%% celda 28 [código]
+rf = RandomForestClassifier(n_estimators=PARAM["rf_arboles_final"], n_jobs=-1,
+                            random_state=SEMILLAS[3], **estudio_rf.best_params)
+rf.fit(X_rf, y_rf)
+pred_rf_hold = rf.predict_proba(d_hold[campos_buenos].fillna(-999).values)[:, 1]
+curva_rf = curva_ganancia(pred_rf_hold, clase_hold)
+
+print(f"RF en {PARAM['mes_holdout']}: ganancia máxima {curva_rf.max():,.0f} enviando a {curva_rf.argmax() + 1:,}")
+del rf, X_rf
+
+#%% celda 29 [texto]
+## 7. LightGBM: optimización bayesiana
+
+#%% celda 30 [texto]
+Cross validation de 5 folds sobre marzo–abril, métrica = ganancia suavizada por mes, *early stopping* para
+elegir la cantidad de árboles. Los rangos empujan hacia modelos que generalizan:
+`min_data_in_leaf` alto, `feature_fraction` y `bagging_fraction` < 1, regularización L1/L2.
+
+La base de Optuna se guarda en disco: **si Colab se desconecta, al volver a correr la celda retoma donde quedó.**
+
+#%% celda 31 [código]
+PARAMS_FIJOS = {
+    "objective": "binary",
+    "metric": "None",                # la única métrica es la ganancia
+    "boosting_type": "gbdt",
+    "boost_from_average": True,
+    "feature_pre_filter": False,
+    "max_bin": 31,
+    "bagging_freq": 1,
+    "verbosity": -1,
+}
+
+
+def armar_params(hp, semilla):
+    return {**PARAMS_FIJOS, **hp, "seed": semilla}
+
+
+dtrain_optim = dataset_lgb(d_optim, campos_buenos)
+
+
+def objetivo_lgbm(trial):
+    hp = {
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 8, 256, log=True),
+        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 50, 5000, log=True),
+        "feature_fraction": trial.suggest_float("feature_fraction", 0.1, 1.0),
+        "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+        "lambda_l1": trial.suggest_float("lambda_l1", 1e-3, 10, log=True),
+        "lambda_l2": trial.suggest_float("lambda_l2", 1e-3, 10, log=True),
+    }
+    cv = lgb.cv(
+        armar_params(hp, SEMILLAS[5]), dtrain_optim,
+        num_boost_round=PARAM["max_arboles"],
+        nfold=PARAM["nfold"], stratified=True, seed=SEMILLAS[6],
+        feval=feval_ganancia,
+        callbacks=[lgb.early_stopping(PARAM["early_stopping"], verbose=False)],
+    )
+    clave = [k for k in cv if k.endswith("ganancia-mean")][0]
+    trial.set_user_attr("best_iter", len(cv[clave]))
+    return cv[clave][-1]
+
+
+estudio_lgbm = optuna.create_study(
+    study_name="lgbm", direction="maximize",
+    storage=f"sqlite:///{CARPETA_EXP}optuna.db", load_if_exists=True,
+    sampler=optuna.samplers.TPESampler(seed=SEMILLAS[7]),
+)
+faltan = PARAM["lgbm_trials"] - len(estudio_lgbm.trials)
+t0 = time.time()
+if faltan > 0:
+    estudio_lgbm.optimize(objetivo_lgbm, n_trials=faltan)
+print(f"{time.time() - t0:.0f}s | mejor ganancia CV: {estudio_lgbm.best_value:,.0f}")
+print(estudio_lgbm.best_params, "| árboles:", estudio_lgbm.best_trial.user_attrs["best_iter"])
+
+#%% celda 32 [código]
+optuna.visualization.plot_optimization_history(estudio_lgbm)
+
+#%% celda 33 [código]
+optuna.visualization.plot_param_importances(estudio_lgbm)
+
+#%% celda 34 [código]
+optuna.visualization.plot_slice(estudio_lgbm)
+
+#%% celda 35 [texto]
+## 8. Contra la maldición del ganador: top-k trials × semillas en junio
+
+#%% celda 36 [texto]
+El mejor trial de la BO es, en parte, el que tuvo más suerte (z0333). Tomo los `top_k` mejores, los entreno
+en marzo–abril con `n_semillas_eval` semillas distintas y mido la ganancia en junio, que la BO nunca vio.
+Me quedo con el de **mejor ganancia media**, mirando también que su dispersión no sea enorme.
+
+Ojo: como junio se usa para elegir trial y corte, la ganancia de junio que se reporte acá queda un poco optimista.
+
+#%% celda 37 [código]
+trials_ok = [t for t in estudio_lgbm.trials if t.value is not None]
+top_trials = sorted(trials_ok, key=lambda t: t.value, reverse=True)[:PARAM["top_k"]]
+cortes = np.array(PARAM["cortes"])
+semillas_eval = SEMILLAS[10:10 + PARAM["n_semillas_eval"]]
+
+filas = []
+curvas_ensamble = {}
+t0 = time.time()
+for t in top_trials:
+    suma_pred = np.zeros(len(d_hold))
+    for s in semillas_eval:
+        modelo = lgb.train(armar_params(t.params, s), dtrain_optim, num_boost_round=t.user_attrs["best_iter"])
+        pred = modelo.predict(d_hold[campos_buenos])
+        suma_pred += pred
+        curva = curva_ganancia(pred, clase_hold)
+        for n in cortes:
+            filas.append({"trial": t.number, "semilla": s, "corte": n, "ganancia": curva[n - 1]})
+    curvas_ensamble[t.number] = curva_ganancia(suma_pred / len(semillas_eval), clase_hold)
+    print(f"trial {t.number} listo ({time.time() - t0:.0f}s)")
+
+df_semillas = pd.DataFrame(filas)
+df_semillas.to_csv(CARPETA_EXP + "holdout_semillas.csv", index=False)
+
+#%% celda 38 [código]
+media_por_corte = df_semillas.groupby(["trial", "corte"])["ganancia"].agg(["mean", "std"]).reset_index()
+mejor_por_trial = media_por_corte.loc[media_por_corte.groupby("trial")["mean"].idxmax()].set_index("trial")
+mejor_por_trial["ganancia_cv"] = [estudio_lgbm.trials[i].value for i in mejor_por_trial.index]
+mejor_por_trial["ganancia_ensamble"] = [curvas_ensamble[i][int(n) - 1] for i, n in mejor_por_trial["corte"].items()]
+mejor_por_trial = mejor_por_trial.sort_values("mean", ascending=False)
+
+trial_elegido = PARAM["trial_elegido"] if PARAM["trial_elegido"] is not None else int(mejor_por_trial.index[0])
+print("Trial elegido:", trial_elegido)
+print(f"Random Forest (línea base) en junio: {curva_rf.max():,.0f}")
+mejor_por_trial.round(0)
+
+#%% celda 39 [código]
+# distribución de la ganancia en junio por trial, cada uno en su mejor corte
+fig, ax = plt.subplots(figsize=(10, 5))
+orden_trials = mejor_por_trial.index.tolist()
+datos = [df_semillas[(df_semillas["trial"] == t) & (df_semillas["corte"] == mejor_por_trial.loc[t, "corte"])]["ganancia"] / 1e6
+         for t in orden_trials]
+cajas = ax.boxplot(datos, patch_artist=True, widths=0.5)
+for i, caja in enumerate(cajas["boxes"]):
+    caja.set_facecolor("#2a78d6" if orden_trials[i] == trial_elegido else "#c9cdd3")
+    caja.set_edgecolor("#4a4f57")
+ax.set_xticks(range(1, len(orden_trials) + 1), [f"trial {t}" for t in orden_trials])
+ax.axhline(curva_rf.max() / 1e6, color="#4a4f57", linestyle="--", linewidth=1)
+ax.text(len(orden_trials) + 0.4, curva_rf.max() / 1e6, "Random Forest", va="bottom", ha="right", color="#4a4f57")
+ax.set_ylabel("Ganancia en junio (millones)")
+ax.set_title(f"Ganancia en {PARAM['mes_holdout']} con {len(semillas_eval)} semillas por trial (azul: elegido)")
+ax.grid(axis="y", color="#e6e8eb")
+ax.spines[["top", "right"]].set_visible(False)
+plt.show()
+
+#%% celda 40 [texto]
+## 9. Punto de corte: ¿a cuántos clientes enviar?
+
+#%% celda 41 [texto]
+Como en z601, pienso en **cantidad de envíos** y no en probabilidad. Elijo el corte que maximiza la ganancia
+*media entre semillas* del trial elegido (más estable que la curva de una sola corrida).
+Como agosto tiene otra cantidad de clientes que junio, traslado el corte como **proporción de la cartera**.
+
+#%% celda 42 [código]
+curva_media = media_por_corte[media_por_corte["trial"] == trial_elegido].set_index("corte")
+corte_optimo = int(curva_media["mean"].idxmax())
+if corte_optimo in (cortes.min(), cortes.max()):
+    print("ATENCIÓN: el corte óptimo quedó en el borde de la grilla, ampliar PARAM['cortes']")
+
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.fill_between(curva_media.index, (curva_media["mean"] - curva_media["std"]) / 1e6,
+                (curva_media["mean"] + curva_media["std"]) / 1e6, color="#2a78d6", alpha=0.15, linewidth=0)
+ax.plot(curva_media.index, curva_media["mean"] / 1e6, color="#2a78d6", linewidth=2, label="Media entre semillas (± 1 desvío)")
+ax.plot(cortes, curvas_ensamble[trial_elegido][cortes - 1] / 1e6, color="#4a4f57", linewidth=2, linestyle="--",
+        label="Ensamble (promedio de probabilidades)")
+ax.axvline(corte_optimo, color="#4a4f57", linewidth=1)
+ax.text(corte_optimo, ax.get_ylim()[0], f"  corte = {corte_optimo:,}", va="bottom", color="#4a4f57")
+ax.set_xlabel("Cantidad de envíos")
+ax.set_ylabel("Ganancia en junio (millones)")
+ax.set_title(f"Trial {trial_elegido}: ganancia en {PARAM['mes_holdout']} según cantidad de envíos")
+ax.legend(frameon=False)
+ax.grid(axis="y", color="#e6e8eb")
+ax.spines[["top", "right"]].set_visible(False)
+plt.show()
+
+proporcion_envios = corte_optimo / len(d_hold)
+n_futuro = int((data["foto_mes"] == PARAM["mes_futuro"]).sum())
+n_envios = int(round(proporcion_envios * n_futuro))
+print(f"Corte en junio: {corte_optimo:,} ({100 * proporcion_envios:.2f}% de la cartera) -> agosto: {n_envios:,} envíos")
+
+#%% celda 43 [texto]
+## 10. Modelo final y entrega
+
+#%% celda 44 [texto]
+Reentreno con **marzo–junio** usando los hiperparámetros del trial elegido, el mismo undersampling,
+y promedio las probabilidades de `n_semillas_final` semillas sobre agosto.
+
+Como el dataset final tiene más filas que el de optimización, escalo `min_data_in_leaf` en la misma proporción
+para que las hojas representen la misma fracción de los datos. La cantidad de árboles queda igual.
+
+#%% celda 45 [código]
+hp_final = dict(estudio_lgbm.trials[trial_elegido].params)
+n_arboles = estudio_lgbm.trials[trial_elegido].user_attrs["best_iter"]
+
+d_final = submuestrear(data[data["foto_mes"].isin(PARAM["meses_final"])], PARAM["undersampling"], SEMILLAS[0])
+escala = len(d_final) / len(d_optim)
+hp_final["min_data_in_leaf"] = int(round(hp_final["min_data_in_leaf"] * escala))
+dtrain_final = dataset_lgb(d_final, campos_buenos)
+
+d_futuro = data[data["foto_mes"] == PARAM["mes_futuro"]]
+semillas_final = SEMILLAS[30:30 + PARAM["n_semillas_final"]]
+suma_pred = np.zeros(len(d_futuro))
+
+t0 = time.time()
+for i, s in enumerate(semillas_final, 1):
+    modelo = lgb.train({**armar_params(hp_final, s), "max_bin": PARAM["max_bin_final"]}, dtrain_final,
+                       num_boost_round=n_arboles)
+    suma_pred += modelo.predict(d_futuro[campos_buenos])
+    print(f"semilla {i}/{len(semillas_final)} ({time.time() - t0:.0f}s)")
+
+modelo.save_model(CARPETA_EXP + "modelo_final_ultima_semilla.txt")
+prob_futuro = suma_pred / len(semillas_final)
+print(hp_final, "| árboles:", n_arboles)
+
+#%% celda 46 [código]
+tb_pred = pd.DataFrame({"numero_de_cliente": d_futuro["numero_de_cliente"].values, "prob": prob_futuro})
+tb_pred = tb_pred.sort_values("prob", ascending=False).reset_index(drop=True)
+tb_pred.to_csv(CARPETA_EXP + "probabilidades_202108.csv", index=False)
+
+entrega = tb_pred.head(n_envios)[["numero_de_cliente"]]
+# numeración correlativa entre todas las corridas de exp/: entrega01_202108.csv, entrega02_202108.csv, ...
+import glob, re
+patron = re.compile(rf"entrega(\d+)_{PARAM['mes_futuro']}\.csv$")
+previas = [int(m.group(1)) for f in glob.glob(BASE + "exp/**/entrega*.csv", recursive=True)
+           if (m := patron.search(os.path.basename(f)))]
+n_entrega = max(previas, default=0) + 1
+archivo_entrega = CARPETA_EXP + f"entrega{n_entrega:02d}_{PARAM['mes_futuro']}.csv"
+entrega.to_csv(archivo_entrega, index=False, header=False)  # el formato de entrega va sin encabezado
+
+# controles
+assert entrega["numero_de_cliente"].is_unique
+assert entrega["numero_de_cliente"].isin(d_futuro["numero_de_cliente"]).all()
+print(f"{len(entrega):,} clientes en {archivo_entrega}")
+print(f"Probabilidad del último cliente incluido: {tb_pred.loc[n_envios - 1, 'prob']:.4f}")
+
+#%% celda 47 [código]
+# registro del experimento, para poder reproducirlo
+registro = {
+    "PARAM": PARAM,
+    "variables_excluidas_drift": excluir_drift,
+    "n_variables": len(campos_buenos),
+    "trial_elegido": trial_elegido,
+    "hiperparametros_final": hp_final,
+    "n_arboles": n_arboles,
+    "corte_junio": corte_optimo,
+    "n_envios_agosto": n_envios,
+    "archivo_entrega": archivo_entrega,
+    "ganancia_junio_media": float(curva_media.loc[corte_optimo, "mean"]),
+    "ganancia_junio_rf": float(curva_rf.max()),
+}
+with open(CARPETA_EXP + "registro.json", "w", encoding="utf-8") as f:
+    json.dump(registro, f, indent=2, ensure_ascii=False, default=str)
+registro

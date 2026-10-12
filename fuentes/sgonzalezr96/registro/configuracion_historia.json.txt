@@ -1,0 +1,10 @@
+{
+  "version": "ventana3_filas_originales_maxabs_v1",
+  "original": "C:\\Users\\sofia\\Desktop\\DMEyF\\data\\competencia_01.csv",
+  "bytes": 581933884,
+  "mtime": 1790275592524118700,
+  "excluir": [
+    "cprestamos_personales",
+    "mprestamos_personales"
+  ]
+}

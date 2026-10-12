@@ -1,0 +1,17 @@
+{
+  "experimento": 4112,
+  "nombre": "bo_profesor_ds3007",
+  "reanudar": true,
+  "descripcion": "Training Strategy 1.7 del profesor sobre ds3007 (dataset con todas sus indicaciones de FE: ccajas_depositos NA en 202105, _zero, lags/deltas 1 y 2, tend3 y avg3, rank cero fijo, proceso de muerte). Sin undersampling, AUC; fijos max_bin 31, min_data_in_leaf 0, feature_fraction 0.50, feature_fraction_bynode 0.20, learning_rate 0.005; bayesianos num_iterations (250-4000), num_leaves (8-2000), min_sum_hessian_in_leaf (0.001-100). Validacion interna 5 x 70/30 en 202103+202104. 40 pruebas (12 al azar), corte domingo 13:00 con al menos 15. Top 12 para el ensamble.",
+  "dataset": "ds3007_profesor.parquet",
+  "usar_lag2": true,
+  "meses_train": [
+    202103,
+    202104
+  ],
+  "n_trials": 40,
+  "n_startup_trials": 12,
+  "min_pruebas": 15,
+  "hora_limite": "2026-10-11 13:00",
+  "top_n": 12
+}

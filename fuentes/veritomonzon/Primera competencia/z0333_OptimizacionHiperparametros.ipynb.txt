@@ -1,0 +1,742 @@
+#%% celda 1 [texto]
+# 3 Optimización de Hiperpárametros
+
+#%% celda 2 [texto]
+## 3.01 Introduccion
+En general los algoritmos que generan modelos predictivos poseen hiperparámetros que *dado un dataset* deben ser optimizados.
+<br> La invocación de uno de esos algoritmos sin hiperparámetros no es más que
+invocarlos con hiperparámetros por default definidos por el fabricante. Por ejemplo en el caso de la librería **rpart** es cp=0.01, maxdepth=30, minsplit=20, minbucket=6,  lo que en nuestro dataset genera un arbol de un solo nodo (decimos "no se abre el arbol"); la razon de esto es la proporcion de "BAJA+1" y "BAJA+2"
+
+#%% celda 3 [texto]
+En el primer notebook de la asignatura usted probó optimizar manualmente los hiperparámetros entrenando en un mes completo y viendo los resultados directamente en el Public Leaderboard, que es una porción de los datos de futuro.
+<br> En el mundo real no se dispone jamás de la clase del futuro, con lo cual lo anterior es meramente un artifical divertimento.
+<br> La solución es estimar la bondad de un set de hiperparámetros en alguna combinación de:
+  * Una sola partición de  <training, testing>
+  * Multiples particiones de <training, testing>
+  * El método de  k-fold Cross Validation , generalmente con n>=5
+  * Utilizar   n-repated  k-fold Cross Validation
+  * Leave One Out  si la cardinalidad del dataset y el poder de cómputo se lo permiten
+
+#%% celda 4 [texto]
+Luego de comenzar a trabajar con el método de  "Multiples particiones de <training, testing>  se le invitó a extender un esqueleto de código del método de **Optimización de Hiperparámetros por Grid Search**
+
+#%% celda 5 [texto]
+## 3.02 Conceptos
+
+En esta entrega veremos los siguiente conceptos:
+* El origen del overfitting en un arbol de decisión
+* *La maldición del ganador*, overfitting en los hiperparámetros ganadores, Selective Inference
+* Data Drifting
+* Alterntivas de búsqueda
+  * Grid Search, la fuerza bruta
+  * Bayesian Optimization, la heurística
+
+#%% celda 6 [texto]
+## 3.04 Origen del Overfitting en un arbol de decisión
+¿Qué combinacion de hiperparámetros overfitea un árbol de decisión, para nuestro dataset?
+<br>¿Cómo se ve el overfitting desde el punto de vista de las curvas de ganancia?
+
+#%% celda 7 [texto]
+El objetivo de este capítulo es que usted juegue manualmente con los hiperparámetros de un rpart, observe las curvas de ganancia generadas en una particion <training=50%, testing=50%>  y obtengla conclusiones sobre el fenómeno observado.
+
+#%% celda 8 [texto]
+Introducimos el concepto de **Curva de Ganancia**
+<br> Al aplicar un modelo a un dataset se le asigna a cada registro una probabilidad, a su vez cada registro contribuye con una ganancia la que puede ser una pérdida o una ganancia.  
+<br>Ordenamos el dataset por probabilidad *descendente* y computamos la ganancia acumulada, generando de esta forma la curva de ganancia
+<br> Para visualizar el efecto del under/over  fitting adecuadamente, realizamos una particion  <training= 50%, testing= 50%>
+
+#%% celda 9 [texto]
+tener presente:
+<br> Overfitting  **NO**  es la diferencia entre las curvas
+<br> Lo que divide el underfitting del overfitting al aumentar la complejidad del modelo es la complejidad donde se alcanza la métrica máxima.
+
+#%% celda 10 [texto]
+### ¿Qué debe hacer usted?
+Probar al menos estas combinaciones:
+* **Arbol crecimiento descontrolado**
+   * cp= -1
+   * maxdepth= 30
+   * minsplit= 2
+   * minbucket= 1
+* Arbol talla reducida
+   * cp= -1
+   * maxdepth= 3
+   * minsplit= 20000
+   * minbucket= 10000
+
+#%% celda 11 [texto]
+#### Seteo del ambiente en Google Colab
+
+#%% celda 12 [texto]
+Esta parte se debe correr con el runtime en Python3
+<br>Ir al menu, Runtime -> Change Runtime Type -> Runtime type ->  **Python 3**
+
+#%% celda 13 [texto]
+Conectar la virtual machine donde esta corriendo Google Colab con el  Google Drive, para poder tener persistencia de archivos
+
+#%% celda 14 [código]
+# primero establecer el Runtime de Python 3
+from google.colab import drive
+drive.mount('/content/.drive')
+
+#%% celda 15 [texto]
+<br>los siguientes comando estan en shell script de Linux
+*   Crear las carpetas en el Google Drive
+*   Bajar el  **competencia_01_crudo**  al  Google Drive  y tambien al disco local de la virtual machine que esta corriendo Google Colab
+
+#%% celda 16 [código]
+%%shell
+
+mkdir -p "/content/.drive/My Drive/dmeyf"
+mkdir -p "/content/buckets"
+ln -sfn "/content/.drive/My Drive/dmeyf" /content/buckets/b1
+
+
+mkdir -p /content/buckets/b1/exp
+mkdir -p /content/buckets/b1/datasets
+mkdir -p /content/datasets
+
+
+# defino funcion descargar()
+descargar() {
+  carpeta_destino="/content/buckets/b1/datasets/"
+  url_origen="https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/"
+  archivo="$1"
+
+  if ! test -f "$carpeta_destino""$archivo"; then
+    wget  "$url_origen""$archivo"  -O "$carpeta_destino""$archivo"
+  fi
+
+  if ! test -f  "/content/datasets/""$archivo"; then
+    cp  "$carpeta_destino""$archivo"  "/content/datasets/""$archivo"
+  fi;
+}
+
+
+# hago la descarga efectiva, llamando a descargar()
+descargar  "competencia_01_crudo.csv"
+
+#%% celda 17 [texto]
+## Generacion de la clase_ternaria
+
+#%% celda 18 [texto]
+Esta parte se debe correr con el runtime en lenguaje **R** Ir al menu, Runtime -> Change Runtime Tipe -> Runtime type -> R
+
+#%% celda 19 [código]
+require( "data.table" )
+
+# leo el dataset
+dataset <- fread("/content/datasets/competencia_01_crudo.csv" )
+
+# calculo el periodo0 consecutivo
+dsimple <- dataset[, list(
+    "pos" = .I,
+    numero_de_cliente,
+    periodo0 = as.integer(foto_mes/100)*12 +  foto_mes%%100 ) ]
+
+
+# ordeno
+setorder( dsimple, numero_de_cliente, periodo0 )
+
+# calculo topes
+periodo_ultimo <- dsimple[, max(periodo0) ]
+periodo_anteultimo <- periodo_ultimo - 1
+
+
+# calculo los leads de orden 1 y 2
+dsimple[, c("periodo1", "periodo2") :=
+    shift(periodo0, n=1:2, fill=NA, type="lead"),  numero_de_cliente ]
+
+# assign most common class values = "CONTINUA"
+dsimple[ periodo0 < periodo_anteultimo, clase_ternaria := "CONTINUA" ]
+
+# calculo BAJA+1
+dsimple[ periodo0 < periodo_ultimo &
+    ( is.na(periodo1) | periodo0 + 1 < periodo1 ),
+    clase_ternaria := "BAJA+1" ]
+
+# calculo BAJA+2
+dsimple[ periodo0 < periodo_anteultimo & (periodo0+1 == periodo1 )
+    & ( is.na(periodo2) | periodo0 + 2 < periodo2 ),
+    clase_ternaria := "BAJA+2" ]
+
+
+# pego el resultado en el dataset original y grabo
+setorder( dsimple, pos )
+dataset[, clase_ternaria := dsimple$clase_ternaria ]
+
+fwrite( dataset,
+    file =  "/content/datasets/competencia_01.csv.gz",
+    sep = ","
+)
+
+#%% celda 20 [código]
+setorder( dataset, foto_mes, clase_ternaria, numero_de_cliente)
+dataset[, .N, list(foto_mes, clase_ternaria)]
+
+#%% celda 21 [texto]
+Esta parte se debe correr con el runtime en lenguaje **R** Ir al menu, Runtime -> Change Runtime Type -> Runtime type -> R
+
+#%% celda 22 [texto]
+limpio el ambiente de R
+
+#%% celda 23 [código]
+# limpio la memoria
+rm(list=ls(all.names=TRUE)) # remove all objects
+gc(full=TRUE, verbose=FALSE) # garbage collection
+
+#%% celda 24 [código]
+# cargo las librerias que necesito
+require("data.table")
+require("rpart")
+require("ggplot2")
+
+#%% celda 25 [código]
+if(!require("R.utils")) install.packages("R.utils")
+require("R.utils")
+
+#%% celda 26 [código]
+# carpeta de trabajo
+setwd("/content/buckets/b1/exp")
+experimento <- "exp304"
+dir.create(experimento, showWarnings=FALSE)
+setwd( paste0("/content/buckets/b1/exp/", experimento ))
+
+#%% celda 27 [texto]
+### Acción :  Jugar con  minsplit, minbucket y maxdepth
+
+#%% celda 28 [código]
+# cambiar aqui los parametros
+PARAM <- list()
+PARAM$semilla_primigenia <- 333331
+
+
+PARAM$minsplit <- 300
+PARAM$minbucket <- 20
+PARAM$maxdepth <- 11
+
+#%% celda 29 [código]
+# particionar agrega una columna llamada fold a un dataset
+#   que consiste en una particion estratificada segun agrupa
+# particionar( data=dataset, division=c(70,30),
+#  agrupa=clase_ternaria, seed=semilla)   crea una particion 70, 30
+
+particionar <- function(data, division, agrupa= "", campo= "fold", start= 1, seed= NA) {
+  if (!is.na(seed)) set.seed(seed)
+
+  bloque <- unlist(mapply(
+    function(x, y) {rep(y, x)},division, seq(from= start, length.out= length(division))))
+
+  data[, (campo) := sample(rep(bloque,ceiling(.N / length(bloque))))[1:.N],by= agrupa]
+}
+
+#%% celda 30 [código]
+# lectura del dataset
+dataset <- fread("/content/datasets/competencia_01.csv.gz")
+
+#%% celda 31 [código]
+# a partir de ahora solo trabajo con 202106, el ultimo mes que tiene clase
+
+dataset <- dataset[foto_mes == 202106] # defino donde voy a entrenar
+
+#%% celda 32 [código]
+# La division training/testing es 50%, 50%
+#  que sea 50/50 se indica con el c(1,1)
+
+particionar(dataset,
+  division= c(1, 1),
+  agrupa= "clase_ternaria",
+  seed= PARAM$semilla_primigenia
+)
+
+#%% celda 33 [código]
+# Entreno el modelo
+# los datos donde voy a entrenar
+# aqui es donde se deben probar distintos hiperparametros
+
+modelo <- rpart(
+  formula= "clase_ternaria ~ . -fold",
+  data= dataset[fold == 1, ],
+  xval= 0,
+  cp= -1,
+  minsplit= PARAM$minsplit,
+  minbucket= PARAM$minbucket,
+  maxdepth= PARAM$maxdepth
+)
+
+#%% celda 34 [código]
+# aplico el modelo a TODOS los datos, inclusive los de training
+prediccion <- predict(modelo, dataset, type= "prob")
+
+#%% celda 35 [código]
+# Pego la probabilidad de  BAJA+2
+tb_prediccion <- dataset[, list(fold,clase_ternaria)]
+tb_prediccion[, prob_baja2 := prediccion[, "BAJA+2"]]
+
+#%% celda 36 [código]
+# Dibujo la curva de ganancia acumulada
+setorder(tb_prediccion, fold, -prob_baja2)
+
+#%% celda 37 [código]
+# agrego una columna que es la de las ganancias
+# la multiplico por 2 para que ya este normalizada
+#  es 2 porque cada fold es el 50%
+
+tb_prediccion[, gan := 2 *ifelse(clase_ternaria == "BAJA+2", 1072500, -27500)]
+tb_prediccion[, ganancia_acumulada := cumsum(gan), by= fold]
+tb_prediccion[, pos := sequence(.N), by= fold]
+
+#%% celda 38 [código]
+tb_prediccion
+
+#%% celda 39 [código]
+# agrego una columna que es la de las ganancias
+# la multiplico por 2 para que ya este normalizada
+#  es 2 porque cada fold es el 50%
+
+tb_prediccion[, gan := 2 *ifelse(clase_ternaria == "BAJA+2", 1072500, -27500)]
+tb_prediccion[, ganancia_acumulada := cumsum(gan), by= fold]
+tb_prediccion[, pos := sequence(.N), by= fold]
+
+#%% celda 40 [código]
+# defino hasta donde muestra el grafico
+amostrar <- 20000
+
+#%% celda 41 [código]
+# Esta hermosa curva muestra como en el mentiroso training
+#   la ganancia es siempre mejor que en el real testing
+
+options( repr.plot.width=10, repr.plot.height=10)
+
+gra <- ggplot(
+           data= tb_prediccion[pos <= amostrar],
+           aes( x= pos, y= ganancia_acumulada,
+                color= ifelse(fold == 1, "train", "test") )
+             ) + geom_line()
+
+gra <- gra + theme(text = element_text(size = 16))
+
+options(repr.plot.width=16, repr.plot.height=9)
+print( gra )
+
+#%% celda 42 [código]
+# veo los resultados
+
+print(PARAM)
+cat( "Train gan max: ", tb_prediccion[fold==1, max(ganancia_acumulada)], "\n" )
+cat( "Test  gan max: ", tb_prediccion[fold==2, max(ganancia_acumulada)], "\n" )
+
+#%% celda 43 [texto]
+## 3.05 Análisis de la salida de Grid Search
+
+En clase utilizando un enfoque constructivista de educacion cada una de las mesas del aula analizará las salidas de las corridas de Grid Search de la Tarea para el Hogar.
+<br>Se espera que quienes ya trabajan como Data Analyst se luzcan en el análisis de esos datos
+<br>Finalmente se utilizara un *arma conceptual secreta*, iluminando elegantemente donde están las mayores ganancias.
+
+#%% celda 44 [texto]
+## 3.06 La Maldición del Ganador
+
+#%% celda 45 [texto]
+¿Los hiperparámetros ganadores de toda la cohorte, estan overfiteando?
+<br> Trabajaremos con la hoja **C3-GS Overfitting** de la Google Sheet Colaborativa
+<br> Determinar de toda la cohorte quien obtuvo la mayor ganancia y con qué hiperparámetros
+<br> copiarlos  a la hoja **C3-GS Overfitting**
+<br> Quien obtuvo esa ganancia no debe hacer nada
+<br> El resto de la cohorte, modifica su script de Grid Search para calcular la ganancia de dichos hiperparámetros ganadores  utilizando su Semilla Primigenia y registra la ganancia en la linea correspondiente a su nombre en la hoja C3-GS Overfitting
+
+#%% celda 46 [texto]
+¿ Como compara la ganancia del ganador versus el resto de las ganancias recién calculadas ?
+
+#%% celda 47 [texto]
+#### Bibliografia
+
+#%% celda 48 [texto]
+* Selective Inference - the silent killer of replicability   https://www.youtube.com/watch?v=6ZxIzVjV1DE
+* Ioannidis, J. P. A. Why most published research findings are false. PLoS Med. 2, e124 (2005). https://journals.plos.org/plosmedicine/article/file?id=10.1371/journal.pmed.0020124&type=printable
+
+#%% celda 49 [texto]
+
+
+---
+
+#%% celda 50 [texto]
+## 3.07 Bayesian Optimization
+
+#%% celda 51 [texto]
+Se explicará en clase como a partir del Grid Search se deriva el algoritmo de Bayesian Optimization
+
+#%% celda 52 [texto]
+
+
+---
+
+#%% celda 53 [texto]
+## 3.08 Bayesian Optimization código
+
+#%% celda 54 [texto]
+Esta parte se debe correr con el runtime en lenguaje **R** Ir al menu, Runtime -> Change Runtime Type -> Runtime type -> R
+
+#%% celda 55 [texto]
+limpio el ambiente de R
+
+#%% celda 56 [código]
+# limpio la memoria
+rm(list=ls(all.names=TRUE)) # remove all objects
+gc(full=TRUE, verbose=FALSE) # garbage collection
+
+#%% celda 57 [texto]
+* Instalacion de la libreria  rpart.plot  para dibujar el arbol
+* invocacion de las librerias  **data.table** y  **rpart**
+
+#%% celda 58 [código]
+# cargo las librerias que necesito
+require("data.table")
+require("rpart")
+require("parallel")
+
+#%% celda 59 [código]
+if( ! require("rlist") ) install.packages("rlist")
+require("rlist")
+
+#%% celda 60 [código]
+if(!require("R.utils")) install.packages("R.utils")
+require("R.utils")
+
+#%% celda 61 [código]
+# paquete necesarios para la Bayesian Optimization
+if( !require("DiceKriging") ) install.packages("DiceKriging")
+require("DiceKriging")
+
+#%% celda 62 [código]
+# paquete necesarios para la Bayesian Optimization
+if( !require("mlrMBO") ) install.packages("mlrMBO")
+require("mlrMBO")
+
+#%% celda 63 [texto]
+Accion a realizar : cambiar por su semilla primigenia
+
+#%% celda 64 [código]
+# Defino parametros
+PARAM <- list()
+
+PARAM$semilla_primigenia <- 333331
+PARAM$experimento <- "HT308"
+
+PARAM$BO_iter <- 40 # cantidad de iteraciones de la Bayesian Optimization
+
+# la letra L al final de 1L significa ENTERO
+PARAM$hs <- makeParamSet(
+    makeNumericParam("cp", lower= -1, upper= 0.1),
+    makeIntegerParam("minsplit", lower= 1L, upper= 20000L),
+    makeIntegerParam("minbucket", lower= 1L, upper= 10000L),
+    makeIntegerParam("maxdepth", lower= 3L, upper= 30L),
+    forbidden= quote(minbucket > 0.5 * minsplit)
+)
+# minbuket NO PUEDE ser mayor que la mitad de minsplit
+
+#%% celda 65 [código]
+# carpeta de trabajo
+carpeta <- normalizePath(
+  if (dir.exists("Primera competencia")) "Primera competencia" else "../Primera competencia",
+  mustWork = TRUE
+)
+dir.create(file.path(carpeta, "exp", PARAM$experimento), recursive = TRUE, showWarnings = FALSE)
+setwd(file.path(carpeta, "exp", PARAM$experimento))
+
+#%% celda 66 [código]
+particionar <- function(data, division, agrupa = "", campo = "fold",
+                        start = 1, seed = NA) {
+  if (!is.na(seed)) set.seed(seed)
+
+  bloque <- unlist(mapply(
+    function(x, y) {
+      rep(y, x)
+    }, division,
+    seq(from= start, length.out= length(division))
+  ))
+
+  data[, (campo) := sample(rep(bloque, ceiling(.N / length(bloque))))[1:.N],
+    by= agrupa
+  ]
+}
+
+#%% celda 67 [código]
+# fold_test  tiene el numero de fold que voy a usar para testear,
+#  entreno en el resto de los folds
+# param tiene los hiperparametros del arbol
+
+ArbolSimple <- function(fold_test, param_rpart) {
+  # genero el modelo
+  # entreno en todo MENOS el fold_test que uso para testing
+  modelo <- rpart("clase_ternaria ~ .",
+    data= dataset[fold != fold_test, ],
+    xval= 0,
+    control= param_rpart
+  )
+
+  # aplico el modelo a los datos de testing
+  # aplico el modelo sobre los datos de testing
+  # quiero que me devuelva probabilidades
+  prediccion <- predict(modelo,
+    dataset[fold == fold_test, ],
+    type= "prob"
+  )
+
+  # esta es la probabilidad de baja
+  prob_baja2 <- prediccion[, "BAJA+2"]
+
+  # calculo la ganancia
+  ganancia_testing <- dataset[fold == fold_test][
+    prob_baja2 > 1 / 40,
+    sum(ifelse(clase_ternaria == "BAJA+2",
+      1072500, -27500
+    ))
+  ]
+
+  # esta es la ganancia sobre el fold de testing, NO esta normalizada
+  return(ganancia_testing)
+}
+
+#%% celda 68 [código]
+ArbolesCrossValidation <- function(param_rpart, qfolds, pagrupa, semilla) {
+  # generalmente  c(1, 1, 1, 1, 1 )  cinco unos
+  divi <- rep(1, qfolds)
+
+  # particiono en dataset en folds
+  particionar(dataset, divi, seed= semilla, agrupa= pagrupa)
+
+  ganancias <- mcmapply(ArbolSimple,
+    seq(qfolds), # 1 2 3 4 5
+    MoreArgs= list(param_rpart),
+    SIMPLIFY= FALSE,
+    mc.cores= detectCores()
+  )
+
+  dataset[, fold := NULL]
+
+  # devuelvo la primer ganancia y el promedio
+  # promedio las ganancias
+  ganancia_promedio <- mean(unlist(ganancias))
+  # aqui normalizo la ganancia
+  ganancia_promedio_normalizada <- ganancia_promedio * qfolds
+
+  return(ganancia_promedio_normalizada)
+}
+
+#%% celda 69 [código]
+# esta funcion solo puede recibir los parametros que se estan optimizando
+# el resto de los parametros, lamentablemente se pasan como variables globales
+
+EstimarGanancia <- function(x) {
+  message(format(Sys.time(), "%a %b %d %X %Y"))
+  GLOBAL_iteracion <<- GLOBAL_iteracion + 1
+
+  xval_folds <- 5
+  # param= x los hiperparametros del arbol
+  # qfolds= xval_folds  la cantidad de folds
+  ganancia <- ArbolesCrossValidation(
+    param_rpart= x,
+    qfolds= xval_folds,
+    pagrupa= "clase_ternaria",
+    semilla= PARAM$semilla_primigenia
+  )
+
+  return(ganancia)
+}
+
+#%% celda 70 [código]
+# leo el dataset
+dataset <- fread(file.path(carpeta, "competencia_01.csv.gz"))
+
+#%% celda 71 [código]
+dataset <- dataset[foto_mes==202104]
+
+#%% celda 72 [código]
+
+archivo_log <- "BO_log.txt"
+archivo_BO <- "bayesian.RDATA"
+
+# leo si ya existe el log
+#  para retomar en caso que se se corte el programa
+GLOBAL_iteracion <- 0
+GLOBAL_mejor <- -Inf
+
+if (file.exists(archivo_log)) {
+  tabla_log <- fread(archivo_log)
+  GLOBAL_iteracion <- nrow(tabla_log)
+  GLOBAL_mejor <- tabla_log[, max(y)]
+}
+
+#%% celda 73 [código]
+
+# Aqui comienza la configuracion de la Bayesian Optimization
+
+funcion_optimizar <- EstimarGanancia
+
+configureMlr(show.learner.output= FALSE)
+
+# configuro la busqueda bayesiana,
+#  los hiperparametros que se van a optimizar
+# por favor, no desesperarse por lo complejo
+# minimize= FALSE estoy Maximizando la ganancia
+obj.fun <- makeSingleObjectiveFunction(
+  fn= funcion_optimizar,
+  minimize= FALSE,
+  noisy= TRUE,
+  par.set= PARAM$hs,
+  has.simple.signature= FALSE
+)
+
+ctrl <- makeMBOControl(
+  save.on.disk.at.time= 600,
+  save.file.path= archivo_BO
+)
+
+ctrl <- setMBOControlTermination(ctrl, iters= PARAM$BO_iter)
+ctrl <- setMBOControlInfill(ctrl, crit= makeMBOInfillCritEI())
+
+surr.km <- makeLearner("regr.km",
+  predict.type= "se",
+  covtype= "matern3_2", control= list(trace= TRUE)
+)
+
+#%% celda 74 [código]
+
+# inicio la optimizacion bayesiana
+if (!file.exists(archivo_BO)) {
+  bayesiana_salida <- mbo(
+    fun= obj.fun,
+    learner= surr.km,
+    control= ctrl
+  )
+} else {
+  bayesiana_salida <- mboContinue(archivo_BO)
+}
+# retomo en caso que ya exista
+
+#%% celda 75 [código]
+# almaceno los resultados de la Bayesian Optimization
+# y capturo los mejores hiperparametros encontrados
+
+tb_bayesiana <- as.data.table(bayesiana_salida$opt.path)
+setorder(tb_bayesiana, -y)
+fwrite(tb_bayesiana, file= "BO_log.txt", sep= "\t")
+
+PARAM$out$lgbm$mejores_hiperparametros <- tb_bayesiana[
+  1,
+  list(minsplit, minbucket, maxdepth)
+]
+PARAM$out$lgbm$mejores_hiperparametros$cp <- -1  # fijo, no formo parte de la busqueda en esta corrida
+
+print(PARAM$out$lgbm$mejores_hiperparametros)
+
+#%% celda 76 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+#%% celda 77 [texto]
+
+
+---
+
+#%% celda 78 [código]
+# ================================================================
+# Validacion del ganador de HT309 (busqueda angosta) con semillas
+# frescas - mismo chequeo que le hicimos a HT308
+# ================================================================
+
+if (!require("primes")) install.packages("primes")
+require("primes")
+primos <- generate_primes(min = 100000, max = 1000000)
+set.seed(PARAM$semilla_primigenia)
+semillas_validacion_309 <- sample(primos, 5)
+
+# top candidatos de HT309 (sin columna cp, la agregamos fija en -1)
+tb_bayesiana_309 <- fread("BO_log.txt")
+setorder(tb_bayesiana_309, -y)
+top_candidatos_309 <- tb_bayesiana_309[1:5, list(minsplit, minbucket, maxdepth)]
+
+validar_candidato_309 <- function(fila, semillas) {
+  param_rpart <- c(list(cp = -1), as.list(fila))
+
+  ganancias <- sapply(semillas, function(sem) {
+    ArbolesCrossValidation(
+      param_rpart = param_rpart,
+      qfolds = 5,
+      pagrupa = "clase_ternaria",
+      semilla = sem
+    )
+  })
+
+  list(
+    ganancia_media = mean(ganancias),
+    ganancia_sd = sd(ganancias),
+    ganancia_min = min(ganancias),
+    ganancia_max = max(ganancias)
+  )
+}
+
+resultados_validacion_309 <- list()
+for (i in 1:nrow(top_candidatos_309)) {
+  cat(sprintf("Validando candidato %d/%d (minsplit=%d, minbucket=%d, maxdepth=%d)...\n",
+              i, nrow(top_candidatos_309),
+              top_candidatos_309$minsplit[i], top_candidatos_309$minbucket[i], top_candidatos_309$maxdepth[i]))
+  res <- validar_candidato_309(top_candidatos_309[i], semillas_validacion_309)
+  resultados_validacion_309[[i]] <- c(as.list(top_candidatos_309[i]), res)
+}
+
+tb_validacion_309 <- rbindlist(resultados_validacion_309)
+setorder(tb_validacion_309, -ganancia_media)
+print(tb_validacion_309)
+
+#%% celda 79 [código]
+# ================================================================
+# Segunda ronda de Bayesian Optimization, angosta, sobre la zona
+# validada (familia "arboles medianos"): minsplit ~1000-1800,
+# minbucket ~270-510, maxdepth ~11-15
+# cp queda FIJO en -1 (ya sabemos que cualquier valor negativo
+# da lo mismo, asi no gastamos iteraciones en esa dimension)
+# ================================================================
+
+PARAM$experimento <- "HT309"
+
+PARAM$hs <- makeParamSet(
+    makeIntegerParam("minsplit", lower= 500L, upper= 2500L),
+    makeIntegerParam("minbucket", lower= 150L, upper= 700L),
+    makeIntegerParam("maxdepth", lower= 8L, upper= 18L),
+    forbidden= quote(minbucket > 0.5 * minsplit)
+)
+
+# nueva carpeta de trabajo, para no pisar los resultados de HT308
+setwd(file.path(carpeta, "exp"))
+dir.create(PARAM$experimento, showWarnings = FALSE)
+setwd(file.path(carpeta, "exp", PARAM$experimento))
+
+# EstimarGanancia ahora inyecta cp=-1 fijo, ya que x solo trae
+# minsplit/minbucket/maxdepth (saque cp del espacio de busqueda)
+EstimarGanancia <- function(x) {
+  message(format(Sys.time(), "%a %b %d %X %Y"))
+  GLOBAL_iteracion <<- GLOBAL_iteracion + 1
+
+  param_rpart <- c(list(cp = -1), x)
+
+  ganancia <- ArbolesCrossValidation(
+    param_rpart = param_rpart,
+    qfolds = 5,
+    pagrupa = "clase_ternaria",
+    semilla = PARAM$semilla_primigenia
+  )
+
+  return(ganancia)
+}
+
+archivo_log <- "BO_log.txt"
+archivo_BO <- "bayesian.RDATA"
+
+GLOBAL_iteracion <- 0
+GLOBAL_mejor <- -Inf
+
+if (file.exists(archivo_log)) {
+  tabla_log <- fread(archivo_log)
+  GLOBAL_iteracion <- nrow(tabla_log)
+  GLOBAL_mejor <- tabla_log[, max(y)]
+}

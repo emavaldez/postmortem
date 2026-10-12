@@ -1,0 +1,255 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–13] Carga data.table, lightgbm, ParamHelpers, mlrMBO y DiceKriging, desactiva la
+#   notación científica (scipen = 999) y lee con fread el archivo /home/ds/datasets/competencia_01_crudo.csv en
+#   el objeto dataset.
+#%% celda 1 [código]
+library(data.table)
+library(lightgbm)
+library(ParamHelpers)
+library(mlrMBO)
+library(DiceKriging)
+
+options(scipen = 999)
+
+print("[PASO 1] Leyendo el archivo crudo original desde el disco...")
+flush.console()
+dataset <- fread("/home/ds/datasets/competencia_01_crudo.csv")
+
+# [Anotación · líneas 14–27] Calcula periodo0, un número de período consecutivo (año × 12 + mes) a partir de
+#   foto_mes, ordena por cliente y período y guarda el último período y el anterior a ese. Para cada cliente
+#   agrega periodo1 y periodo2: el período de su fila siguiente y el de dos filas más adelante (NA si no
+#   existen).
+#%% celda 2 [código]
+print("[PASO 2] Ejecutando algoritmo de Clase Ternaria")
+flush.console()
+
+# Calculamos el periodo consecutivo lineal
+dataset[, periodo0 := as.integer(foto_mes/100)*12 + foto_mes%%100]
+setorder(dataset, numero_de_cliente, periodo0)
+
+periodo_ultimo <- dataset[, max(periodo0)]
+periodo_anteultimo <- periodo_ultimo - 1
+
+# Generamos las ventanas móviles hacia adelante agrupando por cliente
+dataset[, c("periodo1", "periodo2") := shift(periodo0, n=1:2, fill=NA, type="lead"), by = numero_de_cliente]
+
+# [Anotación · líneas 28–32] Asigna clase_ternaria en tres pasos sucesivos. CONTINUA: todas las filas
+#   anteriores al anteúltimo período. BAJA+1: filas anteriores al último período cuyo cliente no tiene fila en
+#   el período siguiente. BAJA+2: filas anteriores al anteúltimo período cuyo cliente está en el período
+#   siguiente y no en el que le sigue. Las filas del último período y las del anteúltimo que no son BAJA+1
+#   quedan sin clase.
+# Asignación de estados secuenciales de la cátedra
+dataset[periodo0 < periodo_anteultimo, clase_ternaria := "CONTINUA"]
+dataset[periodo0 < periodo_ultimo & (is.na(periodo1) | periodo0 + 1 < periodo1), clase_ternaria := "BAJA+1"]
+dataset[periodo0 < periodo_anteultimo & (periodo0+1 == periodo1) & (is.na(periodo2) | periodo0 + 2 < periodo2), clase_ternaria := "BAJA+2"]
+
+# [Anotación · líneas 33–42] Pasa ccajas_depositos a NA en las filas de 202105 y, si existe
+#   cprestamos_personales, elimina esa columna y mprestamos_personales. Crea clase01, que vale 1 cuando
+#   clase_ternaria es BAJA+2 y 0 en los demás casos, e imprime la cantidad de filas por clase. La salida
+#   guardada en el notebook original muestra 645.999 CONTINUA, 5.103 BAJA+1, 4.067 BAJA+2 y 327.892 filas sin
+#   clase.
+# Parches obligatorios de Data Quality y eliminación de columnas 
+dataset[foto_mes == 202105, ccajas_depositos := NA]
+if ("cprestamos_personales" %in% colnames(dataset)) {
+  dataset[, c("cprestamos_personales", "mprestamos_personales") := NULL]
+}
+dataset[, clase01 := ifelse(clase_ternaria == "BAJA+2", 1L, 0L)]
+
+print("Control de etiquetas recuperadas en la RAM:")
+print(dataset[, .N, by = clase_ternaria])
+
+# [Anotación · líneas 43–58] Toma como columnas a procesar todas menos numero_de_cliente, foto_mes,
+#   clase_ternaria, clase01 y los tres períodos auxiliares. Para cada una crea <variable>_lag1 con el valor de
+#   la fila anterior del mismo cliente (shift de 1 agrupado por numero_de_cliente, con el dataset ordenado por
+#   cliente y período) y <variable>_delta1 como el valor actual menos ese lag. Imprime la cantidad de columnas
+#   resultante (457 según la salida guardada en el notebook original).
+#%% celda 3 [código]
+print("[PASO 3] Generando historia clínica de ORDEN 1 EXCLUSIVA...")
+flush.console()
+
+columnas_conductuales <- setdiff(colnames(dataset), c("numero_de_cliente", "foto_mes", "clase_ternaria", "clase01", "periodo0", "periodo1", "periodo2"))
+
+cols_lag1 <- paste0(columnas_conductuales, "_lag1")
+dataset[, (cols_lag1) := shift(.SD, n = 1, type = "lag"), by = numero_de_cliente, .SDcols = columnas_conductuales]
+
+for (v in columnas_conductuales) {
+  dataset[, paste0(v, "_delta1") := get(v) - get(paste0(v, "_lag1"))]
+}
+
+print(paste("[OK] Columnas en RAM:", ncol(dataset)))
+flush.console()
+
+# [Anotación · líneas 59–75] Separa las filas de 202103 y 202104 para entrenar y las de 202106 para validar
+#   dentro de la optimización. Define campos_buenos_O1: todas las columnas menos las dos clases,
+#   numero_de_cliente, foto_mes y los períodos auxiliares (variables originales, lags y deltas). Construye el
+#   lgb.Dataset de entrenamiento con etiqueta clase01 y la matriz de validación.
+#%% celda 4 [código]
+print("[PASO 4] Inicializando la Optimización Bayesiana")
+flush.console()
+
+# Partición temporal de control: Marzo y Abril unificados entrenan, Junio valida de forma pura
+df_train_bo <- dataset[foto_mes %in% c(202103, 202104)]
+df_val_bo   <- dataset[foto_mes == 202106]
+
+campos_buenos_O1 <- setdiff(colnames(dataset), c("clase_ternaria", "clase01", "numero_de_cliente", "foto_mes", "periodo0", "periodo1", "periodo2"))
+
+dtrain_bo_puro <- lgb.Dataset(
+  data = data.matrix(df_train_bo[, campos_buenos_O1, with = FALSE]),
+  label = df_train_bo$clase01,
+  free_raw_data = FALSE
+)
+matriz_val_bo_puro <- data.matrix(df_val_bo[, campos_buenos_O1, with = FALSE])
+
+# [Anotación · líneas 76–87] Define el espacio de búsqueda con tres hiperparámetros: num_iterations entero
+#   entre 500 y 3000, num_leaves entero entre 16 y 63 y min_sum_hessian_in_leaf numérico entre 0,01 y 5,0. Fija
+#   set.seed(314159), genera un diseño inicial de 20 puntos con generateDesign y pone en 0 el contador global de
+#   evaluaciones.
+# Espacio de búsqueda 
+obj_space_oficial <- makeParamSet(
+  makeIntegerParam("num_iterations",          lower = 500L,  upper = 3000L), 
+  makeIntegerParam("num_leaves",              lower = 16L,   upper = 63L),   
+  makeNumericParam("min_sum_hessian_in_leaf",  lower = 0.01,  upper = 5.0)    
+)
+
+set.seed(314159)
+diseno_inicial_oficial <- generateDesign(n = 20L, par.set = obj_space_oficial) # 20 basales
+
+GLOBAL_ITER <- 0
+
+# [Anotación · líneas 88–115] Función objetivo de la optimización. Arma los parámetros de LightGBM con valores
+#   fijos (gbdt, objective binary, metric auc, max_bin 31, min_data_in_leaf 0, feature_fraction 0,50,
+#   feature_fraction_bynode 0,20, learning_rate 0,005, nthreads 1) y los tres valores del punto evaluado;
+#   entrena con nrounds = num_iterations y predice 202106. Ordena por probabilidad descendente, asigna 117.500 a
+#   cada BAJA+2 y -27.500 a cada fila restante, suma las primeras 10.000 filas, imprime el resultado y lo
+#   devuelve.
+funcion_objetivo_oficial <- function(x) {
+  GLOBAL_ITER <<- GLOBAL_ITER + 1
+  
+  params <- list(
+    boosting = "gbdt", objective = "binary", metric = "auc", max_bin = 31,
+    min_data_in_leaf = 0, feature_fraction = 0.50, feature_fraction_bynode = 0.20,
+    learning_rate = 0.005, boost_from_average = TRUE, verbosity = -100, nthreads = 1
+  )
+  params$num_iterations          <- as.integer(x["num_iterations"])
+  params$num_leaves              <- as.integer(x["num_leaves"])
+  params$min_sum_hessian_in_leaf <- as.numeric(x["min_sum_hessian_in_leaf"])
+  
+  modelo <- lgb.train(data = dtrain_bo_puro, params = params, nrounds = params$num_iterations)
+  prediccion <- predict(modelo, matriz_val_bo_puro)
+  
+  tbl_eval <- data.table(clase_ternaria = df_val_bo$clase_ternaria, prob = prediccion)
+  setorder(tbl_eval, -prob)
+  
+  tbl_eval[, ganancia_individual := ifelse(clase_ternaria == "BAJA+2", 117500, -27500)]
+  max_ganancia <- tbl_eval[1:10000, sum(ganancia_individual)]
+  
+  cat(sprintf("[BO] Iteración %02d | Rondas: %d | Hojas: %d | Hessian: %.6f | Ganancia Junio: $%s\n", 
+              GLOBAL_ITER, params$num_iterations, params$num_leaves, params$min_sum_hessian_in_leaf, format(max_ganancia, big.mark=".")))
+  flush.console()
+  
+  return(max_ganancia)
+}
+
+# [Anotación · líneas 116–125] Envuelve la función como objetivo de un solo criterio a maximizar (minimize =
+#   FALSE). Configura mlrMBO con 30 iteraciones, criterio de adquisición Expected Improvement y, como modelo
+#   sustituto, kriging (regr.km) con covarianza matern3_2 y predicción con error estándar.
+obj_fun_oficial <- makeSingleObjectiveFunction(
+  name = "Optimizacion", fn = funcion_objetivo_oficial, par.set = obj_space_oficial, has.simple.signature = FALSE, minimize = FALSE
+)
+
+mbo_ctrl <- makeMBOControl()
+mbo_ctrl <- setMBOControlTermination(mbo_ctrl, iters = 30L) # 30 MBO inteligentes. Total = 50.
+mbo_ctrl <- setMBOControlInfill(mbo_ctrl, crit = makeMBOInfillCritEI())
+
+surr_km <- makeLearner("regr.km", predict.type = "se", covtype = "matern3_2", control = list(trace = FALSE))
+
+# [Anotación · líneas 126–134] Ejecuta mbo() con el diseño inicial de 20 puntos y las 30 iteraciones (50
+#   evaluaciones en total), guarda el resultado en optimizacion_marzo_abril_pure.rds y extrae en
+#   vector_parametros_campeones el punto que devuelve la búsqueda (run_bayes_oficial$x).
+# GATILLADO TEÓRICO DETERMINISTA: Al ejecutarse, este bloque guarda las variables óptimas en 'run_bayes_oficial'
+run_bayes_oficial <- mbo(obj_fun_oficial, design = diseno_inicial_oficial, learner = surr_km, control = mbo_ctrl, show.info = FALSE)
+
+# Grabamos el .rds
+saveRDS(run_bayes_oficial, file = "optimizacion_marzo_abril_pure.rds")
+
+# EXTRAEMOS EL VECTOR DE PARÁMETROS GANADORES 
+vector_parametros_campeones <- run_bayes_oficial$x
+
+# [Anotación · líneas 135–150] Define los meses del entrenamiento final (202103, 202104, 202105 y 202106) y el
+#   mes a predecir (202108). Construye el lgb.Dataset final con las columnas de campos_buenos_O1 y etiqueta
+#   clase01, y la matriz de 202108.
+#%% celda 5 [código]
+print("[PASO 5] Configurando matrices finales de producción al 100% de datos usando ORDEN 1 LAGS/DELTAS")
+flush.console()
+
+meses_entrenamiento_final <- c(202103, 202104, 202105, 202106)
+
+dataset_train_final  <- dataset[foto_mes %in% meses_entrenamiento_final]
+dataset_future_final <- dataset[foto_mes == 202108] # Agosto futuro de producción
+
+dtrain_produccion <- lgb.Dataset(
+  data = data.matrix(dataset_train_final[, campos_buenos_O1, with = FALSE]), 
+  label = dataset_train_final$clase01, 
+  free_raw_data = FALSE
+)
+matriz_future_produccion <- data.matrix(dataset_future_final[, campos_buenos_O1, with = FALSE])
+
+# [Anotación · líneas 151–163] Arma los parámetros del modelo final: los mismos valores fijos de la función
+#   objetivo, más num_leaves y min_sum_hessian_in_leaf tomados del resultado de la optimización.
+print("[PASO 6] Lanzando Bagging dinámico de semillas extraídas del vector de la BO...")
+flush.console()
+
+params_produccion_dinamicos <- list(
+  boosting = "gbdt", objective = "binary", metric = "auc", max_bin = 31, min_data_in_leaf = 0,
+  feature_fraction = 0.50, feature_fraction_bynode = 0.20, learning_rate = 0.005,
+  boost_from_average = TRUE, verbosity = -100, nthreads = 1,
+  # ----------------------------------------------------------------------------
+  num_leaves              = as.integer(vector_parametros_campeones["num_leaves"]),
+  min_sum_hessian_in_leaf = as.numeric(vector_parametros_campeones["min_sum_hessian_in_leaf"])
+  # ----------------------------------------------------------------------------
+)
+
+# [Anotación · líneas 164–185] Fija set.seed(314159) y sortea 5 semillas entre 1 y 1.000.000. Para cada una
+#   asigna el parámetro seed, entrena un LightGBM sobre los cuatro meses con la cantidad de rondas que devolvió
+#   la optimización (num_iterations) y suma su predicción para 202108 a un acumulador que empieza en cero.
+set.seed(314159)
+# Replicamos tus tandas de 5 en 5 semillas fijas de ese día
+total_semillas_finales <- sample(1:1000000, 5)
+
+probabilidades_acumuladas <- rep(0, nrow(dataset_future_final))
+
+for (s in 1:length(total_semillas_finales)) {
+  cat(paste0("   -> Entrenando Semilla de Production ", s, " de 5... \n"))
+  flush.console()
+  
+  params_produccion_dinamicos$seed <- total_semillas_finales[s]
+  
+  # Forzamos las rondas dinámicas extraídas del vector de la BO
+  modelo_instancia <- lgb.train(
+    data = dtrain_produccion, 
+    params = params_produccion_dinamicos, 
+    nrounds = as.integer(vector_parametros_campeones["num_iterations"])
+  )
+  
+  probabilidades_acumuladas <- probabilidades_acumuladas + predict(modelo_instancia, matriz_future_produccion)
+}
+
+# [Anotación · líneas 186–199] Divide el acumulado por 5 para obtener la probabilidad promedio de cada cliente
+#   y ordena de mayor a menor. Escribe en ieh_final_1110.csv el numero_de_cliente de las primeras 10.000 filas,
+#   sin encabezado y con tabulador como separador, e imprime un mensaje de fin.
+tb_prediccion_definitiva <- data.table(
+  numero_de_cliente = as.integer(dataset_future_final$numero_de_cliente), 
+  prob = probabilidades_acumuladas / 5
+)
+setorder(tb_prediccion_definitiva, -prob)
+
+print("[PASO 7] Exportando entregable (Corte 10.000)...")
+flush.console()
+
+fwrite(tb_prediccion_definitiva[1:10000, list(numero_de_cliente)], file = "ieh_final_1110.csv", col.names = FALSE, sep = "\t")
+
+print("====================================================================")
+print("=== ¡PROCESO GUARDADO CON ÉXITO! ===")
+print("====================================================================")

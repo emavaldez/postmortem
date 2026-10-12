@@ -1,0 +1,50 @@
+{
+  "experimento": 5001,
+  "nombre": "sim_z601_p95",
+  "descripcion": "Simulacion: semillerio 50 semillas, z601, variables p95. Train 202104 -> 202106.",
+  "modo": "simulacion",
+  "dataset": "ds3001_crudo.parquet",
+  "variables": "4003_canaritos/4003_variables_p95.txt",
+  "hiperparametros": "z601",
+  "meses_train": [
+    202104
+  ],
+  "mes_prediccion": 202106,
+  "clase": "clase_binaria2",
+  "escalar_min_data_in_leaf": true,
+  "n_semillas": 50,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000,
+    15500,
+    16000,
+    16500,
+    17000,
+    17500,
+    18000,
+    18500,
+    19000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "_config": "5001_sim_z601_p95.json",
+  "_fecha_inicio": "2026-10-05 23:57:43",
+  "_script": "07_modelo_final.py",
+  "_git_commit": "sin_git"
+}

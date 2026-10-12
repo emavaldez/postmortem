@@ -1,0 +1,23 @@
+{
+  "experimento": 3001,
+  "nombre": "fe_lags_deltas",
+  "descripcion": "Lags y deltas 1 y 2 sobre todas las variables, con tres tratamientos de montos: crudo, dividido por mediana del mes, rank dentro del mes.",
+  "dataset_entrada": "ds1001_base.parquet",
+  "versiones": [
+    "crudo",
+    "mediana",
+    "rank"
+  ],
+  "lags": [
+    1,
+    2
+  ],
+  "deltas": [
+    1,
+    2
+  ],
+  "regex_montos": "^(m|Master_m|Visa_m)",
+  "_fecha_inicio": "2026-10-05 00:58:30",
+  "_script": "03_feature_engineering.py",
+  "_git_commit": "sin_git"
+}

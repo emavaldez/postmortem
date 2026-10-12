@@ -1,0 +1,41 @@
+{
+  "experimento": 5105,
+  "nombre": "comparar_variantes_receta",
+  "descripcion": "Solo receta del profesor (sin ensamble), CON lag1, lag2, delta1 y delta2 como indico el profesor: 3002 contra 3003 (proceso de muerte, conteo), 3004 (indicador por producto, sin rankear) y 3005 (rank luego lag). Hiperparametros de 4105 (p23 de 4104), semillerio de 30, train 202104 (sus lag2 estan vacios), mitad B de 202106 (x2), bootstrap pareado.",
+  "referencia": "receta_3002",
+  "n_semillas": 30,
+  "candidatos": {
+    "receta_3002": {
+      "dataset": "ds3002_rank_total.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    },
+    "muerte_conteo_3003": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    },
+    "muerte_flags_3004": {
+      "dataset": "ds3004_flags.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    },
+    "rank_luego_lag_3005": {
+      "dataset": "ds3005_rank_luego_lag.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    }
+  }
+}

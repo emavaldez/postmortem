@@ -1,0 +1,191 @@
+#%% celda 1 [texto]
+# Modelo A: corrijo el rankeo de gen_1 (v2 -- fix del bug de truncamiento a entero)
+
+**Qué cambió respecto a la v1:** el primer intento (`gen_1_rankeada`) tenía un bug -- se creaba la columna
+copiando `gen_1_sin_rankear` (que es entero), así que la columna nueva quedaba tipada como entero, y al
+asignarle los valores del rankeo (decimales) R los truncaba silenciosamente (R tiró un warning de
+"precision lost"). El ranking se calculaba bien pero se guardaba mal, perdiendo la parte decimal del
+percentil. Acá se fuerza `as.numeric()` antes de asignar para evitar el truncamiento.
+
+**La optimización de corte vía CV se descarta** -- se probó en la v1 y dio mucho peor (448.99M vs. 463.98M
+de referencia): la proporción óptima encontrada en los folds internos (202103+202104) no generalizó a
+`future` (202106), mismo problema de sobreajuste que ya vimos con las BO. Nos quedamos con corte fijo=12.000.
+
+Se corren dos variantes con las 10 semillas:
+
+- **(1) Original**: gen_1 sin rankear, corte=12.000 -- referencia ya conocida: 463.980.000
+- **(2) gen_1 rankeada (bug corregido)**, corte=12.000
+
+#%% celda 2 [texto]
+### Setup y carga del dataset
+
+#%% celda 3 [código]
+rm(list = ls())
+gc()
+
+require("data.table")
+require("lightgbm")
+
+PARAM_carpeta_datasets <- "C:/Users/Laura/Documents/DMEyF/datasets/"
+PARAM_carpeta_exp      <- "C:/Users/Laura/Documents/DMEyF/exp/"
+
+t0 <- Sys.time()
+dataset <- fread(paste0(PARAM_carpeta_datasets, "competencia_01_con_lags_fe_historico_rankeado.csv.gz"))
+cat("Dataset cargado:", nrow(dataset), "filas x", ncol(dataset), "columnas en",
+    round(as.numeric(Sys.time()-t0, units="secs"),1), "seg\n")
+
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+#%% celda 4 [texto]
+### Reconstruyo las compuestas y gen_1 -- CON el rankeo de gen_1 corregido
+
+#%% celda 5 [código]
+agregar_si_existen <- function(dt, nombre_nueva, columnas, fun_combinacion) {
+  presentes <- columnas[columnas %in% colnames(dt)]
+  if (length(presentes) < 2) return(invisible(NULL))
+  dt[, (nombre_nueva) := fun_combinacion(.SD), .SDcols = presentes]
+}
+suma_filas <- function(sd) Reduce(`+`, sd)
+
+agregar_si_existen(dataset, "consumo_tarjetas_total", c("mtarjeta_visa_consumo", "mtarjeta_master_consumo"), suma_filas)
+agregar_si_existen(dataset, "consumototal_tarjetas", c("Visa_mconsumototal", "Master_mconsumototal"), suma_filas)
+agregar_si_existen(dataset, "saldo_tarjetas_total", c("Visa_msaldototal", "Master_msaldototal"), suma_filas)
+agregar_si_existen(dataset, "limite_tarjetas_total", c("Visa_mlimitecompra", "Master_mlimitecompra"), suma_filas)
+agregar_si_existen(dataset, "pagado_tarjetas_total", c("Visa_mpagado", "Master_mpagado"), suma_filas)
+agregar_si_existen(dataset, "pagominimo_tarjetas_total", c("Visa_mpagominimo", "Master_mpagominimo"), suma_filas)
+agregar_si_existen(dataset, "descuentos_tarjetas_total",
+                    c("mcajeros_propios_descuentos", "mtarjeta_visa_descuentos", "mtarjeta_master_descuentos"), suma_filas)
+
+if (all(c("consumototal_tarjetas", "limite_tarjetas_total") %in% colnames(dataset))) {
+  dataset[, utilizacion_tarjetas := ifelse(limite_tarjetas_total == 0, 0,
+                                            consumototal_tarjetas / limite_tarjetas_total)]
+}
+if (all(c("Visa_status", "Master_status") %in% colnames(dataset))) {
+  dataset[, tarjetas_activas_count := as.integer(Visa_status == 0) + as.integer(Master_status == 0)]
+}
+
+agregar_si_existen(dataset, "ingresos_payroll_total", c("mpayroll", "mpayroll2"), suma_filas)
+agregar_si_existen(dataset, "prestamos_sin_personales_total",
+                    c("mprestamos_prendarios", "mprestamos_hipotecarios"), suma_filas)
+agregar_si_existen(dataset, "inversiones_totales",
+                    c("minversion1_pesos", "minversion1_dolares", "minversion2"), suma_filas)
+agregar_si_existen(dataset, "plazo_fijo_total", c("mplazo_fijo_dolares", "mplazo_fijo_pesos"), suma_filas)
+
+if (all(c("mtransferencias_recibidas", "mtransferencias_emitidas") %in% colnames(dataset))) {
+  dataset[, transferencias_netas := mtransferencias_recibidas - mtransferencias_emitidas]
+}
+agregar_si_existen(dataset, "comisiones_totales_manual", c("mcomisiones_mantenimiento", "mcomisiones_otras"), suma_filas)
+
+# gen_1 SIN rankear (para la variante 1, la original que reproduce 463.98M)
+dataset[, gen_1_sin_rankear := ctrx_quarter + cpayroll_trx_min3]
+
+# gen_1 rankeada -- misma funcion de rankeo cero-fijo que se uso para el resto del dataset
+rankear_cero_fijo <- function(x) {
+  out <- rep(0, length(x))
+  idx_nz <- which(x != 0 & !is.na(x))
+  n <- length(idx_nz)
+  if (n == 1) {
+    out[idx_nz] <- 100
+  } else if (n > 1) {
+    r <- frank(x[idx_nz], ties.method = "average")
+    out[idx_nz] <- 1 + 99 * (r - 1) / (n - 1)
+  }
+  out[is.na(x)] <- NA_real_
+  out
+}
+
+dataset[, gen_1_rankeada := as.numeric(gen_1_sin_rankear)]  # as.numeric() evita el truncamiento a entero
+dataset[, gen_1_rankeada := rankear_cero_fijo(gen_1_rankeada), by = foto_mes]
+
+cat("Compuestas reconstruidas; gen_1 en las dos versiones (sin rankear / rankeada)\n")
+cat("Ejemplo gen_1_sin_rankear:", head(dataset$gen_1_sin_rankear, 3), "\n")
+cat("Ejemplo gen_1_rankeada:   ", head(dataset$gen_1_rankeada, 3), "\n")
+
+#%% celda 6 [texto]
+### Cargo la lista ganadora (358 vars) y armo train (202103+202104) / future (202106)
+
+#%% celda 7 [código]
+campos_base <- fread(paste0(PARAM_carpeta_exp, "campos_canaritos_asesinos_2sd.txt"))$variable
+campos_base <- campos_base[campos_base %in% colnames(dataset)]
+cat("Variables base (sin gen_1):", length(campos_base), "\n")
+
+dataset_train <- dataset[foto_mes %in% c(202103, 202104)]
+dfuture       <- dataset[foto_mes == 202106]
+
+cat("train:", nrow(dataset_train), "filas | future:", nrow(dfuture), "filas\n")
+
+#%% celda 8 [texto]
+### Hiperparámetros (`param_viejo`, min_data_in_leaf=4000)
+
+#%% celda 9 [código]
+param_viejo <- list(
+  boosting = "gbdt", objective = "binary", metric = "auc",
+  first_metric_only = TRUE, boost_from_average = TRUE, feature_pre_filter = FALSE, verbosity = -100,
+  learning_rate = 0.02, feature_fraction = 0.1541961, feature_fraction_bynode = 1,
+  min_data_in_leaf = 4000, num_leaves = 1684, max_depth = -1,
+  lambda_l1 = 1.520327, lambda_l2 = 7.548036, min_gain_to_split = 0.2158453, max_delta_step = 0,
+  bagging_fraction = 0.8425105, bagging_freq = 6, min_sum_hessian_in_leaf = 0.001,
+  pos_bagging_fraction = 1, neg_bagging_fraction = 1, extra_trees = FALSE, path_smooth = 0,
+  cat_l2 = 10, cat_smooth = 10, max_cat_to_onehot = 4, top_rate = 0.2, other_rate = 0.1,
+  use_missing = TRUE, is_unbalance = FALSE, num_iterations = 600, early_stopping_rounds = 0,
+  max_bin = 31, scale_pos_weight = 0.5, force_row_wise = TRUE
+)
+
+SEMILLAS_10 <- c(585581, 249449, 655649, 503039, 798191, 112909, 334667, 421303, 667021, 887923)
+CORTE_FIJO_ORIGINAL <- 12000
+
+#%% celda 10 [texto]
+### Las 10 semillas, dos variantes
+
+#%% celda 11 [código]
+evaluar <- function(campos, semillas, corte) {
+  matriz_train <- data.matrix(dataset_train[, campos, with = FALSE])
+  matriz_future <- data.matrix(dfuture[, campos, with = FALSE])
+
+  ganancias <- c()
+  for (semilla in semillas) {
+    param_semilla <- param_viejo
+    param_semilla$seed <- semilla
+
+    dtrain <- lgb.Dataset(data = matriz_train, label = dataset_train$clase01, free_raw_data = FALSE)
+    modelo <- lgb.train(data = dtrain, param = param_semilla, verbose = -1)
+    prediccion <- predict(modelo, matriz_future)
+
+    tbl <- data.table(prob = prediccion, clase_ternaria = dfuture$clase_ternaria)
+    setorder(tbl, -prob)
+    tbl[, gan_individual := ifelse(clase_ternaria == "BAJA+2", 1072500, -27500)]
+    ganancia <- sum(tbl[1:corte, gan_individual])
+
+    ganancias <- c(ganancias, ganancia)
+    cat("    semilla", semilla, "-> ganancia", ganancia, "\n")
+
+    rm(dtrain, modelo)
+    gc(verbose = FALSE)
+  }
+  ganancias
+}
+
+campos_gen1_sin_rankear <- c(campos_base, "gen_1_sin_rankear")
+campos_gen1_rankeada    <- c(campos_base, "gen_1_rankeada")
+
+cat("=== (1) Original: gen_1 sin rankear, corte=12000 ===\n")
+gan_1 <- evaluar(campos_gen1_sin_rankear, SEMILLAS_10, CORTE_FIJO_ORIGINAL)
+cat("media:", mean(gan_1), " desvio:", sd(gan_1), "\n\n")
+
+cat("=== (2) gen_1 rankeada (bug corregido), corte=12000 ===\n")
+gan_2 <- evaluar(campos_gen1_rankeada, SEMILLAS_10, CORTE_FIJO_ORIGINAL)
+cat("media:", mean(gan_2), " desvio:", sd(gan_2), "\n\n")
+
+#%% celda 12 [texto]
+### Resumen final
+
+#%% celda 13 [código]
+cat("--- (1) Original (referencia): gen_1 sin rankear, corte=12000 ---\n")
+cat("media:", mean(gan_1), " desvio:", sd(gan_1), "\n\n")
+
+cat("--- (2) gen_1 rankeada (bug corregido), corte=12000 ---\n")
+cat("media:", mean(gan_2), " desvio:", sd(gan_2), "\n")
+cat("diferencia vs (1):", mean(gan_2) - mean(gan_1), "\n\n")
+
+cat("Verificacion del fix: gen_1_rankeada ahora deberia tener decimales, no enteros truncados\n")
+cat("Ejemplo:", head(dataset$gen_1_rankeada, 5), "\n")

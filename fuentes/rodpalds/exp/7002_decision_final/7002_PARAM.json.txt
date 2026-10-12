@@ -1,0 +1,9 @@
+{
+  "experimento": 7002,
+  "nombre": "decision_final",
+  "sobrescribir": true,
+  "descripcion": "Aplica R4 (bo4109 contra la prueba 23) y R5 (min_data final) y escribe 5018 y 6014.",
+  "_fecha_inicio": "2026-10-10 15:45:12",
+  "_script": "13_decidir.py",
+  "_git_commit": "sin_git"
+}

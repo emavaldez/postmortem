@@ -1,0 +1,387 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–14] Celda de texto. Indica que el notebook sólo lee y combina predicciones ya
+#   generadas (no entrena ni envía), que se edita únicamente el BLOQUE 1, y define los dos métodos: RANK
+#   (promedio ponderado de posiciones; menor posición va primero) y PROB (promedio ponderado de probabilidades).
+#   Señala que las entradas se alinean por ID y que se exige el universo de 164.647 clientes.
+#%% celda 1 [texto]
+# DMEyF 2026 — Metaensembles finales de agosto
+
+**Sólo lectura y combinación de predicciones.** No descarga el dataset, no entrena, no ejecuta BO/OOF, no modifica E012, E015 ni SAFE, y no envía submissions.
+
+**Uso:** editar únicamente el **BLOQUE 1** (rutas, semillas, combinaciones, método y corte). Ejecutar los bloques 1 a 5 en orden. El BLOQUE 4 hace pruebas muy pequeñas en una carpeta temporal; el BLOQUE 5 exporta los candidatos reales.
+
+- **RANK**: promedio ponderado de posiciones (menor = mejor). 
+- **PROB**: promedio ponderado de `prediction_media` (E012) o `prediction` (E015/SAFE); mayor = mejor. No confundir los dos métodos.
+- Todas las entradas se alinean **por ID**, nunca por orden físico. Se exige el universo idéntico de 164.647 clientes y probabilidades en [0,1].
+- Si los archivos todavía están repartidos entre VM, copiarlos sin modificarlos a la VM de ejecución y completar las rutas en el BLOQUE 1. También sirven directamente las carpetas de checkpoints cuando todos los experimentos estén juntos.
+- La carpeta de salida usa nombres descriptivos y una firma basada en los **archivos de entrada**. Una segunda ejecución idéntica reutiliza sólo salidas completas y verificadas; jamás sobrescribe una salida diferente.
+
+**Nota:** La cantidad de semillas se declara en la configuración y aparece en el resumen, pero este notebook no reentrena ni determina el número a partir de probabilidades: conviene verificarlo contra el checkpoint original.
+
+# [Anotación · líneas 16–36] Carga data.table y define las rutas absolutas de entrada
+#   (/home/ds/Expe/experimentos) y de salida (/home/ds/Expe/metaensemblesCorr/). Busca con Sys.glob el archivo
+#   ensemble_agosto_ambos_criterios.csv del ensemble E012 de 12 semillas (carpeta n12_*) y el archivo
+#   *_n10_probabilidades_agosto.csv del ensemble P2 de 10 semillas, y exige que haya exactamente uno de cada
+#   uno.
+#%% celda 2 [código]
+# BLOQUE 1 — CONFIGURACIÓN: EDITAR SÓLO ESTA CELDA #####
+suppressPackageStartupMessages(library(data.table))
+
+raiz <- "/home/ds/Expe/experimentos"
+#salida <- "/home/ds/Expe/metaensembles/DMEYF2026_V1"
+salida <- "/home/ds/Expe/metaensemblesCorr/"
+
+archivo_E012 <- Sys.glob(file.path(
+  raiz,
+  "C01_E012_RAW_T4_BO_FINAL_V1/checkpoints/ensembles/n12_*/ensemble_agosto_ambos_criterios.csv"
+))
+
+archivo_P2 <- Sys.glob(file.path(
+  raiz,
+  "SAFE_P2_P3_FINAL_HNC5_V1/checkpoints/ensembles/P2/n10_*/*_n10_probabilidades_agosto.csv"
+))
+
+stopifnot(length(archivo_E012) == 1L)
+stopifnot(length(archivo_P2) == 1L)
+
+
+# [Anotación · líneas 38–51] Asigna las rutas a los modelos E012 y P2 (E015 y P3 quedan en NA), declara la
+#   cantidad de semillas de cada uno (E012=12, P2=10) y la columna de probabilidad a leer: prediction_media para
+#   E012 y prediction para los demás. No se configura columna de rank, por lo que la posición se calcula a
+#   partir de la probabilidad.
+# Cambiar una ruta al pasar de 5 a 10/12/20 semillas. NA = aún no disponible.
+rutas <- c(
+  E012 = archivo_E012,
+  E015 = NA_character_,
+  P2   = archivo_P2,
+  P3   = NA_character_
+)
+    
+semillas <- c(E012=12L, E015=NA_integer_,P2=10L, P3=NA_integer_)
+
+# Columnas confirmadas en las implementaciones originales.
+# Si una nueva versión exporta otra columna, corregir aquí tras inspeccionar el CSV.
+columnas_prob <- c(E012="prediction_media", E015="prediction", P2="prediction", P3="prediction")
+columnas_rank <- c(E012=NA_character_, E015=NA_character_, P2=NA_character_, P3=NA_character_) #"rank_medio"
+
+# [Anotación · líneas 53–67] Elige el método RANK y una única combinación activa, P2_E012, con pesos 0,50 y
+#   0,50 (las otras cuatro están comentadas). Define los cortes de 10.500 a 15.000 de a 500, el corte final de
+#   12.500 y el tamaño esperado de 164.647 clientes.
+metodo <- "RANK"                     # "RANK" o "PROB"
+combinaciones <- list(
+  #E012_E015 = c(E012=0.50, E015=0.50),
+  P2_E012 = c(P2=0.50, E012=0.50)
+  # P2_E015 = c(P2=0.50, E015=0.50),
+  # P2_E012_E015 = c(P2=1/3, E012=1/3, E015=1/3),
+  # P3_E012 = c(P3=0.50, E012=0.50)
+)
+
+cortes <- seq(10500L, 15000L, by=500L)
+corte_final <- 12500L              # También genera una copia marcada "FINAL"
+n_clientes <- 164647L
+
+message("Configuración: ", metodo, " | ", length(combinaciones),
+        " combinación(es) | corte final ", corte_final)
+
+# [Anotación · líneas 69–97] validar_config() comprueba método, nombres de combinaciones, cortes y corte
+#   final. normalizar_pesos() exige pesos positivos con nombres de modelos conocidos y los divide por su suma.
+#%% celda 3 [código]
+# BLOQUE 2 — LEER Y VALIDAR CADA ENTRADA #####
+validar_config <- function() {
+  if (!metodo %in% c("RANK","PROB")) stop("metodo debe ser RANK o PROB")
+  if (!length(combinaciones) || is.null(names(combinaciones)) ||
+      anyNA(names(combinaciones)) || any(!nzchar(names(combinaciones))) ||
+      anyDuplicated(names(combinaciones))) stop("Nombrar cada combinación sin duplicados")
+  if (any(!grepl("^[A-Za-z0-9_]+$",names(combinaciones))))
+    stop("Nombres de combinaciones: sólo letras, números y guión bajo")
+  if (anyNA(cortes) || any(cortes != as.integer(cortes)) ||
+      any(cortes < 1L | cortes > n_clientes) || anyDuplicated(cortes))
+    stop("Cortes inválidos")
+  if (length(corte_final)!=1L || is.na(corte_final) ||
+      corte_final != as.integer(corte_final) || corte_final < 1L ||
+      corte_final > n_clientes) stop("corte_final inválido")
+  if (length(n_clientes)!=1L || is.na(n_clientes) || n_clientes<1L)
+    stop("n_clientes inválido")
+  invisible(TRUE)
+}
+
+normalizar_pesos <- function(p) {
+  if (!is.numeric(p) || is.null(names(p)) || !length(p) ||
+      anyNA(names(p)) || any(!nzchar(names(p))) || anyDuplicated(names(p)))
+    stop("Los pesos deben ser un vector numérico con nombres de modelos únicos")
+  if (any(!names(p) %in% names(rutas))) stop("Modelo desconocido: ",
+                                               paste(setdiff(names(p),names(rutas)),collapse=", "))
+  if (any(!is.finite(p)) || any(p<=0) || sum(p)<=0) stop("Pesos no positivos o inválidos")
+  p/sum(p)
+}
+
+# [Anotación · líneas 99–126] leer_modelo(): comprueba que el CSV exista y tenga las columnas configuradas,
+#   lee numero_de_cliente como texto y la probabilidad, exige la cantidad de filas esperada, IDs sin NA ni
+#   duplicados y probabilidades entre 0 y 1. Si no hay columna de rank calcula la posición como
+#   frank(-probabilidad) con empates promedio.
+leer_modelo <- function(modelo, archivo, esperado=n_clientes) {
+  if (length(archivo)!=1L || is.na(archivo) || !nzchar(archivo) || !file.exists(archivo))
+    stop("Falta el CSV de ",modelo,". Completar rutas en el BLOQUE 1: ",archivo)
+  pcol <- unname(columnas_prob[modelo]); rcol <- unname(columnas_rank[modelo])
+  if (is.na(pcol) || !nzchar(pcol)) stop("Falta columna de probabilidad configurada para ",modelo)
+  columnas <- c("numero_de_cliente",pcol,if (!is.na(rcol)) rcol)
+  cabecera <- names(fread(archivo,nrows=0L,showProgress=FALSE))
+  faltantes <- setdiff(columnas,cabecera)
+  if (length(faltantes)) stop("En ",modelo," faltan columnas: ",paste(faltantes,collapse=", "),
+                             "; existen: ",paste(cabecera,collapse=", "))
+  d <- fread(archivo,select=columnas,
+             colClasses=c(numero_de_cliente="character"),showProgress=FALSE)
+  if (nrow(d)!=esperado) stop(modelo,": ",nrow(d)," filas; esperadas ",esperado)
+  ids <- d[["numero_de_cliente"]]
+  if (anyNA(ids) || any(!nzchar(ids)) || anyDuplicated(ids))
+    stop(modelo,": IDs NA, vacíos o duplicados")
+  p <- d[[pcol]]
+  if (!is.numeric(p) || anyNA(p) || any(!is.finite(p)) || any(p<0 | p>1))
+    stop(modelo,": probabilidades no numéricas, NA o fuera de [0,1]")
+  if (!is.na(rcol)) {
+    r <- d[[rcol]]
+    if (!is.numeric(r) || anyNA(r) || any(!is.finite(r)) || any(r<1 | r>esperado))
+      stop(modelo,": rank_medio no numérico o fuera de [1,N]")
+  } else {
+    r <- frank(-p,ties.method="average")
+  }
+  data.table(numero_de_cliente=ids,probabilidad=as.numeric(p),ranking=as.numeric(r))
+}
+
+# [Anotación · líneas 128–142] alinear_modelos(): toma los IDs del primer modelo como base, exige que cada
+#   modelo tenga exactamente el mismo conjunto de clientes y reordena cada tabla por coincidencia de ID.
+alinear_modelos <- function(entradas,modelos) {
+  base <- entradas[[modelos[1L]]]$numero_de_cliente
+  for (m in modelos) {
+    d <- entradas[[m]]
+    if (length(d$numero_de_cliente)!=length(base) ||
+        !setequal(base,d$numero_de_cliente))
+      stop("Los clientes de ",m," no coinciden exactamente con el universo")
+    ix <- match(base,d$numero_de_cliente)
+    if (anyNA(ix)) stop("Fallo de alineación de ",m)
+    entradas[[m]] <- d[ix]
+    if (!identical(entradas[[m]]$numero_de_cliente,base))
+      stop("Fallo de alineación de ",m)
+  }
+  entradas[modelos]
+}
+
+# [Anotación · líneas 144–163] combinar(): suma, para cada cliente, peso × posición (RANK) o peso ×
+#   probabilidad (PROB) de cada modelo en score_meta. Ordena por score_meta ascendente en RANK o descendente en
+#   PROB, con numero_de_cliente como desempate, y numera la posición final; conserva las columnas prob_ y rank_
+#   de cada modelo.
+combinar <- function(entradas,pesos,criterio) {
+  if (!criterio %in% c("RANK","PROB")) stop("Método inválido")
+  ms <- names(pesos)
+  d <- data.table(numero_de_cliente=entradas[[ms[1L]]]$numero_de_cliente)
+  puntuacion <- numeric(nrow(d))
+  for (m in ms) {
+    e <- entradas[[m]]
+    set(d,j=paste0("prob_",m),value=e$probabilidad)
+    set(d,j=paste0("rank_",m),value=e$ranking)
+    valores <- if (criterio=="RANK") e$ranking else e$probabilidad
+    puntuacion <- puntuacion + unname(pesos[m])*valores
+  }
+  d[, score_meta := puntuacion]
+  if (criterio=="RANK") setorderv(d,c("score_meta","numero_de_cliente"),c(1L,1L))
+  else setorderv(d,c("score_meta","numero_de_cliente"),c(-1L,1L))
+  d[, posicion := seq_len(.N)]
+  setcolorder(d,c("numero_de_cliente","posicion","score_meta",
+                  setdiff(names(d),c("numero_de_cliente","posicion","score_meta"))))
+  d
+}
+
+# [Anotación · líneas 165–186] firma_texto() devuelve el MD5 de unas líneas de texto, etiqueta_pesos() arma el
+#   texto de pesos del nombre de carpeta (por ejemplo P2_50p00pct) y validar_top() relee un archivo de envío y
+#   comprueba que tenga n líneas únicas, sin comas, iguales a los primeros n IDs del orden.
+#%% celda 4 [código]
+# BLOQUE 3 — EXPORTACIÓN SEGURA: TOP N, FINAL Y RESUMEN #####
+firma_texto <- function(lineas) {
+  f <- tempfile("firma_meta_")
+  on.exit(unlink(f),add=TRUE)
+  writeLines(lineas,f,useBytes=TRUE)
+  unname(tools::md5sum(f))
+}
+
+etiqueta_pesos <- function(p) {
+  partes <- paste0(names(p),"_",gsub("\\.","p",sprintf("%05.2f",100*unname(p))),"pct")
+  paste(partes,collapse="__")
+}
+
+validar_top <- function(archivo,orden,n) {
+  lineas <- readLines(archivo,warn=FALSE)
+  if (length(lineas)!=n || anyNA(lineas) || any(!nzchar(lineas)) ||
+      anyDuplicated(lineas) || any(grepl(",",lineas,fixed=TRUE)) ||
+      !identical(lineas,head(orden$numero_de_cliente,n)))
+    stop("Submission inválida: ",archivo)
+  invisible(TRUE)
+}
+
+# [Anotación · líneas 188–215] exportar_meta(), inicio: alinea y combina las entradas, calcula una firma con
+#   el nombre, el método, los pesos, el MD5 de cada CSV de entrada, las semillas declaradas y los cortes, y arma
+#   la etiqueta de la carpeta con los primeros 12 caracteres. Si la carpeta ya existe la reutiliza sólo cuando
+#   su manifiesto y los MD5 de sus archivos coinciden; si no, se detiene sin sobrescribir.
+exportar_meta <- function(nombre,pesos,criterio,entradas,archivos,conteos,
+                          carpeta_raiz=salida,lista_cortes=cortes,final=corte_final) {
+  modelos <- names(pesos)
+  entradas <- alinear_modelos(entradas,modelos)
+  datos <- combinar(entradas,pesos,criterio)
+  md5_entradas <- unname(tools::md5sum(archivos[modelos]))
+  if (anyNA(md5_entradas)) stop("No se pudieron firmar los CSV de entrada")
+  lineas_firma <- c("META2026_V1",nombre,criterio,
+                    paste(modelos,sprintf("%.16g",unname(pesos)),sep="="),
+                    paste(modelos,md5_entradas,sep="="),
+                    paste(modelos,conteos[modelos],sep="="),
+                    paste(lista_cortes,collapse=","),as.character(final))
+  firma <- firma_texto(lineas_firma)
+  etiqueta <- paste0(nombre,"__",criterio,"__",etiqueta_pesos(pesos),
+                    "__",substr(firma,1L,12L))
+  destino <- file.path(carpeta_raiz,etiqueta)
+  if (dir.exists(destino)) {
+    meta_path <- file.path(destino,"manifiesto.rds")
+    if (!file.exists(meta_path)) stop("Salida preexistente incompleta: ",destino)
+    meta <- readRDS(meta_path)
+    archivos_salida <- file.path(destino,meta$archivos)
+    if (!identical(meta$firma,firma) || !all(file.exists(archivos_salida)) ||
+        !identical(unname(tools::md5sum(archivos_salida)),unname(meta$md5)))
+      stop("Salida existente modificada/incompleta: ",destino,
+           ". No se sobrescribe automáticamente.")
+    message("Resultado existente, verificado y reutilizado: ",destino)
+    return(meta$resumen)
+  }
+# [Anotación · líneas 216–235] Crea una carpeta temporal y escribe
+#   PREDICCIONES_RANKING_COMPLETO__<etiqueta>.csv con todos los clientes, un archivo
+#   SUBMISSION__<etiqueta>__TOPn.csv por cada corte (una columna de IDs sin encabezado) y
+#   SUBMISSION_FINAL__<etiqueta>__TOP12500.csv con los primeros corte_final clientes; valida cada archivo al
+#   escribirlo.
+  dir.create(carpeta_raiz,recursive=TRUE,showWarnings=FALSE)
+  temporal <- tempfile(pattern=paste0(etiqueta,"_TMP_"),tmpdir=carpeta_raiz)
+  if (!dir.create(temporal)) stop("No se pudo crear directorio temporal")
+  on.exit(if (dir.exists(temporal)) unlink(temporal,recursive=TRUE),add=TRUE)
+
+  completo <- paste0("PREDICCIONES_RANKING_COMPLETO__",etiqueta,".csv")
+  fwrite(datos,file.path(temporal,completo))
+  submissions <- character()
+  for (n in lista_cortes) {
+    nm <- paste0("SUBMISSION__",etiqueta,"__TOP",n,".csv")
+    fwrite(datos[seq_len(n),.(numero_de_cliente)],file.path(temporal,nm),
+           col.names=FALSE,quote=FALSE)
+    validar_top(file.path(temporal,nm),datos,n)
+    submissions <- c(submissions,nm)
+  }
+
+  final_nombre <- paste0("SUBMISSION_FINAL__",etiqueta,"__TOP",final,".csv")
+  fwrite(datos[seq_len(final),.(numero_de_cliente)],file.path(temporal,final_nombre),
+         col.names=FALSE,quote=FALSE)
+  validar_top(file.path(temporal,final_nombre),datos,final)
+
+# [Anotación · líneas 237–259] Arma la tabla resumen (combinación, método, modelo, peso, semillas declaradas,
+#   archivo de origen y su MD5, corte final, rutas) y la guarda como RESUMEN__<etiqueta>.csv; escribe
+#   manifiesto.rds con los MD5 de las salidas y renombra la carpeta temporal a su nombre definitivo.
+  resumen <- data.table(combinacion=nombre,metodo=criterio,
+                        modelo=modelos,peso=unname(pesos),
+                        semillas=as.integer(conteos[modelos]),
+                        origen=unname(archivos[modelos]),
+                        md5_origen=md5_entradas,corte_final=final,
+                        carpeta=destino,
+                        predicciones_completas=file.path(destino,completo),
+                        submission_final=file.path(destino,final_nombre),
+                        cortes_generados=paste(lista_cortes,collapse=","),
+                        firma=firma)
+  resumen_nombre <- paste0("RESUMEN__",etiqueta,".csv")
+  fwrite(resumen,file.path(temporal,resumen_nombre))
+
+  lista_archivos <- c(completo,submissions,final_nombre,resumen_nombre)
+  meta <- list(firma=firma,archivos=lista_archivos,
+               md5=unname(tools::md5sum(file.path(temporal,lista_archivos))),
+               resumen=resumen)
+  saveRDS(meta,file.path(temporal,"manifiesto.rds"))
+  if (!file.rename(temporal,destino)) stop("No se pudo confirmar la carpeta final")
+  message("CANDIDATO: ",nombre," | ",criterio," | ",paste(modelos,collapse="+"))
+  message("SUBMISSION FINAL: ",file.path(destino,final_nombre))
+  resumen
+}
+
+# [Anotación · líneas 261–296] Pruebas en una carpeta temporal con seis clientes ficticios: lectura de dos
+#   CSV, alineación por ID con el segundo en orden inverso, combinación por PROB y por RANK, rechazo de un ID
+#   cambiado y exportación con cortes 2 y 4 y final 3.
+#%% celda 5 [código]
+# BLOQUE 4 — PRUEBAS R PEQUEÑAS (no utilizan datos reales) #####
+local({
+  tmp <- tempfile("meta_test_"); dir.create(tmp)
+  on.exit(unlink(tmp,recursive=TRUE),add=TRUE)
+  ids <- c("102","103","104","105","106","107")
+  f1 <- file.path(tmp,"e012.csv"); f2 <- file.path(tmp,"e015.csv")
+  fwrite(data.table(numero_de_cliente=ids,
+                    prediction_media=c(.90,.80,.70,.60,.20,.10),
+                    rank_medio=c(1,2,3,4,5,6)),f1)
+  fwrite(data.table(numero_de_cliente=rev(ids),
+                    prediction=c(.10,.20,.60,.70,.80,.90)),f2)
+  a <- leer_modelo("E012",f1,6L)
+  b <- leer_modelo("E015",f2,6L)
+  ent <- alinear_modelos(list(E012=a,E015=b),c("E012","E015"))
+  stopifnot(identical(ent$E012$numero_de_cliente,ent$E015$numero_de_cliente),
+            identical(ent$E015$probabilidad, c(.90,.80,.70,.60,.20,.10)))
+  pesos_test <- c(E012=0.5,E015=0.5)
+  p <- combinar(ent,pesos_test,"PROB")
+  r <- combinar(ent,pesos_test,"RANK")
+  stopifnot(nrow(p)==6L,nrow(r)==6L,p$numero_de_cliente[1L]=="102",
+            r$numero_de_cliente[1L]=="102",p$posicion[6L]==6L)
+  # Error deliberado: un ID cambiado no debe superar el control.
+  malo <- copy(b); malo$numero_de_cliente[1L] <- "999"
+  stopifnot(inherits(try(alinear_modelos(list(E012=a,E015=malo),
+                                        c("E012","E015")),silent=TRUE),"try-error"))
+  res <- exportar_meta("PRUEBA",pesos_test,"RANK",ent,
+                       c(E012=f1,E015=f2),c(E012=12L,E015=5L),
+                       carpeta_raiz=file.path(tmp,"exportados"),
+                       lista_cortes=c(2L,4L),final=3L)
+  stopifnot(file.exists(res$submission_final[1L]),
+            length(readLines(res$submission_final[1L]))==3L,
+            file.exists(res$predicciones_completas[1L]))
+  message("PRUEBAS PEQUEÑAS OK: lectura, columnas, alineación por ID, RANK, PROB, ",
+          "IDs inconsistentes, cortes sin cabecera y archivo FINAL.")
+})
+
+# [Anotación · líneas 298–317] Valida la configuración, normaliza los pesos de cada combinación, comprueba que
+#   cada modelo usado tenga semillas declaradas y ruta existente, y lee y valida las entradas contra el universo
+#   de 164.647 clientes.
+#%% celda 6 [código]
+# BLOQUE 5 — GENERAR METAENSEMBLES Y SUBMISSIONS REALES #####
+validar_config()
+
+pesos_por_combo <- lapply(combinaciones,normalizar_pesos)
+modelos_usados <- unique(unlist(lapply(pesos_por_combo,names),use.names=FALSE))
+if (!length(modelos_usados)) stop("No hay modelos elegidos")
+for (m in modelos_usados) {
+  if (is.na(semillas[m]) || semillas[m]<1L)
+    stop("Declarar cantidad de semillas de ",m," en el BLOQUE 1")
+  if (is.na(rutas[m]) || !file.exists(rutas[m]))
+    stop("Completar ruta del CSV de ",m," en el BLOQUE 1: ",rutas[m])
+}
+
+entradas <- setNames(vector("list",length(modelos_usados)),modelos_usados)
+for (m in modelos_usados) {
+  entradas[[m]] <- leer_modelo(m,rutas[m],n_clientes)
+  message("ENTRADA OK ",m,": ",nrow(entradas[[m]]),
+          " clientes; ",semillas[m]," semillas declaradas")
+}
+
+# [Anotación · líneas 319–331] Exporta cada combinación con exportar_meta(), imprime el resumen y la ruta de
+#   los archivos SUBMISSION_FINAL y avisa que no se envía nada. La salida guardada de esta celda lista dos
+#   combinaciones (E012_E015 y P2_E012) con P2 declarada con 5 semillas y E012 con 12, y la carpeta P2_E012
+#   lleva la firma dc97cf4f7614 que nombra el README.
+resultados <- list()
+for (nombre in names(pesos_por_combo)) {
+  pp <- pesos_por_combo[[nombre]]
+  resultados[[nombre]] <- exportar_meta(nombre,pp,metodo,
+                                        entradas[names(pp)],rutas,semillas)
+}
+resumen_final <- rbindlist(resultados,use.names=TRUE,fill=TRUE)
+print(resumen_final[,.(combinacion,metodo,modelo,peso,semillas,corte_final)])
+message("SUBMISSIONS FINALES PARA DESCARGAR DESDE JUPYTER:")
+
+for (f in unique(resumen_final$submission_final)) message("  ",f)
+message("El archivo final se llama SUBMISSION_FINAL")
+message("No se envió ningún archivo a la competencia.")

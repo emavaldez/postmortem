@@ -1,0 +1,106 @@
+{
+  "version": "b1_drift_v1",
+  "experiment": "B1_variables_rotas",
+  "objective": "maximizar_ganancia_robusta_sin_refit",
+  "frozen_models": {
+    "run": "c1q0ccajas06",
+    "source": "modelos/modelo_<seed>.txt",
+    "require_reproduction_tol": 1e-12
+  },
+  "train": [
+    202103,
+    202104
+  ],
+  "eval": 202106,
+  "target": "BAJA+2_vs_resto",
+  "schema": "C3_2062",
+  "rounds_origin": 300,
+  "seeds": [
+    17,
+    101,
+    202,
+    303,
+    404,
+    505,
+    606,
+    707,
+    808,
+    909,
+    1001,
+    1102,
+    1203,
+    1304,
+    1405,
+    1506,
+    1607,
+    1708,
+    1809,
+    1910
+  ],
+  "n_grid": {
+    "min": 8000,
+    "max": 15000,
+    "step": 500
+  },
+  "economics": {
+    "gain_hit": 1072500,
+    "cost_nonhit": 27500
+  },
+  "arms": {
+    "C3_ORIG": [],
+    "Q0_CCAJAS": [
+      [
+        "ccajas_depositos",
+        202105
+      ]
+    ],
+    "B1_VISA": [
+      [
+        "Visa_fultimo_cierre",
+        202106
+      ]
+    ],
+    "B1_MASTER": [
+      [
+        "Master_fultimo_cierre",
+        202106
+      ]
+    ],
+    "B1_FECHAS": [
+      [
+        "Visa_fultimo_cierre",
+        202106
+      ],
+      [
+        "Master_fultimo_cierre",
+        202106
+      ]
+    ],
+    "B1_ALL3": [
+      [
+        "ccajas_depositos",
+        202105
+      ],
+      [
+        "Visa_fultimo_cierre",
+        202106
+      ],
+      [
+        "Master_fultimo_cierre",
+        202106
+      ]
+    ]
+  },
+  "selection": {
+    "robust_window_points": 3,
+    "primary": "ensemble_robust_gain",
+    "paired_delta_mean_gt": 0,
+    "paired_delta_median_gt": 0,
+    "positive_seed_fraction_gte": 0.6,
+    "require_robust_gain_gt_control": true
+  },
+  "no_august": true,
+  "no_submit": true,
+  "no_tuning": true,
+  "no_refit": true
+}

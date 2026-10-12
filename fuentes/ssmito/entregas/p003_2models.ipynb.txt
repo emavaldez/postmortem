@@ -1,0 +1,298 @@
+#%% celda 1 [texto]
+# p003 — Predicciones de 2 modelos
+
+Cada modelo usa su dataset y RDS. Los meses, semillas y columnas excluidas son compartidos. Se promedian todas las probabilidades por cliente antes de ordenar y generar el corte.
+
+#%% celda 2 [código]
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import rdata
+from IPython.display import display
+import os
+
+#%% celda 3 [texto]
+## Directorios
+
+#%% celda 4 [código]
+carpeta_entregas = Path.cwd()
+data_folder = carpeta_entregas / "dataset"
+carpeta_parametros = carpeta_entregas / "parametros"
+carpeta_salida = carpeta_entregas / "entregas"
+archivo_logging = carpeta_entregas / "logging_python.csv"
+
+#%% celda 5 [código]
+os.listdir(data_folder)
+
+#%% celda 6 [texto]
+## Parámetros
+
+Completar los dos datasets y RDS en el mismo orden: modelo 1, modelo 2.
+
+#%% celda 7 [código]
+dataset_files = [
+    "c_01_tern_2_lf_k6_p4.csv",  # dataset del modelo 1, con .csv
+    "c_01_tern_2_lf_O2_k3_p6.csv",  # dataset del modelo 2, con .csv
+]
+ids_rds = [
+    40,  # id del RDS del modelo 1
+    40,  # id del RDS del modelo 2
+]
+
+train_final = [202103, 202104, 202105, 202106]
+future = [202108]
+# SEEDS = [
+#     230047, 230059, 230063, 230077, 230081,
+#     230089, 230101, 230107, 230117, 230123,
+# ]
+SEEDS = [
+    230047, 230059, 230063, 230077, 230081,
+    230089, 230101, 230107, 230117, 230123,
+    230137, 230143, 230149, 230189, 230203,
+    230213, 230221, 230227, 230233, 230239,
+]
+
+#%% celda 8 [código]
+columnas_excluir = [
+    "ternaria",
+    "ternaria_lag1",
+    "clase01",
+    "fold",
+    "azar",
+    "training",
+    "cprestamos_personales",
+    "mprestamos_personales",
+    "cprestamos_personales_lag1",
+    "mprestamos_personales_lag1",
+    "cprestamos_personales_delta1",
+    "mprestamos_personales_delta1",
+    "cprestamos_personales_lag_pond",
+    "mprestamos_personales_lag_pond",
+    "cprestamos_personales_delta_lag_pond",
+    "mprestamos_personales_delta_lag_pond"
+]
+
+#%% celda 9 [texto]
+## Lectura de parámetros y preparación de datos
+
+#%% celda 10 [código]
+def convertir_r(valor):
+    if isinstance(valor, dict):
+        return {k: convertir_r(v) for k, v in valor.items()}
+    if isinstance(valor, np.ndarray):
+        if valor.size == 1:
+            return convertir_r(valor.item())
+        return [convertir_r(v) for v in valor.tolist()]
+    if isinstance(valor, (list, tuple)):
+        return [convertir_r(v) for v in valor]
+    if isinstance(valor, np.generic):
+        return convertir_r(valor.item())
+    # R serializa muchos parámetros enteros como double (31.0).
+    # LightGBM Python exige int para esos valores; se conserva su valor.
+    if isinstance(valor, float) and np.isfinite(valor) and valor.is_integer():
+        return int(valor)
+    return valor
+
+def data_matrix(df):
+    matriz = df.copy()
+    for nombre in matriz.columns:
+        serie = matriz[nombre]
+        if isinstance(serie.dtype, pd.CategoricalDtype):
+            codigos = serie.cat.codes
+            matriz[nombre] = (codigos + 1).where(codigos >= 0, np.nan)
+        elif pd.api.types.is_object_dtype(serie.dtype) or pd.api.types.is_string_dtype(serie.dtype):
+            niveles = sorted(serie.dropna().unique())
+            codigos = pd.Categorical(serie, categories=niveles).codes
+            matriz[nombre] = np.where(codigos >= 0, codigos + 1, np.nan)
+    return matriz.to_numpy(dtype=np.float64)
+
+#%% celda 11 [texto]
+## Entrenamiento y predicciones
+
+Los modelos se procesan uno después del otro. Las predicciones de cada semilla quedan en memoria.
+
+#%% celda 12 [código]
+if (len(dataset_files) != 2 or len(ids_rds) != 2
+        or any(not archivo for archivo in dataset_files)
+        or any(id_rds is None for id_rds in ids_rds)):
+    raise ValueError("Completar los dos datasets y sus dos ids_rds, en el mismo orden.")
+
+if len(future) != 1 or not SEEDS or len(SEEDS) != len(set(SEEDS)):
+    raise ValueError("Se requiere un mes a predecir y una lista de semillas sin repetidos.")
+
+predicciones_por_modelo = []
+cantidad_registros_totales = []
+cantidad_registros_entrenamiento = []
+
+for numero_modelo, (dataset_file, id_rds) in enumerate(zip(dataset_files, ids_rds), 1):
+    dataset = pd.read_csv(data_folder / dataset_file, low_memory=False)
+    dataset["ternaria"] = dataset["ternaria"].fillna("")
+    dataset = dataset.sort_values(
+        ["foto_mes", "ternaria", "numero_de_cliente"],
+        kind="stable", na_position="first",
+    ).reset_index(drop=True)
+
+    parametros = convertir_r(rdata.read_rds(carpeta_parametros / f"{id_rds}.rds"))
+    params_base = (
+        parametros
+        if "num_iterations" in parametros
+        else next(iter(parametros.values()))
+    )
+
+    dataset["clase01"] = dataset["ternaria"].isin(["BAJA+1", "BAJA+2"]).astype(np.int32)
+    campos_buenos = [c for c in dataset.columns if c not in columnas_excluir]
+    dataset_train = dataset.loc[dataset["foto_mes"].isin(train_final)].copy()
+    dfuture = dataset.loc[dataset["foto_mes"].isin(future)].copy()
+
+    if dataset_train.empty or dfuture.empty:
+        raise ValueError(f"Modelo {numero_modelo}: no hay filas para los meses elegidos.")
+
+    tb_predicciones = dfuture[["numero_de_cliente"]].set_index("numero_de_cliente")
+    if not tb_predicciones.index.is_unique or tb_predicciones.index.hasnans:
+        raise ValueError(f"Modelo {numero_modelo}: revisar los identificadores de clientes en future.")
+
+    if predicciones_por_modelo and not tb_predicciones.index.sort_values().equals(
+        predicciones_por_modelo[0].index.sort_values()
+    ):
+        raise ValueError("Los dos datasets tienen distintos clientes para el mes a predecir.")
+
+    cantidad_registros_totales.append(len(dataset))
+    cantidad_registros_entrenamiento.append(len(dataset_train))
+
+    display(dataset_train.groupby(["foto_mes", "ternaria"], dropna=False).size().reset_index(name="N"))
+
+    X_train = data_matrix(dataset_train[campos_buenos])
+    X_future = data_matrix(dfuture[campos_buenos])
+
+    for seed in SEEDS:
+        params_semilla = params_base.copy()
+        params_semilla["seed"] = seed
+        num_boost_round = int(params_semilla.pop("num_iterations"))
+
+        dtrain_final = lgb.Dataset(
+            data=X_train,
+            label=dataset_train["clase01"].to_numpy(),
+            feature_name=campos_buenos,
+            categorical_feature=[],
+        )
+        modelo_final = lgb.train(
+            params=params_semilla,
+            train_set=dtrain_final,
+            num_boost_round=num_boost_round,
+        )
+
+        tb_predicciones[f"prob_{seed}"] = modelo_final.predict(X_future)
+        print(f"Modelo={numero_modelo} Semilla={seed}: predicciones listas")
+        del dtrain_final, modelo_final
+
+    predicciones_por_modelo.append(tb_predicciones)
+    del dataset, dataset_train, dfuture, X_train, X_future
+
+#%% celda 13 [texto]
+## Combinación por cliente
+
+#%% celda 14 [código]
+tb_prediccion = (
+    pd.concat(predicciones_por_modelo, axis=1)
+    .mean(axis=1)
+    .rename("prob")
+    .reset_index()
+    .sort_values("prob", ascending=False, kind="stable")
+    .reset_index(drop=True)
+)
+
+#%% celda 15 [texto]
+## Generación del corte
+
+Cambiar `envios` y ejecutar esta celda para generar otro corte sin entrenar de nuevo. Registrar cada generación en la celda de documentación antes de generar la siguiente, para que avance `id_prueba`.
+
+#%% celda 16 [código]
+envios = 12500  
+
+if envios != int(envios) or not 1 <= envios <= len(tb_prediccion):
+    raise ValueError("Revisar envios: debe ser un entero entre 1 y la cantidad de clientes.")
+envios = int(envios)
+
+if archivo_logging.exists():
+    historico = pd.read_csv(archivo_logging)
+    id_prueba = int(historico["id_prueba"].max()) + 1
+else:
+    id_prueba = 1
+
+carpeta_salida.mkdir(parents=True, exist_ok=True)
+archivo = f"p003_2models_{id_prueba}.csv"
+tb_prediccion.head(envios)[["numero_de_cliente"]].to_csv(
+    carpeta_salida / archivo,
+    header=False,
+    index=False,
+)
+archivos_salida = [archivo]
+print(f"Archivo={archivo} Envios={envios}")
+
+#%% celda 17 [código]
+pepe
+
+#%% celda 18 [texto]
+## Documentación
+
+Datasets, RDS y cantidades de registros por modelo se guardan separados por comas, en el mismo orden que los parámetros. La cantidad de registros de predicción corresponde a los clientes de la combinación final. Los datasets se registran sin `.csv`.
+
+#%% celda 19 [código]
+nota = "primer ensamble, rds40, 2 datasets, subimos envios a 12.5"
+resultado_competencia_mean = "107.4425"  # score de Kaggle o referencia a un problema con la entrega
+resultado_competencia_std = "NA"
+ref_submit = "e47_p"
+
+#%% celda 20 [código]
+registro_prueba = pd.DataFrame([{
+    "id_prueba": id_prueba,
+    "ref_submit": ref_submit,
+    "notebook": "p003_2models.ipynb",
+    "dataset": ",".join(Path(archivo).stem for archivo in dataset_files),
+    "seeds": ",".join(map(str, SEEDS)),
+    "cantidad_registros_totales": ",".join(map(str, cantidad_registros_totales)),
+    "cantidad_registros_entrenamiento": ",".join(map(str, cantidad_registros_entrenamiento)),
+    "cantidad_registros_prediccion": len(tb_prediccion),
+    "meses_entrenamiento": ",".join(map(str, train_final)),
+    "meses_prediccion": ",".join(map(str, future)),
+    "columnas_excluidas": ",".join(columnas_excluir),
+    "bajas":"1+2",                                       #baja+1 y baja+2 o solo baja+2
+    "id_rds": ",".join(map(str, ids_rds)),
+    "envios": envios,
+    "archivos": ",".join(archivos_salida),
+    "nota": nota,
+    "resultado_competencia_mean": resultado_competencia_mean,
+    "resultado_competencia_std": resultado_competencia_std
+}])
+
+if archivo_logging.exists():
+    historico = pd.read_csv(
+        archivo_logging,
+        dtype={
+            "ref_submit": str,
+            "id_rds": str,
+            "cantidad_registros_totales": str,
+            "cantidad_registros_entrenamiento": str,
+            "seeds": str,
+            "meses_entrenamiento": str,
+            "meses_prediccion": str,
+            "nota": str,
+            "resultado_competencia_mean": str,
+            "resultado_competencia_std": str,
+        },
+    )
+    fila = historico["id_prueba"].eq(id_prueba)
+
+    if fila.any():
+        historico.loc[fila, registro_prueba.columns] = registro_prueba.to_numpy()
+        historico.to_csv(archivo_logging, index=False)
+    else:
+        registro_prueba.to_csv(archivo_logging, mode="a", header=False, index=False)
+else:
+    registro_prueba.to_csv(archivo_logging, index=False)
+
+# display(registro_prueba)
+
+#%% celda 21 [código]
+display(pd.read_csv(archivo_logging)[['id_prueba','envios','resultado_competencia_mean','resultado_competencia_std', 'ref_submit','dataset','meses_entrenamiento','id_rds','nota']].tail(30))

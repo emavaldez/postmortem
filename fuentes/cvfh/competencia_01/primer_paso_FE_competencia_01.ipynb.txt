@@ -1,0 +1,619 @@
+#%% celda 1 [texto]
+### Setup
+
+#%% celda 2 [código]
+import duckdb
+import pandas as pd
+from pathlib import Path
+
+con = duckdb.connect()
+
+%load_ext sql
+%config SqlMagic.autopandas = True
+%config SqlMagic.feedback = False
+%config SqlMagic.displaycon = False
+
+%sql con
+
+#%% celda 3 [código]
+base_path = Path.cwd()
+dataset_path = str(base_path / "data") + "/"
+dataset_file = "competencia_01_crudo.csv"
+
+#%% celda 4 [texto]
+### Cargo base cruda
+
+#%% celda 5 [código]
+%%sql
+
+CREATE OR REPLACE TABLE competencia_01 AS
+SELECT *
+FROM read_csv_auto("{{dataset_path + dataset_file}}");
+
+#%% celda 6 [texto]
+### Creo target ternario
+
+#%% celda 7 [código]
+%%sql
+
+CREATE OR REPLACE TABLE competencia_01_clase AS
+
+WITH meses AS (
+    SELECT
+        MIN(foto_mes) AS primer_mes,
+        MAX(foto_mes) AS ultimo_mes
+    FROM competencia_01
+),
+
+meses_distintos AS (
+    SELECT DISTINCT
+        foto_mes
+    FROM competencia_01
+),
+
+meses_siguientes AS (
+    SELECT
+        foto_mes,
+        LEAD(foto_mes, 1) OVER (ORDER BY foto_mes) AS mes_1,
+        LEAD(foto_mes, 2) OVER (ORDER BY foto_mes) AS mes_2
+    FROM meses_distintos
+),
+
+base AS (
+    SELECT
+        c.*,
+        ms.mes_1,
+        ms.mes_2,
+
+        -- ¿Existe el cliente en t+1?
+        CASE
+            WHEN c1.numero_de_cliente IS NOT NULL THEN 1
+            ELSE 0
+        END AS esta_mes_1,
+
+        -- ¿Existe el cliente en t+2?
+        CASE
+            WHEN c2.numero_de_cliente IS NOT NULL THEN 1
+            ELSE 0
+        END AS esta_mes_2
+
+    FROM competencia_01 c
+
+    LEFT JOIN meses_siguientes ms
+        ON c.foto_mes = ms.foto_mes
+
+    LEFT JOIN competencia_01 c1
+        ON c.numero_de_cliente = c1.numero_de_cliente
+       AND c1.foto_mes = ms.mes_1
+
+    LEFT JOIN competencia_01 c2
+        ON c.numero_de_cliente = c2.numero_de_cliente
+       AND c2.foto_mes = ms.mes_2
+)
+
+SELECT
+    * EXCLUDE (
+        mes_1,
+        mes_2,
+        esta_mes_1,
+        esta_mes_2
+    ),
+
+    CASE
+
+        -- Último mes: no sabemos nada
+        WHEN foto_mes = (SELECT ultimo_mes FROM meses)
+            THEN NULL
+
+        -- Anteúltimo mes:
+        -- solamente podemos identificar BAJA+1
+        WHEN foto_mes = (
+            SELECT MAX(foto_mes)
+            FROM meses_distintos
+            WHERE foto_mes < (SELECT ultimo_mes FROM meses)
+        )
+        THEN
+            CASE
+                WHEN esta_mes_1 = 0 THEN 'BAJA+1'
+                ELSE NULL
+            END
+
+        -- Resto de los meses
+        WHEN esta_mes_1 = 0
+            THEN 'BAJA+1'
+
+        WHEN esta_mes_2 = 0
+            THEN 'BAJA+2'
+
+        ELSE 'CONTINUA'
+
+    END AS clase_ternaria
+
+FROM base;
+
+#%% celda 8 [texto]
+### FE current
+
+#%% celda 9 [código]
+%%sql
+
+CREATE OR REPLACE TABLE competencia_01_fe AS
+
+WITH base_agregaciones AS (
+
+    SELECT
+        *,
+
+        -- ============================================================
+        -- 1. Agregaciones totales de Tarjetas de Crédito
+        -- ============================================================
+
+        (
+            COALESCE(mtarjeta_visa_consumo, 0)
+            + COALESCE(mtarjeta_master_consumo, 0)
+        ) AS mconsumototal_tc,
+
+        (
+            COALESCE(ctarjeta_visa_transacciones, 0)
+            + COALESCE(ctarjeta_master_transacciones, 0)
+        ) AS cconsumos_total_tc,
+
+        (
+            COALESCE(Visa_msaldototal, 0)
+            + COALESCE(Master_msaldototal, 0)
+        ) AS msaldototal_tc,
+
+        (
+            COALESCE(Visa_mlimitecompra, 0)
+            + COALESCE(Master_mlimitecompra, 0)
+        ) AS mlimitecompra_total,
+
+        (
+            COALESCE(Visa_mpagominimo, 0)
+            + COALESCE(Master_mpagominimo, 0)
+        ) AS mpagominimo_total,
+
+        (
+            COALESCE(Visa_mpagado, 0)
+            + COALESCE(Master_mpagado, 0)
+        ) AS mpagado_total,
+
+        -- ============================================================
+        -- 2. Patrimonio líquido y deuda
+        -- ============================================================
+
+        (
+            COALESCE(mcuentas_saldo, 0)
+            + COALESCE(mplazo_fijo_pesos, 0)
+            + COALESCE(minversion1_pesos, 0)
+            + COALESCE(minversion2, 0)
+        ) AS saldo_liquido_total,
+
+        (
+            COALESCE(mprestamos_personales, 0)
+            + COALESCE(mprestamos_prendarios, 0)
+            + COALESCE(mprestamos_hipotecarios, 0)
+        ) AS deuda_prestamos_total,
+
+        -- ============================================================
+        -- 3. Canales
+        -- ============================================================
+
+        (
+            COALESCE(chomebanking_transacciones, 0)
+            + COALESCE(cmobile_app_trx, 0)
+        ) AS trx_digitales,
+
+        (
+            COALESCE(ccajas_transacciones, 0)
+            + COALESCE(catm_trx, 0)
+            + COALESCE(ccallcenter_transacciones, 0)
+        ) AS trx_fisicas,
+
+        -- ============================================================
+        -- 4. Fechas
+        -- ============================================================
+
+        strptime(
+            CAST(foto_mes AS VARCHAR) || '01',
+            '%Y%m%d'
+        )::DATE AS fecha_foto,
+
+        CASE
+            WHEN Visa_fechaalta IS NOT NULL
+                 AND Visa_fechaalta > 0
+            THEN try_strptime(
+                CAST(Visa_fechaalta AS VARCHAR),
+                '%Y%m%d'
+            )::DATE
+            ELSE NULL
+        END AS visa_fechaalta_date,
+
+        CASE
+            WHEN Master_fechaalta IS NOT NULL
+                 AND Master_fechaalta > 0
+            THEN try_strptime(
+                CAST(Master_fechaalta AS VARCHAR),
+                '%Y%m%d'
+            )::DATE
+            ELSE NULL
+        END AS master_fechaalta_date,
+
+        -- ============================================================
+        -- 5. Flag:
+        --    sin tarjeta + sin acuerdos descubiertos + sin préstamos
+        -- ============================================================
+
+        CASE
+            WHEN
+                COALESCE(Visa_msaldototal, 0) = 0
+                AND COALESCE(Master_msaldototal, 0) = 0
+
+                AND COALESCE(mtarjeta_visa_consumo, 0) = 0
+                AND COALESCE(mtarjeta_master_consumo, 0) = 0
+
+                AND COALESCE(cdescubierto_preacordado, 0) = 0
+
+                AND COALESCE(mprestamos_personales, 0) = 0
+                AND COALESCE(mprestamos_prendarios, 0) = 0
+                AND COALESCE(mprestamos_hipotecarios, 0) = 0
+
+            THEN 1
+            ELSE 0
+        END AS flag_sin_tc_sin_acuerdos_sin_prestamos
+
+    FROM competencia_01_clase
+),
+
+-- ================================================================
+-- 6. Detectar meses donde ccajas_depositos es todo 0 / NA
+-- ================================================================
+
+meses_ccajas AS (
+
+    SELECT
+        foto_mes,
+
+        BOOL_AND(
+            ccajas_depositos IS NULL
+            OR ccajas_depositos = 0
+        ) AS ccajas_todo_cero
+
+    FROM base_agregaciones
+    GROUP BY foto_mes
+),
+
+-- ================================================================
+-- 7. Corregir ccajas_depositos
+-- ================================================================
+
+base_corregida AS (
+
+    SELECT
+        b.* EXCLUDE (ccajas_depositos),
+
+        CASE
+            WHEN mc.ccajas_todo_cero
+                 AND COALESCE(b.ccajas_depositos, 0) = 0
+            THEN NULL
+            ELSE b.ccajas_depositos
+        END AS ccajas_depositos
+
+    FROM base_agregaciones b
+
+    LEFT JOIN meses_ccajas mc
+        ON b.foto_mes = mc.foto_mes
+)
+
+-- ================================================================
+-- 8. Features finales
+-- ================================================================
+
+SELECT
+    * EXCLUDE (
+        fecha_foto,
+        visa_fechaalta_date,
+        master_fechaalta_date
+    ),
+
+    -- ================================================================
+    -- Ratios de Tarjetas
+    -- ================================================================
+
+    ROUND(
+        msaldototal_tc / NULLIF(mlimitecompra_total, 0),
+        4
+    ) AS ratio_utilizacion_limite,
+
+    ROUND(
+        mpagado_total / NULLIF(msaldototal_tc, 0),
+        4
+    ) AS ratio_pago_vs_saldo,
+
+    ROUND(
+        mpagado_total / NULLIF(mpagominimo_total, 0),
+        4
+    ) AS ratio_pago_minimo,
+
+    -- ================================================================
+    -- Solvencia
+    -- ================================================================
+
+    ROUND(
+        saldo_liquido_total / NULLIF(deuda_prestamos_total, 0),
+        4
+    ) AS ratio_liquidez_vs_deuda,
+
+    -- ================================================================
+    -- Intensidad digital
+    -- ================================================================
+
+    ROUND(
+        trx_digitales / NULLIF(trx_digitales + trx_fisicas, 0),
+        4
+    ) AS ratio_canal_digital,
+
+    -- ================================================================
+    -- Tickets
+    -- ================================================================
+
+    ROUND(
+        mtarjeta_visa_consumo
+        / NULLIF(ctarjeta_visa_transacciones, 0),
+        2
+    ) AS ticket_promedio_visa,
+
+    ROUND(
+        mtarjeta_master_consumo
+        / NULLIF(ctarjeta_master_transacciones, 0),
+        2
+    ) AS ticket_promedio_master,
+
+    ROUND(
+        mautoservicio
+        / NULLIF(ctarjeta_debito_transacciones, 0),
+        2
+    ) AS ticket_promedio_debito,
+
+    -- ================================================================
+    -- Antigüedad
+    -- ================================================================
+
+    DATE_DIFF(
+        'month',
+        visa_fechaalta_date,
+        fecha_foto
+    ) AS antiguedad_meses_visa,
+
+    DATE_DIFF(
+        'month',
+        master_fechaalta_date,
+        fecha_foto
+    ) AS antiguedad_meses_master
+
+FROM base_corregida;
+
+#%% celda 10 [texto]
+### Historico
+
+#%% celda 11 [código]
+# ============================================================
+# HISTÓRICO: LAGS + DELTAS
+# Procesamiento por bloques para evitar OutOfMemory
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Obtener columnas numéricas
+# ------------------------------------------------------------
+
+cols = con.sql("""
+    SELECT
+        column_name,
+        data_type
+    FROM information_schema.columns
+    WHERE table_name = 'competencia_01_fe'
+    ORDER BY ordinal_position
+""").fetchall()
+
+excluir = {
+    "foto_mes",
+    "numero_de_cliente",
+    "clase_ternaria"
+}
+
+lag_cols = [
+    column_name
+    for column_name, data_type in cols
+    if column_name not in excluir
+    and (
+        "INT" in data_type.upper()
+        or "DECIMAL" in data_type.upper()
+        or data_type.upper() in {"FLOAT", "DOUBLE", "REAL"}
+    )
+]
+
+print(f"Variables numéricas: {len(lag_cols)}")
+
+
+# ------------------------------------------------------------
+# 2. Crear tabla histórica base
+# ------------------------------------------------------------
+
+con.sql("""
+    CREATE OR REPLACE TABLE competencia_01_hist AS
+    SELECT *
+    FROM competencia_01_fe
+""")
+
+
+# ------------------------------------------------------------
+# 3. Crear LAGS en bloques
+# ------------------------------------------------------------
+
+BLOQUE = 25
+
+for inicio in range(0, len(lag_cols), BLOQUE):
+
+    bloque = lag_cols[inicio:inicio + BLOQUE]
+
+    lag_parts = []
+
+    for col in bloque:
+
+        lag_parts.append(
+            f'''
+            LAG("{col}", 1) OVER (
+                PARTITION BY numero_de_cliente
+                ORDER BY foto_mes
+            ) AS "{col}_lag1"
+            '''
+        )
+
+        lag_parts.append(
+            f'''
+            LAG("{col}", 2) OVER (
+                PARTITION BY numero_de_cliente
+                ORDER BY foto_mes
+            ) AS "{col}_lag2"
+            '''
+        )
+
+    lag_sql = ",\n".join(lag_parts)
+
+    query = f"""
+        ALTER TABLE competencia_01_hist
+        ADD COLUMN dummy_temp INTEGER
+    """
+
+    # DuckDB no permite agregar múltiples columnas calculadas
+    # con ALTER TABLE de esta forma, por lo que usamos una tabla
+    # temporal para cada bloque.
+
+    temp_table = f"hist_lag_{inicio}"
+
+    con.sql(f"""
+        CREATE OR REPLACE TEMP TABLE {temp_table} AS
+
+        SELECT
+            numero_de_cliente,
+            foto_mes,
+            {lag_sql}
+
+        FROM competencia_01_fe
+    """)
+
+    # Agregar las columnas calculadas mediante JOIN
+    con.sql(f"""
+        CREATE OR REPLACE TABLE competencia_01_hist AS
+
+        SELECT
+            h.*,
+            l.* EXCLUDE (
+                numero_de_cliente,
+                foto_mes
+            )
+
+        FROM competencia_01_hist h
+
+        LEFT JOIN {temp_table} l
+            USING (numero_de_cliente, foto_mes)
+    """)
+
+    con.sql(f"DROP TABLE {temp_table}")
+
+    print(
+        f"Lags procesados: "
+        f"{min(inicio + BLOQUE, len(lag_cols))}/{len(lag_cols)}"
+    )
+
+
+# ------------------------------------------------------------
+# 4. Crear DELTAS en bloques
+# ------------------------------------------------------------
+
+for inicio in range(0, len(lag_cols), BLOQUE):
+
+    bloque = lag_cols[inicio:inicio + BLOQUE]
+
+    delta_parts = []
+
+    for col in bloque:
+
+        delta_parts.append(
+            f'''
+            "{col}" - "{col}_lag1"
+            AS "{col}_delta1"
+            '''
+        )
+
+        delta_parts.append(
+            f'''
+            "{col}" - "{col}_lag2"
+            AS "{col}_delta2"
+            '''
+        )
+
+    delta_sql = ",\n".join(delta_parts)
+
+    temp_table = f"hist_delta_{inicio}"
+
+    con.sql(f"""
+        CREATE OR REPLACE TEMP TABLE {temp_table} AS
+
+        SELECT
+            numero_de_cliente,
+            foto_mes,
+            {delta_sql}
+
+        FROM competencia_01_hist
+    """)
+
+    con.sql(f"""
+        CREATE OR REPLACE TABLE competencia_01_hist AS
+
+        SELECT
+            h.*,
+            d.* EXCLUDE (
+                numero_de_cliente,
+                foto_mes
+            )
+
+        FROM competencia_01_hist h
+
+        LEFT JOIN {temp_table} d
+            USING (numero_de_cliente, foto_mes)
+    """)
+
+    con.sql(f"DROP TABLE {temp_table}")
+
+    print(
+        f"Deltas procesados: "
+        f"{min(inicio + BLOQUE, len(lag_cols))}/{len(lag_cols)}"
+    )
+
+
+# ------------------------------------------------------------
+# 5. Resultado
+# ------------------------------------------------------------
+
+print()
+print("============================================")
+print("competencia_01_hist creada correctamente")
+print("============================================")
+print(f"Variables numéricas : {len(lag_cols)}")
+print(f"Lags                : {len(lag_cols) * 2}")
+print(f"Deltas              : {len(lag_cols) * 2}")
+print(f"Nuevas columnas     : {len(lag_cols) * 4}")
+
+#%% celda 12 [texto]
+### Guardo
+
+#%% celda 13 [código]
+output_path = f"{dataset_path}competencia_01_fev4.parquet"
+
+#%% celda 14 [código]
+%%sql
+
+COPY competencia_01_hist
+TO '{{output_path}}'
+(FORMAT PARQUET, COMPRESSION ZSTD);

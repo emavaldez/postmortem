@@ -1,0 +1,46 @@
+"""Rutas y constantes del pipeline."""
+from __future__ import annotations
+
+from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+
+DATA_DIR = REPO_DIR / "data"
+MODELS_DIR = REPO_DIR / "modelos"
+SUBMISSIONS_DIR = REPO_DIR / "submissions"
+OUTPUT_DIR = REPO_DIR / "output"
+
+RAW_CSV_PATH = DATA_DIR / "dataset_crudo.csv"
+DATASET_FE_CSV_PATH = DATA_DIR / "dataset_features.csv"
+
+# Semillas del ensamble.
+SEMILLAS = [100081, 100103, 100129, 100151, 100169]
+
+# Función de ganancia del negocio.
+GANANCIA_ACIERTO = 1_072_500
+COSTO_ESTIMULO = 27_500
+
+# Cantidad de clientes a estimular: se barre dentro de este rango para
+# elegir el corte con mayor ganancia en el control de calidad.
+RANGO_CORTE = (8_000, 15_000)
+PASO_BARRIDO_CORTE = 250
+
+# Columnas con un desplazamiento de distribución fuerte entre meses (medido
+# con PSI, Population Stability Index) que no se deben a un fenómeno
+# económico real sino a un cambio en cómo se generó el dato: se excluyen
+# del feature engineering.
+COLUMNAS_CON_DRIFT = [
+    "Master_fultimo_cierre", "Visa_fultimo_cierre",
+    "Master_Finiciomora", "Visa_Finiciomora",
+]
+
+# Detección de aguinaldo: un cliente "cobra aguinaldo" en un mes si su saldo
+# de cuentas sube muy por encima de su propio promedio/máximo habitual.
+UMBRAL_AGUINALDO = 1.4
+MESES_AGUINALDO = (6, 12)  # junio y diciembre
+INFLACION_AGUINALDO = 1.111  # ajuste del saldo en el mes de aguinaldo
+
+# Submuestreo de la clase mayoritaria (clientes que continúan) al entrenar.
+SUBMUESTREO_CONTINUA = 0.5
+SEMILLA_INTERNA_PASO = 7919  # desplaza la semilla de cada submodelo dentro de una misma semilla
+SUBMODELOS_POR_SEMILLA = 3

@@ -1,0 +1,539 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–23] Importaciones y `_gcs` (copia a Cloud Storage que se omite con el texto de
+#   reemplazo del bucket).
+from __future__ import annotations
+
+import contextlib
+import gc
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from typing import Iterable
+
+import numpy as np
+import pandas as pd
+import yaml
+
+def _gcs(cmd, check=True, **kw):
+    """Respaldo opcional a Cloud Storage. Se omite cuando el bucket es el placeholder de publicacion."""
+    if any("REEMPLAZAR_CON_BUCKET_PROPIO" in str(a) or "BUCKET_PRIVADO_NO_PUBLICADO" in str(a) for a in cmd):
+        return None
+    return subprocess.run(cmd, check=check, **kw)
+
+
+# [Anotación · líneas 26–46] Constantes compartidas: SHA-256 del dataset, las 20 semillas y sus subconjuntos
+#   de 5 y 3, meses (entrenar 202103–202104 y evaluar 202106; búsqueda con 202103 y 202105; final 202103–202106;
+#   predicción 202108), filas esperadas por mes, grilla de cortes 8.000–15.000 de a 500, ganancia y costo, 6
+#   hilos, las tres cantidades de préstamos que algunos brazos quitan, los 7 bloques de C3 y 6 bloques
+#   adicionales.
+RUN = "c1superfinal100"
+DATA_SHA = "59231e670a1342ad6f689ad7edc7ece047fc9f7115c6d7845e6c72fa3bbd95bb"
+SEEDS20 = [17,101,202,303,404,505,606,707,808,909,1001,1102,1203,1304,1405,1506,1607,1708,1809,1910]
+SEEDS5 = SEEDS20[:5]
+SEEDS3 = SEEDS20[:3]
+TRAIN_EVAL = [202103, 202104]
+EVAL_MONTH = 202106
+TUNE_TRAIN = [202103]
+TUNE_EVAL = 202105
+FINAL_TRAIN = [202103,202104,202105,202106]
+SCORE_MONTH = 202108
+EXPECTED_ROWS = {202103:162900,202104:163284,202105:163768,202106:164114,202107:164348,202108:164647}
+N_GRID = list(range(8000,15001,500))
+GAIN_HIT = 1_072_500
+COST = 27_500
+THREADS = 6
+DROP_LOANS = ["cprestamos_personales","cprestamos_prendarios","cprestamos_hipotecarios"]
+C3_BLOCKS = ["historia_numerica","transiciones_numericas","recencia","categoricas","historia_relaciones","tarjetas","ratios"]
+EXTRA_BLOCKS = ["disponibilidad","cobertura_panel","ranks","estado_numerico","stocks_productos_deuda","funciones"]
+SUPER_BLOCKS = C3_BLOCKS + EXTRA_BLOCKS
+REMOTE = "gs://REEMPLAZAR_CON_BUCKET_PROPIO/corridas/" + RUN
+
+
+# [Anotación · líneas 49–109] Utilidades (`require`, hash, huella, JSON), `paths` con las carpetas fijas
+#   dentro de `home`, `add_fe_path` para importar el generador del paso 2 y `base_params`, que lee
+#   `lightgbm.base` de `config.yaml` y agrega 6 hilos y `deterministic=True`.
+def require(ok: bool, msg: str) -> None:
+    if not ok:
+        raise RuntimeError(msg)
+
+
+def digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fingerprint(obj) -> str:
+    return hashlib.sha256(
+        json.dumps(obj, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+    ).hexdigest()
+
+
+def load_json(path: Path):
+    require(path.is_file(), f"Falta {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(obj, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def paths(home: Path) -> dict[str, Path]:
+    stage = home / "c1m1femasiva03_s3/paquete_c1/experimentos_20261006_m1_fe_masiva"
+    return {
+        "stage": stage,
+        "pkg": stage.parent,
+        "fe": stage / "fe_amplia",
+        "s3": home / "c1m1femasiva03_s3/resultados_s3",
+        "bank_orig": home / "c1m1femasiva03_s3/resultados_s1/fe_bank_dev",
+        "data": home / "c1m1femasiva03/datos/competencia_01.parquet",
+        "q0": home / "c1q0ccajas06",
+        "b1": home / "c1b1rotas01",
+        "out": home / RUN,
+    }
+
+
+def add_fe_path(p: dict[str, Path]) -> None:
+    s = str(p["fe"])
+    if s not in sys.path:
+        sys.path.insert(0, s)
+
+
+def base_params(p: dict[str, Path]) -> dict:
+    params = dict(
+        yaml.safe_load((p["pkg"] / "vendor/comun/config.yaml").read_text())["lightgbm"]["base"]
+    )
+    params.update(num_threads=THREADS, deterministic=True)
+    return params
+
+
+# [Anotación · líneas 112–145] `gain_curve` valida puntajes en [0, 1] y calcula la ganancia en cada corte de
+#   la grilla (orden por puntaje descendente, empates por cliente). `robust_choice` elige la terna de cortes
+#   consecutivos de mayor ganancia promedio (desempata por mayor mínimo y menor N) y devuelve su corte central
+#   (`n_robusto`), el promedio (`ganancia_robusta`) y el corte de ganancia máxima.
+def gain_curve(ids: np.ndarray, y: np.ndarray, scores: np.ndarray) -> dict[int, int]:
+    ids = np.asarray(ids, dtype=np.int64)
+    y = np.asarray(y, dtype=np.int8)
+    scores = np.asarray(scores, dtype=np.float64)
+    require(ids.shape == y.shape == scores.shape, "IDs/y/scores desalineados")
+    require(np.isfinite(scores).all(), "Scores no finitos")
+    require(((scores >= 0) & (scores <= 1)).all(), "Scores fuera de [0,1]")
+    order = np.lexsort((ids, -scores))
+    out = {}
+    for n in N_GRID:
+        z = y[order[:n]]
+        hits = int(z.sum())
+        out[n] = int(hits * GAIN_HIT - (n - hits) * COST)
+    return out
+
+
+def robust_choice(curve: dict[int, int]) -> dict:
+    candidates = []
+    for n in N_GRID[1:-1]:
+        ns = [n-500,n,n+500]
+        vals = [int(curve[k]) for k in ns]
+        candidates.append((float(np.mean(vals)), int(min(vals)), -n, n, vals))
+    require(candidates, "Sin candidatos robustos")
+    avg, mn, _, n, vals = max(candidates)
+    peak_n = max(N_GRID, key=lambda k:(curve[k],-k))
+    return {
+        "n_robusto": int(n),
+        "ganancia_robusta": float(avg),
+        "ganancia_min_meseta": int(mn),
+        "meseta_n": [int(n-500),int(n),int(n+500)],
+        "meseta_gain": [int(v) for v in vals],
+        "n_peak": int(peak_n),
+        "gain_peak": int(curve[peak_n]),
+    }
+
+
+# [Anotación · líneas 148–184] `summarize_scores` calcula la curva de cada semilla y la del promedio de
+#   semillas con su meseta elegida. `paired_at_plateau` calcula, por semilla, la diferencia de ganancia promedio
+#   entre un brazo y el control en los cortes de una meseta, y resume media, mediana, desvío y semillas a favor,
+#   empatadas y en contra.
+def summarize_scores(
+    ids: np.ndarray,
+    y: np.ndarray,
+    score_by_seed: dict[int,np.ndarray],
+    seeds: list[int],
+) -> tuple[dict, dict[int,dict[int,int]], np.ndarray]:
+    require(set(score_by_seed) == set(seeds), "Seeds de scores incompletas")
+    seed_curves = {s: gain_curve(ids,y,score_by_seed[s]) for s in seeds}
+    mat = np.vstack([score_by_seed[s] for s in seeds])
+    ens = mat.mean(axis=0,dtype=np.float64)
+    curve = gain_curve(ids,y,ens)
+    return robust_choice(curve), seed_curves, ens
+
+
+def paired_at_plateau(
+    arm_curves: dict[int,dict[int,int]],
+    control_curves: dict[int,dict[int,int]],
+    seeds: list[int],
+    ns: list[int],
+) -> dict:
+    d = np.asarray(
+        [
+            np.mean([arm_curves[s][n] - control_curves[s][n] for n in ns])
+            for s in seeds
+        ],
+        dtype=float,
+    )
+    return {
+        "mean": float(d.mean()),
+        "median": float(np.median(d)),
+        "sd": float(d.std(ddof=1)) if len(d) > 1 else 0.0,
+        "positive_fraction": float((d>0).mean()),
+        "wins": int((d>0).sum()),
+        "ties": int((d==0).sum()),
+        "losses": int((d<0).sum()),
+        "deltas": d.tolist(),
+    }
+
+
+# [Anotación · líneas 187–201] `export_csv` ordena por puntaje descendente (empates por cliente), toma los
+#   primeros n clientes, los ordena de menor a mayor y los escribe uno por línea sin encabezado; verifica
+#   cantidad de líneas, ausencia de repetidos y formato numérico, y devuelve nombre, filas y SHA-256.
+def export_csv(path: Path, ids: np.ndarray, scores: np.ndarray, n: int) -> dict:
+    ids = np.asarray(ids,dtype=np.int64)
+    scores = np.asarray(scores,dtype=np.float64)
+    require(len(ids)==len(scores) and len(np.unique(ids))==len(ids), "IDs inválidos")
+    require(np.isfinite(scores).all(), "Scores no finitos")
+    order = np.lexsort((ids,-scores))
+    chosen = np.sort(ids[order[:n]])
+    path.parent.mkdir(parents=True,exist_ok=True)
+    tmp = path.with_name(path.name+".tmp")
+    np.savetxt(tmp,chosen,fmt="%d")
+    lines = tmp.read_text().splitlines()
+    require(len(lines)==n and len(set(lines))==n, "CSV con cantidad/duplicados inválidos")
+    require(all(re.fullmatch(r"[1-9][0-9]*",x) for x in lines), "CSV formato inválido")
+    tmp.replace(path)
+    return {"file":path.name,"rows":n,"sha256":digest(path),"header":False}
+
+
+# [Anotación · líneas 204–219] `preflight_base` verifica rutas, SHA-256 del dataset, que la confirmación de C3
+#   esté promovida con 20 semillas, que el esquema tenga 2.062 variables con las derivadas a partir de la
+#   posición 152 y que el banco original esté completo.
+def preflight_base(home: Path) -> dict:
+    p = paths(home)
+    for key in ["stage","pkg","fe","s3","bank_orig","data","q0"]:
+        require(p[key].exists(), f"Falta {key}: {p[key]}")
+    require(digest(p["data"]) == DATA_SHA, "Dataset distinto")
+    s3_summary = load_json(p["s3"] / "confirmacion_c3.json")
+    require(s3_summary.get("n_seeds")==20 and s3_summary.get("promote_to_tuning") is True,
+            "C3/S3 no está cerrado")
+    schema_doc = load_json(p["s3"] / "C3_HIST_MAS_TARJETAS/features.json")
+    schema = schema_doc["features"]
+    derived = schema_doc["derived"]
+    require(len(schema)==2062 and schema[152:]==derived, "Schema C3 inesperado")
+    bm = load_json(p["bank_orig"] / "manifest.json")
+    require(bm.get("status")=="completed" and bm.get("input_sha256")==DATA_SHA,
+            "Banco original incompatible")
+    return {"paths":p,"schema":schema,"derived":derived,"s3_summary":s3_summary}
+
+
+# [Anotación · líneas 222–257] `quality_dataset_and_bank` devuelve el dataset y el banco según el brazo de
+#   calidad: el original, la copia de Q0 o la copia de un brazo de B1. `ensure_quality_bank` genera, cuando el
+#   brazo no es el original, un banco de 202105 y 202106 con los 13 bloques sobre la copia corregida.
+def quality_dataset_and_bank(ctx: dict, quality_arm: str) -> tuple[Path,Path|None]:
+    p = ctx["paths"]
+    if quality_arm == "C3_ORIG":
+        return p["data"], p["bank_orig"]
+    if quality_arm == "Q0_CCAJAS":
+        return p["q0"] / "datos/competencia_01_q0_ccajas_202105_na.parquet", None
+    require(quality_arm.startswith("B1_"), f"Quality arm desconocido: {quality_arm}")
+    return p["b1"] / "arms" / quality_arm / "dataset.parquet", None
+
+
+def ensure_quality_bank(ctx: dict, quality_arm: str) -> tuple[Path,Path]:
+    p = ctx["paths"]
+    data, existing = quality_dataset_and_bank(ctx,quality_arm)
+    require(data.is_file(), f"Falta dataset quality {quality_arm}: {data}")
+    if existing is not None:
+        return data, existing
+    bank = p["out"] / "stage0_quality_bank"
+    config = load_json(p["stage"] / "config_screening.json")
+    if (bank/"manifest.json").is_file():
+        m = load_json(bank/"manifest.json")
+        require(m.get("status")=="completed", "Quality bank incompleto")
+        require(m.get("input_sha256")==digest(data), "Quality bank usa otra entrada")
+        require(m.get("output_months")==[202105,202106], "Quality bank meses inesperados")
+        require(m.get("blocks_requested")==SUPER_BLOCKS, "Quality bank bloques inesperados")
+        return data,bank
+    if bank.exists() and any(bank.iterdir()):
+        q = p["out"] / ("stage0_quality_bank_incomplete_"+str(int(pd.Timestamp.utcnow().timestamp())))
+        bank.rename(q)
+    add_fe_path(p)
+    from generar_fe import generate
+    print("STAGE0: generar banco quality mayo-junio",flush=True)
+    generate(data,bank,config,blocks=SUPER_BLOCKS,months=[202105,202106])
+    m = load_json(bank/"manifest.json")
+    require(m.get("status")=="completed" and m.get("input_sha256")==digest(data),
+            "Quality bank no cerró")
+    return data,bank
+
+
+# [Anotación · líneas 260–312] `feature_arms` define los 10 conjuntos de variables de la etapa 1: C3; C3 sin
+#   las tres cantidades de préstamos ni sus derivadas (NOPREST); y cada uno con el agregado de indicadores de
+#   disponibilidad y cobertura (OBS), percentiles del mes (RANK) o indicadores de estado, productos y funciones
+#   del mes (STATE), más dos combinaciones.
+def catalog(p: dict[str,Path]) -> pd.DataFrame:
+    c = pd.read_csv(p["bank_orig"]/"catalogo_features.csv").set_index("feature",verify_integrity=True)
+    return c
+
+
+def feature_arms(ctx: dict) -> dict[str,list[str]]:
+    p = ctx["paths"]
+    cat = catalog(p)
+    c3 = list(ctx["schema"])
+    raw = c3[:152]
+
+    def generated(blocks: Iterable[str], current_only: bool=False) -> list[str]:
+        z = cat[cat.block.isin(list(blocks)) & cat.status.eq("generated")].copy()
+        if current_only:
+            mh = pd.to_numeric(z.min_history,errors="coerce").fillna(0)
+            z = z[mh.eq(0)]
+        return z.index.tolist()
+
+    obs = generated(["disponibilidad","cobertura_panel"],current_only=False)
+    ranks = generated(["ranks"],current_only=True)
+    state = generated(["estado_numerico","stocks_productos_deuda","funciones"],current_only=True)
+
+    def unique(xs: Iterable[str]) -> list[str]:
+        return list(dict.fromkeys(xs))
+
+    def no_loans(xs: list[str]) -> list[str]:
+        out=[]
+        for f in xs:
+            if f in DROP_LOANS:
+                continue
+            if f in cat.index:
+                src = str(cat.loc[f,"sources"])
+                if any(v in src for v in DROP_LOANS):
+                    continue
+            out.append(f)
+        return out
+
+    arms = {
+        "C3": unique(c3),
+        "NOPREST": no_loans(unique(c3)),
+        "C3_OBS": unique(c3+obs),
+        "NOPREST_OBS": no_loans(unique(c3+obs)),
+        "C3_RANK": unique(c3+ranks),
+        "NOPREST_RANK": no_loans(unique(c3+ranks)),
+        "C3_STATE": unique(c3+state),
+        "NOPREST_STATE": no_loans(unique(c3+state)),
+        "NOPREST_OBS_STATE": no_loans(unique(c3+obs+state)),
+        "NOPREST_RANK_OBS": no_loans(unique(c3+ranks+obs)),
+    }
+    for name,feats in arms.items():
+        require(len(feats)==len(set(feats)), f"Features duplicadas {name}")
+        require(all(f in raw or f in cat.index for f in feats), f"Feature desconocida {name}")
+    return arms
+
+
+# [Anotación · líneas 315–356] `load_fold` carga las variables pedidas para los meses de entrenamiento desde
+#   el banco original y para el mes de evaluación desde el banco indicado, con la clase binaria BAJA+2, y
+#   verifica alineación de claves, orden de columnas y filas esperadas.
+def split_derived(features: list[str], ctx: dict) -> list[str]:
+    raw=set(ctx["schema"][:152])
+    return [f for f in features if f not in raw]
+
+
+def load_fold(
+    ctx: dict,
+    features: list[str],
+    train_months: list[int],
+    eval_month: int,
+    eval_bank: Path,
+) -> dict:
+    p=ctx["paths"]
+    add_fe_path(p)
+    from cargar_bloques import cargar_bloques
+    derived=split_derived(features,ctx)
+
+    trdf,_=cargar_bloques(
+        p["bank_orig"],meses=train_months,incluir_raw=True,features=derived
+    )
+    evdf,_=cargar_bloques(
+        eval_bank,meses=[eval_month],incluir_raw=True,features=derived
+    )
+    labels=pd.read_parquet(p["bank_orig"]/"etiquetas.parquet")
+    trlab=labels[labels.foto_mes.isin(train_months)].reset_index(drop=True)
+    evlab=labels[labels.foto_mes.eq(eval_month)].reset_index(drop=True)
+    require(trdf[["numero_de_cliente","foto_mes"]].equals(trlab[["numero_de_cliente","foto_mes"]]),
+            "Train keys desalineadas")
+    require(evdf[["numero_de_cliente","foto_mes"]].equals(evlab[["numero_de_cliente","foto_mes"]]),
+            "Eval keys desalineadas")
+    require(list(trdf[features].columns)==features and list(evdf[features].columns)==features,
+            "Orden features distinto")
+    xtr=trdf[features]
+    xev=evdf[features]
+    ytr=trlab.clase_ternaria.eq("BAJA+2").to_numpy(np.int8)
+    yev=evlab.clase_ternaria.eq("BAJA+2").to_numpy(np.int8)
+    ids=evdf.numero_de_cliente.to_numpy(np.int64)
+    months=trdf.foto_mes.to_numpy(np.int64)
+    require(len(ids)==EXPECTED_ROWS[eval_month], f"Filas eval inesperadas {eval_month}")
+    del trdf,evdf,labels,trlab,evlab
+    gc.collect()
+    return {"x_train":xtr,"x_eval":xev,"y_train":ytr,"y_eval":yev,"ids":ids,"train_months":months}
+
+
+# [Anotación · líneas 359–376] `policy_weights` convierte un peso por mes en un peso por fila y descarta las
+#   filas con peso 0. `score_checkpoint` lee un `.npz` de puntajes si existe y valida identidad, etiqueta,
+#   semilla y claves.
+def policy_weights(months: np.ndarray, weights_by_month: dict[int,float]) -> tuple[np.ndarray,np.ndarray]:
+    w=np.asarray([float(weights_by_month.get(int(m),0.0)) for m in months],dtype=np.float64)
+    keep=w>0
+    require(keep.any(), "Política dejó train vacío")
+    return keep,w[keep]
+
+
+def score_checkpoint(path: Path, identity: str, label: str, seed: int, ids: np.ndarray, y: np.ndarray) -> np.ndarray|None:
+    if not path.is_file():
+        return None
+    with np.load(path,allow_pickle=False) as z:
+        require(str(z["identity"].item())==identity, f"Checkpoint otra identity {path}")
+        require(str(z["label"].item())==label, f"Checkpoint otro label {path}")
+        require(int(z["seed"].item())==seed, f"Checkpoint otra seed {path}")
+        require(np.array_equal(z["ids"],ids) and np.array_equal(z["y"],y), f"Checkpoint keys {path}")
+        sc=np.asarray(z["scores"],dtype=np.float64).copy()
+    require(sc.shape==ids.shape and np.isfinite(sc).all(), f"Scores inválidos {path}")
+    return sc
+
+
+# [Anotación · líneas 379–464] `train_seeds` entrena una semilla tras otra sobre un único `lgb.Dataset`
+#   compartido, con reutilización de puntajes guardados. En el camino de la entrega esta función queda
+#   reemplazada por `train_seeds_per_seed` de `superfinal100_v2.py`.
+def train_seeds(
+    data: dict,
+    features: list[str],
+    params: dict,
+    rounds: int,
+    seeds: list[int],
+    weights_by_month: dict[int,float],
+    out_dir: Path,
+    identity: str,
+    label: str,
+    save_models: bool=False,
+    backup_prefix: str|None=None,
+    reuse_scores: dict[int,np.ndarray]|None=None,
+) -> dict[int,np.ndarray]:
+    import lightgbm as lgb
+    out_dir.mkdir(parents=True,exist_ok=True)
+    reuse_scores=reuse_scores or {}
+
+    keep,w=policy_weights(data["train_months"],weights_by_month)
+    if bool(np.all(keep)):
+        xtr=data["x_train"]
+    else:
+        xtr=data["x_train"].loc[keep].reset_index(drop=True)
+    ytr=data["y_train"][keep]
+    xev=data["x_eval"]
+    ids=data["ids"];yev=data["y_eval"]
+
+    ds=lgb.Dataset(
+        xtr,label=ytr,weight=w,feature_name=features,free_raw_data=True,
+        params={"max_bin": int(params.get("max_bin",255))}
+    )
+    ds.construct()
+    del xtr,ytr,w
+    gc.collect()
+
+    scores_by_seed={}
+    for i,seed in enumerate(seeds,1):
+        cp=out_dir/f"seed_{seed}.npz"
+        mp=out_dir/f"modelo_{seed}.txt"
+        existing=score_checkpoint(cp,identity,label,seed,ids,yev)
+        if existing is not None:
+            scores_by_seed[seed]=existing
+            print(f"REUSAR {label} {i}/{len(seeds)} seed={seed}",flush=True)
+            continue
+
+        if seed in reuse_scores:
+            scores=np.asarray(reuse_scores[seed],dtype=np.float64)
+            require(scores.shape==ids.shape and np.isfinite(scores).all(),"Reuse scores inválidos")
+            with cp.with_suffix(".tmp").open("wb") as fh:
+                np.savez_compressed(
+                    fh,identity=np.array(identity),label=np.array(label),seed=np.array(seed),
+                    ids=ids,y=yev,scores=scores,reused=np.array(True)
+                )
+            cp.with_suffix(".tmp").replace(cp)
+            scores_by_seed[seed]=scores
+            print(f"COPIAR SCORE {label} {i}/{len(seeds)} seed={seed}",flush=True)
+            continue
+
+        print(f"ENTRENAR {label} {i}/{len(seeds)} seed={seed}; features={len(features)}; rounds={rounds}",flush=True)
+        model=lgb.train(dict(params,seed=int(seed)),ds,num_boost_round=int(rounds))
+        scores=np.asarray(model.predict(xev,num_threads=THREADS),dtype=np.float64)
+        require(scores.shape==ids.shape and np.isfinite(scores).all(),"Scores nuevos inválidos")
+        require(((scores>=0)&(scores<=1)).all(),"Scores fuera de rango")
+        model_sha=""
+        if save_models:
+            tmpm=mp.with_suffix(".tmp")
+            model.save_model(str(tmpm))
+            tmpm.replace(mp)
+            model_sha=digest(mp)
+        with cp.with_suffix(".tmp").open("wb") as fh:
+            np.savez_compressed(
+                fh,identity=np.array(identity),label=np.array(label),seed=np.array(seed),
+                ids=ids,y=yev,scores=scores,reused=np.array(False),
+                model_sha256=np.array(model_sha)
+            )
+        cp.with_suffix(".tmp").replace(cp)
+        if backup_prefix:
+            files=[str(cp)]+([str(mp)] if save_models else [])
+            _gcs(["gcloud","storage","cp",*files,backup_prefix+"/"],check=True)
+        scores_by_seed[seed]=scores
+        del model
+        gc.collect()
+
+    del ds,xev
+    gc.collect()
+    return scores_by_seed
+
+
+# [Anotación · líneas 467–493] `load_s3_control` lee los puntajes de C3 del paso 2 para las semillas pedidas.
+#   `validate_catalog_compat` verifica que un banco nuevo defina las variables igual que el original (bloque,
+#   fuentes, fórmula, tipo e historia mínima).
+def load_s3_control(ctx: dict, seeds: list[int]) -> tuple[np.ndarray,np.ndarray,dict[int,np.ndarray]]:
+    p=ctx["paths"]
+    ids0=None;y0=None;out={}
+    for seed in seeds:
+        cp=p["s3"]/"C3_HIST_MAS_TARJETAS"/f"seed_{seed}.npz"
+        require(cp.is_file(),f"Falta S3 seed={seed}")
+        with np.load(cp,allow_pickle=False) as z:
+            ids=np.asarray(z["ids"],dtype=np.int64)
+            y=np.asarray(z["y"],dtype=np.int8)
+            sc=np.asarray(z["scores"],dtype=np.float64)
+        if ids0 is None:
+            ids0=ids.copy();y0=y.copy()
+        else:
+            require(np.array_equal(ids0,ids) and np.array_equal(y0,y),"S3 desalineado")
+        out[seed]=sc.copy()
+    return ids0,y0,out
+
+
+def validate_catalog_compat(original_bank: Path, new_bank: Path, features: list[str]) -> None:
+    a=pd.read_csv(original_bank/"catalogo_features.csv").set_index("feature",verify_integrity=True)
+    b=pd.read_csv(new_bank/"catalogo_features.csv").set_index("feature",verify_integrity=True)
+    derived=[f for f in features if f in a.index]
+    require(set(derived)<=set(b.index),"Banco nuevo no contiene features")
+    for col in ["block","sources","formula","feature_kind","min_history"]:
+        x=a.loc[derived,col].fillna("").astype(str).tolist()
+        y=b.loc[derived,col].fillna("").astype(str).tolist()
+        require(x==y,f"Definición de features cambió: {col}")

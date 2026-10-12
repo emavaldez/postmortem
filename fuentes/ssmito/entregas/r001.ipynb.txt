@@ -1,0 +1,228 @@
+#%% celda 1 [texto]
+# Librerias
+
+#%% celda 2 [código]
+# cargo las librerias que necesito
+require("data.table")
+require("lightgbm")
+library(data.table)
+
+#%% celda 3 [texto]
+# URLS
+
+Ejecutar con el directorio de trabajo en `entregas/`.
+
+#%% celda 4 [código]
+carpeta_entregas <- getwd()
+data_folder <- file.path(carpeta_entregas, "dataset")
+carpeta_parametros <- file.path(carpeta_entregas, "parametros")
+carpeta_salida <- file.path(carpeta_entregas, "entregas")
+archivo_logging <- file.path(carpeta_entregas, "logging.csv")
+
+#%% celda 5 [texto]
+# Parametrizacion de la prueba
+
+Completar el mes a predecir, el ID del `.rds` y la cantidad de envios antes de ejecutar. Revisar los meses de entrenamiento.
+
+#%% celda 6 [código]
+files = list.files(data_folder)
+cat(files, sep = "\n")
+
+#%% celda 7 [código]
+# dataset_file <- "competencia_01_ternaria_lags.csv"
+# dataset_file <- "competencia_01_ternaria_lf_k6_perdida4.csv"
+dataset_file <- "c_01_tern_2_lf_k6_p4.csv"
+
+
+train_final <- c(202103, 202104,202105, 202106)
+future <- 202108  # mes a predecir
+SEEDS <- c(230047, 230059, 230063, 230077, 230081)
+
+id_rds <- 40  # archivo parametros/<id_rds>.rds
+envios <- 11000 # cantidad de clientes con Predicted = 1
+
+#%% celda 8 [código]
+
+columnas_excluir <- c(
+    "ternaria",
+    'ternaria_lag1',
+    "clase01",
+    "fold",
+    "azar",
+    "training",
+    'cprestamos_personales',
+    'mprestamos_personales',
+    'cprestamos_personales_lag1',
+    'mprestamos_personales_lag1',
+    'cprestamos_personales_delta1',
+    'mprestamos_personales_delta1',
+    'cprestamos_personales_lag_pond',
+    'mprestamos_personales_lag_pond',
+    'cprestamos_personales_delta_lag_pond',
+    'mprestamos_personales_delta_lag_pond'
+)
+
+if (anyNA(c(future, id_rds, envios))) {
+  stop("Completar future, id_rds y envios en esta celda.")
+}
+
+#%% celda 9 [texto]
+# LEEMOS DATASET
+
+#%% celda 10 [código]
+dataset_url <- file.path(data_folder, dataset_file)
+dataset <- fread(dataset_url)
+
+setorder(dataset, foto_mes, ternaria, numero_de_cliente)
+dataset[, .N, list(foto_mes, ternaria)]
+
+#%% celda 11 [texto]
+# Parametros
+
+El `.rds` debe estar copiado en `parametros/`. Se usan los parametros guardados, sin volver a ajustar `min_data_in_leaf`.
+
+#%% celda 12 [código]
+parametros <- readRDS(
+  file.path(carpeta_parametros, paste0(id_rds, ".rds"))
+)
+
+#%% celda 13 [texto]
+# Dataset train y prediccion
+
+#%% celda 14 [código]
+dataset[, clase01 := ifelse(ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+campos_buenos <- setdiff(colnames(dataset), columnas_excluir)
+
+dataset_train <- dataset[foto_mes %in% train_final]
+dfuture <- dataset[foto_mes %in% future]
+
+if (length(future) != 1L || nrow(dataset_train) == 0L ||
+    nrow(dfuture) == 0L || envios < 1L || envios > nrow(dfuture) ||
+    envios != as.integer(envios)) {
+  stop("Revisar meses y envios: se requiere un mes a predecir y filas en ambos datasets.")
+}
+
+dataset_train[, .N, list(foto_mes, ternaria)]
+
+#%% celda 15 [texto]
+# Entreno y genero salidas
+
+Se conserva solamente el CSV actual de cada semilla.
+
+#%% celda 16 [código]
+if (file.exists(archivo_logging)) {
+  historico <- fread(archivo_logging)
+  id_prueba <- max(historico$id_prueba) + 1L
+} else {
+  id_prueba <- 1L
+}
+
+dir.create(carpeta_salida, recursive= TRUE, showWarnings= FALSE)
+archivos_salida <- character(length(SEEDS))
+
+for (i in seq_along(SEEDS)) {
+  # El .rds puede contener parametros individuales o una lista por semilla.
+  if ("num_iterations" %in% names(parametros)) {
+    params_semilla <- parametros
+  } else {
+    params_semilla <- parametros[[as.character(SEEDS[i])]]
+    if (is.null(params_semilla)) {
+      stop("El .rds no contiene parametros para la semilla ", SEEDS[i])
+    }
+  }
+  params_semilla$seed <- SEEDS[i]
+
+  dtrain_final <- lgb.Dataset(
+    data= data.matrix(dataset_train[, campos_buenos, with= FALSE]),
+    label= dataset_train[, clase01]
+  )
+
+  modelo_final <- lgb.train(
+    data= dtrain_final,
+    param= params_semilla
+  )
+
+  prediccion <- predict(
+    modelo_final,
+    data.matrix(dfuture[, campos_buenos, with= FALSE])
+  )
+
+  tb_prediccion <- dfuture[, list(numero_de_cliente)]
+  tb_prediccion[, prob := prediccion]
+  setorder(tb_prediccion, -prob)
+  tb_prediccion[, Predicted := 0L]
+  tb_prediccion[1:envios, Predicted := 1L]
+
+  # archivos_salida[i] <- paste0("r001_", SEEDS[i], ".csv")
+  archivos_salida[i] <- paste0("r001_", SEEDS[i],"_", id_prueba, ".csv")
+
+  fwrite(
+    tb_prediccion[Predicted == 1L, list(numero_de_cliente)],
+    file.path(carpeta_salida, archivos_salida[i]),
+    sep= ",",
+    col.names= FALSE
+  )
+
+  cat("Semilla=", SEEDS[i], " Archivo=", archivos_salida[i], "\n", sep= "")
+}
+
+#%% celda 17 [texto]
+# Documentacion de la prueba
+
+Una fila por ejecucion, con todas las semillas usadas. Completar la nota y el resultado de Kaggle como texto. Cuando llegue el resultado, ejecutar solamente esta celda: actualiza la misma fila y conserva las pruebas anteriores.
+
+#%% celda 18 [código]
+#lets stop here
+pepe
+
+#%% celda 19 [código]
+nota <- "rds 40, mismo anterior, bajamos a 11k envios"
+resultado_competencia_mean <- "105.9795"  # score de Kaggle o referencia a un problema con la entrega
+resultado_competencia_std <- "4.5307"
+ref_submit <- 'e16_r'
+
+#%% celda 20 [código]
+
+registro_prueba <- data.table(
+  id_prueba = id_prueba,
+  ref_submit = ref_submit,
+  notebook = "r001.ipynb",
+  dataset = dataset_file,
+  seeds = paste(SEEDS, collapse = ","),
+  cantidad_registros_totales = nrow(dataset),
+  cantidad_registros_entrenamiento = nrow(dataset_train),
+  cantidad_registros_prediccion = nrow(dfuture),
+  meses_entrenamiento = paste(train_final, collapse = ","),
+  meses_prediccion = paste(future, collapse = ","),
+  columnas_excluidas = paste(columnas_excluir, collapse = ","),
+  "bajas" = "1+2",                                       #baja+1 y baja+2 o solo baja+2
+  id_rds = id_rds,
+  envios = envios,
+  archivos = paste(archivos_salida, collapse = ","),
+  nota = nota,
+  resultado_competencia_mean = resultado_competencia_mean,
+  resultado_competencia_std = resultado_competencia_std
+)
+
+if (file.exists(archivo_logging)) {
+  historico <- fread(
+    archivo_logging,
+    colClasses = list(character = c("nota", "resultado_competencia_mean"))
+  )
+  fila <- which(historico$id_prueba == id_prueba)
+
+  if (length(fila) > 0L) {
+    historico[fila, (names(registro_prueba)) := registro_prueba]
+    fwrite(historico, archivo_logging)
+  } else {
+    fwrite(registro_prueba, archivo_logging, append = TRUE, col.names = FALSE)
+  }
+} else {
+  fwrite(registro_prueba, archivo_logging)
+}
+
+#%% celda 21 [código]
+
+# registro_prueba
+tail(fread(archivo_logging), 10)

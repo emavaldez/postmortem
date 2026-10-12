@@ -1,0 +1,66 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–13] Celda de texto: explica que el notebook crea competencia_01.parquet desde el CSV
+#   con dos cambios (clase_ternaria recalculada y ccajas_depositos en NA para 202105) y que, si el parquet ya
+#   existe, no lo reemplaza sino que compara. Declara que 29 filas pasan de CONTINUA a BAJA respecto del CSV.
+#%% celda 1 [texto]
+# Crear `competencia_01.parquet` a partir de `competencia_01.csv`
+
+Todos los notebooks de `submits/` leen `../competencia_01.parquet`. Este notebook lo crea desde el CSV de la cátedra
+(`competencia_01.csv`, en la carpeta raíz del repo) con **dos cambios**:
+
+1. **`clase_ternaria` recalculada con la definición estricta**: BAJA+1 = el cliente no está el mes siguiente;
+   BAJA+2 = está el mes siguiente pero no el subsiguiente; CONTINUA = está en los dos. 202107 solo puede ser BAJA+1
+   (o vacío) y 202108 queda vacío. Respecto del CSV, 29 filas pasan de CONTINUA a BAJA (clientes que se van y vuelven).
+2. **`ccajas_depositos` = NA en 202105** (en ese mes viene todo en cero: dato roto, recomendación del profesor).
+
+Si `competencia_01.parquet` ya existe, **no lo pisa**: verifica que lo que se genera es idéntico (`DataFrame.equals`).
+Tiempo: ~1 min.
+
+# [Anotación · líneas 15–24] Importa os, numpy y pandas, define la ruta de entrada (../competencia_01.csv) y
+#   la de salida (../competencia_01.parquet), lee el CSV y elimina la columna clase_ternaria original.
+#%% celda 2 [código]
+import os
+import numpy as np
+import pandas as pd
+
+ENTRADA = "../competencia_01.csv"
+SALIDA  = "../competencia_01.parquet"
+
+df = pd.read_csv(ENTRADA)
+df = df.drop(columns=["clase_ternaria"])            # se recalcula abajo
+
+# [Anotación · líneas 26–31] Convierte foto_mes en un índice correlativo de meses (año × 12 + mes), arma el
+#   conjunto de pares (cliente, mes) presentes en los datos y calcula para cada fila dos indicadores: si el
+#   cliente figura en el mes siguiente y si figura dos meses después.
+# Mes como número correlativo (202103 -> 2021*12 + 3) para poder sumar 1 y 2 meses
+mes_idx = ((df["foto_mes"] // 100) * 12 + df["foto_mes"] % 100).values
+cliente = df["numero_de_cliente"].values
+presentes = set(zip(cliente, mes_idx))               # pares (cliente, mes) que existen
+esta_mes1 = np.array([(c, m + 1) in presentes for c, m in zip(cliente, mes_idx)])   # ¿está el mes siguiente?
+esta_mes2 = np.array([(c, m + 2) in presentes for c, m in zip(cliente, mes_idx)])   # ¿y el subsiguiente?
+
+# [Anotación · líneas 33–37] Asigna la clase: BAJA+1 si el cliente no figura el mes siguiente; BAJA+2 si
+#   figura el mes siguiente y no el subsiguiente; CONTINUA en otro caso. Deja sin clase todas las filas del
+#   último mes y, en el penúltimo, las de los clientes que sí figuran el mes siguiente.
+ultimo = mes_idx.max()
+clase = np.where(~esta_mes1, "BAJA+1", np.where(~esta_mes2, "BAJA+2", "CONTINUA")).astype(object)
+clase[mes_idx == ultimo] = None                      # 202108: no hay futuro
+clase[(mes_idx == ultimo - 1) & esta_mes1] = None    # 202107: solo se sabe si es BAJA+1
+df = df.assign(clase_ternaria=clase)
+
+# [Anotación · líneas 39–41] Pone NaN en ccajas_depositos para las filas de 202105 e imprime la tabla de
+#   cantidad de filas por mes y clase, contando los valores vacíos.
+df.loc[df["foto_mes"] == 202105, "ccajas_depositos"] = np.nan   # dato roto en 202105
+
+print(df.groupby("foto_mes")["clase_ternaria"].value_counts(dropna=False).unstack())
+
+# [Anotación · líneas 43–48] Si el parquet de salida ya existe, lo lee e imprime si es igual al dataframe
+#   generado (DataFrame.equals); si no existe, lo escribe sin índice e imprime ruta y dimensiones.
+#%% celda 3 [código]
+if os.path.exists(SALIDA):
+    print("Ya existe: ¿es idéntico al que se genera?", df.equals(pd.read_parquet(SALIDA)))
+else:
+    df.to_parquet(SALIDA, index=False)
+    print("Creado:", SALIDA, df.shape)

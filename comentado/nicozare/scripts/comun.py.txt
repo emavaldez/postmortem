@@ -1,0 +1,52 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–6] Docstring del módulo e importación de pandas.
+"""Funciones compartidas por los tres scripts del pipeline."""
+from __future__ import annotations
+
+import pandas as pd
+
+
+# [Anotación · líneas 7–26] detectar_meses ordena los meses presentes y devuelve tres valores por posición:
+#   los meses de entrenamiento (todos menos los dos últimos, o todos menos el último si hay dos meses o menos),
+#   el holdout (el último mes de entrenamiento) y el mes de predicción (el último del dataset).
+def detectar_meses(foto_mes_unicos: list[int]) -> tuple[list[int], int, int]:
+    """A partir de los meses presentes en el dataset, determina:
+      - meses_entrenamiento: los que tienen clase_ternaria completa (todo
+        cliente tiene al menos 2 meses de datos posteriores para saber si
+        se da de baja).
+      - mes_holdout: el último de esos meses, se usa como control de
+        calidad (se excluye de un segundo entrenamiento para medir la
+        ganancia real antes de confiar en el modelo).
+      - mes_prediccion: el mes más reciente del dataset (no tiene
+        clase_ternaria conocida — es el que hay que predecir).
+
+    Un mes tiene clase_ternaria completa si hay al menos dos meses más
+    después de él en el dataset.
+    """
+    meses = sorted(foto_mes_unicos)
+    mes_prediccion = meses[-1]
+    meses_entrenamiento = meses[:-2] if len(meses) > 2 else meses[:-1]
+    mes_holdout = meses_entrenamiento[-1]
+    return meses_entrenamiento, mes_holdout, mes_prediccion
+
+# [Anotación · líneas 27–30] cargar_features lee un archivo de texto y devuelve la lista de sus líneas no
+#   vacías, sin espacios en los extremos.
+
+def cargar_features(ruta) -> list[str]:
+    return [c.strip() for c in ruta.read_text(encoding="utf-8").splitlines() if c.strip()]
+
+# [Anotación · líneas 31–40] submuestrear_continuas genera un número al azar entre 0 y 1 por fila con
+#   numpy.random.default_rng(seed) y conserva las filas con clase_binaria = 1 y las filas cuyo número al azar es
+#   menor o igual a proporcion.
+
+def submuestrear_continuas(df: pd.DataFrame, seed: int, proporcion: float) -> pd.DataFrame:
+    """Conserva todos los positivos (clase_binaria=1) y una fracción al azar
+    de los negativos (clase_binaria=0)."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    azar = rng.random(len(df))
+    mantener = (df["clase_binaria"] == 1) | (azar <= proporcion)
+    return df[mantener]

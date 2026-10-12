@@ -1,0 +1,58 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–12] Importa os, duckdb, numpy y pandas y define las rutas: una carpeta de Google Drive
+#   montada en Colab, el archivo de entrada competencia_01.csv y el de salida competencia_01_fe_v12_NA.csv.
+"""
+Paso 01: Generación de competencia_01_fe_v12_NA.csv a partir del dataset original de la cátedra.
+Construye clase_ternaria (si se parte del crudo sin target), define clase_peligro y preserva NAs.
+"""
+import os
+import duckdb
+import numpy as np
+import pandas as pd
+
+BASE_PATH = '/content/drive/MyDrive/DMEyF/2026/notebooks/data/'
+INPUT_CSV = os.path.join(BASE_PATH, 'competencia_01.csv')
+OUTPUT_CSV = os.path.join(BASE_PATH, 'competencia_01_fe_v12_NA.csv')
+
+# [Anotación · líneas 14–19] Abre una conexión de DuckDB con límite de memoria de 45GB, lee el CSV completo
+#   con read_csv_auto, lo pasa a un DataFrame de pandas y cierra la conexión.
+def main():
+    print("Cargando dataset original con DuckDB...")
+    con = duckdb.connect()
+    con.execute("PRAGMA memory_limit='45GB'")
+    df = con.execute(f"SELECT * FROM read_csv_auto('{INPUT_CSV}')").df()
+    con.close()
+
+# [Anotación · líneas 21–33] Sólo si la tabla no trae clase_ternaria: numera los meses en orden, arma el
+#   conjunto de pares (cliente, índice de mes) presentes y, para cada fila, verifica si el cliente aparece en el
+#   mes siguiente y en el subsiguiente. Asigna BAJA+1 si no aparece en el siguiente, BAJA+2 si aparece en el
+#   siguiente y no en el subsiguiente, y CONTINUA en el resto. Deja sin clase las filas del último mes y las del
+#   penúltimo cuyo cliente aparece en el último.
+    # Si el archivo es el crudo sin clase_ternaria, se calcula según contigüidad m+1 y m+2
+    if 'clase_ternaria' not in df.columns:
+        meses = sorted(df['foto_mes'].unique())
+        mi = df['foto_mes'].map({m: i for i, m in enumerate(meses)}).tolist()
+        cli = df['numero_de_cliente'].tolist()
+        presentes = set(zip(cli, mi))
+        en_m1 = np.fromiter(((c, m + 1) in presentes for c, m in zip(cli, mi)), bool, len(df))
+        en_m2 = np.fromiter(((c, m + 2) in presentes for c, m in zip(cli, mi)), bool, len(df))
+        clase = np.where(~en_m1, 'BAJA+1', np.where(~en_m2, 'BAJA+2', 'CONTINUA')).astype(object)
+        mi_arr = np.array(mi)
+        clase[mi_arr == len(meses) - 1] = None
+        clase[(mi_arr == len(meses) - 2) & en_m1] = None
+        df['clase_ternaria'] = clase
+
+# [Anotación · líneas 35–39] Crea clase_peligro como entero de 8 bits: 1 cuando clase_ternaria es BAJA+1 o
+#   BAJA+2 y 0 en cualquier otro caso, incluidas las filas sin clase. Escribe la tabla completa a CSV sin índice
+#   e imprime la cantidad de filas y de columnas.
+    # Target binario unificado: BAJA+1 y BAJA+2 como positivos (1)
+    df['clase_peligro'] = df['clase_ternaria'].isin(['BAJA+1', 'BAJA+2']).astype(np.int8)
+
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"Dataset exportado exitosamente en: {OUTPUT_CSV} ({df.shape[0]:,} filas, {df.shape[1]} columnas)")
+
+# [Anotación · líneas 41–42] Punto de entrada: ejecuta main() cuando el archivo se corre como script.
+if __name__ == '__main__':
+    main()

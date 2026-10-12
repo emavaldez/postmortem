@@ -1,0 +1,290 @@
+#%% celda 1 [texto]
+# Librerias
+
+#%% celda 2 [código]
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import rdata
+from IPython.display import display
+import os
+
+#%% celda 3 [texto]
+# URLS
+
+Ejecutar con el directorio de trabajo en `entregas/`.
+
+#%% celda 4 [código]
+carpeta_entregas = Path.cwd()
+data_folder = carpeta_entregas / "dataset"
+carpeta_parametros = carpeta_entregas / "parametros"
+carpeta_salida = carpeta_entregas / "entregas"
+archivo_logging = carpeta_entregas / "logging_python.csv"
+
+#%% celda 5 [código]
+os.listdir(data_folder)
+
+#%% celda 6 [texto]
+# Parametrizacion de la prueba
+
+#%% celda 7 [código]
+# dataset_file = "competencia_01_ternaria_lags.csv"
+# dataset_file = "competencia_01_ternaria_lf_k6_perdida4.csv"
+# dataset_file = "c_01_tern_2_lf_k6_p4.csv"
+# dataset_file = "c_01_tern_2_lags.csv"
+# dataset_file = "c_01_tern_2_lf_O2_k3_p6.csv"
+# dataset_file = "c_01_tern_2_lags_O2.csv"
+dataset_file = 'c_01_tern_2_lf_k6_p4.csv'
+
+train_final = [202103, 202104, 202105, 202106]
+future = [202108]  # mes a predecir
+# SEEDS = [230047, 230059, 230063, 230077, 230081]
+# SEEDS = [
+#     230047, 230059, 230063, 230077, 230081,
+#     230089, 230101, 230107, 230117, 230123
+# ]
+SEEDS = [
+    230047, 230059, 230063, 230077, 230081,
+    230089, 230101, 230107, 230117, 230123,
+    230137, 230143, 230149, 230189, 230203,
+    230213, 230221, 230227, 230233, 230239,
+]
+
+id_rds = 40  # archivo parametros/<id_rds>.rds
+envios = 12500  # cantidad de clientes con Predicted = 1
+
+#%% celda 8 [código]
+columnas_excluir = [
+    "ternaria",
+    "ternaria_lag1",
+    "clase01",
+    "fold",
+    "azar",
+    "training",
+    "cprestamos_personales",
+    "mprestamos_personales",
+    "cprestamos_personales_lag1",
+    "mprestamos_personales_lag1",
+    "cprestamos_personales_delta1",
+    "mprestamos_personales_delta1",
+    "cprestamos_personales_lag_pond",
+    "mprestamos_personales_lag_pond",
+    "cprestamos_personales_delta_lag_pond",
+    "mprestamos_personales_delta_lag_pond"
+]
+
+#%% celda 9 [texto]
+# LEEMOS DATASET
+
+#%% celda 10 [código]
+dataset_url = data_folder / dataset_file
+dataset = pd.read_csv(dataset_url, low_memory=False)
+dataset["ternaria"] = dataset["ternaria"].fillna("")
+dataset = dataset.sort_values(
+    ["foto_mes", "ternaria", "numero_de_cliente"],
+    kind="stable", na_position="first",
+).reset_index(drop=True)
+
+display(dataset.groupby(["foto_mes", "ternaria"], dropna=False).size().reset_index(name="N"))
+
+#%% celda 11 [texto]
+# Parametros
+
+El `.rds` debe estar copiado en `parametros/`. Se usan los parametros guardados, sin volver a ajustar `min_data_in_leaf`.
+
+#%% celda 12 [código]
+
+# rdata lee también las listas anidadas del RDS, sin requerir R.
+# Convierte los vectores escalares de R en escalares de Python.
+def convertir_r(valor):
+    if isinstance(valor, dict):
+        return {k: convertir_r(v) for k, v in valor.items()}
+    if isinstance(valor, np.ndarray):
+        if valor.size == 1:
+            return convertir_r(valor.item())
+        return [convertir_r(v) for v in valor.tolist()]
+    if isinstance(valor, (list, tuple)):
+        return [convertir_r(v) for v in valor]
+    if isinstance(valor, np.generic):
+        return convertir_r(valor.item())
+    # R serializa muchos parámetros enteros como double (31.0).
+    # LightGBM Python exige int para esos valores; se conserva su valor.
+    if isinstance(valor, float) and np.isfinite(valor) and valor.is_integer():
+        return int(valor)
+    return valor
+
+parametros = convertir_r(rdata.read_rds(carpeta_parametros / f"{id_rds}.rds"))
+
+#%% celda 13 [texto]
+# Dataset train y prediccion
+
+#%% celda 14 [código]
+dataset["clase01"] = dataset["ternaria"].isin(["BAJA+1", "BAJA+2"]).astype(np.int32)
+
+campos_buenos = [c for c in dataset.columns if c not in columnas_excluir]
+
+dataset_train = dataset.loc[dataset["foto_mes"].isin(train_final)].copy()
+dfuture = dataset.loc[dataset["foto_mes"].isin(future)].copy()
+
+if (len(future) != 1 or dataset_train.empty or dfuture.empty
+        or envios < 1 or envios > len(dfuture) or envios != int(envios)):
+    raise ValueError("Revisar meses y envios: se requiere un mes a predecir y filas en ambos datasets.")
+
+display(dataset_train.groupby(["foto_mes", "ternaria"], dropna=False).size().reset_index(name="N"))
+
+# Equivalente a data.matrix: variables numéricas sin tratar como categóricas.
+# Si existen columnas de texto, R las convierte a códigos de factor desde 1.
+# Los niveles se calculan por separado para train y future, igual que en R.
+def data_matrix(df):
+    matriz = df.copy()
+    for nombre in matriz.columns:
+        serie = matriz[nombre]
+        if isinstance(serie.dtype, pd.CategoricalDtype):
+            codigos = serie.cat.codes
+            matriz[nombre] = (codigos + 1).where(codigos >= 0, np.nan)
+        elif pd.api.types.is_object_dtype(serie.dtype) or pd.api.types.is_string_dtype(serie.dtype):
+            niveles = sorted(serie.dropna().unique())
+            codigos = pd.Categorical(serie, categories=niveles).codes
+            matriz[nombre] = np.where(codigos >= 0, codigos + 1, np.nan)
+    return matriz.to_numpy(dtype=np.float64)
+
+X_train = data_matrix(dataset_train[campos_buenos])
+X_future = data_matrix(dfuture[campos_buenos])
+
+#%% celda 15 [texto]
+# Entreno y genero salidas
+
+#%% celda 16 [código]
+predicciones_por_semilla = {}
+
+params_base = (
+    parametros
+    if "num_iterations" in parametros
+    else next(iter(parametros.values()))
+)
+
+for seed in SEEDS:
+    params_semilla = params_base.copy()
+    params_semilla["seed"] = seed
+    num_boost_round = int(params_semilla.pop("num_iterations"))
+
+    dtrain_final = lgb.Dataset(
+        data=X_train,
+        label=dataset_train["clase01"].to_numpy(),
+        feature_name=campos_buenos,
+        categorical_feature=[],
+    )
+    modelo_final = lgb.train(
+        params=params_semilla,
+        train_set=dtrain_final,
+        num_boost_round=num_boost_round,
+    )
+
+    tb_prediccion = dfuture[["numero_de_cliente"]].copy()
+    tb_prediccion["prob"] = modelo_final.predict(X_future)
+
+    predicciones_por_semilla[seed] = tb_prediccion.sort_values(
+        "prob", ascending=False, kind="stable"
+    ).reset_index(drop=True)
+
+    print(f"Semilla={seed}: predicciones listas")
+    del modelo_final, dtrain_final
+
+#%% celda 17 [texto]
+## CANT ENVIOS
+
+#%% celda 18 [código]
+envios = 11000  # cambiar para cada corte
+
+if envios != int(envios) or not 1 <= envios <= len(dfuture):
+    raise ValueError("Revisar envios: debe ser un entero entre 1 y la cantidad de clientes.")
+envios = int(envios)
+
+if archivo_logging.exists():
+    historico = pd.read_csv(archivo_logging)
+    id_prueba = int(historico["id_prueba"].max()) + 1
+else:
+    id_prueba = 1
+
+carpeta_salida.mkdir(parents=True, exist_ok=True)
+archivos_salida = []
+
+for seed in SEEDS:
+    tb_prediccion = predicciones_por_semilla[seed].copy()
+
+    archivo = f"p001_{seed}_{id_prueba}.csv"
+    tb_prediccion.head(envios)[["numero_de_cliente"]].to_csv(
+        carpeta_salida / archivo,
+        header=False,
+        index=False,
+    )
+
+    archivos_salida.append(archivo)
+    print(f"Semilla={seed} Archivo={archivo}")
+
+#%% celda 19 [texto]
+# Documentacion de la prueba
+
+Una fila por ejecucion, con todas las semillas usadas. Completar la nota y los resultados de Kaggle como texto. Cuando lleguen los resultados, ejecutar las dos celdas de esta seccion: actualizan la misma fila y conservan las pruebas anteriores.
+
+#%% celda 20 [código]
+# cortamos aca
+pepe
+
+#%% celda 21 [código]
+nota = "ID15 con 20 semillas, subimbajamos a 11k envios"
+resultado_competencia_mean = "105.5464"  # score de Kaggle o referencia a un problema con la entrega
+resultado_competencia_std = "2.6225"
+ref_submit = "e44_p"
+
+#%% celda 22 [código]
+registro_prueba = pd.DataFrame([{
+    "id_prueba": id_prueba,
+    "ref_submit": ref_submit,
+    "notebook": "p001.ipynb",
+    "dataset": dataset_file,
+    "seeds": ",".join(map(str, SEEDS)),
+    "cantidad_registros_totales": len(dataset),
+    "cantidad_registros_entrenamiento": len(dataset_train),
+    "cantidad_registros_prediccion": len(dfuture),
+    "meses_entrenamiento": ",".join(map(str, train_final)),
+    "meses_prediccion": ",".join(map(str, future)),
+    "columnas_excluidas": ",".join(columnas_excluir),
+    "bajas":"1+2",                                       #baja+1 y baja+2 o solo baja+2
+    "id_rds": id_rds,
+    "envios": envios,
+    "archivos": ",".join(archivos_salida),
+    "nota": nota,
+    "resultado_competencia_mean": resultado_competencia_mean,
+    "resultado_competencia_std": resultado_competencia_std
+}])
+
+if archivo_logging.exists():
+    historico = pd.read_csv(
+        archivo_logging,
+        dtype={
+            "ref_submit": str,
+            "seeds": str,
+            "meses_entrenamiento": str,
+            "meses_prediccion": str,
+            "nota": str,
+            "resultado_competencia_mean": str,
+            "resultado_competencia_std": str,
+        },
+    )
+    fila = historico["id_prueba"].eq(id_prueba)
+
+    if fila.any():
+        historico.loc[fila, registro_prueba.columns] = registro_prueba.to_numpy()
+        historico.to_csv(archivo_logging, index=False)
+    else:
+        registro_prueba.to_csv(archivo_logging, mode="a", header=False, index=False)
+else:
+    registro_prueba.to_csv(archivo_logging, index=False)
+
+# display(registro_prueba)
+
+#%% celda 23 [código]
+# display(pd.read_csv(archivo_logging).tail(15))
+display(pd.read_csv(archivo_logging)[['id_prueba','envios','resultado_competencia_mean','resultado_competencia_std', 'ref_submit','dataset','meses_entrenamiento','id_rds','nota']].tail(30))

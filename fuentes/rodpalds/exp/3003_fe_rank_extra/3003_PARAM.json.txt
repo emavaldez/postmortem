@@ -1,0 +1,40 @@
+{
+  "experimento": 3003,
+  "nombre": "fe_rank_extra",
+  "descripcion": "Como 3002 (lags/deltas 1 y 2 + rank total por mes con cero fijo, NA se mantiene) mas 6 variables del proceso de muerte: n_apagados, sus deltas 1 y 2, n_dejo_de_usar, ctrx_quarter y mcaja_ahorro relativos al maximo de 3 meses.",
+  "dataset_entrada": "ds1001_base.parquet",
+  "dataset_salida": "ds3003_rank_extra.parquet",
+  "lags": [
+    1,
+    2
+  ],
+  "deltas": [
+    1,
+    2
+  ],
+  "claves": [
+    "ctrx_quarter",
+    "mpasivos_margen",
+    "mcaja_ahorro",
+    "mcuentas_saldo",
+    "ctarjeta_visa_transacciones",
+    "ctarjeta_master_transacciones",
+    "ctarjeta_debito_transacciones",
+    "mprestamos_personales",
+    "mpayroll",
+    "cmobile_app_trx",
+    "chomebanking_transacciones",
+    "mcomisiones",
+    "cdescubierto_preacordado",
+    "mcuenta_corriente",
+    "Visa_msaldototal",
+    "Master_msaldototal"
+  ],
+  "relativas_max3": [
+    "ctrx_quarter",
+    "mcaja_ahorro"
+  ],
+  "_fecha_inicio": "2026-10-09 10:54:08",
+  "_script": "03c_fe_extra.py",
+  "_git_commit": "sin_git"
+}

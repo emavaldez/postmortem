@@ -1,0 +1,11 @@
+{
+  "pruebas": 150,
+  "eleccion": "4102 prueba_117",
+  "evidencia": {
+    "meseta_B_elegido_M": 418.2,
+    "meseta_B_z601_M": 384.0,
+    "mejor_retador": "prueba_117",
+    "semillas_ganadas_por_el_mejor_retador": "10/10"
+  },
+  "_minutos": 23.17
+}

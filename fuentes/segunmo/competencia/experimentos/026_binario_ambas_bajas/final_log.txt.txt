@@ -1,0 +1,13 @@
+
+===== 026b 2026-10-09 12:16 | train (654066, 348) (positivos BAJA+1/2: 8052) | semillas [852583, 771227, 676057, 482687, 399221, 121109] =====
+listo M0 top1 (3 min)
+listo M0 top2 (6 min)
+listo M0 top3 (10 min)
+listo M1 top1 (13 min)
+listo M1 top2 (16 min)
+listo M1 top3 (20 min)
+exp026_mc_k12000.csv
+exp026_b12_k12000.csv
+exp026_mix_k12000.csv
+solapamiento top-12000: mc-b12 93.8% | mc-mix 97.0% | b12-mix 96.8%
+[026b] terminado

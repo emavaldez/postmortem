@@ -1,0 +1,82 @@
+{
+  "experimento": 5110,
+  "nombre": "comparar_bo4109",
+  "descripcion": "R4: Bayesiana limpia 4109 (elegida solo por la mitad A) contra la prueba 23 en la variante elegida por R3 (md20248, 580 arboles). Train 202103+202104, ds3003 con lag2, mitad B de 202106 (x2), 30 semillas, bootstrap pareado.",
+  "mitades": "4102_bo_fuera_de_tiempo/4102_mitades_junio.csv",
+  "referencia": "bo4109",
+  "candidatos": {
+    "bo4109": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4109_bo_limpia_profesor/4109_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ]
+    },
+    "p23": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ],
+      "min_data_in_leaf": 20248,
+      "arboles_lista": [
+        580
+      ]
+    }
+  },
+  "mes_train": 202104,
+  "mes_test": 202106,
+  "clase": "clase_binaria2",
+  "n_semillas": 30,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    8000,
+    8500,
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000,
+    15500,
+    16000,
+    16500,
+    17000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "n_bootstrap": 1000,
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "clientes_agosto": 164647,
+  "sobrescribir": true,
+  "_config": "5110_comparar_bo4109.json",
+  "_fecha_inicio": "2026-10-10 15:10:19",
+  "_script": "11_comparar_pipelines.py",
+  "_git_commit": "sin_git"
+}

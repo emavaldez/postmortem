@@ -1,0 +1,15 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–10] Importa `superfinal100_v2`, reemplaza su `stage5_per_seed` por
+#   `stage5_per_seed_safe` y llama a `main`.
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import superfinal100_v2 as V2
+from stage5_v2_safe import stage5_per_seed_safe
+
+V2.stage5_per_seed = stage5_per_seed_safe
+
+if __name__ == "__main__":
+    V2.main()

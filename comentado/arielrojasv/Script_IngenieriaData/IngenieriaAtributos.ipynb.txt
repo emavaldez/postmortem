@@ -1,0 +1,218 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–9] Celda de título ('Genero nuevos atributos para el dataset') e importación de pandas
+#   y numpy.
+#%% celda 1 [texto]
+## Clientes Banco
+
+Genero nuevos atributos para el dataset
+
+#%% celda 2 [código]
+# Importo librerias
+import pandas as pd
+import numpy as np
+
+# [Anotación · líneas 11–24] Instala jupysql y duckdb-engine con %pip, importa duckdb, carga la extensión sql
+#   de Jupyter configurada para devolver los resultados como DataFrame de pandas y abre una conexión DuckDB en
+#   memoria (duckdb://).
+#%% celda 3 [código]
+# Instalo duckdb
+%pip install jupysql
+%pip install duckdb-engine
+
+#%% celda 4 [código]
+import duckdb
+
+%load_ext sql
+%config SqlMagic.autopandas = True
+%config SqlMagic.feedback = False
+%config SqlMagic.displaycon = False
+
+%sql duckdb://
+
+# [Anotación · líneas 26–34] Monta Google Drive en /content/drive y define la carpeta de datos
+#   '/content/drive/MyDrive/dmeyf/datasets/' y el archivo de entrada 'competencia_01_crudo.csv'.
+#%% celda 5 [código]
+# Carpeta Drive
+from google.colab import drive
+drive.mount("/content/drive")
+
+#%% celda 6 [código]
+# Carpetas y archivo a usar
+dataset_path = '/content/drive/MyDrive/dmeyf/datasets/'
+dataset_file = 'competencia_01_crudo.csv'
+
+# [Anotación · líneas 36–41] Crea o reemplaza la tabla competencia_01 en DuckDB con todas las columnas del
+#   CSV, leído con read_csv_auto.
+#%% celda 7 [código]
+# Cargo archivo original
+%%sql
+create or replace table competencia_01 as
+select *
+from read_csv_auto("{{dataset_path + dataset_file}}")
+
+# [Anotación · líneas 43–51] Abre una sentencia COPY cuyo contenido es una consulta 'select *': conserva todas
+#   las columnas y agrega las que se definen en las líneas siguientes.
+#%% celda 8 [código]
+# Genero nuevos atributos y los guardo en un nuevo archivo
+
+%%sql
+
+COPY
+(
+  select
+  *
+# [Anotación · líneas 52–57] Para mpayroll calcula, con funciones de ventana por numero_de_cliente ordenadas
+#   por foto_mes, el valor de la fila anterior (mpayroll_lag) y el de dos filas atrás (mpayroll_lag2), y la
+#   diferencia del valor actual con cada uno (delta_mpayroll y delta_mpayroll_l2). Agrega mpayroll_relativa
+#   (mpayroll dividido por el promedio de mpayroll del mes, redondeado a 2 decimales) y cseguros (suma de
+#   cseguro_vida, cseguro_auto, cseguro_vivienda y cseguro_accidentes_personales).
+  , lag(mpayroll, 1) over (partition by numero_de_cliente order by ori.foto_mes)  as mpayroll_lag
+  , lag(mpayroll, 2) over (partition by numero_de_cliente order by ori.foto_mes)  as mpayroll_lag2
+  , ( mpayroll - lag(mpayroll, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mpayroll
+  , ( mpayroll - lag(mpayroll, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mpayroll_l2
+  , round(( mpayroll / paym.mpayroll_prom),2)  as mpayroll_relativa
+  , (cseguro_vida + cseguro_auto + cseguro_vivienda + cseguro_accidentes_personales) as cseguros
+# [Anotación · líneas 58–89] Repite las cuatro columnas (lag 1, lag 2, delta contra lag 1 y delta contra lag
+#   2) para 8 variables: mcuentas_saldo, mrentabilidad, mcomisiones, mactivos_margen, mpasivos_margen,
+#   mcuenta_corriente, mcaja_ahorro y mautoservicio. Los alias siguen el patrón variable_lag, variable_lag_2,
+#   delta_variable y delta_variable_l2; en la línea 68 el alias está escrito 'asmcomisiones_lag_2', sin espacio
+#   después de 'as'.
+  , lag(mcuentas_saldo, 1) over (partition by numero_de_cliente order by ori.foto_mes)  as mcuentas_saldo_lag
+  , lag(mcuentas_saldo, 2) over (partition by numero_de_cliente order by ori.foto_mes)  as mcuentas_saldo_lag_2
+  , ( mcuentas_saldo - lag(mcuentas_saldo, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mcuentas_saldo
+  , ( mcuentas_saldo - lag(mcuentas_saldo, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mcuentas_saldo_l2
+  , lag(mrentabilidad, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mrentabilidad_lag
+  , ( mrentabilidad - lag(mrentabilidad, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mrentabilidad
+  , lag(mrentabilidad, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mrentabilidad_lag_2
+  , ( mrentabilidad - lag(mrentabilidad, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mrentabilidad_l2
+  , lag(mcomisiones, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mcomisiones_lag
+  , ( mcomisiones - lag(mcomisiones, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mcomisiones
+  , lag(mcomisiones, 2) over (partition by numero_de_cliente order by ori.foto_mes) asmcomisiones_lag_2
+  , ( mcomisiones - lag(mcomisiones, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mcomisiones_l2
+  , lag(mactivos_margen, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mactivos_margen_lag
+  , ( mactivos_margen - lag(mactivos_margen, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mactivos_margen
+  , lag(mactivos_margen, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mactivos_margen_lag_2
+  , ( mactivos_margen - lag(mactivos_margen, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mactivos_margen_l2
+  , lag(mpasivos_margen, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mpasivos_margen_lag
+  , ( mpasivos_margen - lag(mpasivos_margen, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mpasivos_margen
+  , lag(mpasivos_margen, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mpasivos_margen_lag_2
+  , ( mpasivos_margen - lag(mpasivos_margen, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mpasivos_margen_l2
+  , lag(mcuenta_corriente, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mcuenta_corriente_lag
+  , ( mcuenta_corriente - lag(mcuenta_corriente, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mcuenta_corriente
+  , lag(mcuenta_corriente, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mcuenta_corriente_lag_2
+  , ( mcuenta_corriente - lag(mcuenta_corriente, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mcuenta_corriente_l2
+  , lag(mcaja_ahorro, 1) over (partition by numero_de_cliente order by ori.foto_mes)  as  mcaja_ahorro_lag
+  , ( mcaja_ahorro - lag(mcaja_ahorro, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mcaja_ahorro
+  , lag(mcaja_ahorro, 2) over (partition by numero_de_cliente order by ori.foto_mes)  as  mcaja_ahorro_lag_2
+  , ( mcaja_ahorro - lag(mcaja_ahorro, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mcaja_ahorro_l2
+  , lag(mautoservicio, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mautoservicio_lag
+  , ( mautoservicio - lag(mautoservicio, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mautoservicio
+  , lag(mautoservicio, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mautoservicio_lag_2
+  , ( mautoservicio - lag(mautoservicio, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mautoservicio_l2
+# [Anotación · líneas 90–125] Las mismas cuatro columnas para 9 variables: mtarjeta_visa_consumo,
+#   mtarjeta_master_consumo, mprestamos_prendarios, mprestamos_personales, mplazo_fijo_pesos,
+#   mplazo_fijo_dolares, mcuenta_debitos_automaticos, mextraccion_autoservicio y matm.
+  , lag(mtarjeta_visa_consumo, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mtarjeta_visa_consumo_lag
+  , ( mtarjeta_visa_consumo - lag(mtarjeta_visa_consumo, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mtarjeta_visa_consumo
+  , lag(mtarjeta_visa_consumo, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mtarjeta_visa_consumo_lag_2
+  , ( mtarjeta_visa_consumo - lag(mtarjeta_visa_consumo, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mtarjeta_visa_consumo_l2
+  , lag(mtarjeta_master_consumo, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mtarjeta_master_consumo_lag
+  , ( mtarjeta_master_consumo - lag(mtarjeta_master_consumo, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mtarjeta_master_consumo
+  , lag(mtarjeta_master_consumo, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mtarjeta_master_consumo_lag_2
+  , ( mtarjeta_master_consumo - lag(mtarjeta_master_consumo, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mtarjeta_master_consumo_l2
+  , lag(mprestamos_prendarios, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mprestamos_prendarios_lag
+  , ( mprestamos_prendarios - lag(mprestamos_prendarios, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mprestamos_prendarios
+  , lag(mprestamos_prendarios, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mprestamos_prendarios_lag_2
+  , ( mprestamos_prendarios - lag(mprestamos_prendarios, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mprestamos_prendarios_l2
+  , lag(mprestamos_personales, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mprestamos_personales_lag
+  , ( mprestamos_personales - lag(mprestamos_personales, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mprestamos_personales
+  , lag(mprestamos_personales, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mprestamos_personales_lag_2
+  , ( mprestamos_personales - lag(mprestamos_personales, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mprestamos_personales_l2
+  , lag(mplazo_fijo_pesos, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mplazo_fijo_pesos_lag
+  , ( mplazo_fijo_pesos - lag(mplazo_fijo_pesos, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mplazo_fijo_pesos
+  , lag(mplazo_fijo_pesos, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mplazo_fijo_pesos_lag_2
+  , ( mplazo_fijo_pesos - lag(mplazo_fijo_pesos, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mplazo_fijo_pesos_l2
+  , lag(mplazo_fijo_dolares, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mplazo_fijo_dolares_lag
+  , ( mplazo_fijo_dolares - lag(mplazo_fijo_dolares, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mplazo_fijo_dolares
+  , lag(mplazo_fijo_dolares, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mplazo_fijo_dolares_lag_2
+  , ( mplazo_fijo_dolares - lag(mplazo_fijo_dolares, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mplazo_fijo_dolares_l2
+  , lag(mcuenta_debitos_automaticos, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mcuenta_debitos_automaticos_lag
+  , ( mcuenta_debitos_automaticos - lag(mcuenta_debitos_automaticos, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mcuenta_debitos_automaticos
+  , lag(mcuenta_debitos_automaticos, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mcuenta_debitos_automaticos_lag_2
+  , ( mcuenta_debitos_automaticos - lag(mcuenta_debitos_automaticos, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mcuenta_debitos_automaticos_l2
+  , lag(mextraccion_autoservicio, 1) over (partition by numero_de_cliente order by ori.foto_mes) as mextraccion_autoservicio_lag
+  , ( mextraccion_autoservicio - lag(mextraccion_autoservicio, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mextraccion_autoservicio
+  , lag(mextraccion_autoservicio, 2) over (partition by numero_de_cliente order by ori.foto_mes) as mextraccion_autoservicio_lag_2
+  , ( mextraccion_autoservicio - lag(mextraccion_autoservicio, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_mextraccion_autoservicio_l2
+  , lag(matm, 1) over (partition by numero_de_cliente order by ori.foto_mes) as matm_lag
+  , ( matm - lag(matm, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_matm
+  , lag(matm, 2) over (partition by numero_de_cliente order by ori.foto_mes) as matm_lag_2
+  , ( matm - lag(matm, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_matm_l2
+# [Anotación · líneas 126–157] Las mismas cuatro columnas para 8 variables de tarjetas: Visa_mconsumototal,
+#   Visa_mlimitecompra, Visa_msaldototal, Visa_mpagospesos, Master_mconsumototal, Master_mlimitecompra,
+#   Master_msaldototal y Master_mpagospesos. En las líneas 134 y 136 el lag 1 y el lag 2 de Visa_msaldototal
+#   llevan el mismo alias, Visa_msaldototal_lag.
+  , lag(Visa_mconsumototal, 1) over (partition by numero_de_cliente order by ori.foto_mes) as Visa_mconsumototal_lag
+  , ( Visa_mconsumototal - lag(Visa_mconsumototal, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Visa_mconsumototal
+  , lag(Visa_mconsumototal, 2) over (partition by numero_de_cliente order by ori.foto_mes) as Visa_mconsumototal_lag_2
+  , ( Visa_mconsumototal - lag(Visa_mconsumototal, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Visa_mconsumototal_l2
+  , lag(Visa_mlimitecompra, 1) over (partition by numero_de_cliente order by ori.foto_mes) as  Visa_mlimitecompra_lag
+  , ( Visa_mlimitecompra - lag(Visa_mlimitecompra, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Visa_mlimitecompra
+  , lag(Visa_mlimitecompra, 2) over (partition by numero_de_cliente order by ori.foto_mes) as  Visa_mlimitecompra_lag_2
+  , ( Visa_mlimitecompra - lag(Visa_mlimitecompra, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Visa_mlimitecompra_l2
+  , lag(Visa_msaldototal, 1) over (partition by numero_de_cliente order by ori.foto_mes) as Visa_msaldototal_lag
+  , ( Visa_msaldototal - lag(Visa_msaldototal, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Visa_msaldototal
+  , lag(Visa_msaldototal, 2) over (partition by numero_de_cliente order by ori.foto_mes) as Visa_msaldototal_lag
+  , ( Visa_msaldototal - lag(Visa_msaldototal, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Visa_msaldototal_l2
+  , lag(Visa_mpagospesos, 1) over (partition by numero_de_cliente order by ori.foto_mes) as Visa_mpagospesos_lag
+  , ( Visa_mpagospesos - lag(Visa_mpagospesos, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Visa_mpagospesos
+  , lag(Visa_mpagospesos, 2) over (partition by numero_de_cliente order by ori.foto_mes) as Visa_mpagospesos_lag_2
+  , ( Visa_mpagospesos - lag(Visa_mpagospesos, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Visa_mpagospesos_l2
+  , lag(Master_mconsumototal, 1) over (partition by numero_de_cliente order by ori.foto_mes) as Master_mconsumototal_lag
+  , ( Master_mconsumototal - lag(Master_mconsumototal, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Master_mconsumototal
+  , lag(Master_mconsumototal, 2) over (partition by numero_de_cliente order by ori.foto_mes) as Master_mconsumototal_lag_2
+  , ( Master_mconsumototal - lag(Master_mconsumototal, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Master_mconsumototal_l2
+  , lag(Master_mlimitecompra, 1) over (partition by numero_de_cliente order by ori.foto_mes) as Master_mlimitecompra_lag
+  , ( Master_mlimitecompra - lag(Master_mlimitecompra, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Master_mlimitecompra
+  , lag(Master_mlimitecompra, 2) over (partition by numero_de_cliente order by ori.foto_mes) as Master_mlimitecompra_lag_2
+  , ( Master_mlimitecompra - lag(Master_mlimitecompra, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Master_mlimitecompra_l2
+  , lag(Master_msaldototal, 1) over (partition by numero_de_cliente order by ori.foto_mes) as Master_msaldototal_lag
+  , ( Master_msaldototal - lag(Master_msaldototal, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Master_msaldototal
+  , lag(Master_msaldototal, 2) over (partition by numero_de_cliente order by ori.foto_mes) as Master_msaldototal_lag_2
+  , ( Master_msaldototal - lag(Master_msaldototal, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Master_msaldototal_l2
+  , lag(Master_mpagospesos, 1) over (partition by numero_de_cliente order by ori.foto_mes) as Master_mpagospesos_lag
+  , ( Master_mpagospesos - lag(Master_mpagospesos, 1) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Master_mpagospesos
+  , lag(Master_mpagospesos, 2) over (partition by numero_de_cliente order by ori.foto_mes) as Master_mpagospesos_lag_2
+  , ( Master_mpagospesos - lag(Master_mpagospesos, 2) over (partition by numero_de_cliente order by ori.foto_mes)) as delta_Master_mpagospesos_l2
+# [Anotación · líneas 158–163] Lag 1 y lag 2 de Master_status y de Visa_status, sin deltas.
+#   flag_superior_payroll vale 1 cuando mpayroll supera el 95% del máximo de mpayroll del mes y 0 en otro caso.
+#   mrentabilidad_relativa es mrentabilidad dividida por el promedio de mrentabilidad del mes, redondeada a 2
+#   decimales.
+  , lag(Master_status, 1) over (partition by numero_de_cliente order by ori.foto_mes) as Master_status_lag
+  , lag(Master_status, 2) over (partition by numero_de_cliente order by ori.foto_mes) as Master_status_lag_2
+  , lag(Visa_status, 1) over (partition by numero_de_cliente order by ori.foto_mes) as Visa_status_lag
+  , lag(Visa_status, 2) over (partition by numero_de_cliente order by ori.foto_mes) as Visa_status_lag_2
+  , case when ori.mpayroll > (paym.mpayroll_max * .95) then 1 else 0 end as flag_superior_payroll
+  , round(( mrentabilidad / paym.mrentabilidad_prom),2)  as mrentabilidad_relativa
+# [Anotación · líneas 164–174] Origen de la consulta: la tabla competencia_01 (alias ori) unida por foto_mes
+#   con una subconsulta (alias paym) que calcula, para cada mes, el promedio y el máximo de mpayroll y el
+#   promedio de mrentabilidad. Como la selección es 'select *', las columnas de la subconsulta también forman
+#   parte del resultado.
+    from competencia_01 ori
+    inner join
+    (
+        select foto_mes
+        , avg(mpayroll) as mpayroll_prom
+        , max(mpayroll) as mpayroll_max
+        , avg(mrentabilidad) as mrentabilidad_prom
+        from competencia_01
+        group by foto_mes
+    ) paym
+    on ori.foto_mes = paym.foto_mes
+
+# [Anotación · líneas 176–177] Cierra el COPY: escribe el resultado en
+#   '/content/drive/MyDrive/dmeyf/datasets/competencia_01_fe_Final.csv', en formato CSV con encabezado.
+)
+TO '/content/drive/MyDrive/dmeyf/datasets/competencia_01_fe_Final.csv' (FORMAT CSV, HEADER TRUE);

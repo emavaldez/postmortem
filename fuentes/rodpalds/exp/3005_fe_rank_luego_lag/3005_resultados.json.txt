@@ -1,0 +1,10 @@
+{
+  "archivo": "ds3005_rank_luego_lag.parquet",
+  "columnas": 771,
+  "MB": 581,
+  "nuevas": 6,
+  "orden": "rank_luego_lag",
+  "extras": "conteo",
+  "rankear_extras": true,
+  "_minutos": 0.54
+}

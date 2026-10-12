@@ -1,0 +1,223 @@
+{
+  "version": "superfinal100_v1",
+  "run": "c1superfinal100",
+  "goal_public_gain_millions": 100,
+  "baseline": "C3",
+  "target": "BAJA+2_vs_resto",
+  "eval": {
+    "train": [
+      202103,
+      202104
+    ],
+    "month": 202106
+  },
+  "final_score": 202108,
+  "gain": {
+    "hit": 1072500,
+    "cost": 27500,
+    "n_grid": {
+      "min": 8000,
+      "max": 15000,
+      "step": 500
+    },
+    "robust_window": 3
+  },
+  "quality_stage": "reuse_B1_predefined_rule",
+  "representation": {
+    "screening_seeds": [
+      17,
+      101,
+      202
+    ],
+    "confirmation_seeds": [
+      17,
+      101,
+      202,
+      303,
+      404
+    ],
+    "arms": [
+      "C3",
+      "NOPREST",
+      "C3_OBS",
+      "NOPREST_OBS",
+      "C3_RANK",
+      "NOPREST_RANK",
+      "C3_STATE",
+      "NOPREST_STATE",
+      "NOPREST_OBS_STATE",
+      "NOPREST_RANK_OBS"
+    ],
+    "drop_raw": [
+      "cprestamos_personales",
+      "cprestamos_prendarios",
+      "cprestamos_hipotecarios"
+    ],
+    "blocks": {
+      "OBS": [
+        "disponibilidad",
+        "cobertura_panel"
+      ],
+      "RANK": [
+        "ranks"
+      ],
+      "STATE": [
+        "estado_numerico",
+        "stocks_productos_deuda",
+        "funciones"
+      ]
+    },
+    "current_only_blocks": [
+      "ranks",
+      "estado_numerico",
+      "stocks_productos_deuda",
+      "funciones"
+    ],
+    "screen_win_fraction": 0.6666666667,
+    "confirm_win_fraction": 0.6
+  },
+  "recency": {
+    "seeds": [
+      17,
+      101,
+      202,
+      303,
+      404
+    ],
+    "policies": {
+      "EXPANDING": {
+        "202103": 1,
+        "202104": 1
+      },
+      "RECENCY_050": {
+        "202103": 0.5,
+        "202104": 1
+      },
+      "RECENCY_025": {
+        "202103": 0.25,
+        "202104": 1
+      },
+      "RECENT_ONLY": {
+        "202103": 0,
+        "202104": 1
+      }
+    },
+    "final_mapping": {
+      "EXPANDING": {
+        "202103": 1,
+        "202104": 1,
+        "202105": 1,
+        "202106": 1
+      },
+      "RECENCY_050": {
+        "202103": 0.125,
+        "202104": 0.25,
+        "202105": 0.5,
+        "202106": 1
+      },
+      "RECENCY_025": {
+        "202103": 0.015625,
+        "202104": 0.0625,
+        "202105": 0.25,
+        "202106": 1
+      },
+      "RECENT_ONLY": {
+        "202103": 0,
+        "202104": 0,
+        "202105": 0,
+        "202106": 1
+      }
+    }
+  },
+  "tuning": {
+    "trials": 20,
+    "seed": 17,
+    "train": [
+      202103
+    ],
+    "eval": 202105,
+    "top_k": 3,
+    "space": {
+      "learning_rate": [
+        "float_log",
+        0.015,
+        0.06
+      ],
+      "num_leaves": [
+        "int",
+        24,
+        128
+      ],
+      "min_data_in_leaf": [
+        "int_log",
+        100,
+        1200
+      ],
+      "feature_fraction": [
+        "float",
+        0.55,
+        1
+      ],
+      "bagging_fraction": [
+        "float",
+        0.65,
+        1
+      ],
+      "lambda_l1": [
+        "float_log",
+        1e-8,
+        5
+      ],
+      "lambda_l2": [
+        "float_log",
+        1e-8,
+        10
+      ],
+      "max_bin": [
+        "categorical",
+        [
+          63,
+          127,
+          255
+        ]
+      ],
+      "rounds": [
+        "int",
+        200,
+        550
+      ]
+    }
+  },
+  "confirmation": {
+    "seeds": [
+      17,
+      101,
+      202,
+      303,
+      404,
+      505,
+      606,
+      707,
+      808,
+      909,
+      1001,
+      1102,
+      1203,
+      1304,
+      1405,
+      1506,
+      1607,
+      1708,
+      1809,
+      1910
+    ],
+    "positive_fraction_min": 0.6
+  },
+  "final": {
+    "single_submit": true,
+    "cutoff_source": "confirmation_robust_plateau_center",
+    "no_alt_n": true
+  },
+  "no_leaderboard_selection": true,
+  "stop_after_this_experiment": true
+}

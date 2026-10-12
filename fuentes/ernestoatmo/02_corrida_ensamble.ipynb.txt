@@ -1,0 +1,241 @@
+#%% celda 1 [código]
+import os
+import shutil
+import urllib.request
+import pandas as pd
+import numpy as np
+from lightgbm import LGBMClassifier
+import gc
+import warnings
+warnings.filterwarnings("ignore")
+
+# =============================================================================
+# 0. FUNCIONES DE OPTIMIZACIÓN DE MEMORIA
+# =============================================================================
+def reducir_memoria(df):
+    for col in df.columns:
+        col_type = df[col].dtype
+        if col_type != object:
+            if str(col_type)[:3] == 'int':
+                df[col] = pd.to_numeric(df[col], downcast='integer')
+            else:
+                df[col] = pd.to_numeric(df[col], downcast='float')
+    return df
+
+# =============================================================================
+# 1. MONTAJE DE DRIVE Y DESCARGA CONDICIONAL
+# =============================================================================
+try:
+    from google.colab import drive
+    if not os.path.exists('/content/.drive'):
+        drive.mount('/content/.drive')
+except ImportError:
+    pass
+
+os.makedirs("/content/.drive/My Drive/dmeyf", exist_ok=True)
+os.makedirs("/content/buckets/b1/datasets", exist_ok=True)
+os.makedirs("/content/datasets", exist_ok=True)
+
+if not os.path.exists("/content/buckets/b1"):
+    try:
+        os.symlink("/content/.drive/My Drive/dmeyf", "/content/buckets/b1")
+    except:
+        pass
+
+file_drive = "/content/buckets/b1/datasets/competencia_01_crudo.csv"
+file_local = "/content/datasets/competencia_01_crudo.csv"
+url = "https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv"
+
+if not os.path.isfile(file_drive):
+    urllib.request.urlretrieve(url, file_drive)
+
+if not os.path.isfile(file_local):
+    shutil.copy(file_drive, file_local)
+
+# =============================================================================
+# 2. FUNCIÓN: RANKING CON CERO FIJO IN-PLACE
+# =============================================================================
+def aplicar_rank_cero_fijo_inplace(df, columnas_a_rankear):
+    def escalar_rangos(s, val_min, val_max):
+        if s.empty:
+            return s
+        r = s.rank(method='dense')
+        r_min, r_max = r.min(), r.max()
+        if r_min == r_max:
+            return pd.Series(val_max, index=s.index)
+        p = (r - r_min) / (r_max - r_min)
+        return val_min + p * (val_max - val_min)
+
+    for col in columnas_a_rankear:
+        mask_pos = df[col] > 0
+        mask_neg = df[col] < 0
+
+        if mask_pos.any():
+            df.loc[mask_pos, col] = df.loc[mask_pos].groupby('foto_mes')[col].transform(lambda x: escalar_rangos(x, 0.001, 1.0))
+        if mask_neg.any():
+            df.loc[mask_neg, col] = df.loc[mask_neg].groupby('foto_mes')[col].transform(lambda x: escalar_rangos(x, -1.0, -0.001))
+    return df
+
+# =============================================================================
+# 3. CARGA, COMPRESIÓN Y CREACIÓN DE LA CLASE BINARIA
+# =============================================================================
+print("Cargando dataset...")
+dataset = pd.read_csv(file_local)
+dataset = reducir_memoria(dataset)
+
+dataset.loc[dataset['foto_mes'] == 202105, 'ccajas_depositos'] = np.nan
+
+dataset['periodo0'] = (dataset['foto_mes'] // 100) * 12 + (dataset['foto_mes'] % 100)
+dataset.sort_values(['numero_de_cliente', 'periodo0'], inplace=True)
+
+dataset['periodo1'] = dataset.groupby('numero_de_cliente')['periodo0'].shift(-1)
+dataset['periodo2'] = dataset.groupby('numero_de_cliente')['periodo0'].shift(-2)
+
+periodo_ultimo = dataset['periodo0'].max()
+periodo_anteultimo = periodo_ultimo - 1
+
+dataset['clase_binaria'] = np.nan
+dataset.loc[dataset['periodo0'] < periodo_anteultimo, 'clase_binaria'] = 'CONTINUA'
+
+mask_baja1 = (dataset['periodo0'] < periodo_ultimo) & (dataset['periodo1'].isna() | (dataset['periodo0'] + 1 < dataset['periodo1']))
+mask_baja2 = (dataset['periodo0'] < periodo_anteultimo) & (dataset['periodo0'] + 1 == dataset['periodo1']) & (dataset['periodo2'].isna() | (dataset['periodo0'] + 2 < dataset['periodo2']))
+
+dataset.loc[mask_baja1 | mask_baja2, 'clase_binaria'] = 'BAJA'
+dataset['target'] = np.where(dataset['clase_binaria'] == 'BAJA', 1, np.where(dataset['clase_binaria'] == 'CONTINUA', 0, np.nan))
+dataset.drop(columns=['periodo0', 'periodo1', 'periodo2'], inplace=True)
+gc.collect()
+
+# =============================================================================
+# 4. APLICACIÓN DE RANKING
+# =============================================================================
+print("Aplicando Ranking Cero Fijo...")
+features_base = [c for c in dataset.columns if c not in ['numero_de_cliente', 'foto_mes', 'clase_binaria', 'target']]
+dataset = aplicar_rank_cero_fijo_inplace(dataset, features_base)
+gc.collect()
+
+# =============================================================================
+# 5. FEATURE ENGINEERING: LAGS Y DELTAS
+# =============================================================================
+print("Calculando Lags y Deltas...")
+dataset.sort_values(['numero_de_cliente', 'foto_mes'], inplace=True)
+dataset['periodo_temp'] = (dataset['foto_mes'] // 100) * 12 + (dataset['foto_mes'] % 100)
+
+for col in features_base:
+    dataset[f'{col}_LAG1'] = dataset.groupby('numero_de_cliente')[col].shift(1).astype('float32')
+    dataset[f'{col}_LAG2'] = dataset.groupby('numero_de_cliente')[col].shift(2).astype('float32')
+
+    periodo_lag1 = dataset.groupby('numero_de_cliente')['periodo_temp'].shift(1)
+    periodo_lag2 = dataset.groupby('numero_de_cliente')['periodo_temp'].shift(2)
+
+    dataset.loc[dataset['periodo_temp'] - periodo_lag1 != 1, f'{col}_LAG1'] = np.nan
+    dataset.loc[dataset['periodo_temp'] - periodo_lag2 != 2, f'{col}_LAG2'] = np.nan
+
+    dataset[f'{col}_DELTA-LAG1'] = (dataset[col] - dataset[f'{col}_LAG1']).astype('float32')
+    dataset[f'{col}_DELTA-LAG2'] = (dataset[col] - dataset[f'{col}_LAG2']).astype('float32')
+
+dataset.drop(columns=['periodo_temp'], inplace=True)
+features_totales = [c for c in dataset.columns if c not in ['numero_de_cliente', 'foto_mes', 'clase_binaria', 'target']]
+gc.collect()
+
+# =============================================================================
+# 6. SPLIT PARA ENSAMBLE Y LIBERACIÓN DE MEMORIA
+# =============================================================================
+print("Preparando particiones...")
+meses_train = [202103, 202104, 202105, 202106]
+train_mask = dataset['foto_mes'].isin(meses_train) & dataset['target'].notna()
+X_train = dataset.loc[train_mask, features_totales]
+y_train = dataset.loc[train_mask, 'target']
+
+predict_mask = dataset['foto_mes'] == 202108
+X_predict = dataset.loc[predict_mask, features_totales]
+clientes_predict = dataset.loc[predict_mask, 'numero_de_cliente'].values
+
+del dataset
+gc.collect()
+
+# =============================================================================
+# 7. ENTRENAMIENTO DEL ENSAMBLE (20 SEMILLAS)
+# =============================================================================
+n_semillas = 20
+np.random.seed(331613)
+semillas = np.random.randint(10000, 999999, size=n_semillas)
+
+params = {
+    'n_estimators': 1250,
+    'num_leaves': 700,
+    'min_sum_hessian_in_leaf': 0.003,
+    'learning_rate': 0.005,
+    'min_child_samples': 0,
+    'colsample_bytree': 0.50,
+    'max_depth': -1,
+    'min_split_gain': 0.0,
+    'reg_alpha': 0.0,
+    'reg_lambda': 0.0,
+    'max_bin': 31,
+    'subsample': 1.0,
+    'is_unbalance': False,
+    'scale_pos_weight': 1.0,
+    'extra_trees': False,
+    'boosting_type': 'gbdt',
+    'objective': 'binary',
+    'feature_pre_filter': False,
+    'deterministic': True,
+    'verbosity': -100,
+    'n_jobs': -1
+}
+
+predicciones_acumuladas = np.zeros(len(X_predict))
+print(f"Iniciando entrenamiento del ensamble de {n_semillas} modelos...")
+
+for i, semilla in enumerate(semillas, 1):
+    print(f"Entrenando modelo {i}/{n_semillas} con semilla: {semilla}...")
+    params['random_state'] = int(semilla)
+    clf = LGBMClassifier(**params)
+    clf.fit(X_train, y_train)
+    predicciones_acumuladas += clf.predict_proba(X_predict)[:, 1]
+    del clf
+    gc.collect()
+
+probabilidades_ensamble = predicciones_acumuladas / n_semillas
+
+# =============================================================================
+# 8. GENERACIÓN DE ARCHIVOS CSV LIMPIOS
+# =============================================================================
+df_resultados = pd.DataFrame({
+    'numero_de_cliente': clientes_predict.astype('int64').astype(str),
+    'probabilidad': probabilidades_ensamble
+})
+
+df_resultados = df_resultados.sort_values(by='probabilidad', ascending=False)
+cortes = [10000, 10500, 11000, 11500, 12000]
+
+print("\nGenerando archivos de salida...")
+for corte in cortes:
+    nombre_archivo = f"prediccion_202108_corte_{corte}.csv"
+    df_resultados.head(corte)[['numero_de_cliente']].to_csv(nombre_archivo, index=False)
+    print(f"Guardado: {nombre_archivo}")
+
+print("Proceso finalizado.")
+
+#%% celda 2 [código]
+import pandas as pd
+
+import pandas as pd
+
+# Generar la lista de cortes: desde 10000 hasta 12000 (inclusive) con pasos de 125
+cortes_extendidos = list(range(10000, 12001, 125))
+
+print(f"Generando {len(cortes_extendidos)} nuevos cortes de validación...")
+
+# Forzamos la limpieza de la columna directamente en memoria por si quedó algún .0 residual
+df_resultados['numero_de_cliente'] = pd.to_numeric(df_resultados['numero_de_cliente']).astype('int64').astype(str)
+
+for corte in cortes_extendidos:
+    nombre_archivo = f"prediccion_202108_2_corte_{corte}.csv"
+
+    # Exportar estrictamente la columna de IDs ya limpia
+    df_resultados.head(corte)[['numero_de_cliente']].to_csv(nombre_archivo, index=False)
+
+    print(f"Guardado: {nombre_archivo}")
+
+print("¡Archivos extra generados con éxito y con los IDs limpios!")

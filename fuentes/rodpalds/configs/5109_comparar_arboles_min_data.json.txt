@@ -1,0 +1,49 @@
+{
+  "experimento": 5109,
+  "nombre": "comparar_arboles_min_data",
+  "descripcion": "D7/D8/D18: prueba 23 entrenando con marzo + abril (ds3003 con lag2), min_data_in_leaf 20.248 (actual; 40.496 en el final, fuera del rango del profesor) contra 10.124 (20.248 en el final, dentro del rango), cortes de 400 a 1.100 arboles. Mitad B x2, 30 semillas, bootstrap pareado. Decide 13_decidir.py p23 con reglas fijadas de antemano.",
+  "referencia": "md20248_a580",
+  "n_semillas": 30,
+  "candidatos": {
+    "md20248": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ],
+      "arboles_lista": [
+        400,
+        580,
+        750,
+        900,
+        1100
+      ]
+    },
+    "md10124": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ],
+      "min_data_in_leaf": 10124,
+      "arboles_lista": [
+        400,
+        580,
+        750,
+        900,
+        1100
+      ]
+    }
+  },
+  "sobrescribir": true
+}

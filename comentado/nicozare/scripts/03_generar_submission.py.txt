@@ -1,0 +1,83 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–15] Docstring del módulo: indica que se predice sobre el mes más reciente del dataset
+#   con los modelos ya guardados, que se promedian los 3 submodelos de cada semilla y luego las 5 semillas, que
+#   no se descarta ningún cliente antes de ordenar y que la salida son 5 archivos por semilla más uno con el
+#   promedio.
+"""Genera los archivos de submission.
+
+Predice con los modelos ya entrenados sobre el mes más reciente del dataset
+(el único sin clase conocida, que es justamente el que hay que predecir).
+Para cada semilla, promedia sus 3 submodelos; para cada cliente, se toma el
+promedio de las 5 semillas como probabilidad final. Se seleccionan los
+`corte_optimo` clientes con mayor probabilidad.
+
+No se descarta ningún cliente antes de rankear: al predecir sobre el mes más
+reciente, cualquier candidato ya existe en ese mes por definición.
+
+Salida: un archivo por semilla (5 "modelos candidatos", según pide el
+enunciado de la entrega) más un sexto archivo con el promedio de las 5 —
+las probabilidades promediadas entre semillas, antes de rankear.
+"""
+# [Anotación · líneas 16–25] Importa numpy, pandas y lightgbm, las funciones cargar_features y detectar_meses
+#   de comun.py y las rutas y constantes de config.py.
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+from comun import cargar_features, detectar_meses
+from config import DATASET_FE_CSV_PATH, MODELS_DIR, SEMILLAS, SUBMISSIONS_DIR, SUBMODELOS_POR_SEMILLA
+
+
+# [Anotación · líneas 26–34] Lee data/dataset_features.csv, obtiene con detectar_meses el mes de predicción
+#   (el último del dataset) y se queda con sus filas. Lee la lista de variables de modelos/features.txt y arma
+#   la matriz X con esas columnas.
+def main() -> None:
+    data = pd.read_csv(DATASET_FE_CSV_PATH, low_memory=False)
+    _, _, mes_prediccion = detectar_meses(sorted(data["foto_mes"].unique()))
+    mes = data[data["foto_mes"] == mes_prediccion]
+    print(f"Prediciendo sobre foto_mes={mes_prediccion}: {len(mes):,} clientes", flush=True)
+
+    feats = cargar_features(MODELS_DIR / "features.txt")
+    X = mes[feats]
+
+# [Anotación · líneas 35–42] Para cada una de las 5 semillas carga sus 3 modelos desde
+#   modelos/lgb_seed_<semilla>_k<k>.txt y guarda el promedio de las tres predicciones sobre X.
+    probs_por_semilla = {}
+    for seed in SEMILLAS:
+        submodelos = [
+            lgb.Booster(model_file=str(MODELS_DIR / f"lgb_seed_{seed}_k{k}.txt"))
+            for k in range(SUBMODELOS_POR_SEMILLA)
+        ]
+        probs_por_semilla[seed] = np.mean([m.predict(X) for m in submodelos], axis=0)
+
+# [Anotación · líneas 43–53] Lee el corte de modelos/corte_optimo.txt. Para cada semilla ordena los clientes
+#   por probabilidad descendente, toma los primeros corte y escribe sus numero_de_cliente como enteros, sin
+#   índice ni encabezado, en submissions/submission_seed_<semilla>.csv.
+    corte = int((MODELS_DIR / "corte_optimo.txt").read_text(encoding="utf-8").strip())
+    print(f"Corte: {corte:,} clientes", flush=True)
+
+    SUBMISSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    for seed in SEMILLAS:
+        orden = np.argsort(probs_por_semilla[seed])[::-1][:corte]
+        seleccionados = mes.iloc[orden]["numero_de_cliente"].astype("int64")
+        destino = SUBMISSIONS_DIR / f"submission_seed_{seed}.csv"
+        seleccionados.to_csv(destino, index=False, header=False)
+        print(f"  semilla {seed}: {len(seleccionados):,} clientes -> {destino}", flush=True)
+
+# [Anotación · líneas 54–63] Promedia las probabilidades de las 5 semillas, toma los corte clientes de mayor
+#   promedio y los escribe en submissions/submission_promedio.csv con el mismo formato. Las dos últimas líneas
+#   ejecutan main() cuando el archivo se corre como script.
+    promedio = np.mean([probs_por_semilla[s] for s in SEMILLAS], axis=0)
+    orden = np.argsort(promedio)[::-1][:corte]
+    seleccionados = mes.iloc[orden]["numero_de_cliente"].astype("int64")
+    destino = SUBMISSIONS_DIR / "submission_promedio.csv"
+    seleccionados.to_csv(destino, index=False, header=False)
+    print(f"  promedio de las 5 semillas: {len(seleccionados):,} clientes -> {destino}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

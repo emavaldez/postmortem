@@ -1,0 +1,531 @@
+#%% celda 1 [texto]
+# p005 — Predicciones de 3 modelos por semilla, con datos en memoria
+
+Adaptación de `p004_3models.ipynb`. Cada modelo conserva su dataset y RDS, leídos desde `dataset/` y `parametros/`. Los meses y columnas excluidas son compartidos.
+
+Para cada semilla se entrenan los modelos 1, 2 y 3, en ese orden. Después se guardan sus tres predicciones en `predicciones/`. Se puede interrumpir la generación y pasar a la celda de combinación: solamente se usan semillas con los tres archivos completos. Volver a ejecutar la generación retoma las semillas pendientes, hasta completar las 50.
+
+Guardar y ejecutar esta notebook desde `entregas/`, como p004. Las primeras 20 semillas son las de p004; se agregan los siguientes 30 primos de la misma secuencia.
+
+Los tres datasets se leen y preparan una sola vez. Se mantienen en RAM sus matrices de entrenamiento, etiquetas, matrices de predicción e identificadores de clientes durante todas las semillas. Los DataFrames usados para prepararlas se liberan para evitar copias duplicadas.
+
+#%% celda 2 [código]
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import rdata
+from IPython.display import display
+import os
+import gc
+import hashlib
+import json
+
+#%% celda 3 [texto]
+## Directorios
+
+#%% celda 4 [código]
+carpeta_entregas = Path.cwd()
+data_folder = carpeta_entregas / "dataset"
+carpeta_parametros = carpeta_entregas / "parametros"
+carpeta_salida = carpeta_entregas / "entregas"
+archivo_logging = carpeta_entregas / "logging_python.csv"
+carpeta_predicciones = carpeta_entregas / "predicciones"
+
+#%% celda 5 [código]
+os.listdir(data_folder)
+
+#%% celda 6 [texto]
+## Parámetros
+
+Completar los tres datasets y RDS en el mismo orden: modelo 1, modelo 2, modelo 3. Se conservan los valores de p004. `nombre_corrida` identifica las predicciones guardadas; usar otro nombre cuando cambien datasets, RDS, meses o columnas. La celda de generación se puede volver a ejecutar para retomar esta misma corrida.
+
+#%% celda 7 [código]
+dataset_files = [
+    "c_01_tern_2_lf_k6_p4.csv",  # dataset del modelo 1, con .csv
+    "c_01_tern_2_lf_O2_k3_p6.csv",  # dataset del modelo 2, con .csv
+    "RANKS_LF_O2_K6_P4.csv",  # dataset del modelo 3, con .csv
+]
+ids_rds = [
+    40,  # id del RDS del modelo 1
+    40,  # id del RDS del modelo 2
+    62,  # id del RDS del modelo 3
+]
+
+train_final = [202103, 202104, 202105, 202106]
+future = [202108]
+SEEDS = [
+    230047, 230059, 230063, 230077, 230081,
+    230089, 230101, 230107, 230117, 230123,
+    230137, 230143, 230149, 230189, 230203,
+    230213, 230221, 230227, 230233, 230239,
+    230257, 230273, 230281, 230291, 230303,
+    230309, 230311, 230327, 230339, 230341,
+    230353, 230357, 230369, 230383, 230387,
+    230389, 230393, 230431, 230449, 230453,
+    230467, 230471, 230479, 230501, 230507,
+    230539, 230551, 230561, 230563, 230567,
+]
+
+nombre_corrida = "p005_3models_overnight"
+carpeta_corrida = carpeta_predicciones / nombre_corrida
+
+#%% celda 8 [código]
+columnas_excluir = [
+    "ternaria",
+    "ternaria_lag1",
+    "clase01",
+    "fold",
+    "azar",
+    "training",
+    "cprestamos_personales",
+    "mprestamos_personales",
+    "cprestamos_personales_lag1",
+    "mprestamos_personales_lag1",
+    "cprestamos_personales_delta1",
+    "mprestamos_personales_delta1",
+    "cprestamos_personales_lag_pond",
+    "mprestamos_personales_lag_pond",
+    "cprestamos_personales_delta_lag_pond",
+    "mprestamos_personales_delta_lag_pond"
+]
+
+#%% celda 9 [texto]
+## Lectura de parámetros y preparación de datos
+
+#%% celda 10 [código]
+def convertir_r(valor):
+    if isinstance(valor, dict):
+        return {k: convertir_r(v) for k, v in valor.items()}
+    if isinstance(valor, np.ndarray):
+        if valor.size == 1:
+            return convertir_r(valor.item())
+        return [convertir_r(v) for v in valor.tolist()]
+    if isinstance(valor, (list, tuple)):
+        return [convertir_r(v) for v in valor]
+    if isinstance(valor, np.generic):
+        return convertir_r(valor.item())
+    # R serializa muchos parámetros enteros como double (31.0).
+    # LightGBM Python exige int para esos valores; se conserva su valor.
+    if isinstance(valor, float) and np.isfinite(valor) and valor.is_integer():
+        return int(valor)
+    return valor
+
+def data_matrix(df):
+    matriz = df.copy()
+    for nombre in matriz.columns:
+        serie = matriz[nombre]
+        if isinstance(serie.dtype, pd.CategoricalDtype):
+            codigos = serie.cat.codes
+            matriz[nombre] = (codigos + 1).where(codigos >= 0, np.nan)
+        elif pd.api.types.is_object_dtype(serie.dtype) or pd.api.types.is_string_dtype(serie.dtype):
+            niveles = sorted(serie.dropna().unique())
+            codigos = pd.Categorical(serie, categories=niveles).codes
+            matriz[nombre] = np.where(codigos >= 0, codigos + 1, np.nan)
+    return matriz.to_numpy(dtype=np.float64)
+
+#%% celda 11 [texto]
+## Archivos de la corrida
+
+`configuracion.json` registra los parámetros y fuentes de esta corrida. En cada `semilla_XXXXXX/` se guardan tres CSV con `numero_de_cliente` y `prob`. `completa.json` se escribe al terminar los tres archivos y registra las cantidades de filas. Una carpeta sin esa marca queda fuera del promedio y se vuelve a generar al retomar.
+
+#%% celda 12 [código]
+def configuracion_solicitada():
+    if (len(dataset_files) != 3 or len(ids_rds) != 3
+            or any(not archivo for archivo in dataset_files)
+            or any(id_rds is None for id_rds in ids_rds)):
+        raise ValueError("Completar los tres datasets y sus tres ids_rds, en el mismo orden.")
+    if len(future) != 1 or not SEEDS or len(SEEDS) != len(set(SEEDS)):
+        raise ValueError("Se requiere un mes a predecir y una lista de semillas sin repetidos.")
+    if not nombre_corrida or Path(nombre_corrida).name != nombre_corrida or nombre_corrida in (".", ".."):
+        raise ValueError("nombre_corrida debe ser un nombre de carpeta, sin directorios.")
+    return {
+        "dataset_files": list(dataset_files),
+        "ids_rds": [str(id_rds) for id_rds in ids_rds],
+        "train_final": list(train_final),
+        "future": list(future),
+        "seeds": list(SEEDS),
+        "columnas_excluir": list(columnas_excluir),
+    }
+
+
+def guardar_json(archivo, datos):
+    temporal = archivo.with_name(archivo.name + ".tmp")
+    temporal.write_text(json.dumps(datos, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporal, archivo)
+
+
+def fuente_modelo(numero_modelo, configuracion):
+    dataset_file = configuracion["dataset_files"][numero_modelo - 1]
+    id_rds = configuracion["ids_rds"][numero_modelo - 1]
+    datos = (data_folder / dataset_file).stat()
+    return {
+        "dataset_bytes": datos.st_size,
+        "dataset_mtime_ns": datos.st_mtime_ns,
+        "rds_sha256": hashlib.sha256((carpeta_parametros / f"{id_rds}.rds").read_bytes()).hexdigest(),
+    }
+
+
+def leer_configuracion():
+    archivo = carpeta_corrida / "configuracion.json"
+    configuracion = json.loads(archivo.read_text(encoding="utf-8"))
+    solicitada = configuracion_solicitada()
+    if any(configuracion.get(k) != v for k, v in solicitada.items()):
+        raise ValueError("Esta corrida tiene otros parámetros. Revisar los parámetros o usar otro nombre_corrida.")
+    return configuracion
+
+
+def preparar_corrida():
+    solicitada = configuracion_solicitada()
+    fuentes = [fuente_modelo(n, solicitada) for n in (1, 2, 3)]
+    versiones = {"lightgbm": lgb.__version__, "pandas": pd.__version__, "numpy": np.__version__}
+    archivo = carpeta_corrida / "configuracion.json"
+    if archivo.exists():
+        configuracion = leer_configuracion()
+        if configuracion["fuentes"] != fuentes or configuracion["versiones"] != versiones:
+            raise ValueError("Cambiaron las fuentes o versiones de esta corrida. Revisarlas o usar otro nombre_corrida.")
+    else:
+        configuracion = dict(solicitada, fuentes=fuentes, versiones=versiones)
+        carpeta_corrida.mkdir(parents=True, exist_ok=True)
+        guardar_json(archivo, configuracion)
+    return configuracion
+
+
+def archivos_semilla(seed):
+    carpeta = carpeta_corrida / f"semilla_{seed}"
+    return [carpeta / f"modelo_{n}_{seed}.csv" for n in (1, 2, 3)]
+
+
+def semillas_guardadas(configuracion):
+    completas = []
+    for seed in configuracion["seeds"]:
+        marca = carpeta_corrida / f"semilla_{seed}" / "completa.json"
+        if marca.exists() and all(archivo.exists() for archivo in archivos_semilla(seed)):
+            completas.append(seed)
+    return completas
+
+#%% celda 13 [código]
+def preparar_modelo(numero_modelo, configuracion):
+    if fuente_modelo(numero_modelo, configuracion) != configuracion["fuentes"][numero_modelo - 1]:
+        raise ValueError(f"Modelo {numero_modelo}: cambiaron el dataset o RDS de esta corrida.")
+
+    dataset_file = configuracion["dataset_files"][numero_modelo - 1]
+    id_rds = configuracion["ids_rds"][numero_modelo - 1]
+    dataset = pd.read_csv(data_folder / dataset_file, low_memory=False)
+    dataset["ternaria"] = dataset["ternaria"].fillna("")
+    dataset = dataset.sort_values(
+        ["foto_mes", "ternaria", "numero_de_cliente"],
+        kind="stable", na_position="first",
+    ).reset_index(drop=True)
+
+    parametros = convertir_r(rdata.read_rds(carpeta_parametros / f"{id_rds}.rds"))
+    params_base = (
+        parametros
+        if "num_iterations" in parametros
+        else next(iter(parametros.values()))
+    )
+
+    dataset["clase01"] = dataset["ternaria"].isin(["BAJA+1", "BAJA+2"]).astype(np.int32)
+    campos_buenos = [c for c in dataset.columns if c not in configuracion["columnas_excluir"]]
+    dataset_train = dataset.loc[dataset["foto_mes"].isin(configuracion["train_final"])].copy()
+    dfuture = dataset.loc[dataset["foto_mes"].isin(configuracion["future"])].copy()
+
+    if dataset_train.empty or dfuture.empty:
+        raise ValueError(f"Modelo {numero_modelo}: no hay filas para los meses elegidos.")
+
+    tb_predicciones = dfuture[["numero_de_cliente"]].set_index("numero_de_cliente")
+    if not tb_predicciones.index.is_unique or tb_predicciones.index.hasnans:
+        raise ValueError(f"Modelo {numero_modelo}: revisar los identificadores de clientes en future.")
+
+    cantidad_total = len(dataset)
+    cantidad_train = len(dataset_train)
+
+    X_train = data_matrix(dataset_train[campos_buenos])
+    X_future = data_matrix(dfuture[campos_buenos])
+    datos_modelo = {
+        "params_base": params_base,
+        "campos_buenos": campos_buenos,
+        "X_train": X_train,
+        "X_future": X_future,
+        "clase01": dataset_train["clase01"].to_numpy(copy=True),
+        "clientes": tb_predicciones.index.copy(),
+        "cantidad_total": cantidad_total,
+        "cantidad_train": cantidad_train,
+    }
+    del dataset, dataset_train, dfuture
+    print(f"Modelo={numero_modelo}: datos preparados en memoria")
+    return datos_modelo
+
+
+def entrenar_modelo(numero_modelo, seed, configuracion):
+    if fuente_modelo(numero_modelo, configuracion) != configuracion["fuentes"][numero_modelo - 1]:
+        raise ValueError(f"Modelo {numero_modelo}: cambiaron el dataset o RDS de esta corrida.")
+
+    datos_modelo = datos_modelos[numero_modelo - 1]
+    params_base = datos_modelo["params_base"]
+    campos_buenos = datos_modelo["campos_buenos"]
+    X_train = datos_modelo["X_train"]
+    X_future = datos_modelo["X_future"]
+    tb_predicciones = pd.DataFrame(index=datos_modelo["clientes"].copy())
+    params_semilla = params_base.copy()
+    params_semilla["seed"] = seed
+    num_boost_round = int(params_semilla.pop("num_iterations"))
+
+    dtrain_final = lgb.Dataset(
+        data=X_train,
+        label=datos_modelo["clase01"],
+        feature_name=campos_buenos,
+        categorical_feature=[],
+    )
+    modelo_final = lgb.train(
+        params=params_semilla,
+        train_set=dtrain_final,
+        num_boost_round=num_boost_round,
+    )
+    tb_predicciones["prob"] = modelo_final.predict(X_future)
+    if not np.isfinite(tb_predicciones["prob"].to_numpy()).all():
+        raise ValueError(f"Modelo {numero_modelo}, semilla {seed}: predicciones no finitas.")
+    print(f"Modelo={numero_modelo} Semilla={seed}: predicciones listas")
+    del dtrain_final, modelo_final
+    return tb_predicciones, datos_modelo["cantidad_total"], datos_modelo["cantidad_train"]
+
+#%% celda 14 [texto]
+## Entrenamiento y predicciones
+
+Ejecutar esta celda y dejarla correr. Primero carga y prepara los tres datasets una sola vez; después recorre las semillas y entrena los modelos 1, 2 y 3 para cada una. Las matrices preparadas permanecen en memoria durante toda la generación. No se imprime la tabla de cantidades por mes y clase.
+
+Para detenerla, usar **Interrupt / Interrumpir kernel**; después ejecutar la celda de combinación. Las ternas anteriores quedan guardadas aunque la interrupción ocurra durante un entrenamiento o una escritura.
+
+Al retomar esta celda se saltean las semillas completas y se reutilizan los datos que siguen en memoria. Tras reiniciar el kernel, los datos se cargan nuevamente una sola vez. Si todas las semillas están completas, no se cargan los datasets.
+
+Usar el mismo `nombre_corrida` permite continuar las ternas guardadas con la versión anterior de esta notebook.
+
+#%% celda 15 [código]
+configuracion = preparar_corrida()
+completas = set(semillas_guardadas(configuracion))
+
+try:
+    pendientes = [seed for seed in configuracion["seeds"] if seed not in completas]
+    if pendientes and (
+        "datos_modelos" not in globals()
+        or len(datos_modelos) != 3
+        or globals().get("configuracion_en_memoria") != configuracion
+    ):
+        # Se libera cualquier preparación anterior antes de cargar esta configuración.
+        configuracion_en_memoria = None
+        datos_modelos = []
+        gc.collect()
+        for numero_modelo in (1, 2, 3):
+            datos_modelo = preparar_modelo(numero_modelo, configuracion)
+            if datos_modelos and not datos_modelo["clientes"].sort_values().equals(
+                datos_modelos[0]["clientes"].sort_values()
+            ):
+                raise ValueError("Los datasets tienen distintos clientes para el mes a predecir.")
+            datos_modelos.append(datos_modelo)
+            del datos_modelo
+            gc.collect()
+        configuracion_en_memoria = configuracion
+
+    for seed in configuracion["seeds"]:
+        if seed in completas:
+            print(f"Semilla={seed}: terna ya guardada")
+            continue
+
+        predicciones_semilla = []
+        totales_semilla = []
+        entrenamiento_semilla = []
+        for numero_modelo in (1, 2, 3):
+            predicciones, cantidad_total, cantidad_train = entrenar_modelo(numero_modelo, seed, configuracion)
+            if predicciones_semilla and not predicciones.index.sort_values().equals(
+                predicciones_semilla[0].index.sort_values()
+            ):
+                raise ValueError("Los datasets tienen distintos clientes para el mes a predecir.")
+            predicciones_semilla.append(predicciones)
+            totales_semilla.append(cantidad_total)
+            entrenamiento_semilla.append(cantidad_train)
+            gc.collect()
+
+        archivos = archivos_semilla(seed)
+        archivos[0].parent.mkdir(parents=True, exist_ok=True)
+        # La marca se elimina antes de reescribir una terna incompleta.
+        marca = archivos[0].parent / "completa.json"
+        marca.unlink(missing_ok=True)
+        for predicciones, archivo in zip(predicciones_semilla, archivos):
+            temporal = archivo.with_name(archivo.name + ".tmp")
+            predicciones.reset_index().to_csv(temporal, index=False)
+            os.replace(temporal, archivo)
+        guardar_json(marca, {
+            "seed": seed,
+            "cantidad_registros_totales": totales_semilla,
+            "cantidad_registros_entrenamiento": entrenamiento_semilla,
+            "cantidad_clientes": len(predicciones_semilla[0]),
+            "archivos": [archivo.name for archivo in archivos],
+        })
+        completas.add(seed)
+        del predicciones_semilla, predicciones
+        gc.collect()
+        print(f"Semilla={seed}: terna guardada ({len(completas)} completas)")
+except KeyboardInterrupt:
+    print("Generación interrumpida. La combinación usará solamente las ternas completas.")
+finally:
+    print(f"Ternas completas en disco: {len(semillas_guardadas(configuracion))}/{len(configuracion['seeds'])}")
+
+#%% celda 16 [texto]
+## Combinación por cliente
+
+Esta celda lee las predicciones guardadas. Se puede ejecutar después de interrumpir la generación o cuando terminan las 50 semillas. También funciona tras reiniciar el kernel: ejecutar imports, directorios, parámetros y funciones anteriores, y saltar la celda de entrenamiento.
+
+Cada semilla completa aporta exactamente tres probabilidades por cliente. Se conservan la combinación y el orden de columnas de p004 (modelo y luego semilla). La lectura de los CSV recupera los valores `float64` sin pérdida por redondeo. Si no hay ninguna terna completa, primero hay que generar una.
+
+#%% celda 17 [código]
+configuracion = leer_configuracion()
+semillas_completas = semillas_guardadas(configuracion)
+if not semillas_completas:
+    raise ValueError("No hay ternas completas para combinar. Generar al menos una semilla.")
+
+informacion_semillas = []
+for seed in semillas_completas:
+    marca = carpeta_corrida / f"semilla_{seed}" / "completa.json"
+    informacion = json.loads(marca.read_text(encoding="utf-8"))
+    if informacion["seed"] != seed or informacion["archivos"] != [a.name for a in archivos_semilla(seed)]:
+        raise ValueError(f"Semilla {seed}: la documentación de la terna no corresponde a sus archivos.")
+    informacion_semillas.append(informacion)
+
+cantidad_registros_totales = informacion_semillas[0]["cantidad_registros_totales"]
+cantidad_registros_entrenamiento = informacion_semillas[0]["cantidad_registros_entrenamiento"]
+if any(info["cantidad_registros_totales"] != cantidad_registros_totales
+       or info["cantidad_registros_entrenamiento"] != cantidad_registros_entrenamiento
+       for info in informacion_semillas):
+    raise ValueError("Las ternas tienen distintas cantidades de registros de origen.")
+
+predicciones_por_modelo = []
+clientes_referencia = None
+for numero_modelo in (1, 2, 3):
+    probabilidades = []
+    for seed, informacion in zip(semillas_completas, informacion_semillas):
+        archivo = archivos_semilla(seed)[numero_modelo - 1]
+        predicciones = pd.read_csv(archivo, float_precision="round_trip")
+        if list(predicciones.columns) != ["numero_de_cliente", "prob"]:
+            raise ValueError(f"Revisar columnas de {archivo.name}.")
+        predicciones = predicciones.set_index("numero_de_cliente")
+        if (not predicciones.index.is_unique or predicciones.index.hasnans
+                or len(predicciones) != informacion["cantidad_clientes"]
+                or not np.isfinite(predicciones["prob"].to_numpy()).all()):
+            raise ValueError(f"Revisar clientes o probabilidades de {archivo.name}.")
+        clientes = predicciones.index.sort_values()
+        if clientes_referencia is None:
+            clientes_referencia = clientes
+        elif not clientes.equals(clientes_referencia):
+            raise ValueError("Los archivos tienen distintos clientes: no se puede promediar con igual cantidad de predicciones.")
+        probabilidades.append(predicciones["prob"].rename(f"prob_{seed}"))
+    predicciones_por_modelo.append(pd.concat(probabilidades, axis=1))
+
+tb_prediccion = (
+    pd.concat(predicciones_por_modelo, axis=1)
+    .mean(axis=1)
+    .rename("prob")
+    .reset_index()
+    .sort_values("prob", ascending=False, kind="stable")
+    .reset_index(drop=True)
+)
+
+print(f"Semillas completas={len(semillas_completas)} Predicciones por cliente={3 * len(semillas_completas)}")
+print(f"Clientes={len(tb_prediccion)} Corrida={carpeta_corrida}")
+
+#%% celda 18 [texto]
+## Generación del corte
+
+Cambiar `envios` y ejecutar esta celda para generar otro corte sin entrenar de nuevo. Registrar cada generación en la celda de documentación antes de generar la siguiente, para que avance `id_prueba`.
+
+#%% celda 19 [código]
+envios = 12500  # cambiar para cada corte
+
+if envios != int(envios) or not 1 <= envios <= len(tb_prediccion):
+    raise ValueError("Revisar envios: debe ser un entero entre 1 y la cantidad de clientes.")
+envios = int(envios)
+
+if archivo_logging.exists():
+    historico = pd.read_csv(archivo_logging)
+    id_prueba = int(historico["id_prueba"].max()) + 1
+else:
+    id_prueba = 1
+
+carpeta_salida.mkdir(parents=True, exist_ok=True)
+archivo = f"p005_3models_{id_prueba}.csv"
+while (carpeta_salida / archivo).exists():
+    id_prueba += 1
+    archivo = f"p005_3models_{id_prueba}.csv"
+tb_prediccion.head(envios)[["numero_de_cliente"]].to_csv(
+    carpeta_salida / archivo,
+    header=False,
+    index=False,
+)
+archivos_salida = [archivo]
+print(f"Archivo={archivo} Envios={envios}")
+
+#%% celda 20 [texto]
+## Documentación
+
+Se mantiene el formato de `logging_python.csv` de p004. Se registran las semillas efectivamente combinadas, los datasets, RDS, meses y cantidades de filas de la corrida guardada. La nota identifica la carpeta de predicciones y cuántas probabilidades aportó cada cliente.
+
+Completar `ref_submit` y los resultados cuando estén disponibles. Se puede volver a ejecutar la celda de registro para actualizar esa entrega.
+
+#%% celda 21 [código]
+nota = "3 modelos igual q antes, pero ahora en el runner con 50 semillas, entrega hecha con 50, subimos envios a 13k"
+resultado_competencia_mean = "106.7000"  # completar con el score de Kaggle
+resultado_competencia_std = "NA"
+ref_submit = "e55_p"  # completar con la referencia de la entrega
+
+#%% celda 22 [código]
+registro_prueba = pd.DataFrame([{
+    "id_prueba": id_prueba,
+    "ref_submit": ref_submit,
+    "notebook": "p005_3models_por_semilla_memoria.ipynb",
+    "dataset": ",".join(Path(archivo).stem for archivo in configuracion["dataset_files"]),
+    "seeds": ",".join(map(str, semillas_completas)),
+    "cantidad_registros_totales": ",".join(map(str, cantidad_registros_totales)),
+    "cantidad_registros_entrenamiento": ",".join(map(str, cantidad_registros_entrenamiento)),
+    "cantidad_registros_prediccion": len(tb_prediccion),
+    "meses_entrenamiento": ",".join(map(str, configuracion["train_final"])),
+    "meses_prediccion": ",".join(map(str, configuracion["future"])),
+    "columnas_excluidas": ",".join(configuracion["columnas_excluir"]),
+    "bajas":"1+2",                                       #baja+1 y baja+2 o solo baja+2
+    "id_rds": ",".join(map(str, configuracion["ids_rds"])),
+    "envios": envios,
+    "archivos": ",".join(archivos_salida),
+    "nota": nota,
+    "resultado_competencia_mean": resultado_competencia_mean,
+    "resultado_competencia_std": resultado_competencia_std
+}])
+
+if archivo_logging.exists():
+    historico = pd.read_csv(
+        archivo_logging,
+        dtype={
+            "ref_submit": str,
+            "id_rds": str,
+            "cantidad_registros_totales": str,
+            "cantidad_registros_entrenamiento": str,
+            "seeds": str,
+            "meses_entrenamiento": str,
+            "meses_prediccion": str,
+            "nota": str,
+            "resultado_competencia_mean": str,
+            "resultado_competencia_std": str,
+        },
+    )
+    fila = historico["id_prueba"].eq(id_prueba)
+
+    if fila.any():
+        historico.loc[fila, registro_prueba.columns] = registro_prueba.to_numpy()
+        historico.to_csv(archivo_logging, index=False)
+    else:
+        registro_prueba.to_csv(archivo_logging, mode="a", header=False, index=False)
+else:
+    registro_prueba.to_csv(archivo_logging, index=False)
+
+# display(registro_prueba)
+
+#%% celda 23 [código]
+# display(pd.read_csv(archivo_logging).tail(15))
+display(pd.read_csv(archivo_logging)[['id_prueba','envios','resultado_competencia_mean','resultado_competencia_std', 'ref_submit','dataset','meses_entrenamiento','id_rds','nota']].tail(30))

@@ -1,0 +1,93 @@
+{
+  "experimento": 5109,
+  "nombre": "comparar_arboles_min_data",
+  "descripcion": "D7/D8/D18: prueba 23 entrenando con marzo + abril (ds3003 con lag2), min_data_in_leaf 20.248 (actual; 40.496 en el final, fuera del rango del profesor) contra 10.124 (20.248 en el final, dentro del rango), cortes de 400 a 1.100 arboles. Mitad B x2, 30 semillas, bootstrap pareado. Decide 13_decidir.py p23 con reglas fijadas de antemano.",
+  "mitades": "4102_bo_fuera_de_tiempo/4102_mitades_junio.csv",
+  "referencia": "md20248_a580",
+  "candidatos": {
+    "md20248": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ],
+      "arboles_lista": [
+        400,
+        580,
+        750,
+        900,
+        1100
+      ]
+    },
+    "md10124": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ],
+      "min_data_in_leaf": 10124,
+      "arboles_lista": [
+        400,
+        580,
+        750,
+        900,
+        1100
+      ]
+    }
+  },
+  "mes_train": 202104,
+  "mes_test": 202106,
+  "clase": "clase_binaria2",
+  "n_semillas": 30,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    8000,
+    8500,
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000,
+    15500,
+    16000,
+    16500,
+    17000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "n_bootstrap": 1000,
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "clientes_agosto": 164647,
+  "sobrescribir": true,
+  "_config": "5109_comparar_arboles_min_data.json",
+  "_fecha_inicio": "2026-10-10 10:51:05",
+  "_script": "11_comparar_pipelines.py",
+  "_git_commit": "sin_git"
+}

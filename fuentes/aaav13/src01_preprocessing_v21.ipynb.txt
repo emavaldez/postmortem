@@ -1,0 +1,100 @@
+#%% celda 1 [código]
+import pandas as pd
+import numpy as np
+import os
+
+DATA_PATH = "C:\\Users\\Admin\\Documents\\Maestria DM\\DM EyF\\churn_features_lightgbm.csv"
+
+def cargar_y_preprocesar():
+    print("Iniciando la carga del archivo CSV...")
+    
+    if not os.path.exists(DATA_PATH):
+        print(f"Error: No se encuentra el archivo en {DATA_PATH}. Verifica la ruta.")
+        return None
+
+    # Carga directa del CSV
+    df = pd.read_csv(DATA_PATH)
+    
+    print(f"Dimensiones originales del dataset: {df.shape[0]} filas, {df.shape[1]} columnas.")
+
+
+    print("Primeras columnas:", list(df.columns[:10]))
+
+    return df
+
+if __name__ == "__main__":
+    df_clientes = cargar_y_preprocesar()
+
+#%% celda 2 [código]
+import pandas as pd
+import numpy as np
+import os
+import lightgbm as lgb
+import joblib
+
+# 1. Cargar el dataset completo
+
+dir_path = r'C:\Users\Admin\Documents\Maestria DM\DM EyF'
+dataset_path = os.path.join(dir_path, 'churn_features_lightgbm.csv') 
+
+print("Cargando el dataset...")
+df_clientes = pd.read_csv(dataset_path)
+
+
+print("Preparando conjuntos de entrenamiento y predicción...")
+df_train = df_clientes[(df_clientes['foto_mes'] >= 202103) & (df_clientes['foto_mes'] <= 202107)].copy()
+df_agosto = df_clientes[df_clientes['foto_mes'] == 202108].copy()
+
+id_col = 'numero_de_cliente'
+target_col = 'clase_ternaria'
+
+if target_col in df_train.columns:
+    df_train['target'] = np.where(df_train[target_col].isin(['BAJA+2', 'BAJA+1']), 1, 0)
+else:
+    target_col = 'clase_binaria' 
+
+ignore_cols = [id_col, target_col, 'clase_ternaria', 'foto_mes', 'target']
+features = [col for col in df_train.columns if col not in ignore_cols]
+
+X_train = df_train[features]
+y_train = df_train['target']
+
+X_agosto = df_agosto[features]
+
+# 5. Entrenar el modelo LightGBM con los datos de marzo a julio
+print("Entrenando el modelo LightGBM con meses 202103 a 202107...")
+
+modelo = lgb.LGBMClassifier(
+    n_estimators=500,
+    learning_rate=0.09,
+    max_depth=7,
+    random_state=42,
+    n_jobs=-1
+)
+
+modelo.fit(X_train, y_train)
+
+
+modelos_dir = r'C:\Users\Admin\Documents\Maestria DM\DM EyF\Modelos'
+os.makedirs(modelos_dir, exist_ok=True)
+joblib.dump(modelo, os.path.join(modelos_dir, 'modelo_lgb_churn_entrenado.pkl'))
+joblib.dump(features, os.path.join(modelos_dir, 'features_entrenamiento.pkl'))
+
+# 6. Generar probabilidades de churn para agosto (202108)
+print("Generando probabilidades de churn para agosto...")
+y_prob_agosto = modelo.predict_proba(X_agosto)[:, 1]
+df_agosto['probabilidad_churn'] = y_prob_agosto
+
+# 7. Seleccionar los mejores candidatos mediante número fijo de envíos
+CANTIDAD_ENVIOS = 9300
+
+clientes_a_estimular = df_agosto.sort_values(by='probabilidad_churn', ascending=False).head(CANTIDAD_ENVIOS).copy()
+
+# 8. Exportar el resultado al CSV
+output_path = r'C:\Users\Admin\Documents\Maestria DM\DM EyF\competencia1_aa_v21.csv'
+clientes_a_estimular[[id_col]].to_csv(output_path, index=False)
+
+print(f"\n¡Proceso finalizado con éxito!")
+print(f"Se entrenó con los meses: 202103 a 202107.")
+print(f"Se seleccionaron los {len(clientes_a_estimular)} mejores clientes candidatos a estímulo para 202108.")
+print(f"Listado guardado en: {output_path}")

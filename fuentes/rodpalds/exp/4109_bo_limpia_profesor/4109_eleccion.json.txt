@@ -1,0 +1,29 @@
+{
+  "origen": "4109 prueba_23",
+  "params": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "max_bin": 31,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "deterministic": true,
+    "force_row_wise": true,
+    "verbose": -1,
+    "num_leaves": 112,
+    "min_data_in_leaf": 1317,
+    "feature_fraction": 0.06758203921316773,
+    "bagging_fraction": 0.9100890274338594,
+    "learning_rate": 0.031015231424636656
+  },
+  "arboles": 280,
+  "fraccion_mes_referencia": 2.0,
+  "variables": null,
+  "evidencia": {
+    "meseta_B_elegido_M": 417.0,
+    "referencia": "z601",
+    "meseta_B_referencia_M": 357.0,
+    "meseta_B_z601_M": 357.0,
+    "mejor_retador_segun_A": "prueba_23",
+    "semillas_ganadas_por_el_retador": "20/20"
+  }
+}

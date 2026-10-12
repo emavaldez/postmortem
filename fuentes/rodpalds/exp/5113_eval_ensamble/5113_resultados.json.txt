@@ -1,0 +1,6 @@
+{
+  "modelos": 12,
+  "R6": "escalado 388.6 M vs sin escalar 389.7 M -> no escalar",
+  "R7": "ensamble 389.7 M vs p23 441.3 M -> QUEDARSE CON 5015",
+  "_minutos": 305.81
+}

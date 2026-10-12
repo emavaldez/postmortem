@@ -1,0 +1,47 @@
+{
+  "resumen": [
+    {
+      "modelo": "actual_crudo_p95",
+      "dataset": "ds3001_crudo.parquet",
+      "variables": 123,
+      "hiper": "4102 prueba_117",
+      "arboles": 181,
+      "meseta_M": 434.6,
+      "maximo_M": 445.0,
+      "envios_optimos": 13500,
+      "envios_agosto_p25_p50_p75": "12,741 / 13,343 / 13,644",
+      "dif_vs_actual_crudo_p95_M": NaN,
+      "IC90_M": NaN,
+      "pct_remuestreos_gana": NaN
+    },
+    {
+      "modelo": "rank_bo4105",
+      "dataset": "ds3002_rank_total.parquet",
+      "variables": 456,
+      "hiper": "4105 p23_4104",
+      "arboles": 580,
+      "meseta_M": 433.3,
+      "maximo_M": 445.5,
+      "envios_optimos": 13000,
+      "envios_agosto_p25_p50_p75": "11,236 / 12,541 / 13,042",
+      "dif_vs_actual_crudo_p95_M": -1.0,
+      "IC90_M": "[-18.9 ; 15.7]",
+      "pct_remuestreos_gana": "48%"
+    },
+    {
+      "modelo": "rank_bo4104",
+      "dataset": "ds3002_rank_total.parquet",
+      "variables": 456,
+      "hiper": "4104 prueba_35",
+      "arboles": 238,
+      "meseta_M": 429.2,
+      "maximo_M": 443.3,
+      "envios_optimos": 13000,
+      "envios_agosto_p25_p50_p75": "10,835 / 12,641 / 13,143",
+      "dif_vs_actual_crudo_p95_M": -5.6,
+      "IC90_M": "[-20.3 ; 9.6]",
+      "pct_remuestreos_gana": "26%"
+    }
+  ],
+  "_minutos": 10.81
+}

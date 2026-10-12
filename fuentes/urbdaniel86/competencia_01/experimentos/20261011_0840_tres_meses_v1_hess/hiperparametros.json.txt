@@ -1,0 +1,46 @@
+{
+  "configs": [
+    {
+      "trial": 18,
+      "auc_cv": 0.9298727263992016,
+      "num_iterations": 2375,
+      "params": {
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "num_leaves": 36,
+        "min_sum_hessian_in_leaf": 19.22195270528995
+      }
+    },
+    {
+      "trial": 34,
+      "auc_cv": 0.9298584052497011,
+      "num_iterations": 3760,
+      "params": {
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "num_leaves": 25,
+        "min_sum_hessian_in_leaf": 17.60535766103993
+      }
+    },
+    {
+      "trial": 38,
+      "auc_cv": 0.929564807487532,
+      "num_iterations": 3627,
+      "params": {
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "num_leaves": 34,
+        "min_sum_hessian_in_leaf": 17.38417162213993
+      }
+    }
+  ]
+}

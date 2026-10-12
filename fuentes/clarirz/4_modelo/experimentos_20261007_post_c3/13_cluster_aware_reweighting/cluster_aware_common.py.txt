@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+HIT=1_072_500
+COST=27_500
+N_FIXED=13_500
+CLUSTERS=(1,2,3,4,5)
+STATIC_RECIPES={
+    "CONTROL": {1:1.0,2:1.0,3:1.0,4:1.0,5:1.0},
+    "C25_FOCUSED": {1:1.0,2:3.0,3:1.0,4:1.0,5:2.5},
+    "DIFFICULTY_JUNE": {1:1.36,2:2.90,3:1.02,4:1.02,5:2.50},
+}
+ARMS=("CONTROL","C25_FOCUSED","DIFFICULTY_JUNE","BALANCED_CAPPED")
+
+
+def require(ok: bool, msg: str) -> None:
+    if not ok:
+        raise RuntimeError(msg)
+
+
+def digest(path: Path) -> str:
+    h=hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda:f.read(8*1024*1024),b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fingerprint(obj: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(obj,sort_keys=True,ensure_ascii=False,allow_nan=False).encode()
+    ).hexdigest()
+
+
+def load_json(path: Path) -> dict:
+    require(path.is_file(),f"Falta {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path,obj: Any) -> None:
+    path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_name(path.name+".tmp")
+    tmp.write_text(json.dumps(obj,ensure_ascii=False,indent=2,allow_nan=False)+"\n",encoding="utf-8")
+    tmp.replace(path)
+
+
+def gain_from_hits(hits: int,n: int=N_FIXED) -> int:
+    return int(hits*HIT-(n-hits)*COST)
+
+
+def topn_indices(ids: np.ndarray,scores: np.ndarray,n: int=N_FIXED) -> np.ndarray:
+    ids=np.asarray(ids,dtype=np.int64)
+    scores=np.asarray(scores,dtype=np.float64)
+    require(ids.shape==scores.shape,"IDs/scores desalineados")
+    require(len(np.unique(ids))==len(ids),"IDs duplicados")
+    require(np.isfinite(scores).all(),"Scores no finitos")
+    return np.lexsort((ids,-scores))[:n]
+
+
+def topn_metrics(ids,y,scores,positive_cluster,n: int=N_FIXED) -> dict:
+    ids=np.asarray(ids,dtype=np.int64)
+    y=np.asarray(y,dtype=np.int8)
+    pc=np.asarray(positive_cluster,dtype=np.int8)
+    require(ids.shape==y.shape==np.asarray(scores).shape==pc.shape,"Metricas desalineadas")
+    require(np.all((pc==0)|np.isin(pc,CLUSTERS)),"Cluster eval invalido")
+    require(np.all(pc[y==0]==0),"Negativos no deben tener cluster positivo")
+    require(np.all(np.isin(pc[y==1],CLUSTERS)),"BAJA+2 eval sin cluster")
+    idx=topn_indices(ids,scores,n)
+    hits=int(y[idx].sum())
+    out={
+        "n":int(n),"hits":hits,"gain":gain_from_hits(hits,n),
+        "precision":float(hits/n),
+        "total_baja2":int(y.sum()),
+        "recall_baja2":float(hits/max(1,int(y.sum()))),
+    }
+    selected=np.zeros(len(ids),dtype=bool); selected[idx]=True
+    hard=0
+    for k in CLUSTERS:
+        total=int(((y==1)&(pc==k)).sum())
+        cap=int((selected&(y==1)&(pc==k)).sum())
+        out[f"c{k}_total"]=total
+        out[f"c{k}_captured"]=cap
+        out[f"c{k}_recall"]=float(cap/total) if total else None
+        if k in (2,5):
+            hard+=cap
+    out["c25_captured"]=int(hard)
+    return out
+
+
+def raw_recipe(arm: str,y: np.ndarray,positive_cluster: np.ndarray,base_weights: np.ndarray) -> dict[int,float]:
+    require(arm in ARMS,f"Arm desconocido {arm}")
+    if arm in STATIC_RECIPES:
+        return dict(STATIC_RECIPES[arm])
+    y=np.asarray(y,dtype=np.int8)
+    pc=np.asarray(positive_cluster,dtype=np.int8)
+    bw=np.asarray(base_weights,dtype=np.float64)
+    masses={}
+    for k in CLUSTERS:
+        masses[k]=float(bw[(y==1)&(pc==k)].sum())
+        require(masses[k]>0,f"BALANCED_CAPPED sin masa positiva C{k}")
+    med=float(np.median(list(masses.values())))
+    return {k:float(np.clip(med/masses[k],0.5,4.0)) for k in CLUSTERS}
+
+
+def make_weights(y,positive_cluster,base_weights,arm: str) -> tuple[np.ndarray,dict]:
+    y=np.asarray(y,dtype=np.int8)
+    pc=np.asarray(positive_cluster,dtype=np.int8)
+    bw=np.asarray(base_weights,dtype=np.float64)
+    require(y.shape==pc.shape==bw.shape,"Pesos desalineados")
+    require(np.isfinite(bw).all() and (bw>=0).all(),"Base weights invalidos")
+    require(np.all(pc[y==0]==0),"Negativos con cluster")
+    require(np.all(np.isin(pc[y==1],CLUSTERS)),"Positivos sin cluster")
+    raw=raw_recipe(arm,y,pc,bw)
+    before=float(bw[y==1].sum())
+    require(before>0,"Sin masa positiva")
+    tmp=np.ones(len(y),dtype=np.float64)
+    for k in CLUSTERS:
+        tmp[(y==1)&(pc==k)]=raw[k]
+    denom=float((bw[y==1]*tmp[y==1]).sum())
+    require(denom>0,"Denominador de normalizacion invalido")
+    scale=before/denom
+    eff={k:float(raw[k]*scale) for k in CLUSTERS}
+    w=bw.copy()
+    for k in CLUSTERS:
+        w[(y==1)&(pc==k)]*=eff[k]
+    after=float(w[y==1].sum())
+    require(np.isclose(before,after,rtol=0,atol=1e-10*max(1.0,before)),
+            f"Masa positiva cambio: {before} -> {after}")
+    detail={
+        "arm":arm,"raw_recipe":{str(k):raw[k] for k in CLUSTERS},
+        "normalization_scale":float(scale),
+        "effective_recipe":{str(k):eff[k] for k in CLUSTERS},
+        "positive_mass_before":before,"positive_mass_after":after,
+    }
+    return w,detail
+
+
+def paired_summary(candidate_gains,control_gains) -> dict:
+    a=np.asarray(candidate_gains,dtype=np.float64)
+    b=np.asarray(control_gains,dtype=np.float64)
+    require(a.shape==b.shape and a.ndim==1 and len(a)>0,"Pareado invalido")
+    d=a-b
+    return {
+        "mean":float(d.mean()),"median":float(np.median(d)),
+        "sd":float(d.std(ddof=1)) if len(d)>1 else 0.0,
+        "wins":int((d>0).sum()),"ties":int((d==0).sum()),"losses":int((d<0).sum()),
+        "deltas":[float(x) for x in d],
+    }
+
+
+def choose_screen_winner(rows: list[dict]) -> str|None:
+    passed=[r for r in rows if r.get("arm")!="CONTROL" and bool(r.get("passed"))]
+    if not passed:
+        return None
+    passed=sorted(
+        passed,
+        key=lambda r:(-int(r["ensemble_gain"]),-int(r["delta_c25_captured"]),
+                      -float(r["paired_median"]),str(r["arm"]))
+    )
+    return str(passed[0]["arm"])

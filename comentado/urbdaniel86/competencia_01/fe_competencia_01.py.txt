@@ -1,0 +1,154 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–12] Importa argparse, duckdb y Path. `main()` lee el argumento `--path` (por defecto
+#   `../data/competencia_01.csv`) y abre una base DuckDB en memoria.
+import argparse
+import duckdb
+from pathlib import Path
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--path', default='../data/competencia_01.csv')
+    args = parser.parse_args()
+
+    dataset_path = args.path
+
+    con = duckdb.connect(':memory:')
+
+# [Anotación · líneas 14–20] Carga el CSV con `read_csv_auto` en la tabla `competencia_01` y agrega la columna
+#   `t`: el número de orden del mes (`dense_rank` sobre `foto_mes`), que vale 1 para el primer mes y sube de a 1
+#   por cada mes presente en el archivo.
+    # Carga del archivo CSV en DuckDB
+    
+    con.execute("""
+        CREATE OR REPLACE TABLE competencia_01 AS
+        SELECT *, dense_rank() OVER (ORDER BY foto_mes) AS t
+        FROM read_csv_auto(?)
+    """, [dataset_path])
+
+# [Anotación · líneas 22–28] Pasa `ccajas_depositos` a NULL en todas las filas de `foto_mes = 202105`.
+    # Corregir ccajas_depositos para 202105
+    
+    con.execute("""
+        UPDATE competencia_01
+        SET ccajas_depositos = null
+        WHERE foto_mes = 202105
+    """)
+
+# [Anotación · líneas 30–40] Define dos macros SQL: `ratio_seguro(a, b)` divide tratando los nulos como 0 y
+#   devuelve NULL cuando el denominador es 0 o nulo; `suma_sin_null(a, b)` suma tratando los nulos como 0.
+    # Macros para evitar errores de division por cero y sumar nulls como 0
+
+    con.execute("""
+        CREATE OR REPLACE MACRO ratio_seguro(a, b) AS
+        IFNULL(a, 0) / NULLIF(IFNULL(b, 0), 0)
+    """)
+
+    con.execute("""
+        CREATE OR REPLACE MACRO suma_sin_null(a, b) AS 
+        IFNULL(a, 0) + IFNULL(b, 0)
+    """)
+
+# [Anotación · líneas 42–59] Define las listas de trabajo: `campos_fe` con 12 variables (ctrx_quarter,
+#   mrentabilidad, mcomisiones, mcuentas_saldo, mpasivos_margen, mactivos_margen, mtarjeta_visa_consumo,
+#   mtarjeta_master_consumo, cproductos, ctarjeta_visa_transacciones, mpayroll, mcaja_ahorro); `campos_rank` con
+#   las 9 de esa lista cuyo nombre empieza con `m`; `pares_tc` con los pares Master/Visa de `msaldototal` y
+#   `mconsumototal`; y `feats`, la lista de expresiones SQL que se va llenando.
+    # Creación de features: historia, orden y combinaciones horizontales
+
+    campos_fe = [
+        'ctrx_quarter', 'mrentabilidad', 'mcomisiones', 'mcuentas_saldo',
+        'mpasivos_margen', 'mactivos_margen', 'mtarjeta_visa_consumo',
+        'mtarjeta_master_consumo', 'cproductos', 'ctarjeta_visa_transacciones',
+        'mpayroll', 'mcaja_ahorro',
+    ]
+
+    # Los montos son los que sufren data drifting -> les agregamos variables de orden
+    campos_rank = [c for c in campos_fe if c.startswith('m')]
+
+    pares_tc = [
+        ('Master_msaldototal', 'Visa_msaldototal', 'tc_msaldototal'),
+        ('Master_mconsumototal', 'Visa_mconsumototal', 'tc_mconsumototal'),
+    ]
+
+    feats = []
+
+# [Anotación · líneas 61–75] Para cada una de las 12 variables arma 8 expresiones: `lag_1` y `lag_2` (el valor
+#   de 1 y 2 filas atrás del mismo cliente, sólo si esa fila corresponde al mes `t-1` o `t-2`; si no, NULL),
+#   `delta_1` y `delta_2` (valor actual menos cada lag), y `media_3`, `min_3`, `max_3` y `slope_3` (pendiente de
+#   la regresión de la variable contra `t`) sobre la ventana de 3 meses. Son 96 expresiones.
+    # Historia: valor pasado, delta, ventana movil de 3 meses y tendencia
+    for c in campos_fe:
+        lag1 = f'case when lag(t, 1) over ventana_cliente = t - 1 then lag({c}, 1) over ventana_cliente end'
+        lag2 = f'case when lag(t, 2) over ventana_cliente = t - 2 then lag({c}, 2) over ventana_cliente end'
+
+        feats += [
+            f'{lag1} as {c}_lag_1',
+            f'{c} - ({lag1}) as {c}_delta_1',
+            f'{lag2} as {c}_lag_2',
+            f'{c} - ({lag2}) as {c}_delta_2',
+            f'avg({c}) over ventana_3 as {c}_media_3',
+            f'min({c}) over ventana_3 as {c}_min_3',
+            f'max({c}) over ventana_3 as {c}_max_3',
+            f'regr_slope({c}, t) over ventana_3 as {c}_slope_3',
+        ]
+
+# [Anotación · líneas 77–82] Para cada una de las 9 variables de monto arma `<variable>_rank`: la posición
+#   dentro del mes llevada a la escala 0–1, calculada como (rank − 1) / (cantidad de valores no nulos del mes −
+#   1); queda NULL si el valor es nulo.
+    # Orden dentro del mes: inmune al drift de los montos
+    for c in campos_rank:
+        rank = (f'case when {c} is null then null else '
+                f'(rank() over (partition by foto_mes order by {c}) - 1.0) '
+                f'/ nullif(count({c}) over (partition by foto_mes) - 1, 0) end')
+        feats.append(f'{rank} as {c}_rank')
+
+# [Anotación · líneas 84–93] Agrega `tc_msaldototal` y `tc_mconsumototal` (suma Master + Visa con
+#   `suma_sin_null`) y dos cocientes con `ratio_seguro`: `tc_consumo_sobre_saldo` (consumo total de tarjetas
+#   sobre `mcuentas_saldo`) y `comisiones_sobre_rentabilidad` (`mcomisiones` sobre `mrentabilidad`).
+    # Combinacion horizontal Visa + Master
+    for a, b, alias in pares_tc:
+        feats.append(f'suma_sin_null({a}, {b}) as {alias}')
+
+    # Ratios: siempre con ratio_seguro, nunca con "/"
+    feats += [
+        'ratio_seguro(suma_sin_null(Master_mconsumototal, Visa_mconsumototal), mcuentas_saldo)'
+        ' as tc_consumo_sobre_saldo',
+        'ratio_seguro(mcomisiones, mrentabilidad) as comisiones_sobre_rentabilidad',
+    ]
+
+# [Anotación · líneas 95–109] Une las expresiones en una sola consulta que crea la tabla `competencia_01_fe`
+#   con todas las columnas originales menos `t` más las variables nuevas. Define dos ventanas: `ventana_cliente`
+#   (por `numero_de_cliente`, ordenada por `t`) y `ventana_3` (misma partición, filas cuyo `t` está entre el
+#   actual menos 2 y el actual). Imprime la cantidad de variables nuevas.
+    bloque = '\n    , '.join(feats)
+
+    query_fe = f"""create or replace table competencia_01_fe as
+        select
+            * exclude (t)
+            , {bloque}
+        from competencia_01
+        window
+            ventana_cliente as (partition by numero_de_cliente order by t),
+            ventana_3 as (partition by numero_de_cliente order by t
+                        range between 2 preceding and current row)
+    """
+    con.execute(query_fe)
+
+    print(f'{len(feats)} features nuevas')
+
+# [Anotación · líneas 111–122] Escribe la tabla en `competencia_01_fe.parquet` (formato Parquet, compresión
+#   ZSTD) en la misma carpeta del CSV de entrada, imprime la ruta y define el punto de entrada del script.
+    # Guardar el dataset final en un CSV
+
+    out_path = Path(args.path).parent / "competencia_01_fe.parquet"
+
+    con.execute(f"""
+        COPY competencia_01_fe TO '{out_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+    """)
+
+    print(f'Dataset con features: {out_path}')
+
+if __name__ == "__main__":
+    main()

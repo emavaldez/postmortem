@@ -1,0 +1,62 @@
+{
+  "experimento": 5113,
+  "nombre": "eval_ensamble",
+  "descripcion": "Ensamble (2.1/2.2 del profesor) de las 12 mejores pruebas de 4112, entrenado con 202103+202104 y medido en 202106 completo, con min_sum_hessian escalado (x 1/0,7) y sin escalar; referencia: semillerio de la prueba 23 sobre ds3003 con la misma cantidad de modelos. R6 (escalar o no) y R7 (ensamble o 5015, tolerancia 3 M) fijadas de antemano. Corte domingo 20:00 con al menos 10 modelos.",
+  "sobrescribir": true,
+  "modo": "evaluacion",
+  "dataset": "ds3007_profesor.parquet",
+  "usar_lag2": true,
+  "clase": "clase_binaria2",
+  "top": "4112_bo_profesor_ds3007/4112_top.json",
+  "eleccion": "5113_eval_ensamble/5113_eleccion.json",
+  "top_k": 12,
+  "min_modelos": 10,
+  "hora_limite": "2026-10-11 20:00",
+  "meses_train": [
+    202103,
+    202104
+  ],
+  "mes_futuro": 202106,
+  "mes_prediccion": 202108,
+  "fraccion_train_cv": 0.7,
+  "referencia_p23": {
+    "dataset": "ds3003_rank_extra.parquet",
+    "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+  },
+  "tolerancia_R7_M": 3.0,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "semilla_publico": 571369,
+  "fraccion_publico": 0.3,
+  "meseta": [
+    12000,
+    17000
+  ],
+  "cortes": [
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "reanudar": true,
+  "_config": "5113_eval_ensamble.json",
+  "_fecha_inicio": "2026-10-11 12:17:26",
+  "_script": "18_ensamble_profesor.py",
+  "_git_commit": "sin_git"
+}

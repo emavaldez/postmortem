@@ -1,0 +1,207 @@
+#%% celda 1 [texto]
+<a href="https://colab.research.google.com/github/tobiartinian/Econom-a-y-Finanzas/blob/main/Clase_3.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+
+#%% celda 2 [código]
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from sklearn.tree import DecisionTreeClassifier, plot_tree,  _tree
+from sklearn.model_selection import StratifiedShuffleSplit
+
+#%% celda 3 [código]
+from google.colab import drive
+drive.mount('/content/drive')
+
+#%% celda 4 [código]
+def ganancia(model, X, y, prop=1, threshold=0.025):
+
+  class_index = np.where(model.classes_ == "BAJA+2")[0][0]
+  y_hat = model.predict_proba(X)
+
+  @np.vectorize
+  def ganancia_row(predicted, actual, threshold=0.025):
+    return  (predicted >= threshold) * (ganancia_acierto if actual == "BAJA+2" else -costo_estimulo)
+
+  return ganancia_row(y_hat[:,class_index], y).sum() / prop
+
+#%% celda 5 [código]
+dataset_path = '/content/drive/MyDrive/Economía y finanzas'
+dataset_file = 'competencia_01.csv'
+
+mes_train = 202104
+mes_test = 202105
+
+X = data[data['foto_mes'] == mes_train]
+y = X['clase_ternaria']
+X = X.drop(columns=['clase_ternaria'])
+
+#%% celda 6 [código]
+X.shape
+
+#%% celda 7 [código]
+len(X.columns)
+
+#%% celda 8 [código]
+X.head()
+
+#%% celda 9 [código]
+
+
+tree_params = {
+    'criterion': 'gini',
+    'max_depth': 7,
+    'min_samples_split': 80
+}
+
+#lista de ganancias
+gan_test = []
+gan_train = [] # esta no se mira NUNCA, esta para sumar dibujitos
+
+semillas = [0] # Define 'semillas' as a list of random seeds
+sss = StratifiedShuffleSplit(n_splits=31, test_size=0.3, random_state=semillas[0])
+
+for train_index, test_index in sss.split(X, y):
+
+  model = DecisionTreeClassifier(**tree_params)
+  model.fit(X.iloc[train_index], y.iloc[train_index])
+
+  gan_test.append(ganancia(model, X.iloc[test_index], y.iloc[test_index], prop=0.3))
+  gan_train.append(ganancia(model, X.iloc[train_index], y.iloc[train_index], prop=0.7))
+
+#%% celda 10 [código]
+# DataFrame for plotting
+df_gains = pd.DataFrame({
+    'Ganancia': gan_test + gan_train,
+    'Conjunto': ['Test'] * len(gan_test) + ['Train'] * len(gan_train)
+})
+
+# Plot histograms using FacetGrid to stack them vertically
+g = sns.FacetGrid(df_gains, row='Conjunto', aspect=2, height=4)
+g.map(sns.histplot, 'Ganancia', kde=True, palette='viridis')
+g.set_axis_labels('Ganancia', 'Frecuencia')
+g.set_titles(row_template='Conjunto: {row_name}')
+plt.suptitle('Distribución de Ganancias por Conjunto', y=1.02) # Add a main title
+plt.tight_layout() # Adjust layout to prevent overlapping titles/labels
+plt.show()
+
+#%% celda 11 [código]
+from sklearn.model_selection import StratifiedShuffleSplit
+
+tree_params = {
+    'criterion': 'gini',
+    'max_depth': 5,
+    'min_samples_split': 10
+}
+
+#lista de ganancias
+gan_test = []
+gan_train = [] # esta no se mira NUNCA, esta para sumar dibujitos
+
+semillas = [0] # Define 'semillas' as a list of random seeds
+sss = StratifiedShuffleSplit(n_splits=31, test_size=0.3, random_state=semillas[0])
+
+for train_index, test_index in sss.split(X, y):
+
+  model = DecisionTreeClassifier(**tree_params)
+  model.fit(X.iloc[train_index], y.iloc[train_index])
+
+  gan_test.append(ganancia(model, X.iloc[test_index], y.iloc[test_index], prop=0.3))
+  gan_train.append(ganancia(model, X.iloc[train_index], y.iloc[train_index], prop=0.7))
+
+#%% celda 12 [código]
+# DataFrame for plotting
+df_gains = pd.DataFrame({
+    'Ganancia': gan_test + gan_train,
+    'Conjunto': ['Test'] * len(gan_test) + ['Train'] * len(gan_train)
+})
+
+# Plot histograms using FacetGrid to stack them vertically
+g = sns.FacetGrid(df_gains, row='Conjunto', aspect=2, height=4)
+g.map(sns.histplot, 'Ganancia', kde=True, palette='viridis')
+g.set_axis_labels('Ganancia', 'Frecuencia')
+g.set_titles(row_template='Conjunto: {row_name}')
+plt.suptitle('Distribución de Ganancias por Conjunto', y=1.02) # Add a main title
+plt.tight_layout() # Adjust layout to prevent overlapping titles/labels
+plt.show()
+
+#%% celda 13 [código]
+
+
+tree_params = {
+    'criterion': 'gini',
+    'max_depth': 7,
+    'min_samples_split': 80
+}
+
+#lista de ganancias
+gan_test = []
+gan_train = [] # esta no se mira NUNCA, esta para sumar dibujitos
+
+semillas = [0] # Define 'semillas' as a list of random seeds
+sss = StratifiedShuffleSplit(n_splits=31, test_size=0.3, random_state=semillas[0])
+
+for train_index, test_index in sss.split(X, y):
+
+  model = DecisionTreeClassifier(**tree_params)
+  model.fit(X.iloc[train_index], y.iloc[train_index])
+
+  gan_test.append(ganancia(model, X.iloc[test_index], y.iloc[test_index], prop=0.3))
+  gan_train.append(ganancia(model, X.iloc[train_index], y.iloc[train_index], prop=0.7))
+
+#%% celda 14 [código]
+!pip install optuna
+import optuna
+# Removed: from sklearn.metrics import make_scorer
+
+# Make sure the 'ganancia' function is available in the global scope
+
+# Removed: Custom scorer is not needed as ganancia function already takes model, X, y
+
+def objective(trial):
+    # Define the hyperparameter search space using trial.suggest_*
+    criterion = trial.suggest_categorical('criterion', ['gini', 'entropy'])
+    max_depth = trial.suggest_int('max_depth', 3, 15) # Explore a wider range for max_depth
+    min_samples_split = trial.suggest_int('min_samples_split', 10, 500) # Explore a wider range
+
+    model = DecisionTreeClassifier(
+        criterion=criterion,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        random_state=semillas[0]
+    )
+
+    # Use StratifiedShuffleSplit for cross-validation within Optuna
+    sss_cv = StratifiedShuffleSplit(n_splits=3, test_size=0.3, random_state=semillas[0])
+
+    scores = []
+    for train_index, test_index in sss_cv.split(X, y):
+        model.fit(X.iloc[train_index], y.iloc[train_index])
+        # Directly call ganancia function
+        scores.append(ganancia(model, X.iloc[test_index], y.iloc[test_index], prop=0.3))
+
+    return np.mean(scores)
+
+# Create an Optuna study and optimize
+study = optuna.create_study(direction='maximize') # We want to maximize the ganancia
+study.optimize(objective, n_trials=5, show_progress_bar=True)
+
+# Print the best trial results
+print(f"\nNumber of finished trials: {len(study.trials)}")
+print(f"Best trial: {study.best_trial.value}")
+print("Best parameters:")
+for key, value in study.best_trial.params.items():
+    print(f"  {key}: {value}")
+
+# You can access the best model like this:
+best_optuna_params = study.best_trial.params
+best_optuna_model = DecisionTreeClassifier(**best_optuna_params, random_state=semillas[0])
+best_optuna_model.fit(X, y) # Train the best model on the full dataset
+
+#%% celda 15 [código]
+import optuna.visualization as ov
+
+# Visualize the optimization history using a contour plot
+# This helps to see the relationship between hyperparameters and the objective value.
+ov.plot_contour(study, params=['max_depth', 'min_samples_split'])

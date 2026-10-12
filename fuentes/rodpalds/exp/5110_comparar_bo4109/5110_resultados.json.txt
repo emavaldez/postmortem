@@ -1,0 +1,37 @@
+{
+  "resumen": [
+    {
+      "modelo": "p23",
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": 766,
+      "hiper": "4107 p23_4104",
+      "arboles": 580,
+      "meses_train": "202103 202104",
+      "min_data_in_leaf": 20248,
+      "meseta_M": 443.1,
+      "maximo_M": 456.0,
+      "envios_optimos": 13500,
+      "envios_agosto_p25_p50_p75": "13,042 / 13,644 / 13,845",
+      "dif_vs_bo4109_M": 11.4,
+      "IC90_M": "[-11.4 ; 34.2]",
+      "pct_remuestreos_gana": "78%"
+    },
+    {
+      "modelo": "bo4109",
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": 766,
+      "hiper": "4109 prueba_23",
+      "arboles": 280,
+      "meses_train": "202103 202104",
+      "min_data_in_leaf": 1317,
+      "meseta_M": 432.5,
+      "maximo_M": 444.4,
+      "envios_optimos": 12000,
+      "envios_agosto_p25_p50_p75": "12,139 / 12,541 / 13,945",
+      "dif_vs_bo4109_M": NaN,
+      "IC90_M": NaN,
+      "pct_remuestreos_gana": NaN
+    }
+  ],
+  "_minutos": 34.87
+}

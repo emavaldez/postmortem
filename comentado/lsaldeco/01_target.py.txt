@@ -1,0 +1,91 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–11] Importa os, duckdb y pandas. Define la carpeta de datos
+#   (/home/laura/(modificar)/DMEyF/datos/), el archivo de entrada competencia_01_crudo.csv y el de salida
+#   competencia_01.csv, y arma las rutas completas.
+import os
+import duckdb
+import pandas as pd
+
+# 1. Definir rutas (modificar path)
+dataset_path = "/home/laura/(modificar)/DMEyF/datos/"
+dataset_filename = "competencia_01_crudo.csv"
+output_filename = "competencia_01.csv"
+
+file_path = os.path.join(dataset_path, dataset_filename)
+output_path = os.path.join(dataset_path, output_filename)
+
+# [Anotación · líneas 13–16] Abre una base DuckDB en memoria e imprime un aviso de inicio.
+# 2. Inicializar conexión a DuckDB
+con = duckdb.connect(database=":memory:")
+
+print("Cargando dataset crudo y calculando la clase ternaria...")
+
+# [Anotación · líneas 18–29] Inicia la consulta que crea la tabla competencia_01. Lee del CSV crudo los meses
+#   distintos y los clientes distintos y arma todas las combinaciones cliente–mes (CROSS JOIN).
+# 3. Ejecutar la query para crear la tabla con la clase ternaria
+con.execute(f"""
+    CREATE OR REPLACE TABLE competencia_01 AS
+    WITH periodos AS (
+        SELECT DISTINCT foto_mes FROM read_csv_auto('{file_path}')
+    ),
+    clientes AS (
+        SELECT DISTINCT numero_de_cliente FROM read_csv_auto('{file_path}')
+    ),
+    todo AS (
+        SELECT numero_de_cliente, foto_mes FROM clientes CROSS JOIN periodos
+    ),
+# [Anotación · líneas 30–44] Une esas combinaciones con el CSV crudo (LEFT JOIN) y define mes_0 = 1 si el
+#   cliente tiene registro en ese mes y 0 si no. Con LEAD toma esa misma marca un mes y dos meses adelante
+#   (mes_1 y mes_2) y asigna clase_ternaria: BAJA+1 si está en el mes y no en el siguiente; BAJA+2 si está en el
+#   mes y en el siguiente y no dos meses después; CONTINUA si está en los tres; NULL en cualquier otro caso.
+    clase_ternaria AS (
+        SELECT
+            c.*
+            , IF(c.numero_de_cliente IS NULL, 0, 1) AS mes_0
+            , LEAD(mes_0, 1) OVER (PARTITION BY t.numero_de_cliente ORDER BY foto_mes) AS mes_1
+            , LEAD(mes_0, 2) OVER (PARTITION BY t.numero_de_cliente ORDER BY foto_mes) AS mes_2
+            , CASE
+                WHEN mes_0 = 1 AND mes_1 = 0 THEN 'BAJA+1'
+                WHEN mes_0 = 1 AND mes_1 = 1 AND mes_2 = 0 THEN 'BAJA+2'
+                WHEN mes_0 = 1 AND mes_1 = 1 AND mes_2 = 1 THEN 'CONTINUA'
+                ELSE NULL
+              END AS clase_ternaria
+        FROM todo t
+        LEFT JOIN read_csv_auto('{file_path}') c USING (numero_de_cliente, foto_mes)
+    )
+# [Anotación · líneas 45–48] Conserva sólo las filas en que el cliente tiene registro (mes_0 = 1) y quita las
+#   columnas auxiliares mes_0, mes_1 y mes_2.
+    SELECT * EXCLUDE (mes_0, mes_1, mes_2)
+    FROM clase_ternaria
+    WHERE mes_0 = 1
+""")
+
+# [Anotación · líneas 50–55] Exporta la tabla competencia_01 a competencia_01.csv con encabezado.
+print(f"Guardando el resultado procesado en '{output_path}'...")
+
+# 4. Exportar la tabla resultante a un nuevo archivo CSV
+con.execute(f"""
+    COPY competencia_01 TO '{output_path}' (FORMAT CSV, HEADER)
+""")
+
+# [Anotación · líneas 57–73] Cuenta clientes por foto_mes y por valor de clase_ternaria con PIVOT, dejando
+#   afuera 202108, y muestra la tabla por pantalla.
+# 5. Generar y mostrar por pantalla la tabla pivoteada de control
+print("\n--- Distribución de la Clase Ternaria por Mes ---")
+df_pivot = con.execute("""
+
+PIVOT (
+    SELECT *
+    FROM competencia_01
+    WHERE foto_mes != 202108
+)
+ON clase_ternaria
+USING count(numero_de_cliente)
+GROUP BY foto_mes
+ORDER BY foto_mes;
+""").fetchdf()
+
+print(df_pivot)
+print("\n¡Listo!")

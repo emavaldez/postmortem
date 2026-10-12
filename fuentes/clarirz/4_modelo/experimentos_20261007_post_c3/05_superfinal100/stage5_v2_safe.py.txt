@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import gc
+from pathlib import Path
+import subprocess
+import time
+
+import numpy as np
+import pandas as pd
+
+import super_common as C
+import run_superfinal100 as V1
+import superfinal100_v2 as V2
+
+def _gcs(cmd, check=True, **kw):
+    """Respaldo opcional a Cloud Storage. Se omite cuando el bucket es el placeholder de publicacion."""
+    if any("REEMPLAZAR_CON_BUCKET_PROPIO" in str(a) or "BUCKET_PRIVADO_NO_PUBLICADO" in str(a) for a in cmd):
+        return None
+    return subprocess.run(cmd, check=check, **kw)
+
+
+
+def stage5_per_seed_safe(
+    ctx: dict,
+    s0: dict,
+    s1: dict,
+    s2: dict,
+    s3: dict,
+    s4: dict,
+) -> dict:
+    import lightgbm as lgb
+
+    out = V1.stage_path(ctx, 5, "final")
+    result_path = out / "RESULT.json"
+    if result_path.is_file():
+        return C.load_json(result_path)
+    if not s4["promote_to_august"]:
+        result = {
+            "status": "stopped_no_promotion",
+            "stage4_identity": s4["identity"],
+            "no_submit": True,
+        }
+        C.write_json(result_path, result)
+        _gcs(
+            ["gcloud", "storage", "cp", str(result_path), V2.REMOTE + "/stage5_RESULT.json"],
+            check=True,
+        )
+        print("STAGE5 NO EJECUTADO: no promovió bajo regla v2.", flush=True)
+        return result
+
+    total_gib, available_gib = V2.meminfo_gib()
+    V2.require(
+        total_gib >= V2.MIN_TOTAL_GIB,
+        f"VM insuficiente: MemTotal={total_gib:.1f}GiB < {V2.MIN_TOTAL_GIB}",
+    )
+    features = C.load_json(Path(s1["winner_features_file"]))["features"]
+    n_train = sum(C.EXPECTED_ROWS[m] for m in C.FINAL_TRAIN)
+    n_score = C.EXPECTED_ROWS[C.SCORE_MONTH]
+    estimated_gib = (
+        ((2 * n_train + n_score) * len(features) * 8) / V2.GIB
+        + V2.RESERVE_GIB
+    )
+    V2.require(
+        available_gib >= estimated_gib,
+        f"RAM disponible insuficiente: {available_gib:.1f}GiB < "
+        f"estimado {estimated_gib:.1f}GiB",
+    )
+    print(
+        f"RAM_GUARD_OK total={total_gib:.1f} available={available_gib:.1f} "
+        f"estimated={estimated_gib:.1f}",
+        flush=True,
+    )
+
+    bank = V1.prepare_final_bank(ctx, s0, features)
+    gc.collect()
+    _, available_after_bank = V2.meminfo_gib()
+    V2.require(
+        available_after_bank >= estimated_gib,
+        f"RAM insuficiente después del banco: {available_after_bank:.1f}GiB < "
+        f"estimado {estimated_gib:.1f}GiB",
+    )
+
+    C.add_fe_path(ctx["paths"])
+    from cargar_bloques import cargar_bloques
+
+    derived = C.split_derived(features, ctx)
+    train_df, _ = cargar_bloques(
+        bank, meses=C.FINAL_TRAIN, incluir_raw=True, features=derived
+    )
+    labels = pd.read_parquet(bank / "etiquetas.parquet")
+    train_labels = labels[
+        labels.foto_mes.isin(C.FINAL_TRAIN)
+    ].reset_index(drop=True)
+    V2.require(
+        train_df[["numero_de_cliente", "foto_mes"]].equals(
+            train_labels[["numero_de_cliente", "foto_mes"]]
+        ),
+        "Final train desalineado",
+    )
+    x_train = train_df[features]
+    y_train = train_labels.clase_ternaria.eq("BAJA+2").to_numpy(np.int8)
+    months = train_df.foto_mes.to_numpy(np.int64)
+    keep, weights = C.policy_weights(
+        months, V1.FINAL_RECENCY[s2["winner_policy"]]
+    )
+    x_fit = (
+        x_train
+        if bool(np.all(keep))
+        else x_train.loc[keep].reset_index(drop=True)
+    )
+    y_fit = y_train[keep]
+    del train_df, x_train, train_labels, labels, y_train, months, keep
+    gc.collect()
+
+    score_df, _ = cargar_bloques(
+        bank, meses=[C.SCORE_MONTH], incluir_raw=True, features=derived
+    )
+    ids = score_df.numero_de_cliente.to_numpy(np.int64)
+    V2.require(
+        len(ids) == C.EXPECTED_ROWS[C.SCORE_MONTH]
+        and len(np.unique(ids)) == len(ids),
+        "IDs agosto",
+    )
+    x_score = score_df[features]
+    del score_df
+    gc.collect()
+
+    identity = C.fingerprint(
+        {
+            "run": V2.RUN,
+            "stage": 5,
+            "plan": V2.PLAN,
+            "stage4": s4["identity"],
+            "data_sha": C.digest(Path(s0["dataset"])),
+            "bank_manifest_sha": C.digest(bank / "manifest.json"),
+            "features": C.fingerprint(features),
+            "params": s3["params"],
+            "rounds": s3["rounds"],
+            "policy": s2["winner_policy"],
+            "n": s4["n_final"],
+            "dataset_per_seed": True,
+            "memory_cleanup": True,
+        }
+    )
+    model_dir = out / "models"
+    model_dir.mkdir(exist_ok=True)
+    all_scores: list[np.ndarray] = []
+
+    for index, seed in enumerate(C.SEEDS20, 1):
+        cp = model_dir / f"seed_{seed}.npz"
+        model_path = model_dir / f"modelo_{seed}.txt"
+        if cp.is_file() and model_path.is_file():
+            with np.load(cp, allow_pickle=False) as z:
+                V2.require(
+                    str(z["identity"].item()) == identity
+                    and int(z["seed"].item()) == seed,
+                    f"Checkpoint final incompatible seed={seed}",
+                )
+                V2.require(
+                    np.array_equal(z["ids"], ids),
+                    f"IDs final seed={seed}",
+                )
+                V2.require(
+                    str(z["model_sha256"].item()) == C.digest(model_path),
+                    f"Hash final seed={seed}",
+                )
+                scores = np.asarray(z["scores"], dtype=np.float64).copy()
+            print(f"REUSAR FINAL V2 {index}/20 seed={seed}", flush=True)
+        else:
+            V2.require(
+                not cp.exists() and not model_path.exists(),
+                f"Par final parcial seed={seed}",
+            )
+            _, available_now = V2.meminfo_gib()
+            V2.require(
+                available_now >= V2.RESERVE_GIB,
+                f"RAM < reserva antes seed={seed}",
+            )
+            print(f"ENTRENAR FINAL V2 {index}/20 seed={seed}", flush=True)
+            ds, seed_params = V2.dataset_for_seed(
+                x_fit, y_fit, weights, features, s3["params"], seed
+            )
+            started = time.monotonic()
+
+            def progress(env):
+                iteration = env.iteration + 1
+                if (
+                    iteration == 1
+                    or iteration % 25 == 0
+                    or iteration == s3["rounds"]
+                ):
+                    print(
+                        f"seed={seed} BOOST {iteration}/{s3['rounds']}; "
+                        f"t={time.monotonic()-started:.1f}s",
+                        flush=True,
+                    )
+
+            model = lgb.train(
+                seed_params,
+                ds,
+                num_boost_round=int(s3["rounds"]),
+                callbacks=[progress],
+            )
+            scores = np.asarray(
+                model.predict(x_score, num_threads=C.THREADS),
+                dtype=np.float64,
+            )
+            V2.require(
+                scores.shape == ids.shape and np.isfinite(scores).all(),
+                "Scores final inválidos",
+            )
+            tmp_model = model_path.with_suffix(".tmp")
+            model.save_model(str(tmp_model))
+            tmp_model.replace(model_path)
+            with cp.with_suffix(".tmp").open("wb") as fh:
+                np.savez_compressed(
+                    fh,
+                    identity=np.array(identity),
+                    seed=np.array(seed),
+                    ids=ids,
+                    scores=scores,
+                    model_sha256=np.array(C.digest(model_path)),
+                )
+            cp.with_suffix(".tmp").replace(cp)
+            _gcs(
+                [
+                    "gcloud", "storage", "cp", str(cp), str(model_path),
+                    V2.REMOTE + "/stage5_models/",
+                ],
+                check=True,
+            )
+            del model, ds
+            gc.collect()
+        all_scores.append(scores)
+
+    ensemble = np.vstack(all_scores).mean(axis=0, dtype=np.float64)
+    n_final = int(s4["n_final"])
+    delivery = out / "delivery"
+    delivery.mkdir(exist_ok=True)
+    prefix = "C1SF2" + identity[:12].upper()
+    csv_path = delivery / f"{prefix}ENS{n_final}.csv"
+    info = C.export_csv(csv_path, ids, ensemble, n_final)
+    manifest = {
+        "status": "ready_not_submitted",
+        "run": V2.RUN,
+        "identity": identity,
+        "n": n_final,
+        "file": info,
+        "submit_message": f"submit {prefix}ENS{n_final}",
+        "representation": s1["winner"],
+        "quality_arm": s0["quality_arm"],
+        "recency": s2["winner_policy"],
+        "params": s3["params"],
+        "rounds": s3["rounds"],
+        "stage4_identity": s4["identity"],
+        "execution": "dataframe_64GiB_dataset_per_seed_gc",
+    }
+    C.write_json(delivery / "MANIFEST.json", manifest)
+    (delivery / "mensaje_zulip.txt").write_text(
+        manifest["submit_message"] + "\n", encoding="utf-8"
+    )
+    C.write_json(out / "LISTO.json", manifest)
+    _gcs(
+        [
+            "gcloud", "storage", "cp", str(csv_path),
+            str(delivery / "MANIFEST.json"),
+            str(delivery / "mensaje_zulip.txt"), str(out / "LISTO.json"),
+            V2.REMOTE + "/final/",
+        ],
+        check=True,
+    )
+    result = {
+        "status": "ready_not_submitted",
+        "identity": identity,
+        "n": n_final,
+        "csv": str(csv_path),
+        "sha256": info["sha256"],
+        "submit_message": manifest["submit_message"],
+    }
+    C.write_json(result_path, result)
+    _gcs(
+        [
+            "gcloud", "storage", "cp", str(result_path),
+            V2.REMOTE + "/stage5_RESULT.json",
+        ],
+        check=True,
+    )
+    print("SUPERFINAL100_V2_LISTO. NO ENVIADO.", flush=True)
+    print(manifest["submit_message"], flush=True)
+    return result

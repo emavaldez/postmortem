@@ -1,0 +1,2 @@
+# 019 — blend 017 + 010 (cobertura de riesgo)
+`blend.py`: rank medio de `017` (lag2 + auxiliar, 30 semillas) y `010` (sin ambos, 6 semillas), k=12000, un solo archivo; no reentrena nada. Motivo: el lag2 de 202108 apunta a junio (aguinaldo, PSI 0.23 en `mpayroll`/`cpayroll_trx`) y la validación del lag2 es de folds solapados. Se solapa 98.0% con cada uno (96.0% entre ellos). Public: **101.09M** (+1.95M vs 017), confundido con el cambio de k (11000 → 12000). Sin validación propia; componente del blend de `024`/`031`.

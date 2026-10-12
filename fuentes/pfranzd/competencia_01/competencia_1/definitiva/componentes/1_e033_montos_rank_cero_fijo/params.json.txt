@@ -1,0 +1,125 @@
+{
+  "nota": "hiperpar\u00e1metros finales (ya escalados) del run 20261011-023622_e033_montos_rank_cero_fijo",
+  "ensamble": [
+    {
+      "etiqueta": "t57",
+      "params": {
+        "learning_rate": 0.00784336524123836,
+        "num_iterations": 1233,
+        "feature_fraction": 0.16379783074301202,
+        "num_leaves": 109,
+        "min_data_in_leaf": 3363
+      }
+    },
+    {
+      "etiqueta": "t55",
+      "params": {
+        "learning_rate": 0.007868120807422769,
+        "num_iterations": 965,
+        "feature_fraction": 0.1444210558111195,
+        "num_leaves": 100,
+        "min_data_in_leaf": 3301
+      }
+    },
+    {
+      "etiqueta": "t59",
+      "params": {
+        "learning_rate": 0.007806170435240768,
+        "num_iterations": 1384,
+        "feature_fraction": 0.16462817921681436,
+        "num_leaves": 106,
+        "min_data_in_leaf": 3239
+      }
+    },
+    {
+      "etiqueta": "t58",
+      "params": {
+        "learning_rate": 0.008219575120842306,
+        "num_iterations": 1245,
+        "feature_fraction": 0.16371364291331034,
+        "num_leaves": 107,
+        "min_data_in_leaf": 3425
+      }
+    },
+    {
+      "etiqueta": "t15",
+      "params": {
+        "learning_rate": 0.010685968122036848,
+        "num_iterations": 889,
+        "feature_fraction": 0.34650225919559974,
+        "num_leaves": 62,
+        "min_data_in_leaf": 5133
+      }
+    },
+    {
+      "etiqueta": "t54",
+      "params": {
+        "learning_rate": 0.011917529555688457,
+        "num_iterations": 948,
+        "feature_fraction": 0.27549620057136687,
+        "num_leaves": 63,
+        "min_data_in_leaf": 3510
+      }
+    },
+    {
+      "etiqueta": "t14",
+      "params": {
+        "learning_rate": 0.00821753902853084,
+        "num_iterations": 895,
+        "feature_fraction": 0.22469874811660645,
+        "num_leaves": 49,
+        "min_data_in_leaf": 3332
+      }
+    },
+    {
+      "etiqueta": "t21",
+      "params": {
+        "learning_rate": 0.012150745319066687,
+        "num_iterations": 832,
+        "feature_fraction": 0.1747537732659807,
+        "num_leaves": 93,
+        "min_data_in_leaf": 5914
+      }
+    },
+    {
+      "etiqueta": "t27",
+      "params": {
+        "learning_rate": 0.013567047843587095,
+        "num_iterations": 568,
+        "feature_fraction": 0.13686609516303588,
+        "num_leaves": 56,
+        "min_data_in_leaf": 1670
+      }
+    },
+    {
+      "etiqueta": "t42",
+      "params": {
+        "learning_rate": 0.01216912579650886,
+        "num_iterations": 820,
+        "feature_fraction": 0.22719229571043223,
+        "num_leaves": 92,
+        "min_data_in_leaf": 4940
+      }
+    },
+    {
+      "etiqueta": "t56",
+      "params": {
+        "learning_rate": 0.005037982919471479,
+        "num_iterations": 1096,
+        "feature_fraction": 0.14772514793403757,
+        "num_leaves": 64,
+        "min_data_in_leaf": 1237
+      }
+    },
+    {
+      "etiqueta": "t34",
+      "params": {
+        "learning_rate": 0.011936622886486947,
+        "num_iterations": 914,
+        "feature_fraction": 0.27887816667893817,
+        "num_leaves": 54,
+        "min_data_in_leaf": 4569
+      }
+    }
+  ]
+}

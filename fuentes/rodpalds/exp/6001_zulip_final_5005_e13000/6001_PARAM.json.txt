@@ -1,0 +1,14 @@
+{
+  "experimento": 6001,
+  "nombre": "zulip_final_5005_e13000",
+  "descripcion": "Archivo final para Zulip: semillerio de 5005 (retador 4102 prueba 117, 30 semillas), 13.000 envios.",
+  "modo": "final",
+  "fuente": "5005_prod_eleccion_4102",
+  "envios": 13000,
+  "max_archivos": 20,
+  "clientes_esperados": 164647,
+  "_config": "6001_zulip_final.json",
+  "_fecha_inicio": "2026-10-07 19:35:14",
+  "_script": "10_entrega_zulip.py",
+  "_git_commit": "sin_git"
+}

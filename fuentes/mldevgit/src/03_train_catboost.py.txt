@@ -1,0 +1,7 @@
+from common import args, train_family
+
+def main():
+    opts=args('5 seeds CatBoost FULL457 finales congeladas; sin features lag2').parse_args()
+    train_family(opts.output_dir,'catboost')
+
+if __name__=='__main__': main()

@@ -1,0 +1,145 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–5] Enlace para abrir el notebook en Google Colab e instalación de optuna con %pip.
+#%% celda 1 [texto]
+<a href="https://colab.research.google.com/github/tobiartinian/Econom-a-y-Finanzas/blob/main/Submission.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+
+#%% celda 2 [código]
+%pip install optuna
+
+# [Anotación · líneas 7–15] Importa lightgbm, duckdb, optuna, pandas y os, y abre (o crea) el archivo de base
+#   de datos competencia.duckdb en el directorio de trabajo.
+#%% celda 3 [código]
+import lightgbm as lgb
+import duckdb
+import optuna
+import pandas as pd
+import os
+
+# 1. Conectar a DuckDB
+con = duckdb.connect("competencia.duckdb")
+
+# [Anotación · líneas 17–45] Lista las tablas de esa base. Si no existe competencia_01, lee el encabezado de
+#   /content/drive/MyDrive/Economía y finanzas/competencia_01.csv, arma para cada columna salvo foto_mes,
+#   numero_de_cliente y clase_ternaria una expresión LAG(col, 1) particionada por numero_de_cliente y ordenada
+#   por foto_mes (sufijo _lag1), y crea la tabla con todas las columnas del CSV más esos lags. Si la tabla ya
+#   existe, sólo imprime un aviso.
+# 2. Verificar si la tabla competencia_01 existe, y si no, recrearla desde el CSV
+tablas_existentes = [row[0] for row in con.execute("SHOW TABLES;").fetchall()]
+
+if "competencia_01" not in tablas_existentes:
+    print("⚠️ La tabla 'competencia_01' no está en esta sesión. Generándola desde el CSV...")
+
+    file_path = "/content/drive/MyDrive/Economía y finanzas/competencia_01.csv" # Ajusta tu ruta si es necesario
+
+    # Leer header para las variables con lag
+    df_header = pd.read_csv(file_path, nrows=0)
+    excluir = {'foto_mes', 'numero_de_cliente', 'clase_ternaria'}
+    variables_lag_validas = [col for col in df_header.columns if col not in excluir]
+
+    lags_sql = ",\n    ".join([
+        f"LAG({col}, 1) OVER (PARTITION BY numero_de_cliente ORDER BY foto_mes) AS {col}_lag1"
+        for col in variables_lag_validas
+    ])
+
+    query_create = f"""
+    CREATE OR REPLACE TABLE competencia_01 AS
+    SELECT
+        *,
+        {lags_sql}
+    FROM read_csv_auto('{file_path}');
+    """
+    con.execute(query_create)
+    print("¡Tabla creada y cargada con éxito en DuckDB!")
+else:
+    print("✅ La tabla 'competencia_01' ya existe en DuckDB.")
+
+# [Anotación · líneas 47–56] Carga el estudio de Optuna exp_101_lgbm-opt desde el archivo SQLite
+#   /content/drive/MyDrive/DMEyF/2026/notebooks/data/optimization_lgbm.db, toma study.best_params y los imprime.
+#   El código que genera ese estudio no está en el repositorio.
+# 3. Recuperar los mejores hiperparámetros de Optuna
+storage_name = "sqlite:////content/drive/MyDrive/DMEyF/2026/notebooks/data/optimization_lgbm.db"
+study_name = "exp_101_lgbm-opt"
+
+study = optuna.load_study(study_name=study_name, storage=storage_name)
+best_params = study.best_params
+
+print("\n🏆 Mejores hiperparámetros recuperados de Optuna:")
+for k, v in best_params.items():
+    print(f"  - {k}: {v}")
+
+# [Anotación · líneas 58–65] Agrega a esos parámetros objective=binary, metric=auc, boosting_type=gbdt,
+#   random_state=772859, n_jobs=1 y verbose=-1.
+best_params.update({
+    "objective": "binary",
+    "metric": "auc",
+    "boosting_type": "gbdt",
+    "random_state": 772859,
+    "n_jobs": 1,
+    "verbose": -1
+})
+
+# [Anotación · líneas 67–71] Obtiene los nombres de columna de la tabla con una consulta LIMIT 0 y define como
+#   variables de entrada todas menos foto_mes, numero_de_cliente y clase_ternaria.
+# 4. Extraer features y entrenar
+df_header = con.execute("SELECT * FROM competencia_01 LIMIT 0").df()
+excluir = {"foto_mes", "numero_de_cliente", "clase_ternaria"}
+features = [col for col in df_header.columns if col not in excluir]
+features_sql = ", ".join(features)
+
+# [Anotación · líneas 73–84] Trae de DuckDB las filas con foto_mes entre 202103 y 202106 con esas variables y
+#   una columna target que vale 1 cuando clase_ternaria es 'BAJA+2' y 0 en otro caso; separa X_train e y_train.
+print("\nCargando datos de entrenamiento desde DuckDB...")
+query_train = f"""
+    SELECT
+        {features_sql},
+        CASE WHEN clase_ternaria = 'BAJA+2' THEN 1 ELSE 0 END AS target
+    FROM competencia_01
+    WHERE foto_mes BETWEEN 202103 AND 202106
+"""
+df_train = con.execute(query_train).df()
+
+X_train = df_train.drop(columns=["target"])
+y_train = df_train["target"]
+
+# [Anotación · líneas 86–93] Construye un lgb.Dataset con todas esas filas y entrena con lgb.train durante 400
+#   iteraciones (num_boost_round=400), sin conjunto de validación ni detención temprana.
+print("Entrenando el modelo final de LightGBM...")
+train_data = lgb.Dataset(X_train, label=y_train)
+
+model = lgb.train(
+    best_params,
+    train_data,
+    num_boost_round=400
+)
+
+# [Anotación · líneas 95–108] Trae todas las columnas de las filas de foto_mes = 202108, selecciona las mismas
+#   variables del entrenamiento y guarda la probabilidad predicha en la columna probabilidad.
+# 5. Cargar datos de test y generar submission
+mes_test = 202108
+print(f"Cargando datos del mes de test ({mes_test})...")
+
+query_test = f"""
+    SELECT *
+    FROM competencia_01
+    WHERE foto_mes = {mes_test}
+"""
+df_test = con.execute(query_test).df()
+X_test = df_test[features]
+
+print("Generando predicciones...")
+df_test['probabilidad'] = model.predict(X_test)
+
+# [Anotación · líneas 110–118] Conserva las filas con probabilidad mayor o igual a 0.025, se queda con la
+#   columna numero_de_cliente y la escribe en submission_final.csv sin índice ni encabezado; imprime la cantidad
+#   de clientes guardados y muestra los primeros 10.
+umbral_optimo = 0.025
+df_bajas_predichas = df_test[df_test['probabilidad'] >= umbral_optimo].copy()
+df_submission = df_bajas_predichas[['numero_de_cliente']].copy()
+
+output_filename = 'submission_final.csv'
+df_submission.to_csv(output_filename, index=False, header=False)
+
+print(f"\n✨ ¡Listo! Se filtraron y guardaron {len(df_submission)} clientes predichos como baja+2 en '{output_filename}'.")
+df_submission.head(10)

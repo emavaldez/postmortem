@@ -1,0 +1,94 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–5] Docstring: multiclase con todas las variables con lag1, lag2 y diferencias, 3
+#   configuraciones M1 × N semillas, exclusión de columnas lag2 y d2 por PSI, caché por configuración y semilla.
+"""031 — modelo final M2: multiclase con TODAS las variables con lag1, lag2 y diferencias (028/030), 3 configuraciones M1 de 005 (mejores_trials.json) × N semillas,
+train 202103–06 -> score 202108, score condicional P2/(1-P1), rank medio. Se EXCLUYEN las columnas lag2/d2 cuyo PSI entre las filas de train con lag2 real (202105, 202106)
+y 202108 supera --psi (por defecto 0.20): el lag2 de 202108 apunta a junio (aguinaldo) y esas columnas quedan fuera de la distribución de train. Sin mirar el target.
+La lista queda en drop_psi.txt. Cada (configuración, semilla) se guarda en tmp/ y se reanuda.
+Uso (raíz del repo): caffeinate -i venv/bin/python competencia/experimentos/031_final_todas_lags/final_m2.py --semillas 10 [--psi 0.20]   |   tail -f competencia/experimentos/031_final_todas_lags/log.txt"""
+# [Anotación · líneas 6–27] Imports; carga 028_todas_lags/run.py como módulo t028 con importlib (ese módulo
+#   activa CORREGIR_CCAJAS y aporta construir()); rutas de log y tmp.
+import argparse
+import importlib.util
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.stats import rankdata
+
+AQUI = Path(__file__).resolve().parent
+sys.path.insert(0, str(AQUI.parents[1] / "src")); sys.path.insert(0, str(AQUI.parents[0] / "004_seleccion_variables")); sys.path.insert(0, str(AQUI.parents[0] / "005_optuna"))
+spec = importlib.util.spec_from_file_location("t028", AQUI.parents[0] / "028_todas_lags" / "run.py"); t028 = importlib.util.module_from_spec(spec); spec.loader.exec_module(t028)
+import config  # noqa: E402
+from config import ID_COL  # noqa: E402
+from drift import psi  # noqa: E402
+from modelos import guardar_modelo, verificar_orden_cache  # noqa: E402
+from multiclase import entrenar, etiquetas, filas, score_cond  # noqa: E402
+from validacion import PARAMS_BASE  # noqa: E402
+
+LOG, TMP = AQUI / "log.txt", AQUI / "tmp"
+
+
+# [Anotación · líneas 30–33] escribir() imprime y agrega al log.
+def escribir(msg):
+    print(msg, flush=True)
+    with open(LOG, "a") as f:
+        f.write(msg + "\n")
+
+
+# [Anotación · líneas 36–48] Argumentos --semillas (10), --psi (0,20) y --min_data. Lee de mejores_trials.json
+#   las tres configuraciones cuyo nombre empieza con M1 y, si se pasa --min_data, reemplaza min_data_in_leaf de
+#   top1, top2 y top3 por los valores dados (50, 65 y 80 en la entrega) y agrega md50-65-80_ a los nombres de
+#   archivo.
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("--semillas", type=int, default=10); ap.add_argument("--psi", type=float, default=0.20)
+    ap.add_argument("--min_data", default="", help="min_data_in_leaf para M1 top1,top2,top3 separados por coma (032/033: meseta en 50-80)"); args = ap.parse_args()
+    semillas = config.semillas(args.semillas)                       # semillas explícitas en config.py (5 propias + derivadas)
+    js = json.loads((t028.A005 / "mejores_trials.json").read_text())
+    cfg = {tuple(k.split("_")): (d["r"], d["num_boost_round"], {**PARAMS_BASE, **{a: b for a, b in d.items() if a not in ("r", "num_boost_round")}}) for k, d in js.items() if k.startswith("M1")}
+    TAG = ""
+    if args.min_data:                                                                # 033: meseta de min_data_in_leaf entre 50 y 80
+        md = [int(v) for v in args.min_data.split(",")]
+        for i, k in enumerate(sorted(cfg)):
+            cfg[k][2]["min_data_in_leaf"] = md[i]
+        TAG = "md" + "-".join(map(str, md)) + "_"
+    TMP.mkdir(exist_ok=True)
+# [Anotación · líneas 49–55] Construye las columnas para 202103–202106 y para 202108. Calcula el PSI de cada
+#   columna terminada en _lag2 o _d2 entre las filas de entrenamiento de 202105 y 202106 y las de 202108,
+#   escribe en drop_psi.txt las que superan el umbral y las quita de la lista (quedan 855 según el log).
+    dt = t028.construir([202103, 202104, 202105, 202106]); sc = t028.construir([202108], solo_con_target=False)
+    cols = [c for c in dt.columns if c not in ("numero_de_cliente", "foto_mes", "clase_ternaria") and not c.startswith("canario")]
+    ref = dt[dt.foto_mes.isin([202105, 202106])]                                    # filas de train con lag2 real
+    p = {c: psi(ref[c], sc[c]) for c in cols if c.endswith(("_lag2", "_d2"))}
+    drop = sorted([c for c, v in p.items() if v > args.psi], key=lambda c: -p[c])
+    (AQUI / "drop_psi.txt").write_text("\n".join(f"{c}\t{p[c]:.3f}" for c in drop) + "\n")
+    cols = [c for c in cols if c not in drop]; y3 = etiquetas(dt)
+# [Anotación · líneas 56–57] Escribe el encabezado del log con dimensiones, columnas excluidas y cantidad de
+#   semillas, y verifica el orden de la caché.
+    escribir(f"\n===== 031 final M2 {time.strftime('%Y-%m-%d %H:%M')} | train {dt.shape} | {len(cols)} columnas (excluidas por PSI>{args.psi}: {len(drop)}: {drop}) | {len(semillas)} semillas × {len(cfg)} configs | min_data: {args.min_data or "originales"} =====")
+    verificar_orden_cache(TMP, sc[ID_COL].values)                       # no mezclar predicciones cacheadas con otro orden de filas
+# [Anotación · líneas 58–69] Para cada configuración y semilla sin caché: entrena el multiclase con BAJA+1 y
+#   BAJA+2 completos y una fracción r de CONTINUA, calcula P2 / (1 − P1) sobre 202108 y guarda el modelo con su
+#   huella y el .npy. Promedia entre semillas por configuración.
+    t0, S = time.time(), {}
+    for (c, nombre), (r, rondas, params) in cfg.items():
+        ps = []
+        for s in semillas:
+            f = TMP / f"m2_{TAG}{c}_{nombre}_{s}.npy"
+            if not f.exists():
+                m = entrenar(params, dt[cols], y3, filas(y3, r, s), s, rondas)
+                sc_ = score_cond(m.predict(sc[cols]))
+                guardar_modelo(m, f"031_m2_{TAG}{c}_{nombre}_{s}", sc_)
+                np.save(f, sc_)
+            ps.append(np.load(f))
+        S[f"{c}_{nombre}"] = np.mean(ps, axis=0); escribir(f"listo {c} {nombre} ({len(semillas)} semillas, {(time.time()-t0)/60:.0f} min)")
+# [Anotación · líneas 70–72] Promedia los ranks de las 3 configuraciones y escribe
+#   tmp/scores_m2_<TAG>202108.csv con el rank medio y una columna por configuración.
+    rk = np.mean([rankdata(v) / len(v) for v in S.values()], axis=0)
+    pd.DataFrame({ID_COL: sc[ID_COL].values, "rank": rk, **S}).to_csv(TMP / f"scores_m2_{TAG}202108.csv", index=False)
+    escribir("[031 final M2] terminado")

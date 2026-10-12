@@ -1,0 +1,18 @@
+{
+  "experimento": 5021,
+  "nombre": "prod_ensamble",
+  "modo": "produccion",
+  "descripcion": "Final Training + Scoring del profesor: los modelos elegidos en 5113 (hiperparametros distintos, 10+) entrenados con 202103-202106 sin undersampling, aplicados a 202108 y ensamblados promediando probabilidades. Corte lunes 07:30 con al menos 10 modelos.",
+  "dataset": "ds3007_profesor.parquet",
+  "eleccion": "5113_eval_ensamble/5113_eleccion.json",
+  "min_modelos": 10,
+  "hora_limite": "2026-10-12 07:30",
+  "meses_train": [
+    202103,
+    202104,
+    202105,
+    202106
+  ],
+  "mes_prediccion": 202108,
+  "reanudar": true
+}

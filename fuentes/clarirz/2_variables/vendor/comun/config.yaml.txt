@@ -1,0 +1,185 @@
+# Configuracion unica del repo experimentos (Primera Competencia DMEyF 2026).
+# Todo paso lee este archivo; nada se hardcodea en los run.py.
+# Cambiar aca = cambiar el experimento. Registrar el cambio en DECISIONES.md del paso afectado.
+
+proyecto: competencia_01_dmeyf_2026
+
+datos:
+  # Ruta local al parquet operativo (se puede pisar con --data en cualquier run.py).
+  ruta: "/home/clara-m-rodr-guez/Documents/Maestría DM/EyF/DMEyF2026/dmeyf2026/monday/competencia_01.parquet"
+  id: numero_de_cliente
+  mes: foto_mes
+  target: clase_ternaria
+  positivo: "BAJA+2"
+  clases_validas: ["BAJA+1", "BAJA+2", "CONTINUA"]
+  n_features_raw_esperadas: 152
+  n_filas_esperadas: 983061
+
+meses:
+  todos: [202103, 202104, 202105, 202106, 202107, 202108]
+  # Meses con BAJA+2 observable (necesitan t+2 dentro del dataset).
+  maduros: [202103, 202104, 202105, 202106]
+  # 202107 no se usa como target maduro; solo aporta historia (lags) para 202108.
+  historia_solo: 202107
+  # Mes a predecir. No tiene target.
+  scoring: 202108
+
+# Protocolo de evaluacion para todas las ablations (01, 02, 03, 05).
+# Train con targets maduros y dos meses de distancia al mes evaluado,
+# imitando la operacion real (ultimo mes maduro al predecir 202108 es 202106).
+protocolo_evaluacion:
+  nombre: EXPANDING_MATURE
+  train: [202103, 202104]
+  eval: 202106
+  nota: >
+    202106 ya fue consultado en EXP_001..005 (ROADMAP_EXPERIMENTAL.md). Es validacion
+    temporal de desarrollo reutilizada, no holdout virgen. Toda cifra sobre 202106 se lee asi.
+
+# Entrenamiento final para scoring de 202108.
+protocolo_final:
+  train: [202103, 202104, 202105, 202106]
+  historia_desde: 202107
+  scoring: 202108
+
+ganancia:
+  acierto_baja2: 1072500
+  costo_estimulo: 27500
+  # Umbral "nivel uno" del libro de la catedra (7.1.1): P(BAJA+2) >= 1/40.
+  # Coincide con el punto de equilibrio costo/(ganancia+costo) = 27500/1100000 = 0.025.
+  umbral_prob: 0.025
+  topn_min: 8000
+  topn_max: 15000
+  topn_step: 500
+  # N fijo para la comparacion pareada entre representaciones.
+  # "auto": usa el mejor N del ensemble del baseline (01). Un entero lo fija a mano.
+  n_fijo_comparacion: auto
+
+semillas:
+  # Ablations rapidas (5 semillas). Mismas que experimentos/01_baseline_raw.
+  ablation: [17, 101, 202, 303, 404]
+  # Semillerio final: se generan deterministicamente con RandomState(semilla_madre).
+  final_n: 20
+  final_semilla_madre: 17
+
+lightgbm:
+  # Mismos hiperparametros que experimentos/01_baseline_raw (RESULTADO.md 2026-10-02).
+  base:
+    objective: binary
+    metric: binary_logloss
+    boosting_type: gbdt
+    learning_rate: 0.03
+    num_leaves: 64
+    min_data_in_leaf: 100
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    max_bin: 255
+    verbosity: -1
+    force_col_wise: true
+  num_boost_round: 300
+
+# FE1: historia minima (HIST10). Misma lista que EXP_001..005, planilla y 02_raw_historia.
+historia:
+  variables:
+    - ctrx_quarter
+    - mcaja_ahorro
+    - mcuentas_saldo
+    - mpasivos_margen
+    - mpayroll
+    - cpayroll_trx
+    - mtarjeta_visa_consumo
+    - ctarjeta_visa_transacciones
+    - ctarjeta_debito_transacciones
+    - cextraccion_autoservicio
+  operadores: [lag1, delta1]
+
+# Bloques FE adicionales (paso 03). Se prueban uno por vez, acumulativos sobre la mejor
+# representacion anterior, pareados y a N fijo. Definiciones = fe_config_v6.json.
+bloques:
+  saldo_negativo:
+    variables: [mcuentas_saldo]
+    operadores: [es_negativo, paso_a_negativo, negativo_a_negativo, salio_de_negativo]
+    evidencia_previa: "nunca probado"
+  estados_producto:
+    variables: [Visa_status, Master_status, active_quarter]
+    operadores: [lag_estado, cambio_estado, persistencia_estado]
+    evidencia_previa: "nunca probado"
+  multidimensional:
+    variables:
+      - ctrx_quarter
+      - mcaja_ahorro
+      - mcuentas_saldo
+      - mpasivos_margen
+      - mtarjeta_visa_consumo
+      - ctarjeta_debito_transacciones
+      - chomebanking_transacciones
+      - mtransferencias_recibidas
+      - mpayroll
+    q: 0.10
+    evidencia_previa: "nunca probado"
+  rank_drift:
+    variables:
+      - ctrx_quarter
+      - mcaja_ahorro
+      - mcuentas_saldo
+      - mpasivos_margen
+      - mtarjeta_visa_consumo
+      - mpayroll
+      - chomebanking_transacciones
+      - mtransferencias_recibidas
+    evidencia_previa: "RANKS negativo en EXP_004; solo si 00 muestra drift en 202108"
+
+# Variables "rotas" en un mes -> NA en ese mes (libro 13.3). Salida de 00 sobre el parquet real
+# (2026-10-02): Visa/Master_fultimo_cierre con 69% de ceros en 202106 y 0% en todos los demas meses.
+# Se aplica antes de construir historia y vale para todas las representaciones, RAW incluida.
+# ccajas_depositos 202105: pendiente de confirmar con la salida de 00 (ver 00/DECISIONES.md).
+variables_rotas:
+  "202106": [Visa_fultimo_cierre, Master_fultimo_cierre]
+
+# Grupos de variables que se pueden excluir de una representacion con '-<grupo>'
+# (ademas de las familias de comun/familias.csv y de 'historia').
+# prestamos_conteos (2026-10-02, salida de 00 y 08): cprestamos_prendarios y cprestamos_hipotecarios
+# tienen marzo roto (media 0,018 / 0,014 vs 0,043-0,062 el resto, con % ceros estable);
+# cprestamos_personales cae 27% de marzo a agosto con el monto estable. Los montos mprestamos_* son limpios.
+grupos_exclusion:
+  prestamos_conteos: [cprestamos_personales, cprestamos_prendarios, cprestamos_hipotecarios]
+
+# Paso 04. Optimizacion bayesiana sobre la representacion elegida.
+optuna:
+  n_trials: 40
+  # Para optimizar no se toca 202106: train 202103 (maduro) -> eval 202105 (dos meses).
+  train: [202103]
+  eval: 202105
+  top_k_revalidar: 3
+  semilla: 17
+  espacio:
+    learning_rate: {tipo: float, min: 0.01, max: 0.08, log: true}
+    num_leaves: {tipo: int, min: 16, max: 128}
+    min_data_in_leaf: {tipo: int, min: 100, max: 2000, log: true}
+    feature_fraction: {tipo: float, min: 0.4, max: 1.0}
+    bagging_fraction: {tipo: float, min: 0.5, max: 1.0}
+    lambda_l1: {tipo: float, min: 1.0e-8, max: 10.0, log: true}
+    lambda_l2: {tipo: float, min: 1.0e-8, max: 10.0, log: true}
+    max_bin: {tipo: categorico, valores: [31, 63, 127, 255]}
+    num_boost_round: {tipo: int, min: 150, max: 600}
+
+# Eleccion vigente para 05, 06 y 07. Se actualiza a mano con lo que digan DECISIONES.md de 02/03/04.
+eleccion:
+  # raw | raw_historia | raw_historia+<bloque>[+<bloque>]
+  # 2026-10-02: sin la familia prestamos (03: +54 M pareado, 5/5; ver 03/DECISIONES.md)
+  representacion: raw_historia-prestamos
+  # "base" usa lightgbm.base; una ruta a json (salida de 04_optuna) usa esos hiperparametros si "adoptar" es true.
+  params: base
+
+# Paso 07. Archivos a generar por submit.
+submissions:
+  prefijo: C1
+  # Varios N para el mismo modelo: el bot devuelve ganancia publica por archivo;
+  # mirar media y desvio, no el mejor aislado. El primero recibe las variantes por semillas.
+  # 2026-10-02 v1 (raw_historia): meseta 9.000-15.000, maximo 13.500 -> [13000, 11000, 12000, 14000].
+  # 2026-10-02 v2 (raw_historia-prestamos): pico en 11.000, meseta 10.000-13.000 (05/DECISIONES.md).
+  n_candidatos: [11000, 10500, 12000, 13000]
+  destinatario_zulip: "@competencia-uno"
+  formato_mensaje: "submit NombreInternoSinEspacios"
+  filas_min: 8000
+  filas_max: 15000

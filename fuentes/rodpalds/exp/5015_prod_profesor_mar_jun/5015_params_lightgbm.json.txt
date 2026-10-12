@@ -1,0 +1,21 @@
+{
+  "origen": "eleccion: 4107 p23_4104",
+  "arboles": 580,
+  "params": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "max_bin": 31,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "deterministic": true,
+    "force_row_wise": true,
+    "verbose": -1,
+    "learning_rate": 0.0678,
+    "num_leaves": 41,
+    "min_data_in_leaf": 40496,
+    "feature_fraction": 0.1798,
+    "bagging_fraction": 0.3124,
+    "lambda_l1": 0.001,
+    "lambda_l2": 0.001
+  }
+}

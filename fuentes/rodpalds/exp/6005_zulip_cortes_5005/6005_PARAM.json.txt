@@ -1,0 +1,19 @@
+{
+  "experimento": 6005,
+  "nombre": "zulip_cortes_5005",
+  "descripcion": "Cortes alternativos del retador (5005) para comparar en el publico con el de 13.000 (6001).",
+  "modo": "final",
+  "fuente": "5005_prod_eleccion_4102",
+  "envios": [
+    10000,
+    11000,
+    12000,
+    14000
+  ],
+  "max_archivos": 20,
+  "clientes_esperados": 164647,
+  "_config": "6005_zulip_cortes_5005.json",
+  "_fecha_inicio": "2026-10-09 01:24:10",
+  "_script": "10_entrega_zulip.py",
+  "_git_commit": "sin_git"
+}

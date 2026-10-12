@@ -1,0 +1,18 @@
+
+===== 015 2026-10-07 23:30 | semillas [676057, 482687, 399221] =====
+[A s=676057] óptimo ex post k=7726 (262.7M) | k=11500: 237.1M (5 min)
+[A s=482687] óptimo ex post k=7321 (270.6M) | k=11500: 248.1M (11 min)
+[A s=399221] óptimo ex post k=8774 (264.7M) | k=11500: 251.3M (16 min)
+[B s=676057] óptimo ex post k=12111 (424.8M) | k=11500: 419.6M (22 min)
+[B s=482687] óptimo ex post k=11288 (418.9M) | k=11500: 416.4M (28 min)
+[B s=399221] óptimo ex post k=14001 (421.3M) | k=11500: 402.1M (34 min)
+[Bh s=676057] óptimo ex post k=12679 (413.6M) | k=11500: 403.1M (40 min)
+[Bh s=482687] óptimo ex post k=11049 (415.6M) | k=11500: 408.6M (45 min)
+[Bh s=399221] óptimo ex post k=12332 (403.4M) | k=11500: 394.4M (50 min)
+
+Ganancia media por k (M ARS) y pérdida vs el pico de cada fold:
+fold      A      B     Bh  media_folds  pierde_vs_pico_media
+8000  258.5  379.5  373.6        337.2                 -23.2
+
+k del pico por fold: A: 7500, B: 12500, Bh: 13000 | pico de la media de folds: 10500
+[015] terminado

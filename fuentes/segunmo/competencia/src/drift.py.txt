@@ -1,0 +1,43 @@
+"""Detección de drift sin usar el target: PSI por variable y validación adversarial.
+
+psi(ref, act)        Population Stability Index con bins por cuantiles de la referencia; los nulos son un bin propio.
+tabla_psi(df_ref, df_act, cols)   PSI de cada columna.
+adversarial(df_a, df_b, cols)     LightGBM que intenta distinguir el mes A del mes B (AUC ~0.5 = sin drift);
+                                  devuelve (AUC en hold-out, importancias por gain).
+"""
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+
+
+def psi(ref: pd.Series, act: pd.Series, bins: int = 10, eps: float = 1e-4) -> float:
+    ref_n, act_n = ref.dropna(), act.dropna()
+    if ref_n.nunique() < 2:
+        cortes = np.array([-np.inf, np.inf])
+    else:
+        cortes = np.unique(np.quantile(ref_n, np.linspace(0, 1, bins + 1)))
+        cortes[0], cortes[-1] = -np.inf, np.inf
+    def prop(s):
+        h = np.histogram(s.dropna(), bins=cortes)[0].astype(float)
+        p = np.append(h, s.isna().sum()) / max(len(s), 1)   # último bin = nulos
+        return np.clip(p, eps, None)
+    e, a = prop(ref), prop(act)
+    return float(np.sum((a - e) * np.log(a / e)))
+
+
+def tabla_psi(df_ref: pd.DataFrame, df_act: pd.DataFrame, cols) -> pd.Series:
+    return pd.Series({c: psi(df_ref[c], df_act[c]) for c in cols}).sort_values(ascending=False)
+
+
+def adversarial(df_a: pd.DataFrame, df_b: pd.DataFrame, cols, semilla: int = 852583, rounds: int = 100):
+    X = pd.concat([df_a[cols], df_b[cols]], ignore_index=True)
+    y = np.r_[np.zeros(len(df_a)), np.ones(len(df_b))]
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, stratify=y, random_state=semilla)
+    params = {"objective": "binary", "num_leaves": 31, "learning_rate": 0.1, "feature_fraction": 0.5,
+              "max_bin": 31, "seed": semilla, "verbose": -1, "num_threads": 0}
+    m = lgb.train(params, lgb.Dataset(Xtr, label=ytr), num_boost_round=rounds)
+    auc = roc_auc_score(yte, m.predict(Xte))
+    imp = pd.Series(m.feature_importance("gain"), index=cols).sort_values(ascending=False)
+    return auc, imp / imp.sum()

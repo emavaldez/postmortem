@@ -1,0 +1,10 @@
+{
+  "archivos": [
+    "Z6008_5202_e11500_semillerio.csv",
+    "Z6008_5202_e12000_semillerio.csv",
+    "Z6008_5202_e12500_semillerio.csv",
+    "Z6008_5202_e13000_semillerio.csv"
+  ],
+  "cuerpo": "submit 6008zulipfinalensamble5202",
+  "_minutos": 0.0
+}

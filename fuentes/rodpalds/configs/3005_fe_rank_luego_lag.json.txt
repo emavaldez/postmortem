@@ -1,0 +1,9 @@
+{
+  "experimento": 3005,
+  "nombre": "fe_rank_luego_lag",
+  "dataset_salida": "ds3005_rank_luego_lag.parquet",
+  "orden": "rank_luego_lag",
+  "extras": "conteo",
+  "rankear_extras": true,
+  "descripcion": "Orden alternativo de la receta: primero rank por mes con cero fijo, despues lag y delta del ranking (posicion del mes anterior y cambio de posicion). Mismas 6 variables del proceso de muerte que 03c, rankeadas."
+}

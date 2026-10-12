@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import fcntl
+import gc
+import hashlib
+import importlib.metadata
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import yaml
+
+def _gcs(cmd, check=True, **kw):
+    """Respaldo opcional a Cloud Storage. Se omite cuando el bucket es el placeholder de publicacion."""
+    if any("REEMPLAZAR_CON_BUCKET_PROPIO" in str(a) or "BUCKET_PRIVADO_NO_PUBLICADO" in str(a) for a in cmd):
+        return None
+    return subprocess.run(cmd, check=check, **kw)
+
+
+RUN = "c1q0ccajas06"
+PARENT_PACKAGE = "48e5161ed025af4a39d61ba2c270b1acad4e6a8b"
+DATA_SHA = "59231e670a1342ad6f689ad7edc7ece047fc9f7115c6d7845e6c72fa3bbd95bb"
+SEEDS = [17,101,202,303,404,505,606,707,808,909,1001,1102,1203,1304,1405,1506,1607,1708,1809,1910]
+TRAIN = [202103, 202104]
+EVAL = 202106
+OUTPUT_MONTHS = [202103, 202104, 202105, 202106]
+EXPECTED_ROWS = {202103:162900,202104:163284,202105:163768,202106:164114,202107:164348,202108:164647}
+CORRECTION_VAR = "ccajas_depositos"
+CORRECTION_MONTH = 202105
+BLOCKS = ["historia_numerica", "transiciones_numericas", "recencia", "categoricas", "historia_relaciones", "tarjetas", "ratios"]
+N_GRID = list(range(8000, 15001, 500))
+BAND = [10500, 11000, 11500]
+GAIN_HIT = 1_072_500
+COST = 27_500
+ROUNDS = 300
+THREADS = 6
+REPRO_TOL = 1e-12
+MIN_FREE_GIB_PREPARE = 15.0
+MIN_AVAILABLE_GIB_TRAIN = 24.0
+REMOTE_DEFAULT = "gs://BUCKET_PRIVADO_NO_PUBLICADO/corridas/c1q0ccajas06"
+
+
+def require(ok: bool, msg: str) -> None:
+    if not ok:
+        raise RuntimeError(msg)
+
+
+def digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fingerprint(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+def write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def mem_available_gib() -> float:
+    info = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        key, rest = line.split(":", 1)
+        info[key] = float(rest.strip().split()[0])
+    return info.get("MemAvailable", 0.0) / 1024 / 1024
+
+
+def disk_free_gib(path: Path) -> float:
+    return shutil.disk_usage(path).free / 1024**3
+
+
+def backup_small(out: Path, remote: str) -> None:
+    for rel in ["PLAN_Q0.json", "CANARY_OK.json", "RESUMEN.json", "RESULTADOS.md", "LISTO.json", "datos/correccion.json"]:
+        p = out / rel
+        if p.is_file():
+            target = remote + "/" + rel
+            _gcs(["gcloud", "storage", "cp", str(p), target], check=True)
+    for rel in ["bank_q0/manifest.json", "bank_q0/catalogo_features.csv", "bank_q0/resumen_bloques.csv"]:
+        p = out / rel
+        if p.is_file():
+            target = remote + "/" + rel
+            _gcs(["gcloud", "storage", "cp", str(p), target], check=True)
+
+
+def base_paths(home: Path) -> dict[str, Path]:
+    stage = home / "c1m1femasiva03_s3/paquete_c1/experimentos_20261006_m1_fe_masiva"
+    pkg = stage.parent
+    return {
+        "stage": stage,
+        "pkg": pkg,
+        "fe": stage / "fe_amplia",
+        "s3": home / "c1m1femasiva03_s3/resultados_s3",
+        "bank_orig": home / "c1m1femasiva03_s3/resultados_s1/fe_bank_dev",
+        "data": home / "c1m1femasiva03/datos/competencia_01.parquet",
+        "c3_final": home / "c1c3final04b",
+        "out": home / RUN,
+    }
+
+
+def load_json(path: Path):
+    require(path.is_file(), f"Falta {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def preflight(home: Path, for_training: bool = False) -> dict:
+    p = base_paths(home)
+    for key in ["stage", "pkg", "fe", "s3", "bank_orig", "data"]:
+        require(p[key].exists(), f"Falta ruta requerida {key}: {p[key]}")
+    require(digest(p["data"]) == DATA_SHA, "Dataset SHA256 distinto")
+
+    package = load_json(p["pkg"] / "PAQUETE.json")
+    require(package.get("git_commit") == PARENT_PACKAGE, "Paquete S3 distinto del congelado")
+    critical = [
+        p["stage"] / "run_s3_confirm_c3.py",
+        p["stage"] / "plan_s3_confirm_c3.json",
+        p["stage"] / "config_screening.json",
+        p["pkg"] / "vendor/comun/config.yaml",
+    ] + sorted(p["fe"].glob("*.py")) + [p["fe"] / "catalogo_fuentes.csv"]
+    for f in critical:
+        rel = str(f.relative_to(p["pkg"]))
+        require(package.get("archivos", {}).get(rel) == digest(f), f"Código S3 alterado: {rel}")
+
+    s3_summary = load_json(p["s3"] / "confirmacion_c3.json")
+    require(s3_summary.get("n_seeds") == 20 and s3_summary.get("promote_to_tuning") is True, "S3 no está cerrado/promovido")
+    schema_doc = load_json(p["s3"] / "C3_HIST_MAS_TARJETAS/features.json")
+    features = schema_doc["features"]
+    derived = schema_doc["derived"]
+    require(len(features) == 2062 and len(derived) == 1910, f"Schema C3 inesperado: {len(features)} total, {len(derived)} derivadas")
+    require(features[152:] == derived and len(set(features)) == len(features), "Orden/schema C3 inválido")
+
+    bank_manifest = load_json(p["bank_orig"] / "manifest.json")
+    require(bank_manifest.get("status") == "completed", "Banco original incompleto")
+    require(bank_manifest.get("input_sha256") == DATA_SHA, "Banco original pertenece a otro dataset")
+
+    source = pd.read_parquet(p["data"], columns=["numero_de_cliente", "foto_mes", "clase_ternaria", CORRECTION_VAR])
+    counts = {int(k): int(v) for k, v in source.groupby("foto_mes").size().items()}
+    require(counts == EXPECTED_ROWS, f"Conteos mensuales inesperados: {counts}")
+    require(not source[["numero_de_cliente", "foto_mes"]].duplicated().any(), "Claves duplicadas")
+    may = source.loc[source.foto_mes.eq(CORRECTION_MONTH), CORRECTION_VAR]
+    require(len(may) == EXPECTED_ROWS[CORRECTION_MONTH], "Cantidad de filas mayo inesperada")
+    require(may.notna().all(), f"{CORRECTION_VAR}@{CORRECTION_MONTH} ya contiene NA; no coincide con el caso docente")
+    require((may.to_numpy(dtype=float) == 0).all(), f"{CORRECTION_VAR}@{CORRECTION_MONTH} no es todo cero; no aplicar esta receta")
+    mature = source.loc[source.foto_mes.le(202106), "clase_ternaria"]
+    require(mature.notna().all() and set(mature.unique()) == {"BAJA+1", "BAJA+2", "CONTINUA"}, "Targets maduros inesperados")
+    del source, may, mature
+
+    for seed in SEEDS:
+        cp = p["s3"] / "C3_HIST_MAS_TARJETAS" / f"seed_{seed}.npz"
+        m1 = p["s3"] / "M1_RAW" / f"seed_{seed}.npz"
+        require(cp.is_file() and m1.is_file(), f"Faltan checkpoints S3 seed {seed}")
+
+    env_ref = None
+    if (p["c3_final"] / "PLAN_FINAL.json").is_file():
+        env_ref = load_json(p["c3_final"] / "PLAN_FINAL.json").get("environment")
+    current_env = {k: importlib.metadata.version(k) for k in ["numpy", "pandas", "pyarrow", "lightgbm", "PyYAML"]}
+    if env_ref:
+        for k, v in env_ref.items():
+            if k in current_env:
+                require(current_env[k] == v, f"Entorno cambió para {k}: {current_env[k]} != {v}")
+
+    out_parent = p["out"].parent
+    free = disk_free_gib(out_parent)
+    require(free >= MIN_FREE_GIB_PREPARE, f"Disco libre insuficiente: {free:.1f} GiB < {MIN_FREE_GIB_PREPARE}")
+    avail = mem_available_gib()
+    if for_training:
+        require(avail >= MIN_AVAILABLE_GIB_TRAIN, f"RAM disponible insuficiente: {avail:.1f} GiB < {MIN_AVAILABLE_GIB_TRAIN}")
+
+    return {
+        "paths": p,
+        "features": features,
+        "derived": derived,
+        "s3_summary": s3_summary,
+        "current_env": current_env,
+        "disk_free_gib": free,
+        "mem_available_gib": avail,
+    }
+
+
+def prepare_corrected_data(ctx: dict) -> tuple[Path, str]:
+    p = ctx["paths"]
+    out = p["out"]
+    data_dir = out / "datos"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    corrected = data_dir / "competencia_01_q0_ccajas_202105_na.parquet"
+    meta = data_dir / "correccion.json"
+    if corrected.exists() or meta.exists():
+        require(corrected.is_file() and meta.is_file(), "Corrección parcial: falta parquet o metadata; no se sobreescribe")
+        m = load_json(meta)
+        require(m.get("source_sha256") == DATA_SHA, "Corrección deriva de otro dataset")
+        require(m.get("variable") == CORRECTION_VAR and m.get("month") == CORRECTION_MONTH, "Corrección existente pertenece a otra receta")
+        require(m.get("corrected_sha256") == digest(corrected), "Parquet corregido alterado")
+        return corrected, m["corrected_sha256"]
+
+    tmp = corrected.with_suffix(".parquet.tmp")
+    if tmp.exists():
+        tmp.unlink()
+    print("PREPARE: leyendo dataset original completo para crear copia corregida...", flush=True)
+    df = pd.read_parquet(p["data"])
+    require(len(df) == sum(EXPECTED_ROWS.values()), "Filas totales inesperadas")
+    mask = df.foto_mes.eq(CORRECTION_MONTH)
+    before = df.loc[mask, CORRECTION_VAR]
+    require(before.notna().all() and (before.to_numpy(dtype=float) == 0).all(), "La anomalía no coincide al preparar")
+    df.loc[mask, CORRECTION_VAR] = np.nan
+    require(df.loc[mask, CORRECTION_VAR].isna().all(), "No se aplicó NA en mayo")
+    df.to_parquet(tmp, index=False)
+    del df, before
+    gc.collect()
+
+    check = pd.read_parquet(tmp, columns=["numero_de_cliente", "foto_mes", CORRECTION_VAR])
+    counts = {int(k): int(v) for k, v in check.groupby("foto_mes").size().items()}
+    require(counts == EXPECTED_ROWS, "La copia corregida cambió conteos")
+    require(check.loc[check.foto_mes.eq(CORRECTION_MONTH), CORRECTION_VAR].isna().all(), "Mayo no quedó todo NA")
+    del check
+    tmp.replace(corrected)
+    corr_sha = digest(corrected)
+    write_json(meta, {
+        "recipe": "Q0_ccajas_depositos_202105_to_NA_only",
+        "source_sha256": DATA_SHA,
+        "corrected_sha256": corr_sha,
+        "variable": CORRECTION_VAR,
+        "month": CORRECTION_MONTH,
+        "rows_modified": EXPECTED_ROWS[CORRECTION_MONTH],
+        "source_rows": sum(EXPECTED_ROWS.values()),
+        "note": "Única modificación intencional: ccajas_depositos=NA en 202105. No se usa futuro ni target para corregir.",
+    })
+    return corrected, corr_sha
+
+
+def prepare_bank(ctx: dict, corrected: Path, corr_sha: str) -> Path:
+    p = ctx["paths"]
+    out = p["out"]
+    bank = out / "bank_q0"
+    config = load_json(p["stage"] / "config_screening.json")
+    if bank.exists() and any(bank.iterdir()):
+        manifest = bank / "manifest.json"
+        if manifest.is_file():
+            m = load_json(manifest)
+            compatible = (
+                m.get("status") == "completed" and
+                m.get("input_sha256") == corr_sha and
+                m.get("config") == config and
+                m.get("blocks_requested") == BLOCKS and
+                m.get("output_months") == OUTPUT_MONTHS
+            )
+            if compatible:
+                print("PREPARE: banco Q0 completo y compatible; reutilizar.", flush=True)
+                return bank
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        quarantine = out / f"bank_q0_incomplete_{stamp}"
+        print("PREPARE: banco previo incompleto/incompatible; se conserva como", quarantine, flush=True)
+        bank.rename(quarantine)
+
+    sys.path.insert(0, str(p["fe"]))
+    from generar_fe import generate
+    print("PREPARE: generando sólo bloques requeridos por C3 Q0...", flush=True)
+    generate(corrected, bank, config, blocks=BLOCKS, months=OUTPUT_MONTHS)
+    m = load_json(bank / "manifest.json")
+    require(m.get("status") == "completed", "Banco Q0 no terminó")
+    require(m.get("input_sha256") == corr_sha, "Banco Q0 usa otra entrada")
+
+    orig = pd.read_csv(p["bank_orig"] / "catalogo_features.csv").set_index("feature", verify_integrity=True)
+    new = pd.read_csv(bank / "catalogo_features.csv").set_index("feature", verify_integrity=True)
+    derived = ctx["derived"]
+    require(set(derived) <= set(new.index), "Banco Q0 no contiene todas las features C3")
+    for col in ["block", "sources", "formula", "feature_kind", "min_history"]:
+        a = orig.loc[derived, col].fillna("").astype(str).tolist()
+        b = new.loc[derived, col].fillna("").astype(str).tolist()
+        require(a == b, f"Cambió definición C3 en {col}")
+    status_diff = int((orig.loc[derived, "status"].astype(str) != new.loc[derived, "status"].astype(str)).sum())
+    write_json(out / "bank_q0_status.json", {"derived": len(derived), "status_diff": status_diff})
+    return bank
+
+
+def make_plan(ctx: dict, corr_sha: str, bank: Path) -> dict:
+    p = ctx["paths"]
+    params = dict(yaml.safe_load((p["pkg"] / "vendor/comun/config.yaml").read_text())["lightgbm"]["base"])
+    params.update(num_threads=THREADS, deterministic=True)
+    checkpoint_hashes = {
+        arm: {str(seed): digest(p["s3"] / arm / f"seed_{seed}.npz") for seed in SEEDS}
+        for arm in ["M1_RAW", "C3_HIST_MAS_TARJETAS"]
+    }
+    return {
+        "version": "c1q0ccajas06_v1",
+        "run": RUN,
+        "question": "Efecto aislado de ccajas_depositos@202105->NA sobre C3 en junio",
+        "source_dataset_sha256": DATA_SHA,
+        "corrected_dataset_sha256": corr_sha,
+        "correction": {"variable": CORRECTION_VAR, "month": CORRECTION_MONTH, "value": "NA"},
+        "train": TRAIN,
+        "eval": EVAL,
+        "target": "BAJA+2_vs_resto",
+        "schema_sha256": digest(p["s3"] / "C3_HIST_MAS_TARJETAS/features.json"),
+        "n_features": len(ctx["features"]),
+        "n_derived": len(ctx["derived"]),
+        "params": params,
+        "rounds": ROUNDS,
+        "seeds": SEEDS,
+        "n_grid": N_GRID,
+        "band": BAND,
+        "reproduction_tolerance": REPRO_TOL,
+        "training_matrix": "original S3 bank March-April",
+        "original_eval": "original S3 bank June",
+        "corrected_eval": "Q0 bank June",
+        "new_model_selection": False,
+        "no_august": True,
+        "no_submit": True,
+        "s3_checkpoint_hashes": checkpoint_hashes,
+        "bank_manifest_sha256": digest(bank / "manifest.json"),
+        "runner_sha256": digest(Path(__file__)),
+        "environment": ctx["current_env"],
+    }
+
+
+def prepare(ctx: dict, remote: str) -> None:
+    p = ctx["paths"]
+    out = p["out"]
+    out.mkdir(parents=True, exist_ok=True)
+    corrected, corr_sha = prepare_corrected_data(ctx)
+    bank = prepare_bank(ctx, corrected, corr_sha)
+    plan = make_plan(ctx, corr_sha, bank)
+    plan_path = out / "PLAN_Q0.json"
+    if plan_path.exists():
+        require(load_json(plan_path) == plan, "PLAN_Q0 existente no coincide")
+    else:
+        write_json(plan_path, plan)
+    backup_small(out, remote)
+    print("PREPARE Q0 OK. No se entrenó ningún modelo.")
+
+
+def identity_from_plan(plan: dict) -> str:
+    return fingerprint(plan)
+
+
+def load_data_for_training(ctx: dict) -> dict:
+    p = ctx["paths"]
+    out = p["out"]
+    bank_q0 = out / "bank_q0"
+    require((bank_q0 / "manifest.json").is_file(), "Falta banco Q0; ejecutar --prepare")
+    sys.path.insert(0, str(p["fe"]))
+    from cargar_bloques import cargar_bloques
+    derived = ctx["derived"]
+    feats = ctx["features"]
+
+    print("CARGA: train y eval original S3...", flush=True)
+    orig, _ = cargar_bloques(p["bank_orig"], meses=TRAIN + [EVAL], incluir_raw=True, features=derived)
+    labels = pd.read_parquet(p["bank_orig"] / "etiquetas.parquet")
+    labels = labels[labels.foto_mes.isin(TRAIN + [EVAL])].reset_index(drop=True)
+    require(orig[["numero_de_cliente", "foto_mes"]].equals(labels[["numero_de_cliente", "foto_mes"]]), "X/y original desalineados")
+    tr = orig.foto_mes.isin(TRAIN).to_numpy()
+    ev = orig.foto_mes.eq(EVAL).to_numpy()
+    x_train = orig.loc[tr, feats].copy()
+    x_eval_orig = orig.loc[ev, feats].copy()
+    y_train = labels.loc[tr, "clase_ternaria"].eq("BAJA+2").to_numpy(np.int8)
+    y_eval = labels.loc[ev, "clase_ternaria"].eq("BAJA+2").to_numpy(np.int8)
+    ids = orig.loc[ev, "numero_de_cliente"].to_numpy(np.int64)
+    del orig, labels
+    gc.collect()
+
+    print("CARGA: eval junio corregido Q0...", flush=True)
+    corr, _ = cargar_bloques(bank_q0, meses=[EVAL], incluir_raw=True, features=derived)
+    require(np.array_equal(corr.numero_de_cliente.to_numpy(np.int64), ids), "IDs Q0 vs original desalineados")
+    require((corr.foto_mes.to_numpy(np.int64) == EVAL).all(), "Mes Q0 inesperado")
+    x_eval_corr = corr[feats].copy()
+    del corr
+    gc.collect()
+
+    require(x_train.shape[1] == x_eval_orig.shape[1] == x_eval_corr.shape[1] == len(feats), "Columnas desalineadas")
+    require(len(ids) == EXPECTED_ROWS[EVAL], "Filas eval inesperadas")
+    return {"x_train":x_train, "x_eval_orig":x_eval_orig, "x_eval_corr":x_eval_corr,
+            "y_train":y_train, "y_eval":y_eval, "ids":ids, "features":feats}
+
+
+def load_s3_scores(path: Path, ids: np.ndarray, y: np.ndarray) -> np.ndarray:
+    with np.load(path, allow_pickle=False) as z:
+        require(np.array_equal(np.asarray(z["ids"], dtype=np.int64), ids), f"IDs checkpoint distintos: {path}")
+        require(np.array_equal(np.asarray(z["y"], dtype=np.int8), y), f"y checkpoint distinto: {path}")
+        scores = np.asarray(z["scores"], dtype=np.float64).copy()
+    require(np.isfinite(scores).all(), f"Scores no finitos: {path}")
+    return scores
+
+
+def fit_one(seed: int, data: dict, ctx: dict, identity: str, remote: str) -> dict:
+    import lightgbm as lgb
+    p = ctx["paths"]
+    out = p["out"]
+    model_dir = out / "modelos"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    cp = model_dir / f"seed_{seed}.npz"
+    modelpath = model_dir / f"modelo_{seed}.txt"
+
+    if cp.exists():
+        require(modelpath.is_file(), f"Checkpoint sin modelo seed {seed}")
+        with np.load(cp, allow_pickle=False) as z:
+            require(str(z["identity"].item()) == identity, f"Checkpoint seed {seed} de otra receta")
+            require(int(z["seed"].item()) == seed, f"Seed inconsistente en checkpoint {seed}")
+            require(str(z["model_sha256"].item()) == digest(modelpath), f"Modelo alterado seed {seed}")
+            require(np.array_equal(z["ids"], data["ids"]), f"IDs checkpoint Q0 distintos seed {seed}")
+            scores_corr = z["scores_corrected"].copy()
+            max_abs = float(z["max_abs_repro_original"].item())
+        require(max_abs <= REPRO_TOL, f"Checkpoint seed {seed} no pasó reproducción original")
+        require(np.isfinite(scores_corr).all() and ((scores_corr >= 0) & (scores_corr <= 1)).all(), f"Scores checkpoint Q0 inválidos seed {seed}")
+        _gcs(["gcloud", "storage", "cp", str(cp), str(modelpath), remote + "/modelos/"], check=True)
+        print(f"REUSAR Q0 seed={seed}; max_abs_repro={max_abs:.3g}; respaldo verificado", flush=True)
+        return {"scores": scores_corr, "max_abs": max_abs}
+
+    params = dict(yaml.safe_load((p["pkg"] / "vendor/comun/config.yaml").read_text())["lightgbm"]["base"])
+    params.update(seed=int(seed), num_threads=THREADS, deterministic=True)
+    print(f"ENTRENAR Q0 seed={seed}: primero reproducir S3 original", flush=True)
+    ds = lgb.Dataset(data["x_train"], label=data["y_train"], free_raw_data=False)
+    model = lgb.train(params, ds, num_boost_round=ROUNDS)
+    scores_orig = np.asarray(model.predict(data["x_eval_orig"], num_threads=THREADS), dtype=np.float64)
+    expected = load_s3_scores(p["s3"] / "C3_HIST_MAS_TARJETAS" / f"seed_{seed}.npz", data["ids"], data["y_eval"])
+    max_abs = float(np.max(np.abs(scores_orig - expected)))
+    require(max_abs <= REPRO_TOL, f"REPRODUCCIÓN FALLÓ seed={seed}: max_abs={max_abs:.3g} > {REPRO_TOL}")
+
+    scores_corr = np.asarray(model.predict(data["x_eval_corr"], num_threads=THREADS), dtype=np.float64)
+    require(scores_corr.shape == data["ids"].shape and np.isfinite(scores_corr).all(), f"Scores Q0 inválidos seed {seed}")
+    require(((scores_corr >= 0) & (scores_corr <= 1)).all(), f"Scores Q0 fuera de [0,1] seed {seed}")
+
+    tmp_model = modelpath.with_suffix(".tmp")
+    model.save_model(str(tmp_model))
+    tmp_model.replace(modelpath)
+    model_sha = digest(modelpath)
+    tmp_cp = cp.with_suffix(".tmp")
+    with tmp_cp.open("wb") as f:
+        np.savez_compressed(
+            f,
+            identity=np.array(identity), seed=np.array(seed), ids=data["ids"], y=data["y_eval"],
+            scores_corrected=scores_corr, max_abs_repro_original=np.array(max_abs),
+            model_sha256=np.array(model_sha), original_score_sha256=np.array(hashlib.sha256(scores_orig.tobytes()).hexdigest()),
+        )
+    tmp_cp.replace(cp)
+    del model, ds, scores_orig, expected
+    gc.collect()
+
+    _gcs(["gcloud", "storage", "cp", str(cp), str(modelpath), remote + "/modelos/"], check=True)
+    print(f"Q0 seed={seed} OK; max_abs_repro={max_abs:.3g}; respaldado", flush=True)
+    return {"scores": scores_corr, "max_abs": max_abs}
+
+
+def gain_curve(ids: np.ndarray, y: np.ndarray, scores: np.ndarray) -> dict[int, int]:
+    order = np.lexsort((ids, -scores))
+    out = {}
+    for n in N_GRID:
+        z = y[order[:n]]
+        hits = int(z.sum())
+        out[n] = int(hits * GAIN_HIT - (n - hits) * COST)
+    return out
+
+
+def ensure_plan(ctx: dict) -> tuple[dict, str]:
+    out = ctx["paths"]["out"]
+    corrected_meta = load_json(out / "datos/correccion.json")
+    bank = out / "bank_q0"
+    plan = make_plan(ctx, corrected_meta["corrected_sha256"], bank)
+    plan_path = out / "PLAN_Q0.json"
+    require(plan_path.is_file(), "Falta PLAN_Q0; ejecutar --prepare")
+    require(load_json(plan_path) == plan, "PLAN_Q0 cambió; no mezclar resultados")
+    return plan, identity_from_plan(plan)
+
+
+def canary(ctx: dict, remote: str) -> None:
+    out = ctx["paths"]["out"]
+    require((out / "bank_q0/manifest.json").is_file(), "Falta --prepare")
+    plan, identity = ensure_plan(ctx)
+    marker = out / "CANARY_OK.json"
+    if marker.exists():
+        m = load_json(marker)
+        require(m.get("identity") == identity, "CANARY_OK pertenece a otro plan")
+        backup_small(out, remote)
+        print("CANARY ya aprobado; respaldo de metadatos verificado.")
+        return
+    data = load_data_for_training(ctx)
+    res = fit_one(17, data, ctx, identity, remote)
+    original = load_s3_scores(ctx["paths"]["s3"] / "C3_HIST_MAS_TARJETAS/seed_17.npz", data["ids"], data["y_eval"])
+    changed = int(np.count_nonzero(res["scores"] != original))
+    max_score_change = float(np.max(np.abs(res["scores"] - original)))
+    write_json(marker, {
+        "status":"passed", "identity":identity, "seed":17,
+        "max_abs_repro_original":res["max_abs"],
+        "n_scores_changed_after_correction":changed,
+        "max_abs_score_change_after_correction":max_score_change,
+    })
+    backup_small(out, remote)
+    print("CANARY Q0 OK:", json.dumps(load_json(marker), ensure_ascii=False))
+    del data
+    gc.collect()
+
+
+def summarize(ctx: dict, identity: str, score_by_seed: dict[int, np.ndarray], remote: str) -> None:
+    p = ctx["paths"]
+    out = p["out"]
+    ids = None
+    y = None
+    for seed in SEEDS:
+        with np.load(out / "modelos" / f"seed_{seed}.npz", allow_pickle=False) as z:
+            if ids is None:
+                ids = z["ids"].copy(); y = z["y"].copy()
+            else:
+                require(np.array_equal(z["ids"], ids) and np.array_equal(z["y"], y), "Checkpoints Q0 desalineados")
+
+    rows = []
+    for seed in SEEDS:
+        q0 = score_by_seed[seed]
+        c3 = load_s3_scores(p["s3"] / "C3_HIST_MAS_TARJETAS" / f"seed_{seed}.npz", ids, y)
+        m1 = load_s3_scores(p["s3"] / "M1_RAW" / f"seed_{seed}.npz", ids, y)
+        curves = {"Q0": gain_curve(ids, y, q0), "C3_ORIG": gain_curve(ids, y, c3), "M1": gain_curve(ids, y, m1)}
+        for n in N_GRID:
+            rows.append({"seed":seed, "n":n,
+                         "gain_q0":curves["Q0"][n], "gain_c3_orig":curves["C3_ORIG"][n], "gain_m1":curves["M1"][n],
+                         "delta_q0_m1":curves["Q0"][n]-curves["M1"][n],
+                         "delta_q0_c3":curves["Q0"][n]-curves["C3_ORIG"][n]})
+    df = pd.DataFrame(rows)
+    df.to_csv(out / "curvas_q0_por_seed.csv", index=False)
+
+    summary_rows = []
+    for n, g in df.groupby("n"):
+        for col in ["delta_q0_m1", "delta_q0_c3"]:
+            x = g[col].astype(float)
+            summary_rows.append({"n":int(n), "contrast":col,
+                                 "mean":float(x.mean()), "median":float(x.median()), "sd":float(x.std(ddof=1)),
+                                 "positive_fraction":float((x>0).mean()), "wins":int((x>0).sum()), "ties":int((x==0).sum()), "losses":int((x<0).sum())})
+    pd.DataFrame(summary_rows).to_csv(out / "resumen_pareado_por_n.csv", index=False)
+
+    band = df[df.n.isin(BAND)].groupby("seed", as_index=False).agg(
+        q0=("gain_q0", "mean"), m1=("gain_m1", "mean"), c3=("gain_c3_orig", "mean")
+    )
+    d = band.q0 - band.m1
+    d11 = df[df.n.eq(11000)].set_index("seed")["delta_q0_m1"].loc[SEEDS]
+    promote = bool(d.mean() > 0 and d.median() > 0 and d11.mean() > 0 and (d > 0).mean() >= 0.60)
+    c3_delta = band.q0 - band.c3
+
+    ens_rows = []
+    q0_mat = np.vstack([score_by_seed[s] for s in SEEDS])
+    c3_mat = np.vstack([load_s3_scores(p["s3"] / "C3_HIST_MAS_TARJETAS" / f"seed_{s}.npz", ids, y) for s in SEEDS])
+    m1_mat = np.vstack([load_s3_scores(p["s3"] / "M1_RAW" / f"seed_{s}.npz", ids, y) for s in SEEDS])
+    for name, mat in [("Q0", q0_mat), ("C3_ORIG", c3_mat), ("M1", m1_mat)]:
+        curve = gain_curve(ids, y, mat.mean(axis=0, dtype=np.float64))
+        for n, gain in curve.items():
+            ens_rows.append({"arm":name, "n":n, "gain":gain})
+    pd.DataFrame(ens_rows).to_csv(out / "ensemble_por_n.csv", index=False)
+
+    result = {
+        "status":"completed",
+        "identity":identity,
+        "n_seeds":20,
+        "primary_vs_m1":{
+            "delta_band_mean":float(d.mean()), "delta_band_median":float(d.median()), "delta_band_sd":float(d.std(ddof=1)),
+            "positive_seed_fraction":float((d>0).mean()), "delta_11000_mean":float(d11.mean()), "promote_under_s3_rule":promote,
+        },
+        "effect_of_correction_vs_original_c3":{
+            "delta_band_mean":float(c3_delta.mean()), "delta_band_median":float(c3_delta.median()), "delta_band_sd":float(c3_delta.std(ddof=1)),
+            "positive_seed_fraction":float((c3_delta>0).mean()),
+        },
+        "no_august":True, "no_submit":True,
+    }
+    write_json(out / "RESUMEN.json", result)
+    md = [
+        "# Q0 — C3 con ccajas_depositos@202105 → NA",
+        "",
+        "Experimento aislado sobre junio. No usa agosto ni leaderboard y no cambia target, features, parámetros, seeds ni corte.",
+        "",
+        "## Regla primaria vs M1",
+        "",
+        f"- Δ banda medio: {result['primary_vs_m1']['delta_band_mean']:.2f}",
+        f"- Δ banda mediana: {result['primary_vs_m1']['delta_band_median']:.2f}",
+        f"- SD: {result['primary_vs_m1']['delta_band_sd']:.2f}",
+        f"- fracción seeds positivas: {result['primary_vs_m1']['positive_seed_fraction']:.3f}",
+        f"- Δ N=11000 medio: {result['primary_vs_m1']['delta_11000_mean']:.2f}",
+        f"- pasa regla S3: **{result['primary_vs_m1']['promote_under_s3_rule']}**",
+        "",
+        "## Efecto aislado de la corrección vs C3 original",
+        "",
+        f"- Δ banda medio Q0-C3: {result['effect_of_correction_vs_original_c3']['delta_band_mean']:.2f}",
+        f"- fracción seeds positivas: {result['effect_of_correction_vs_original_c3']['positive_seed_fraction']:.3f}",
+        "",
+        "Ver `curvas_q0_por_seed.csv`, `resumen_pareado_por_n.csv` y `ensemble_por_n.csv`.",
+    ]
+    (out / "RESULTADOS.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    backup_small(out, remote)
+    _gcs(["gcloud", "storage", "cp", str(out / "curvas_q0_por_seed.csv"), str(out / "resumen_pareado_por_n.csv"), str(out / "ensemble_por_n.csv"), remote + "/"], check=True)
+    ready = {"status":"completed", "identity":identity, "summary_sha256":digest(out / "RESUMEN.json"), "remote":remote}
+    pending = out / "LISTO.pending"
+    write_json(pending, ready)
+    _gcs(["gcloud", "storage", "cp", str(pending), remote + "/LISTO.json"], check=True)
+    pending.replace(out / "LISTO.json")
+    print("Q0 COMPLETADO Y RESPALDADO. No se generó ningún submit.")
+
+
+def execute_all(ctx: dict, remote: str) -> None:
+    out = ctx["paths"]["out"]
+    marker = out / "CANARY_OK.json"
+    require(marker.is_file(), "Falta CANARY_OK: ejecutar --canary antes de --execute")
+    plan, identity = ensure_plan(ctx)
+    require(load_json(marker).get("identity") == identity, "Canary pertenece a otro plan")
+    if (out / "LISTO.json").exists():
+        m = load_json(out / "LISTO.json")
+        require(m.get("identity") == identity, "LISTO pertenece a otro plan")
+        print("Q0 ya completado; no se repite.")
+        return
+
+    data = load_data_for_training(ctx)
+    score_by_seed: dict[int, np.ndarray] = {}
+    for i, seed in enumerate(SEEDS, 1):
+        print(f"Q0 {i}/{len(SEEDS)} seed={seed}", flush=True)
+        r = fit_one(seed, data, ctx, identity, remote)
+        score_by_seed[seed] = r["scores"]
+    summarize(ctx, identity, score_by_seed, remote)
+    del data, score_by_seed
+    gc.collect()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Q0: aislar la corrección docente ccajas_depositos@202105->NA sobre C3/S3")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--preflight", action="store_true")
+    mode.add_argument("--prepare", action="store_true")
+    mode.add_argument("--canary", action="store_true")
+    mode.add_argument("--execute", action="store_true")
+    ap.add_argument("--home", type=Path, default=Path.home())
+    ap.add_argument("--remote", default=REMOTE_DEFAULT)
+    args = ap.parse_args()
+    home = args.home.resolve()
+    ctx = preflight(home, for_training=(args.canary or args.execute))
+    print(f"PREFLIGHT Q0 OK: disco={ctx['disk_free_gib']:.1f} GiB, RAM disponible={ctx['mem_available_gib']:.1f} GiB, features={len(ctx['features'])}")
+    if args.preflight:
+        return
+
+    out = ctx["paths"]["out"]
+    out.mkdir(parents=True, exist_ok=True)
+    lockf = (out / ".lock").open("a")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit("Q0 ya tiene otro proceso activo; no se duplica")
+
+    if args.prepare:
+        prepare(ctx, args.remote)
+    elif args.canary:
+        canary(ctx, args.remote)
+    elif args.execute:
+        execute_all(ctx, args.remote)
+
+
+if __name__ == "__main__":
+    main()

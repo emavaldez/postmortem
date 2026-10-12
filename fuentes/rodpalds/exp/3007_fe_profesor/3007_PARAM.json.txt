@@ -1,0 +1,37 @@
+{
+  "experimento": 3007,
+  "nombre": "fe_profesor",
+  "descripcion": "ds3003 (lags/deltas 1 y 2 + rank cero fijo + proceso de muerte) mas indicaciones del profesor: ccajas_depositos NA en 202105, flags _zero (sin rankear), tendencia y promedio de 3 meses (_tend3, _avg3).",
+  "dataset_entrada": "ds1001_base.parquet",
+  "dataset_salida": "ds3007_profesor.parquet",
+  "rotas": {
+    "ccajas_depositos": [
+      202105
+    ]
+  },
+  "claves": [
+    "ctrx_quarter",
+    "mpasivos_margen",
+    "mcaja_ahorro",
+    "mcuentas_saldo",
+    "ctarjeta_visa_transacciones",
+    "ctarjeta_master_transacciones",
+    "ctarjeta_debito_transacciones",
+    "mprestamos_personales",
+    "mpayroll",
+    "cmobile_app_trx",
+    "chomebanking_transacciones",
+    "mcomisiones",
+    "cdescubierto_preacordado",
+    "mcuenta_corriente",
+    "Visa_msaldototal",
+    "Master_msaldototal"
+  ],
+  "relativas_max3": [
+    "ctrx_quarter",
+    "mcaja_ahorro"
+  ],
+  "_fecha_inicio": "2026-10-10 20:47:14",
+  "_script": "03f_fe_profesor.py",
+  "_git_commit": "sin_git"
+}

@@ -1,0 +1,9 @@
+{
+  "experimento": 7001,
+  "nombre": "decision_p23",
+  "sobrescribir": true,
+  "descripcion": "Aplica R3a (min_data_in_leaf) y R3b (arboles) sobre 5109 y escribe la config de 5110.",
+  "_fecha_inicio": "2026-10-10 12:21:16",
+  "_script": "13_decidir.py",
+  "_git_commit": "sin_git"
+}

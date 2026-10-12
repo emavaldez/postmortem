@@ -1,0 +1,14 @@
+{
+  "hiperparametros": "eleccion: 4104 prueba_35",
+  "arboles": 238,
+  "min_data_in_leaf": 16977,
+  "n_semillas": 20,
+  "archivos_kaggle": 13,
+  "filas": 164647,
+  "prob_p50_p90_p99": [
+    0.0025,
+    0.0266,
+    0.1695
+  ],
+  "_minutos": 17.87
+}

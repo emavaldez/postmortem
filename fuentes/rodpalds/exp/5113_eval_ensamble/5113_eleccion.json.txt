@@ -1,0 +1,216 @@
+{
+  "origen": "5113: ensamble de 12 pruebas de 4112_bo_profesor_ds3007/4112_top.json",
+  "modelos": [
+    {
+      "nombre": "cv4112_p13",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 1158,
+        "min_sum_hessian_in_leaf": 0.008444028457202742
+      },
+      "arboles": 3370
+    },
+    {
+      "nombre": "cv4112_p3",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 1099,
+        "min_sum_hessian_in_leaf": 0.0018990809702396625
+      },
+      "arboles": 3903
+    },
+    {
+      "nombre": "cv4112_p15",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 1007,
+        "min_sum_hessian_in_leaf": 0.10471127325553675
+      },
+      "arboles": 2258
+    },
+    {
+      "nombre": "cv4112_p12",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 1828,
+        "min_sum_hessian_in_leaf": 0.0023574214951843403
+      },
+      "arboles": 3108
+    },
+    {
+      "nombre": "cv4112_p10",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 1092,
+        "min_sum_hessian_in_leaf": 0.0020579183388477968
+      },
+      "arboles": 1731
+    },
+    {
+      "nombre": "cv4112_p14",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 246,
+        "min_sum_hessian_in_leaf": 0.08637919596409331
+      },
+      "arboles": 1811
+    },
+    {
+      "nombre": "cv4112_p8",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 744,
+        "min_sum_hessian_in_leaf": 0.0019489099277231526
+      },
+      "arboles": 1234
+    },
+    {
+      "nombre": "cv4112_p9",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 40,
+        "min_sum_hessian_in_leaf": 0.04253276764716304
+      },
+      "arboles": 3848
+    },
+    {
+      "nombre": "cv4112_p2",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 329,
+        "min_sum_hessian_in_leaf": 0.002990263555904469
+      },
+      "arboles": 918
+    },
+    {
+      "nombre": "cv4112_p5",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 32,
+        "min_sum_hessian_in_leaf": 8.253624762378942
+      },
+      "arboles": 1331
+    },
+    {
+      "nombre": "cv4112_p7",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 180,
+        "min_sum_hessian_in_leaf": 0.10989900755006411
+      },
+      "arboles": 3786
+    },
+    {
+      "nombre": "cv4112_p1",
+      "params": {
+        "objective": "binary",
+        "boosting_type": "gbdt",
+        "max_bin": 31,
+        "min_data_in_leaf": 0,
+        "feature_fraction": 0.5,
+        "feature_fraction_bynode": 0.2,
+        "learning_rate": 0.005,
+        "feature_pre_filter": false,
+        "num_leaves": 18,
+        "min_sum_hessian_in_leaf": 2.84212130999211
+      },
+      "arboles": 2561
+    }
+  ],
+  "semillas": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103,
+    667333,
+    468859,
+    761993,
+    575317,
+    946111,
+    154097,
+    924697
+  ],
+  "escalar_regularizacion": false,
+  "fraccion_mes_referencia": 2.0,
+  "R6": "escalado 388.6 M vs sin escalar 389.7 M -> no escalar",
+  "R7": "ensamble 389.7 M vs p23 441.3 M -> QUEDARSE CON 5015",
+  "recomendacion": "5015"
+}

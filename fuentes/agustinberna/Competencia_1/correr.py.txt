@@ -1,0 +1,35 @@
+"""Tres folds US50, prestamos conservados, umbrales monto 1.5 y contador 2.
+Ejemplo: python correr.py --raw-path /ruta/competencia_01_crudo.csv --work-dir /ruta/salida --threads 8
+Dependencias: duckdb, lightgbm, optuna, numpy, pandas, pyarrow, psutil, scikit-learn.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import pipeline
+
+CONFIG = {'raw_path': 'competencia_01_crudo.csv', 'months': [202103, 202104, 202105, 202106, 202107, 202108], 'score_month': 202108, 'final_train_months': [202103, 202104, 202105, 202106], 'threads': 8, 'max_columns': 1000, 'ipc': {'202103': 435.8657, '202104': 453.6503, '202105': 468.725, '202106': 483.6049, '202107': 498.0987, '202108': 510.3942}, 'inflation_columns': ['mrentabilidad', 'mrentabilidad_annual', 'mcomisiones', 'mactivos_margen', 'mpasivos_margen', 'mcuenta_corriente_adicional', 'mcuenta_corriente', 'mcaja_ahorro', 'mcaja_ahorro_adicional', 'mcuentas_saldo', 'mautoservicio', 'mtarjeta_visa_consumo', 'mtarjeta_master_consumo', 'mprestamos_personales', 'mprestamos_prendarios', 'mprestamos_hipotecarios', 'mplazo_fijo_pesos', 'minversion1_pesos', 'minversion2', 'mpayroll', 'mpayroll2', 'mcuenta_debitos_automaticos', 'mttarjeta_visa_debitos_automaticos', 'mttarjeta_master_debitos_automaticos', 'mpagodeservicios', 'mpagomiscuentas', 'mcajeros_propios_descuentos', 'mtarjeta_visa_descuentos', 'mtarjeta_master_descuentos', 'mcomisiones_mantenimiento', 'mcomisiones_otras', 'mforex_buy', 'mforex_sell', 'mtransferencias_recibidas', 'mtransferencias_emitidas', 'mextraccion_autoservicio', 'mcheques_depositados', 'mcheques_emitidos', 'mcheques_depositados_rechazados', 'mcheques_emitidos_rechazados', 'matm', 'matm_other', 'Master_mfinanciacion_limite', 'Master_msaldototal', 'Master_msaldopesos', 'Master_mconsumospesos', 'Master_mlimitecompra', 'Master_madelantopesos', 'Master_mpagado', 'Master_mpagospesos', 'Master_mconsumototal', 'Master_mpagominimo', 'Visa_mfinanciacion_limite', 'Visa_msaldototal', 'Visa_msaldopesos', 'Visa_mconsumospesos', 'Visa_mlimitecompra', 'Visa_madelantopesos', 'Visa_mpagado', 'Visa_mpagospesos', 'Visa_mconsumototal', 'Visa_mpagominimo'], 'seed': 700087, 'learning_rate': 0.005, 'min_data_in_leaf': 300, 'feature_fraction': 0.3, 'bagging_fraction': 0.7, 'categorical_columns': ['Master_status', 'Visa_status'], 'score_batch_size': 32768, 'gain': 1072500, 'cost': 27500, 'month_weights': [0.5, 0.25, 0.25], 'n_min': 7000, 'n_max': 15000, 'n_step': 500, 'n_manual': None, 'save_models': True, 'early_stopping': 100, 'trees_min': 300, 'max_trees': 2000, 'leaves_range': [20, 256], 'hessian_range': [0.01, 20], 'work_dir': 'runs/tres_folds_us50_aguinaldo15_001', 'duckdb_memory_gb': 4, 'nominal_limits': [], 'undersampling_continua': 0.5, 'sampling_seed': 700087, 'final_seeds': [700087, 700088, 700089, 700090, 700091, 700092, 700093, 700094, 700095, 700096, 700097, 700098, 700099, 700100, 700101, 700102, 700103, 700104, 700105, 700106], 'trials': 60, 'top_k': 10, 'learning_rate_range': [0.01, 0.1], 'feature_fraction_range': [0.1, 1.0], 'min_data_range': [100, 3000], 'drift_threshold': 0.25, 'drift_rank_top_k': 15, 'aguinaldo_ratio': 1.5, 'aguinaldo_count_ratio': 2.0, 'strategies': {'expanding': {'objective': 'common', 'folds': [{'train': [202103], 'valid': 202105}, {'train': [202103, 202104], 'valid': 202106}, {'train': [202103, 202104, 202105], 'valid': 202106}]}}, 'min_train_valid_gap': 1}
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--raw-path',default=str(Path(__file__).with_name('competencia_01_crudo.csv')))
+    parser.add_argument('--work-dir',default='runs/tres_folds_us50_aguinaldo15_001')
+    parser.add_argument('--threads',type=int,default=8)
+    parser.add_argument('--duckdb-memory-gb',type=int,default=4)
+    parser.add_argument('--stage',choices=['all','prepare','search','select','score'],default='all')
+    args=parser.parse_args()
+    if args.threads<1 or args.duckdb_memory_gb<1:parser.error('CPU y memoria deben ser positivos')
+    raw=Path(args.raw_path).expanduser().resolve()
+    if not raw.is_file():parser.error('No existe el dataset: '+str(raw))
+    root=Path(args.work_dir).expanduser().resolve()
+    root.mkdir(parents=True,exist_ok=True)
+    cfg=dict(CONFIG,raw_path=str(raw),work_dir=str(root),threads=args.threads,duckdb_memory_gb=args.duckdb_memory_gb)
+    config=root/'config.json'
+    if config.exists() and json.loads(config.read_text())!=cfg:
+        parser.error('Salida existente con otra configuracion; elegir otro work-dir')
+    config.write_text(json.dumps(cfg,indent=2)+'\n')
+    pipeline.run(config,args.stage,resume=(root/'manifest.json').exists())
+
+
+if __name__=='__main__':main()

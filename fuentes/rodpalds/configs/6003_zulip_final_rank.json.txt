@@ -1,0 +1,16 @@
+{
+  "experimento": 6003,
+  "nombre": "zulip_final_5008_cortes",
+  "modo": "final",
+  "fuente": "5008_prod_rank_total_bo4104",
+  "envios": [
+    9000,
+    9500,
+    10000,
+    11000,
+    12000,
+    13000,
+    14000
+  ],
+  "descripcion": "Archivos finales (un archivo por corte) de la receta del profesor (5008): 9.000 a 14.000 envios."
+}

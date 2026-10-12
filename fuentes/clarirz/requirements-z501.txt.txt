@@ -1,0 +1,4 @@
+# Dependencias adicionales para generar z501; versiones históricas por contrastar.
+# Antes de afirmar reproducción exacta, comprobar el SHA1 Git del resultado.
+duckdb
+scikit-learn

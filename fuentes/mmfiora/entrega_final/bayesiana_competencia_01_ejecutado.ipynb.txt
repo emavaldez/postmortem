@@ -1,0 +1,321 @@
+#%% celda 1 [texto]
+# DMEyF 2026 - Primera Competencia
+Predicción de **BAJA+2** del Paquete Premium. Notebook en Python / LightGBM que sigue la hoja de ruta de Gustavo Denicolay.
+
+| Etapa | Qué hace |
+|---|---|
+| 0 | Carga el dataset crudo y calcula `clase_ternaria` |
+| 1.1 | Data Quality: `ccajas_depositos` rota en 202105 -> `NaN` |
+| 1.4 | Feature Engineering histórico: lags y delta-lags de orden 1 y 2 |
+| 1.7 | Bayesian Optimization (Optuna/TPE), métrica AUC, sin undersampling |
+| 2.1 | Final training: mejor trial, 20 semillas distintas, en 202103-202106 |
+| 2.2 | Scoring de 202108, un archivo por semilla + ensamble promediado |
+| 2.3 | Corte por cantidad de envíos K y archivos para el bot `@competencia-uno` |
+
+Ganancia: acierto (BAJA+2 enviado) = **+1.072.500**, envío inútil = **-27.500**.
+
+#%% celda 2 [texto]
+## Configuración
+
+#%% celda 3 [código]
+import json, time, warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import optuna
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# ---- mis semillas (primos entre 100003 y 999983) ----
+SEMILLAS_PROPIAS = [285937, 474619, 502487, 600673, 666637]
+SEMILLA = SEMILLAS_PROPIAS[0]
+
+DATA_DIR = Path("..") / "datos"      # acceso (junction) a G:/My Drive/dmeyf/datasets, no se commitea
+EXP_DIR = Path("..") / "exp"                        # resultados del experimento
+EXP_DIR.mkdir(exist_ok=True, parents=True)
+RAW = DATA_DIR / "competencia_01_crudo.csv"
+CACHE = DATA_DIR / "competencia_01.parquet"
+
+MESES_BO_TRAIN = [202103, 202104, 202105]   # entrena cada trial de la optimización
+MES_BO_VALID = 202106                        # valida cada trial (último mes con clase completa)
+MESES_FINAL = [202103, 202104, 202105, 202106]
+MES_APLICAR = 202108
+
+GANANCIA_ACIERTO, COSTO_ENVIO = 1_072_500, -27_500
+
+N_TRIALS = 30            # trials de la Bayesian Optimization
+N_TOP_VALID = 10         # mejores trials usados solo para la curva de ganancia en validación
+N_SEMILLAS = 20          # modelos finales: mismos hiperparámetros, cambia solo la seed (máx 20 archivos por submit)
+NITER_MIN, NITER_MAX = 300, 2500
+KS = list(range(8000, 15001, 500))   # cantidades de envíos a probar (el bot acepta 8000-15000 por archivo)
+
+MODO_RAPIDO = False      # True = prueba de humo con pocos datos, NO usar para la entrega
+if MODO_RAPIDO:
+    N_TRIALS, N_SEMILLAS, NITER_MIN, NITER_MAX = 3, 2, 50, 150
+    EXP_DIR = EXP_DIR / "rapido"; EXP_DIR.mkdir(exist_ok=True, parents=True)
+print("semilla", SEMILLA, "| rapido" if MODO_RAPIDO else "| entrega real")
+
+#%% celda 4 [texto]
+## 0. Dataset y clase_ternaria
+El CSV crudo no trae la clase. Se calcula mirando hacia el futuro, igual que el script en R de la cátedra:
+`BAJA+1` si el cliente no está en el mes siguiente, `BAJA+2` si está el mes siguiente pero no el subsiguiente, `CONTINUA` el resto.
+Los últimos dos meses del dataset quedan sin clase completa (por eso solo se puede entrenar hasta 202106).
+
+#%% celda 5 [código]
+if CACHE.exists():
+    df = pd.read_parquet(CACHE)
+else:
+    t0 = time.time()
+    df = pd.read_csv(RAW, engine="pyarrow")
+    df = df.sort_values(["numero_de_cliente", "foto_mes"]).reset_index(drop=True)
+    df["periodo0"] = (df.foto_mes // 100) * 12 + df.foto_mes % 100
+
+    g = df.groupby("numero_de_cliente")["periodo0"]
+    p1, p2 = g.shift(-1), g.shift(-2)
+    ultimo = df.periodo0.max(); anteultimo = ultimo - 1
+
+    clase = np.full(len(df), None, dtype=object)
+    clase[(df.periodo0 < anteultimo).to_numpy()] = "CONTINUA"
+    m1 = (df.periodo0 < ultimo) & (p1.isna() | (df.periodo0 + 1 < p1))
+    clase[m1.to_numpy()] = "BAJA+1"
+    m2 = (df.periodo0 < anteultimo) & (df.periodo0 + 1 == p1) & (p2.isna() | (df.periodo0 + 2 < p2))
+    clase[m2.to_numpy()] = "BAJA+2"
+    df["clase_ternaria"] = clase
+
+    # float32 para ahorrar memoria
+    for c in df.columns:
+        if c not in ("numero_de_cliente", "foto_mes", "periodo0", "clase_ternaria") \
+                and pd.api.types.is_numeric_dtype(df[c]):
+            df[c] = df[c].astype("float32")
+    df.to_parquet(CACHE)
+    print(f"clase_ternaria calculada y cacheada en {time.time()-t0:.0f}s")
+
+print(df.shape)
+print("columnas no numéricas:", [c for c in df.columns if df[c].dtype == object and c != "clase_ternaria"])
+df.groupby(["foto_mes", "clase_ternaria"], dropna=False).size().unstack(fill_value=0)
+
+#%% celda 6 [texto]
+## 1.1 Data Quality
+`ccajas_depositos` está rota en 202105 (todos ceros) -> se asigna `NaN` solo para ese mes.
+
+#%% celda 7 [código]
+if "ccajas_depositos" in df.columns:
+    print("antes: valores distintos en 202105 =", df.loc[df.foto_mes == 202105, "ccajas_depositos"].nunique())
+    df.loc[df.foto_mes == 202105, "ccajas_depositos"] = np.nan
+    print("despues: no nulos en 202105 =", df.loc[df.foto_mes == 202105, "ccajas_depositos"].notna().sum())
+else:
+    print("ATENCION: no existe la columna ccajas_depositos, revisar el diccionario de datos")
+
+#%% celda 8 [texto]
+## 1.4 Feature Engineering histórico
+Lags y delta-lags (valor actual menos valor del lag) de orden 1 y 2 para todas las variables numéricas.
+Se calculan alineando por (cliente, período) y no por posición, para no cruzar meses si a un cliente le falta alguno.
+
+#%% celda 9 [código]
+EXCLUIR = {"numero_de_cliente", "foto_mes", "periodo0", "clase_ternaria"}
+cols_base = [c for c in df.columns if c not in EXCLUIR]
+MESES_USO = sorted(set(MESES_FINAL + [MES_APLICAR]))
+
+def agregar_lags(df, meses_uso, cols, ks=(1, 2)):
+    clave = ["numero_de_cliente", "periodo0"]
+    uso = df[df.foto_mes.isin(meses_uso)].copy()
+    base = df[clave + cols]
+    nuevas = []
+    for k in ks:
+        r = base.copy()
+        r["periodo0"] = r["periodo0"] + k          # el valor de hace k meses cae en el período actual
+        r.columns = clave + [f"{c}_lag{k}" for c in cols]
+        lag = uso[clave].merge(r, on=clave, how="left").drop(columns=clave)
+        lag.index = uso.index
+        delta = pd.DataFrame(uso[cols].to_numpy() - lag.to_numpy(),
+                             columns=[f"{c}_dlag{k}" for c in cols], index=uso.index)
+        nuevas += [lag, delta]
+    return pd.concat([uso] + nuevas, axis=1)
+
+t0 = time.time()
+ds = agregar_lags(df, MESES_USO, cols_base)
+del df
+FEATURES = [c for c in ds.columns if c not in EXCLUIR]
+ds["y"] = (ds.clase_ternaria == "BAJA+2").astype("int8")
+print(f"{ds.shape[0]:,} filas, {len(FEATURES)} features, {time.time()-t0:.0f}s")
+print("lags 1 y 2 disponibles en 202103:",
+      ds.loc[ds.foto_mes == 202103, [c for c in FEATURES if c.endswith("_lag2")][:5]].notna().mean().round(2).to_dict())
+
+#%% celda 10 [texto]
+## 1.7 Bayesian Optimization
+- Sin undersampling de la clase mayoritaria.
+- Métrica **AUC** en LightGBM.
+- Hiperparámetros fijos: `max_bin=31`, `min_data_in_leaf=0`, `feature_fraction=0.50`, `feature_fraction_bynode=0.20`, `learning_rate=0.005`.
+- Hiperparámetros bayesianos: `num_iterations`, `num_leaves`, `min_sum_hessian_in_leaf`.
+- Cada trial entrena en 202103-202105 y valida en 202106.
+
+#%% celda 11 [código]
+tr = ds[ds.foto_mes.isin(MESES_BO_TRAIN)]
+va = ds[ds.foto_mes == MES_BO_VALID]
+if MODO_RAPIDO:
+    tr = tr.sample(frac=0.10, random_state=SEMILLA)
+X_tr, y_tr = tr[FEATURES].to_numpy(np.float32), tr["y"].to_numpy()
+X_va, y_va = va[FEATURES].to_numpy(np.float32), va["y"].to_numpy()
+print(f"train {X_tr.shape}  positivos {y_tr.mean():.4%} | valid {X_va.shape}  positivos {y_va.mean():.4%}")
+
+FIJOS = dict(
+    objective="binary", metric="auc", boosting="gbdt", verbosity=-1,
+    max_bin=31, min_data_in_leaf=0, feature_fraction=0.50, feature_fraction_bynode=0.20,
+    learning_rate=0.005, feature_pre_filter=False, force_row_wise=True, seed=SEMILLA,
+)
+DS_PARAMS = dict(max_bin=31, min_data_in_leaf=0, feature_pre_filter=False)
+dtrain = lgb.Dataset(X_tr, y_tr, params=DS_PARAMS, free_raw_data=False)
+dvalid = lgb.Dataset(X_va, y_va, reference=dtrain, params=DS_PARAMS, free_raw_data=False)
+
+PRED_DIR = EXP_DIR / "pred_valid"; PRED_DIR.mkdir(exist_ok=True)
+
+def objective(trial):
+    params = dict(FIJOS)
+    params["num_leaves"] = trial.suggest_int("num_leaves", 8, 1024, log=True)
+    params["min_sum_hessian_in_leaf"] = trial.suggest_float("min_sum_hessian_in_leaf", 1e-3, 50.0, log=True)
+    n_iter = trial.suggest_int("num_iterations", NITER_MIN, NITER_MAX)
+    evals = {}
+    t0 = time.time()
+    booster = lgb.train(params, dtrain, num_boost_round=n_iter, valid_sets=[dvalid],
+                        valid_names=["valid"], callbacks=[lgb.record_evaluation(evals)])
+    np.save(PRED_DIR / f"trial_{trial.number}.npy", booster.predict(X_va).astype("float32"))
+    trial.set_user_attr("segundos", round(time.time() - t0))
+    return evals["valid"]["auc"][-1]
+
+study = optuna.create_study(
+    direction="maximize", study_name="bo_lgbm",
+    storage=f"sqlite:///{(EXP_DIR / 'bo.db').as_posix()}", load_if_exists=True,
+    sampler=optuna.samplers.TPESampler(seed=SEMILLA, n_startup_trials=8),
+)
+faltan = N_TRIALS - len([t for t in study.trials if t.state.name == "COMPLETE"])
+print("trials a correr:", max(faltan, 0), "(si se corta, volver a correr esta celda: retoma desde donde quedó)")
+if faltan > 0:
+    study.optimize(objective, n_trials=faltan,
+                   callbacks=[lambda s, t: print(f"trial {t.number:>3}  AUC {t.value:.5f}  {t.params}  {t.user_attrs['segundos']}s")])
+
+#%% celda 12 [código]
+bo = study.trials_dataframe().query("state == 'COMPLETE'").sort_values("value", ascending=False)
+bo.to_csv(EXP_DIR / "bo_resultados.csv", index=False)
+bo[["number", "value", "params_num_leaves", "params_min_sum_hessian_in_leaf", "params_num_iterations", "user_attrs_segundos"]].head(12)
+
+#%% celda 13 [texto]
+## Ganancia en validación según cantidad de envíos
+Ensamble de los mejores trials sobre 202106 (que ningún modelo vio al entrenar). Sirve de guía para elegir K:
+la ganancia máxima sale para una proporción de envíos, que se traslada a 202108.
+
+#%% celda 14 [código]
+top = bo.head(N_TOP_VALID)
+pv = np.mean([np.load(PRED_DIR / f"trial_{int(n)}.npy") for n in top["number"]], axis=0)
+orden = np.argsort(-pv)
+g = np.where(y_va[orden] == 1, GANANCIA_ACIERTO, COSTO_ENVIO).cumsum()
+prop = np.arange(1, len(g) + 1) / len(g)
+
+n_apl = int((ds.foto_mes == MES_APLICAR).sum())
+mejor = g.argmax()
+print(f"clientes en 202106: {len(g):,} | en {MES_APLICAR}: {n_apl:,}")
+print(f"máximo en validación: {g[mejor]:,.0f} con {mejor+1:,} envíos ({prop[mejor]:.2%}) "
+      f"-> equivalente a ~{int(prop[mejor]*n_apl):,} envíos en {MES_APLICAR}")
+
+plt.figure(figsize=(9, 4))
+plt.plot(prop * n_apl, g * (n_apl / len(g)))
+for k in (KS[0], KS[-1]):
+    plt.axvline(k, color="gray", ls=":")
+plt.xlabel(f"envíos (escalado a {MES_APLICAR})"); plt.ylabel("ganancia (escalada)")
+plt.title("Curva de ganancia en validación (202106), ensamble de los mejores trials"); plt.grid(alpha=.3)
+plt.show()
+
+#%% celda 15 [texto]
+## 2.1 Final training
+Se toma el **mejor trial** de la optimización y se entrenan `N_SEMILLAS` modelos con hiperparámetros idénticos,
+cambiando solo la `seed` de LightGBM, en 202103-202106 y sin undersampling.
+Así el bot devuelve la media y el desvío de la ganancia y se reduce el overfitting al Public Leaderboard.
+
+#%% celda 16 [código]
+def es_primo(n):
+    return n > 1 and all(n % i for i in range(2, int(n ** 0.5) + 1))
+rng = np.random.default_rng(SEMILLA)
+semillas = SEMILLAS_PROPIAS[:N_SEMILLAS]   # primero las 5 propias, el resto se completa con primos al azar
+while len(semillas) < N_SEMILLAS:
+    p = int(rng.integers(100_003, 999_983))
+    if es_primo(p) and p not in semillas:
+        semillas.append(p)
+
+mejor_t = bo.iloc[0]
+params_final = dict(FIJOS,
+                    num_leaves=int(mejor_t["params_num_leaves"]),
+                    min_sum_hessian_in_leaf=float(mejor_t["params_min_sum_hessian_in_leaf"]))
+n_iter_final = int(mejor_t["params_num_iterations"])
+print("mejor trial", int(mejor_t["number"]), "AUC", round(mejor_t["value"], 5), params_final, "iteraciones", n_iter_final)
+
+fin = ds[ds.foto_mes.isin(MESES_FINAL)]
+if MODO_RAPIDO:
+    fin = fin.sample(frac=0.10, random_state=SEMILLA)
+dfinal = lgb.Dataset(fin[FEATURES].to_numpy(np.float32), fin["y"].to_numpy(), params=DS_PARAMS, free_raw_data=False)
+apl = ds[ds.foto_mes == MES_APLICAR]
+X_apl = apl[FEATURES].to_numpy(np.float32)
+ids_apl = apl["numero_de_cliente"].to_numpy()
+
+preds = {}
+for i, sem in enumerate(semillas):
+    t0 = time.time()
+    m = lgb.train(dict(params_final, seed=sem), dfinal, num_boost_round=n_iter_final)
+    preds[sem] = m.predict(X_apl)
+    np.save(EXP_DIR / f"pred_202108_seed{sem}.npy", preds[sem].astype("float32"))
+    print(f"modelo {i+1}/{N_SEMILLAS}  semilla {sem}  {time.time()-t0:.0f}s")
+
+#%% celda 17 [texto]
+## 2.2 Scoring y ensamble
+Cada semilla da un ranking de los clientes de 202108. El ensamble promedia las probabilidades por `numero_de_cliente`.
+
+#%% celda 18 [código]
+scores = pd.DataFrame({f"s{sem}": p for sem, p in preds.items()})
+scores.insert(0, "numero_de_cliente", ids_apl)
+assert scores.numero_de_cliente.is_unique
+scores["prob"] = scores.drop(columns="numero_de_cliente").mean(axis=1)
+scores = scores.sort_values("prob", ascending=False).reset_index(drop=True)
+scores.to_csv(EXP_DIR / "scores_202108.csv", index=False)
+print(scores.shape)
+scores[["numero_de_cliente", "prob"]].head()
+
+#%% celda 19 [texto]
+## 2.3 Classification y archivos para el bot
+Formato exigido por `@competencia-uno`: `.csv` **sin encabezado**, una sola columna con los `numero_de_cliente` a estimular
+(enteros, nunca en notación científica), entre 8000 y 15000 registros por archivo.
+
+- `entregas/ensamble/ensamble_K{K}.csv`: un archivo por K (ensamble). Se pueden mandar varios K en un mismo submit para compararlos.
+- `entregas/semillas_K{K}/seed_*.csv`: un archivo por semilla con ese K (máx. 20): el bot informa media y desvío de la ganancia.
+
+Mensaje al bot (privado): cuerpo `submit NombreSinEspacios` + los .csv adjuntos. Vale el **último** submit antes del domingo 11-oct 23:59.
+
+#%% celda 20 [código]
+import shutil
+
+def guardar_ids(ids, ruta):
+    ids = np.asarray(ids).astype("int64")
+    assert 8000 <= len(ids) <= 15000 and len(set(ids)) == len(ids)
+    pd.DataFrame({"id": ids}).to_csv(ruta, header=False, index=False)   # sin encabezado, enteros
+
+ENT = EXP_DIR / "entregas"
+if ENT.exists():
+    shutil.rmtree(ENT)
+(ENT / "ensamble").mkdir(parents=True)
+
+for k in KS:
+    guardar_ids(scores.numero_de_cliente.iloc[:k], ENT / "ensamble" / f"ensamble_K{k}.csv")
+
+K_SEMILLAS = [11000]   # K(s) para los que se genera el set de archivos por semilla; ajustar según el Public Leaderboard
+for k in K_SEMILLAS:
+    carpeta = ENT / f"semillas_K{k}"; carpeta.mkdir()
+    for sem, p in preds.items():
+        top_k = ids_apl[np.argsort(-p)[:k]]
+        guardar_ids(top_k, carpeta / f"seed_{sem}_K{k}.csv")
+
+json.dump(dict(semilla=SEMILLA, meses_final=MESES_FINAL, mes_aplicar=MES_APLICAR, n_trials=N_TRIALS,
+               semillas_finales=semillas, ks=KS, mejor_trial=params_final, num_iterations=n_iter_final),
+          open(EXP_DIR / "config.json", "w"), indent=2, default=str)
+
+print(ENT.resolve())
+print(open(ENT / "ensamble" / f"ensamble_K{KS[0]}.csv").read().splitlines()[:7])

@@ -1,0 +1,137 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–18] Importa duckdb, pandas, numpy, optuna y LGBMClassifier y silencia las
+#   advertencias. Define la carpeta de datos en Google Drive, crea la carpeta de corrida
+#   run_v64_Optuna_Bimodal_20min, fija como entrada competencia_01_fe_v12_NA.csv y lista las columnas que no
+#   entran como variables: clase_ternaria, numero_de_cliente, foto_mes y peso_temporal.
+"""
+Paso 02: Optimización Bayesiana (Origen de los hiperparámetros LowTop2 del modelo M4).
+Entrena en 202103-202105 y valida ganancia directa en 202106 (corte K=11500).
+"""
+import os, gc, duckdb, datetime
+import pandas as pd, numpy as np
+import optuna
+from lightgbm import LGBMClassifier
+import warnings
+
+warnings.filterwarnings('ignore')
+
+base_path = '/content/drive/MyDrive/DMEyF/2026/notebooks/data/'
+run_base_path = os.path.join(base_path, 'run_v64_Optuna_Bimodal_20min')
+os.makedirs(run_base_path, exist_ok=True)
+
+dataset_path = os.path.join(base_path, 'competencia_01_fe_v12_NA.csv')
+cols_basura = ['clase_ternaria', 'numero_de_cliente', 'foto_mes', 'peso_temporal']
+
+# [Anotación · líneas 20–24] Lista las 9 variables a las que se les calculan lags y deltas: ctrx_quarter,
+#   mcaja_ahorro, mtarjeta_visa_consumo, mcuentas_saldo, mpayroll, cpayroll_trx, mprestamos_personales,
+#   mactivos_margen y Visa_mlimitecompra.
+top_vars = [
+    'ctrx_quarter', 'mcaja_ahorro', 'mtarjeta_visa_consumo', 'mcuentas_saldo',
+    'mpayroll', 'cpayroll_trx', 'mprestamos_personales', 'mactivos_margen',
+    'Visa_mlimitecompra'
+]
+
+# [Anotación · líneas 26–34] Lee el CSV completo con DuckDB (límite de memoria de 45GB) a un DataFrame de
+#   pandas y convierte las columnas float64 a float32.
+print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Preparando datos para Optuna (202103-202106)...")
+con = duckdb.connect()
+con.execute("PRAGMA memory_limit='45GB'")
+df = con.execute(f"SELECT * FROM read_csv_auto('{dataset_path}')").df()
+con.close()
+
+for c in df.columns:
+    if df[c].dtype == 'float64':
+        df[c] = df[c].astype('float32', copy=False)
+
+# [Anotación · líneas 36–40] Pone ccajas_depositos en NaN en las filas de 202105, ordena la tabla por
+#   numero_de_cliente y foto_mes y reinicia el índice.
+if 'ccajas_depositos' in df.columns:
+    df.loc[df['foto_mes'] == 202105, 'ccajas_depositos'] = np.nan
+
+df.sort_values(by=['numero_de_cliente', 'foto_mes'], inplace=True)
+df.reset_index(drop=True, inplace=True)
+
+# [Anotación · líneas 42–54] Calcula dos vectores booleanos que indican si la fila anterior y la de dos
+#   posiciones atrás pertenecen al mismo cliente. Para cada una de las 9 variables crea _lag1 y _lag2 (valor de
+#   esas filas) y _delta1 y _delta2 (valor actual menos el de esas filas), en float32, con NaN cuando la fila
+#   desplazada es de otro cliente.
+es_mismo_cliente_1 = (df['numero_de_cliente'] == df['numero_de_cliente'].shift(1)).values
+es_mismo_cliente_2 = (df['numero_de_cliente'] == df['numero_de_cliente'].shift(2)).values
+
+for col in top_vars:
+    if col in df.columns:
+        val_actual = df[col].values
+        val_lag1 = df[col].shift(1).values
+        val_lag2 = df[col].shift(2).values
+
+        df[f'{col}_lag1'] = np.where(es_mismo_cliente_1, val_lag1, np.nan).astype(np.float32)
+        df[f'{col}_lag2'] = np.where(es_mismo_cliente_2, val_lag2, np.nan).astype(np.float32)
+        df[f'{col}_delta1'] = np.where(es_mismo_cliente_1, val_actual - val_lag1, np.nan).astype(np.float32)
+        df[f'{col}_delta2'] = np.where(es_mismo_cliente_2, val_actual - val_lag2, np.nan).astype(np.float32)
+
+# [Anotación · líneas 56–67] Conserva los meses 202103 a 202106. Define entrenamiento como foto_mes hasta
+#   202105 y validación como 202106. Arma el vector de validación con 1 sólo para BAJA+2, separa clase_peligro
+#   como objetivo (NaN pasa a 0), quita las columnas de cols_basura y deja las matrices de entrenamiento y de
+#   validación.
+df_train = df[df['foto_mes'].isin([202103, 202104, 202105, 202106])].copy()
+del df; gc.collect()
+
+mask_tr = df_train['foto_mes'] <= 202105
+mask_val = df_train['foto_mes'] == 202106
+
+y_val_baja2 = (df_train.loc[mask_val, 'clase_ternaria'] == 'BAJA+2').astype(np.int8).values
+y_train = df_train.pop('clase_peligro').fillna(0).astype(np.int8)
+df_train.drop(columns=cols_basura, inplace=True, errors='ignore')
+
+X_tr_opt, y_tr_opt = df_train[mask_tr], y_train[mask_tr]
+X_val_opt = df_train[mask_val]
+
+# [Anotación · líneas 69–81] Función objetivo de Optuna. Parámetros fijos: objective binary, metric auc, gbdt,
+#   is_unbalance True, random_state 17 + número de trial, n_jobs 2, max_bin 31, min_data_in_leaf 0,
+#   learning_rate 0.005, device gpu. Parámetros muestreados: n_estimators entre 1500 y 3000, num_leaves entre 12
+#   y 35, min_sum_hessian_in_leaf entre 0.01 y 5.0 en escala logarítmica, feature_fraction entre 0.3 y 0.6,
+#   feature_fraction_bynode entre 0.15 y 0.4, bagging_fraction entre 0.7 y 1.0 y bagging_freq entre 1 y 5.
+def objective_low(trial):
+    params = {
+        'objective': 'binary', 'metric': 'auc', 'boosting_type': 'gbdt', 'is_unbalance': True,
+        'random_state': 17 + trial.number, 'n_jobs': 2, 'verbose': -1, 'max_bin': 31,
+        'min_data_in_leaf': 0, 'learning_rate': 0.005, 'device': 'gpu',
+        'n_estimators': trial.suggest_int('n_estimators', 1500, 3000),
+        'num_leaves': trial.suggest_int('num_leaves', 12, 35),
+        'min_sum_hessian_in_leaf': trial.suggest_float('min_sum_hessian_in_leaf', 0.01, 5.0, log=True),
+        'feature_fraction': trial.suggest_float('feature_fraction', 0.3, 0.6),
+        'feature_fraction_bynode': trial.suggest_float('feature_fraction_bynode', 0.15, 0.4),
+        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 1.0),
+        'bagging_freq': trial.suggest_int('bagging_freq', 1, 5)
+    }
+# [Anotación · líneas 82–93] Entrena un LGBMClassifier con 202103–202105; si el ajuste lanza una excepción,
+#   quita el parámetro device y vuelve a entrenar. Predice la probabilidad en 202106, ordena de mayor a menor y
+#   devuelve la ganancia de los primeros 11.500: 1.072.500 por cada BAJA+2 y −27.500 por cada uno de los demás.
+    try:
+        model = LGBMClassifier(**params)
+        model.fit(X_tr_opt, y_tr_opt)
+    except Exception:
+        params.pop('device', None)
+        model = LGBMClassifier(**params)
+        model.fit(X_tr_opt, y_tr_opt)
+
+    prob_val = model.predict_proba(X_val_opt)[:, 1]
+    orden = np.argsort(prob_val)[::-1]
+    y_val_ordenado = y_val_baja2[orden]
+    return np.sum(np.where(y_val_ordenado[:11500] == 1, 1072500, -27500))
+
+# [Anotación · líneas 95–97] Crea, o retoma si ya existe, el estudio Optuna_Low con dirección maximize y
+#   almacenamiento SQLite en optuna_low.db dentro de la carpeta de corrida. Ejecuta la búsqueda con timeout de
+#   1.200 segundos y 4 trabajos en paralelo.
+db_path_low = os.path.join(run_base_path, 'optuna_low.db')
+study_low = optuna.create_study(direction='maximize', study_name='Optuna_Low', storage=f'sqlite:///{db_path_low}', load_if_exists=True)
+study_low.optimize(objective_low, timeout=1200, n_jobs=4)
+
+# [Anotación · líneas 99–102] Pasa los trials a un DataFrame, conserva los de estado COMPLETE, los ordena por
+#   valor descendente e imprime la segunda fila (posición 1).
+top_low = study_low.trials_dataframe()
+top_low = top_low[top_low['state'] == 'COMPLETE'].sort_values(by='value', ascending=False)
+print("\n=== PARÁMETROS DEL LOW TOP 2 SELECCIONADO ===")
+print(top_low.iloc[1])

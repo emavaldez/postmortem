@@ -1,0 +1,1385 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+#%% celda 1 [texto]
+# c9923 — c9920 + variables nuevas, con bayesiana propia
+
+**Qué es:** el modelo de `c9920` (su lista de 128 variables, zLightGBM con canaritos 1 a 1, los fijos del profesor) con **variables nuevas** y una **optimización bayesiana propia**, porque con otras variables el óptimo de hiperparámetros puede moverse. Termina en semillas de agosto listas para el bot y para ensamblar.
+
+**Variables** (todas con los valores crudos de cada mes y después ranking con cero fijo por mes, como el resto):
+
+1. **Base:** las 128 de `c9920` (`media_2desvios`), sin volver a seleccionar.
+2. **11 atributos nuevos del mes**, cada uno con lag1, delta_lag1, lag2 y delta_lag2 (55 columnas): `mfondos_pesos_total`, `ctc_transacciones_total`, `mtc_saldo_total`, `mmargen_activo_pasivo`, `mtc_pagominimo_total`, `rtc_saldo_limite`, `rdigital_trx`, `cproductos_perdidos`, `tperdio_payroll`, `tinicio_comision`, `mpatrimonio_neto`.
+3. **`_avg3` y `_slope3`** (ventana t−2, t−1, t; mínimo 2 valores) para los campos base que aparecen en las 128 y para los 11 nuevos.
+
+Prefijos como en el dataset: `m` monto, `c` cantidad, `t` bandera, `r` ratio. "Mes anterior" es la observación anterior del cliente, igual que en los lags de siempre.
+
+**Pasos** (todo con un solo *Run All*):
+
+1. Datos y variables (igual que `c9920` + las nuevas). Imprime cuántas columnas quedaron.
+2. **Bayesiana:** Optuna (TPE multivariado) sobre `num_iterations`, `num_leaves` y `min_sum_hessian_in_leaf`. Entrena marzo a mayo, predice junio, semilla 101737, **maximiza el AUC de junio**. La primera corrida usa los valores de `c9920`. Cada corrida guarda también la *average precision* (solo BAJA+2) y la ganancia.
+3. **Referencia de junio:** 3 semillas con los mejores valores, contra la referencia de `c9920` con las mismas semillas.
+4. **Agosto:** marzo a junio → agosto con los mejores valores, una semilla tras otra (primero las 10 de `s0004`, después primos), tope `N_SEMILLAS_AGOSTO` = 60. **Después de cada semilla** se rehacen los CSV de cortes (9.000 a 15.000) y las probabilidades del ensamble.
+5. Al terminar (o al encontrar `PARAR`), borra la máquina virtual. Todo queda en el bucket.
+
+## Cómo correrlo en la máquina de la cátedra
+
+```bash
+cd ~/dmeyf-primera-competencia/02_c9923_variables_nuevas
+# 1) prueba corta (~15 min, 5 % de los clientes, escribe en exp/c9923/prueba, no apaga la máquina)
+MODO_PRUEBA=1 jupyter nbconvert --to notebook --execute c9923_VariablesNuevas.ipynb --output c9923_prueba.ipynb --ExecutePreprocessor.timeout=-1
+# 2) corrida real, en segundo plano (sigue aunque se cierre la terminal o el navegador)
+nohup jupyter nbconvert --to notebook --execute c9923_VariablesNuevas.ipynb --output c9923_corrida.ipynb --ExecutePreprocessor.timeout=-1 > c9923_run.txt 2>&1 &
+```
+
+- **Seguimiento:** `tail -f ~/buckets/b1/exp/c9923/log.txt`
+- **Parar las semillas de agosto:** `touch ~/buckets/b1/exp/c9923/PARAR`, **solo cuando ya empezó agosto** (si se crea antes, agosto no corre ninguna semilla). Antes de cada semilla nueva el notebook mira si existe: si está, no empieza otra, deja los cortes al día y apaga la máquina. La semilla en curso termina primero (se espera como mucho una). Al arrancar una corrida nueva se borra solo.
+- **Cortar la bayesiana antes** (si se hace tarde): `touch ~/buckets/b1/exp/c9923/CORTAR_BAYESIANA`. Termina la corrida en curso y sigue con la referencia de junio y agosto con lo mejor que haya. Este archivo no se borra solo (así, si se corta la máquina, al retomar no vuelve a la bayesiana): para una corrida nueva desde cero, borralo.
+- **Lo que se manda:** los CSV de `exp/c9923/5_cortes/` siempre tienen todas las semillas terminadas hasta ese momento.
+- **Si Google borra la máquina spot:** otra máquina, el mismo comando. Cada corrida, semilla y el estudio de Optuna se guardan en el bucket apenas terminan; saltea lo hecho y sigue.
+
+#%% celda 2 [código]
+# [Anotación · líneas 39–58] Importa las bibliotecas (numpy, pandas y módulos estándar), fija el identificador
+#   del experimento en c9923 y lee la variable de entorno MODO_PRUEBA. Fuera del modo prueba quedan activadas
+#   dos banderas: borrar la máquina virtual al terminar y borrarla si una celda termina con error.
+from pathlib import Path
+from urllib.request import urlretrieve
+import gc
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+
+EXP_ID = "c9923"
+
+MODO_PRUEBA = os.environ.get("MODO_PRUEBA", "0") == "1"  # o poner True a mano para probar con *Run All*
+APAGAR_AL_TERMINAR = not MODO_PRUEBA  # al final borra la máquina virtual (solo en Google Cloud; los resultados quedan en el bucket)
+APAGAR_SI_FALLA = not MODO_PRUEBA  # si una celda falla, borra la máquina para no gastar créditos
+
+# [Anotación · líneas 60–88] Parámetros de datos y de la búsqueda: URL del dataset, meses de entrenamiento
+#   final 202103 a 202106, mes a predecir 202108, meses que se leen (202103 a 202108), lags de orden 1 y 2 y
+#   cantidad de hilos igual a la de CPU. La lista base es media_2desvios de c9920. La búsqueda entrena con
+#   202103–202105 y valida en 202106, con learning_rate 0,005, feature_fraction 0,5, feature_fraction_bynode
+#   0,2, min_data_in_leaf 0 y max_bin 31 fijos; el espacio es num_iterations 64–4.096, num_leaves 16–2.048 y
+#   min_sum_hessian_in_leaf 1e-6–1, con 25 corridas (11 iniciales), semilla de entrenamiento 101737 y semilla
+#   del muestreador 20261011.
+# Datos (igual que c9920)
+DATA_URL = "https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv"
+FIT_MONTHS = [202103, 202104, 202105, 202106]  # semillas de agosto
+PREDICT_MONTH = 202108
+NEEDED_MONTHS = {202103, 202104, 202105, 202106, 202107, 202108}
+LAG_ORDERS = [1, 2]
+NUM_THREADS = os.cpu_count() or 4
+
+# Base: c9920
+LISTA_C9920 = "media_2desvios"  # la lista del envío c9920c11000
+
+# Bayesiana: entrena marzo a mayo, valida junio
+BO_TRAIN_MONTHS = [202103, 202104, 202105]
+VALID_MONTH = 202106
+LEARNING_RATE = 0.005
+FEATURE_FRACTION = 0.50
+FEATURE_FRACTION_BYNODE = 0.20
+MIN_DATA_IN_LEAF = 0
+MAX_BIN = 31
+LGB_METRIC = "auc"  # como pide la cátedra; sin conjunto de validación no cambia el modelo
+SEARCH_SPACE = {
+    "num_iterations": (64, 4096),
+    "num_leaves": (16, 2048),
+    "min_sum_hessian_in_leaf": (1e-6, 1.0),
+}
+N_TRIALS = 25  # 1 con los valores de c9920 + 10 al azar + 14 guiadas
+N_STARTUP_TRIALS = 11
+BO_SEED = 101737
+SAMPLER_SEED = 20261011
+
+# [Anotación · líneas 90–103] Semillas de la referencia de junio (101737, 303011, 602909), tope de 60 semillas
+#   para agosto, lista de 10 semillas escritas en el código y semilla 20261009 del generador que completa la
+#   lista. Ganancia: +1,0725 por cada BAJA+2 y −0,0275 por cada otro registro, suavizada con una ventana de 501
+#   posiciones. Cortes de 9.000 a 15.000 de a 500 (13 cortes) y corte de referencia 11.000.
+# Referencia de junio
+JUNE_SEEDS = [101737, 303011, 602909]  # las de la referencia de junio de c9920
+
+# Agosto
+N_SEMILLAS_AGOSTO = 60
+SEEDS_S0004 = [101737, 303011, 602909, 707717, 906007, 568318, 641463, 591763, 616818, 193376]
+SEED_LIST_RNG = 20261009  # la misma lista de primos de s0005, s0006 y c9920
+
+# Ganancia y cortes
+GAIN_BAJA2 = 1.0725
+GAIN_OTHER = -0.0275
+GAIN_WINDOW = 501
+CORTES = list(range(9_000, 15_001, 500))
+CORTE_REF = 11_000  # el corte de c9920c11000
+
+# [Anotación · líneas 105–112] En modo prueba reemplaza los parámetros: 5 % de los clientes, num_iterations
+#   entre 20 y 80, num_leaves entre 16 y 1.024, 4 corridas (2 iniciales), 3 semillas de agosto, ventana de 51 y
+#   cortes de 300, 500 y 700.
+PRUEBA_FRACCION_CLIENTES = 0.05
+if MODO_PRUEBA:
+    SEARCH_SPACE = {"num_iterations": (20, 80), "num_leaves": (16, 1024), "min_sum_hessian_in_leaf": (1e-6, 1.0)}
+    N_TRIALS, N_STARTUP_TRIALS = 4, 2
+    N_SEMILLAS_AGOSTO = 3
+    GAIN_WINDOW = 51
+    CORTES = [300, 500, 700]
+    CORTE_REF = 500
+
+
+# [Anotación · líneas 115–141] Define is_prime() y prime_seeds(), que extrae enteros de 6 cifras con
+#   numpy.random.default_rng(20261009) y conserva los primos no repetidos. La lista final de semillas son las 10
+#   escritas en el código seguidas de 50 primos generados así; un assert exige 60 semillas distintas.
+def is_prime(n):
+    if n < 2:
+        return False
+    if n % 2 == 0:
+        return n == 2
+    divisor = 3
+    while divisor * divisor <= n:
+        if n % divisor == 0:
+            return False
+        divisor += 2
+    return True
+
+
+def prime_seeds(n, exclude, rng_seed=SEED_LIST_RNG, low=100_000, high=999_999):
+    """n primos distintos de 6 cifras, siempre en el mismo orden (la lista de s0005, s0006 y c9920)."""
+    rng = np.random.default_rng(rng_seed)
+    seeds, taken = [], set(exclude)
+    while len(seeds) < n:
+        candidate = int(rng.integers(low, high + 1))
+        if candidate not in taken and is_prime(candidate):
+            seeds.append(candidate)
+            taken.add(candidate)
+    return seeds
+
+
+FINAL_SEEDS = (SEEDS_S0004 + prime_seeds(max(N_SEMILLAS_AGOSTO - len(SEEDS_S0004), 0), exclude=SEEDS_S0004))[:N_SEMILLAS_AGOSTO]
+assert len(set(FINAL_SEEDS)) == len(FINAL_SEEDS) == N_SEMILLAS_AGOSTO
+
+# [Anotación · líneas 143–170] Elige las carpetas. Si existe ~/buckets/b1 y no está definida DMEYF_OUT_DIR,
+#   escribe los resultados en ~/buckets/b1/exp/c9923, los temporales en ~/local/c9923, los datos en ~/datasets y
+#   busca la entrada de c9920 en ~/buckets/b1/exp/c9920 (o en DMEYF_C9920_DIR). Si no, busca la raíz del
+#   repositorio y usa outputs/c9923, data/ y outputs/c9920, modificables por variables de entorno. En modo
+#   prueba agrega la subcarpeta prueba/. Crea 2_bayesiana, 3_referencia_junio, 4_agosto y 5_cortes, y define
+#   log.txt y los archivos de control PARAR y CORTAR_BAYESIANA.
+# Carpetas. En Google Cloud: resultados en el bucket (sobreviven si se borra la máquina) y temporales en el disco local.
+BUCKET = Path.home() / "buckets" / "b1"
+EN_GCP = BUCKET.is_dir() and "DMEYF_OUT_DIR" not in os.environ
+if EN_GCP:
+    OUT_DIR = BUCKET / "exp" / EXP_ID
+    LOCAL_DIR = Path.home() / "local" / EXP_ID
+    DATA_DIR = Path.home() / "datasets"
+    C9920_DIR = Path(os.environ.get("DMEYF_C9920_DIR", BUCKET / "exp" / "c9920"))
+else:
+    cwd = Path.cwd().resolve()
+    BASE_DIR = next((p for p in [cwd, *cwd.parents] if (p / "01_c9920_canaritos_asesinos").is_dir()), cwd)  # raíz del repo
+    OUT_DIR = Path(os.environ.get("DMEYF_OUT_DIR", BASE_DIR / "outputs" / EXP_ID))
+    LOCAL_DIR = OUT_DIR / "local"
+    DATA_DIR = Path(os.environ.get("DMEYF_DATA_DIR", BASE_DIR / "data"))
+    C9920_DIR = Path(os.environ.get("DMEYF_C9920_DIR", BASE_DIR / "outputs" / "c9920"))
+if MODO_PRUEBA:
+    OUT_DIR, LOCAL_DIR = OUT_DIR / "prueba", LOCAL_DIR / "prueba"
+
+BO_DIR = OUT_DIR / "2_bayesiana"
+JUNE_DIR = OUT_DIR / "3_referencia_junio"
+AUG_DIR = OUT_DIR / "4_agosto"
+CUTS_DIR = OUT_DIR / "5_cortes"
+for folder in (DATA_DIR, OUT_DIR, LOCAL_DIR, BO_DIR, JUNE_DIR, AUG_DIR, CUTS_DIR):
+    folder.mkdir(parents=True, exist_ok=True)
+
+LOG_PATH = OUT_DIR / "log.txt"
+STOP_FILE = OUT_DIR / "PARAR"  # touch ~/buckets/b1/exp/c9923/PARAR -> no empieza más semillas de agosto
+STOP_BO_FILE = OUT_DIR / "CORTAR_BAYESIANA"  # touch ... -> termina la corrida en curso y pasa a junio y agosto
+
+
+# [Anotación · líneas 173–214] log() imprime cada mensaje y lo agrega con fecha y hora a log.txt. apagar_vm()
+#   lanza en un proceso separado el script ~/machina/direct/apagar_vm.sh y después un gcloud compute instances
+#   delete con los datos del servidor de metadatos; no hace nada si no está en Google Cloud o el script no
+#   existe, y la parte de gcloud se saltea si el nombre de la máquina empieza con desktop o es instance-
+#   instalacion. _apagar_si_falla se registra como callback post_run_cell de IPython: ante un error distinto de
+#   KeyboardInterrupt lo escribe en el log y, si la bandera está activa, borra la máquina.
+def log(*parts):
+    """Imprime y además deja la línea en log.txt (en el bucket), por si se cierra el navegador."""
+    text = " ".join(str(part) for part in parts)
+    print(text, flush=True)
+    with open(LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + text + "\n")
+
+
+def apagar_vm(motivo):
+    """Borra esta máquina virtual con el script de la cátedra (las plantillas spot se borran, no se apagan)."""
+    script = Path.home() / "machina" / "direct" / "apagar_vm.sh"
+    if not EN_GCP or not script.exists():
+        log(f"[apagado] {motivo}: no estoy en una máquina virtual de la cátedra, no apago nada.")
+        return
+    log(f"[apagado] {motivo}: borrando la máquina virtual. Los resultados quedaron en {OUT_DIR}")
+    # Si el script de la cátedra no encuentra el proyecto (fcur_project_id vacío), borra igual con los metadatos de Google (nunca una desktop).
+    respaldo = f"""bash {script}
+case "$(hostname)" in desktop*|instance-instalacion) exit 0;; esac
+MD=http://metadata.google.internal/computeMetadata/v1; H="Metadata-Flavor: Google"
+ZONA=$(curl -s -H "$H" $MD/instance/zone)
+gcloud --quiet compute instances delete "$(curl -s -H "$H" $MD/instance/name)" --zone="${{ZONA##*/}}" --project="$(curl -s -H "$H" $MD/project/project-id)"
+"""
+    with open(OUT_DIR / "apagado.txt", "a") as salida:
+        subprocess.Popen(["bash", "-c", respaldo], stdout=salida, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def _apagar_si_falla(result):
+    error = result.error_in_exec
+    if error is not None and not isinstance(error, KeyboardInterrupt):
+        log(f"[error] {type(error).__name__}: {error}")
+        if APAGAR_SI_FALLA:
+            apagar_vm("una celda falló")
+
+
+try:
+    _ip = get_ipython()
+    for _callback in list(_ip.events.callbacks["post_run_cell"]):
+        if getattr(_callback, "__name__", "") == "_apagar_si_falla":
+            _ip.events.unregister("post_run_cell", _callback)
+    _ip.events.register("post_run_cell", _apagar_si_falla)
+except NameError:
+    pass
+
+
+# [Anotación · líneas 217–236] find_input() busca un archivo de c9920 en su subcarpeta o directamente en la
+#   carpeta de entrada. Lee listas.json y toma la lista media_2desvios como LIST_A; lee
+#   mejores_hiperparametros.json y guarda num_iterations, num_leaves y min_sum_hessian_in_leaf como
+#   C9920_VALUES. Verifica que esos valores estén dentro del espacio de búsqueda y, si no, corta con error.
+def find_input(name, subfolder):
+    """Busca un archivo de c9920 en su subcarpeta del bucket (o directo en la carpeta de entrada)."""
+    for path in (C9920_DIR / subfolder / name, C9920_DIR / name):
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"Falta {name} de c9920: tiene que estar en {C9920_DIR / subfolder}")
+
+
+C9920_LISTS = json.loads(find_input("listas.json", "1_seleccion").read_text(encoding="utf-8"))
+if LISTA_C9920 not in C9920_LISTS:
+    raise KeyError(f"listas.json no tiene la lista {LISTA_C9920!r}: {list(C9920_LISTS)}")
+LIST_A = list(C9920_LISTS[LISTA_C9920])
+_c9920_best = json.loads(find_input("mejores_hiperparametros.json", "3_bayesiana").read_text(encoding="utf-8"))["valores"]
+C9920_VALUES = {"num_iterations": int(_c9920_best["num_iterations"]), "num_leaves": int(_c9920_best["num_leaves"]),
+                "min_sum_hessian_in_leaf": float(_c9920_best["min_sum_hessian_in_leaf"])}
+if MODO_PRUEBA:
+    C9920_VALUES = {**C9920_VALUES, "num_iterations": 60, "num_leaves": min(C9920_VALUES["num_leaves"], 1024)}
+for _key, (_low, _high) in SEARCH_SPACE.items():
+    if not _low <= C9920_VALUES[_key] <= _high:
+        raise ValueError(f"El valor de c9920 {_key} = {C9920_VALUES[_key]} cae fuera del rango {(_low, _high)}")
+
+# [Anotación · líneas 238–247] Borra un archivo PARAR que haya quedado de una corrida anterior y escribe en el
+#   log la configuración: modo, carpetas, lista base, valores de c9920, cantidad de corridas y de semillas.
+if STOP_FILE.exists():  # un PARAR viejo frenaría agosto apenas empieza: se borra al arrancar
+    STOP_FILE.unlink()
+    print("Había un PARAR de una corrida anterior: lo borré.")
+
+log("=" * 70)
+log(f"{EXP_ID} | modo prueba: {MODO_PRUEBA} | Google Cloud: {EN_GCP} | hilos: {NUM_THREADS}")
+log("Resultados:", OUT_DIR, "| datos:", DATA_DIR, "| entrada de c9920:", C9920_DIR)
+log(f"Base: {LISTA_C9920} ({len(LIST_A)} variables) | valores de c9920 (primera corrida): {C9920_VALUES}")
+log(f"Bayesiana: {N_TRIALS} corridas, {SEARCH_SPACE} | agosto: hasta {N_SEMILLAS_AGOSTO} semillas")
+log(f"Para parar agosto: touch {STOP_FILE} | para cortar la bayesiana: touch {STOP_BO_FILE}")
+
+#%% celda 3 [texto]
+## Instalación de zLightGBM y Optuna (igual que `c9920`)
+
+zLightGBM no es un paquete de Python: se compila su núcleo C++ y se coloca dentro del paquete `lightgbm==4.6.0`, en `~/zlgb` (unos minutos, una vez por máquina). Con `canaritos = n`, nunca corta por las primeras n columnas.
+
+#%% celda 4 [código]
+# [Anotación · líneas 255–287] Arma un script de bash que baja zlightgbm_4.6.0.99.tar.gz, compila sus fuentes
+#   C++ con g++ (-O3, OpenMP) en lib_lightgbm.so, instala lightgbm==4.6.0 en una carpeta aparte y reemplaza su
+#   biblioteca por la compilada, todo en ~/zlgb (o en ZLGB_DIR). Lo ejecuta sólo si la biblioteca no existe.
+#   Pone esa carpeta primera en sys.path, importa lightgbm y corta con error si el módulo se cargó desde otro
+#   lugar.
+ZLGB_URL = "https://storage.googleapis.com/open-courses/dmeyf2025-e4a2/zlightgbm_4.6.0.99.tar.gz"
+BUILD_SCRIPT = r"""
+set -euo pipefail
+TARGET="$1"
+WORK="$TARGET"_build
+mkdir -p "$WORK" && cd "$WORK"
+curl -sSfLO {url}
+tar xzf zlightgbm_4.6.0.99.tar.gz
+S=zlightgbm/src
+FILES=$(find $S/src -name '*.cpp' -not -path '*/cuda/*' -not -name lightgbm_R.cpp -not -name main.cpp | grep -v 'gpu_tree_learner\|cuda')
+g++ -O3 -std=c++17 -fPIC -shared -fopenmp -DUSE_SOCKET -DMM_MALLOC -DMM_PREFETCH -DFMT_HEADER_ONLY \
+  -I$S/include -I$S/external_libs/fmt/include -I$S/external_libs/fast_double_parser/include \
+  $FILES -o lib_lightgbm.so
+"{python}" -m pip install -q "lightgbm==4.6.0" --target "$WORK/pkg" --no-deps
+rm -rf "$TARGET" && mkdir -p "$TARGET"
+cp -r "$WORK/pkg/lightgbm" "$TARGET/lightgbm"
+cp "$WORK/lib_lightgbm.so" "$TARGET/lightgbm/lib/lib_lightgbm.so"
+""".format(url=ZLGB_URL, python=sys.executable)
+
+ZLGB_DIR = Path(os.environ.get("ZLGB_DIR", Path.home() / "zlgb"))
+if not (ZLGB_DIR / "lightgbm" / "lib" / "lib_lightgbm.so").exists():
+    log("Compilando zlightgbm en", ZLGB_DIR, "(tarda unos minutos)...")
+    start = time.perf_counter()
+    subprocess.run(["bash", "-c", BUILD_SCRIPT, "build", str(ZLGB_DIR)], check=True)
+    log(f"zlightgbm compilado en {(time.perf_counter() - start) / 60:.1f} min")
+
+if "lightgbm" in sys.modules and not Path(sys.modules["lightgbm"].__file__).resolve().is_relative_to(ZLGB_DIR.resolve()):
+    raise RuntimeError("El kernel ya tiene cargado otro lightgbm. Reiniciá el kernel y volvé a ejecutar.")
+sys.path.insert(0, str(ZLGB_DIR))
+import lightgbm as lgb
+
+if not Path(lgb.__file__).resolve().is_relative_to(ZLGB_DIR.resolve()):
+    raise RuntimeError(f"Se cargó lightgbm desde {lgb.__file__}, no desde {ZLGB_DIR}.")
+
+# [Anotación · líneas 289–303] Prueba con datos sintéticos (20.000 filas, 10 columnas uniformes adelante y 10
+#   normales): entrena 20 rondas con y sin el parámetro canaritos = 10 y exige que con el parámetro haya 0
+#   cortes en las primeras 10 columnas y sin él al menos uno; si no se cumple, corta con error.
+# Prueba: con canaritos adelante, zlightgbm nunca los usa; sin el parámetro, sí (LightGBM común).
+_rng = np.random.default_rng(0)
+_X = _rng.normal(size=(20_000, 10))
+_y = ((_X[:, 0] + _X[:, 1] * _X[:, 2] + _rng.normal(size=20_000) * 2) > 1).astype(int)
+_Xc = np.hstack([_rng.uniform(size=(20_000, 10)), _X])
+_params = dict(objective="binary", num_leaves=256, min_data_in_leaf=5, learning_rate=0.05,
+               verbose=-1, seed=1, num_threads=NUM_THREADS)
+_plain = lgb.train(_params, lgb.Dataset(_Xc, label=_y), num_boost_round=20)
+_canary = lgb.train({**_params, "canaritos": 10}, lgb.Dataset(_Xc, label=_y), num_boost_round=20)
+_splits_plain = int(_plain.feature_importance("split")[:10].sum())
+_splits_canary = int(_canary.feature_importance("split")[:10].sum())
+if _splits_canary != 0 or _splits_plain == 0:
+    raise RuntimeError("Este lightgbm no parece ser zlightgbm: el parámetro canaritos no tuvo efecto.")
+del _rng, _X, _y, _Xc, _plain, _canary
+log(f"zlightgbm OK ({lgb.__file__}): cortes en canaritos sin el parámetro {_splits_plain}, con el parámetro 0")
+
+# [Anotación · líneas 305–315] Importa Optuna (lo instala con pip, sin versión fija, si no está), baja su
+#   nivel de mensajes a WARNING, silencia ExperimentalWarning y escribe la versión en el log.
+try:
+    import optuna
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "optuna"], check=True)
+    import importlib
+    importlib.invalidate_caches()
+    import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
+from optuna.trial import TrialState
+log("Optuna", optuna.__version__)
+
+#%% celda 5 [texto]
+## Datos (igual que `c9920`)
+
+- **Clase ternaria:** se arma con todas las fotos (CONTINUA, BAJA+1, BAJA+2). Julio y agosto quedan sin clase. Positivos: BAJA+1 y BAJA+2.
+- `ccajas_depositos` en NA en 202105. Sin undersampling.
+- En modo prueba se usa el 5 % de los clientes (siempre los mismos).
+
+#%% celda 6 [código]
+# [Anotación · líneas 325–332] Busca competencia_01_crudo.csv en la carpeta de datos (acepta también el nombre
+#   comptetencia_01_crudo.csv); si no está, lo baja de DATA_URL a un archivo temporal y lo renombra.
+data_start = time.perf_counter()
+RAW_PATH = next((p for p in [DATA_DIR / "competencia_01_crudo.csv", DATA_DIR / "comptetencia_01_crudo.csv"] if p.exists()), None)
+if RAW_PATH is None:
+    RAW_PATH = DATA_DIR / "competencia_01_crudo.csv"
+    log("Bajando el dataset a", RAW_PATH)
+    urlretrieve(DATA_URL, RAW_PATH.with_suffix(".tmp"))
+    os.replace(RAW_PATH.with_suffix(".tmp"), RAW_PATH)
+log("Dataset:", RAW_PATH, f"({RAW_PATH.stat().st_size / 2**20:.0f} MB)")
+
+# [Anotación · líneas 334–356] Arma la clase ternaria con todos los meses del archivo. Convierte foto_mes a un
+#   número de mes corrido (año × 12 + mes), ordena por cliente y obtiene los dos períodos siguientes de cada
+#   cliente. Marca CONTINUA los registros anteriores al penúltimo período; BAJA+1 los anteriores al último cuyo
+#   período siguiente falta o no es el mes consecutivo; BAJA+2 los anteriores al penúltimo que tienen el mes
+#   siguiente y no el subsiguiente. Las asignaciones posteriores pisan a las anteriores. El último período queda
+#   sin clase y el penúltimo sólo recibe BAJA+1 cuando falta el mes siguiente. Devuelve las etiquetas en el
+#   orden de filas del CSV.
+# Clase ternaria con todas las fotos (idéntico a s0004, s0006 y c9920).
+keys = pd.read_csv(RAW_PATH, usecols=["numero_de_cliente", "foto_mes"])
+work = keys.copy()
+work["_row_id"] = np.arange(len(work), dtype=np.int64)
+work["periodo0"] = (work["foto_mes"] // 100) * 12 + work["foto_mes"] % 100
+work = work.sort_values(["numero_de_cliente", "periodo0"], kind="mergesort")
+periods = work.groupby("numero_de_cliente", sort=False)["periodo0"]
+work["periodo1"] = periods.shift(-1)
+work["periodo2"] = periods.shift(-2)
+last_period = int(work["periodo0"].max())
+penultimate_period = last_period - 1
+clase = pd.Series(pd.NA, index=work.index, dtype="string")
+continua = work["periodo0"] < penultimate_period
+baja_1 = (work["periodo0"] < last_period) & (work["periodo1"].isna() | (work["periodo0"] + 1 < work["periodo1"]))
+baja_2 = (
+    (work["periodo0"] < penultimate_period)
+    & (work["periodo0"] + 1 == work["periodo1"])
+    & (work["periodo2"].isna() | (work["periodo0"] + 2 < work["periodo2"]))
+)
+clase.loc[continua] = "CONTINUA"
+clase.loc[baja_1] = "BAJA+1"
+clase.loc[baja_2] = "BAJA+2"
+labels = pd.Series(clase.to_numpy(), index=work["_row_id"].to_numpy()).sort_index().reset_index(drop=True)
+
+
+# [Anotación · líneas 359–372] release_memory() llama al recolector de basura y a malloc_trim de libc.
+#   client_in_sample() devuelve todos los clientes salvo en modo prueba, donde conserva aquellos cuyo número
+#   multiplicado por 2654435761, módulo 1.000, es menor que 50 (5 %).
+def release_memory():
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def client_in_sample(client_ids):
+    """Modo prueba: el mismo 5 % de los clientes siempre (por número de cliente)."""
+    if not MODO_PRUEBA:
+        return np.ones(len(client_ids), dtype=bool)
+    return (np.asarray(client_ids, dtype=np.int64) * 2654435761 % 1000) < PRUEBA_FRACCION_CLIENTES * 1000
+
+
+# [Anotación · líneas 375–403] Lee el encabezado y toma como campos base todas las columnas menos
+#   numero_de_cliente, foto_mes y clase_ternaria. Recorre el CSV en bloques de 25.000 filas, conserva las de los
+#   meses 202103 a 202108, les asigna la clase por número de fila y convierte cada campo a float32 (lo no
+#   numérico pasa a NA). Concatena los bloques en panel_keys (cliente, mes, fila, clase) y en la matriz
+#   base_values.
+csv_columns = list(pd.read_csv(RAW_PATH, nrows=0).columns)
+KEY_COLUMNS = {"numero_de_cliente", "foto_mes", "clase_ternaria", "_row_id"}
+base_feature_names = [c for c in csv_columns if c not in KEY_COLUMNS]
+n_base = len(base_feature_names)
+
+key_parts, value_parts = [], []
+offset = 0
+for chunk in pd.read_csv(RAW_PATH, chunksize=25_000, low_memory=False):
+    chunk_row_ids = np.arange(offset, offset + len(chunk), dtype=np.int64)
+    offset += len(chunk)
+    keep = chunk["foto_mes"].isin(NEEDED_MONTHS).to_numpy() & client_in_sample(chunk["numero_de_cliente"].to_numpy())
+    if not keep.any():
+        continue
+    part = pd.DataFrame({
+        "numero_de_cliente": chunk["numero_de_cliente"].to_numpy()[keep],
+        "foto_mes": chunk["foto_mes"].to_numpy()[keep],
+        "_row_id": chunk_row_ids[keep],
+    })
+    part["clase_ternaria"] = labels.iloc[part["_row_id"].to_numpy()].to_numpy()
+    values = np.empty((int(keep.sum()), n_base), dtype=np.float32)
+    for j, column in enumerate(base_feature_names):
+        values[:, j] = pd.to_numeric(chunk[column], errors="coerce").astype("float32").to_numpy()[keep]
+    key_parts.append(part)
+    value_parts.append(values)
+del chunk, part, values, keys, work, clase, labels
+panel_keys = pd.concat(key_parts, ignore_index=True)
+base_values = np.concatenate(value_parts)
+del key_parts, value_parts
+release_memory()
+
+# [Anotación · líneas 405–406] Pone en NA ccajas_depositos en todas las filas de 202105 y verifica que haya
+#   152 campos base.
+base_values[panel_keys["foto_mes"].eq(202105).to_numpy(), base_feature_names.index("ccajas_depositos")] = np.nan
+assert n_base == 152
+
+# [Anotación · líneas 408–426] Para k = 1 y 2 calcula, para cada fila, la posición de la observación k lugares
+#   antes del mismo cliente (ordenando por cliente, mes y número de fila) y una máscara que indica si existe.
+#   Guarda también el mes de cada fila y su número de mes corrido, que se usa como eje x de la pendiente.
+#   Escribe en el log el tamaño del panel.
+# Posición de la observación anterior (k = 1) y de dos antes (k = 2) del mismo cliente (idéntico a c9920).
+clients = panel_keys["numero_de_cliente"].to_numpy()
+order = np.lexsort((panel_keys["_row_id"].to_numpy(), panel_keys["foto_mes"].to_numpy(), clients))
+sorted_clients = clients[order]
+sorted_positions = np.arange(len(order))
+previous = {}
+for k in LAG_ORDERS:
+    valid_sorted = sorted_positions >= k
+    valid_sorted[valid_sorted] = sorted_clients[sorted_positions[valid_sorted] - k] == sorted_clients[valid_sorted]
+    position = np.zeros(len(order), dtype=np.int64)
+    valid = np.zeros(len(order), dtype=bool)
+    position[order] = np.where(valid_sorted, order[np.maximum(sorted_positions - k, 0)], 0)
+    valid[order] = valid_sorted
+    previous[k] = (position, valid)
+del clients, order, sorted_clients, sorted_positions, valid_sorted, position, valid
+
+row_months = panel_keys["foto_mes"].to_numpy()
+row_period = ((row_months // 100) * 12 + row_months % 100).astype(np.float64)  # para la pendiente (x = mes)
+log(f"Panel: {len(panel_keys)} filas de {sorted(NEEDED_MONTHS)} | {n_base} campos originales")
+
+#%% celda 7 [texto]
+## Atributos nuevos del mes (11)
+
+Con los valores crudos de cada mes, antes de lags y ranking. Sumas: un NA cuenta como 0 (si todos son NA, queda NA). Ratios: NA si el denominador es 0 o NA. Las banderas y `cproductos_perdidos` miran la observación anterior del cliente (sin observación anterior, NA).
+
+| Variable | Cálculo |
+|---|---|
+| `mfondos_pesos_total` | mcaja_ahorro + mcuenta_corriente + mplazo_fijo_pesos |
+| `ctc_transacciones_total` | ctarjeta_visa_transacciones + ctarjeta_master_transacciones |
+| `mtc_saldo_total` | Visa_msaldototal + Master_msaldototal |
+| `mmargen_activo_pasivo` | mactivos_margen − mpasivos_margen |
+| `mtc_pagominimo_total` | Visa_mpagominimo + Master_mpagominimo |
+| `rtc_saldo_limite` | mtc_saldo_total / (Visa_mlimitecompra + Master_mlimitecompra) |
+| `rdigital_trx` | (homebanking + app) / (homebanking + app + callcenter + cajas + cajeros propios + otros cajeros), transacciones del mes |
+| `cproductos_perdidos` | productos activos el mes anterior e inactivos en este (8 productos, tabla en el código) |
+| `tperdio_payroll` | 1 si cpayroll_trx anterior > 0 y actual = 0; 0 si los dos existen y no pasa |
+| `tinicio_comision` | 1 si mcomisiones_mantenimiento actual > 0 y anterior ≤ 0; 0 si los dos existen y no pasa |
+| `mpatrimonio_neto` | (mcuentas_saldo + plazos fijos + inversiones) − (préstamos + saldos de Visa y Master) |
+
+#%% celda 8 [código]
+# [Anotación · líneas 448–467] raw() devuelve un campo base como float64. suma() suma columnas tratando NA
+#   como 0 y devuelve NA sólo si todos los sumandos son NA. ratio() divide y devuelve NA cuando el denominador
+#   es 0 o alguno de los dos valores no es finito.
+_base_pos = {name: j for j, name in enumerate(base_feature_names)}
+
+
+def raw(name):
+    return base_values[:, _base_pos[name]].astype(np.float64)
+
+
+def suma(*arrays):
+    """Suma con NA como 0; NA solo si todos son NA."""
+    stack = np.column_stack(arrays)
+    total = np.nansum(stack, axis=1)
+    total[np.isnan(stack).all(axis=1)] = np.nan
+    return total
+
+
+def ratio(numerator, denominator):
+    out = np.full(len(numerator), np.nan)
+    ok = np.isfinite(numerator) & np.isfinite(denominator) & (denominator != 0)
+    out[ok] = numerator[ok] / denominator[ok]
+    return out
+
+
+# [Anotación · líneas 470–490] anterior() devuelve el valor de la observación anterior del cliente (NA si no
+#   hay). bandera() convierte una condición en 1/0 y pone NA si falta alguno de los valores que mira.
+#   estado_producto() da 1 si alguna de las columnas del producto es mayor que 0, 0 si todas son 0 y NA en el
+#   resto de los casos.
+_prev_position, _prev_valid = previous[1]
+
+
+def anterior(values):
+    """El valor de la observación anterior del cliente (NA si no hay)."""
+    out = values[_prev_position].copy()
+    out[~_prev_valid] = np.nan
+    return out
+
+
+def bandera(condition, *arrays):
+    """1/0 según la condición; NA si falta alguno de los valores que mira."""
+    out = np.where(condition, 1.0, 0.0)
+    out[~np.all([np.isfinite(a) for a in arrays], axis=0)] = np.nan
+    return out
+
+
+def estado_producto(columns):
+    """1 si alguna fuente > 0; 0 si todas son 0; NA si ninguna es > 0 y alguna es NA."""
+    stack = np.column_stack([raw(c) for c in columns])
+    return np.where((stack > 0).any(axis=1), 1.0, np.where((stack == 0).all(axis=1), 0.0, np.nan))
+
+
+# [Anotación · líneas 493–498] Asserts con valores escritos a mano para suma(), ratio() y bandera().
+# Pruebas de las funciones con valores a mano
+assert np.allclose(suma(np.array([1.0, np.nan, np.nan]), np.array([2.0, 3.0, np.nan])), [3.0, 3.0, np.nan], equal_nan=True)
+assert np.allclose(ratio(np.array([1.0, 1.0, np.nan, 2.0]), np.array([4.0, 0.0, 1.0, np.nan])), [0.25, np.nan, np.nan, np.nan], equal_nan=True)
+_p, _c = np.array([5.0, 5.0, 0.0, np.nan, 5.0]), np.array([0.0, 3.0, 0.0, 0.0, np.nan])
+assert np.allclose(bandera((_p > 0) & (_c == 0), _p, _c), [1, 0, 0, np.nan, np.nan], equal_nan=True)
+del _p, _c
+
+# [Anotación · líneas 500–519] Define 8 productos con sus columnas de origen (tarjetas de crédito, sueldo,
+#   débitos automáticos, pagos, préstamos, inversiones, seguros y caja de seguridad), 6 columnas de activos y 5
+#   de deudas. Verifica que todas las columnas necesarias existan en el dataset y, si falta alguna, corta con
+#   KeyError.
+PRODUCTOS = {
+    "tarjetas_credito": ["ctarjeta_visa", "ctarjeta_master"],
+    "sueldo": ["cpayroll_trx", "cpayroll2_trx"],
+    "debitos_automaticos": ["ccuenta_debitos_automaticos", "ctarjeta_visa_debitos_automaticos", "ctarjeta_master_debitos_automaticos"],
+    "pagos": ["cpagodeservicios", "cpagomiscuentas"],
+    "prestamos": ["cprestamos_personales", "cprestamos_prendarios", "cprestamos_hipotecarios"],
+    "inversiones": ["cplazo_fijo", "cinversion1", "cinversion2"],
+    "seguros": ["cseguro_vida", "cseguro_auto", "cseguro_vivienda", "cseguro_accidentes_personales"],
+    "caja_seguridad": ["ccaja_seguridad"],
+}
+ACTIVOS = ["mcuentas_saldo", "mplazo_fijo_pesos", "mplazo_fijo_dolares", "minversion1_pesos", "minversion1_dolares", "minversion2"]
+DEUDAS = ["mprestamos_personales", "mprestamos_prendarios", "mprestamos_hipotecarios", "Visa_msaldototal", "Master_msaldototal"]
+_needed = {c for cols in PRODUCTOS.values() for c in cols} | set(ACTIVOS) | set(DEUDAS) | {
+    "mcaja_ahorro", "mcuenta_corriente", "ctarjeta_visa_transacciones", "ctarjeta_master_transacciones", "mactivos_margen",
+    "mpasivos_margen", "Visa_mpagominimo", "Master_mpagominimo", "Visa_mlimitecompra", "Master_mlimitecompra",
+    "chomebanking_transacciones", "cmobile_app_trx", "ccallcenter_transacciones", "ccajas_transacciones", "catm_trx",
+    "catm_trx_other", "cpayroll_trx", "mcomisiones_mantenimiento"}
+_missing = sorted(_needed - set(base_feature_names))
+if _missing:
+    raise KeyError(f"Faltan columnas en el dataset: {_missing}")
+
+# [Anotación · líneas 521–532] Calcula valores intermedios: saldo total de tarjetas (Visa + Master),
+#   transacciones digitales (homebanking + app), transacciones por todos los canales, cpayroll_trx y
+#   mcomisiones_mantenimiento actuales y de la observación anterior. Cuenta los productos perdidos: para cada
+#   uno de los 8 productos suma 1 si estaba activo en la observación anterior e inactivo en la actual, y deja NA
+#   si no hay observación anterior. El patrimonio es activos menos deudas con NA como 0, y NA si ambos son NA.
+mtc_saldo = suma(raw("Visa_msaldototal"), raw("Master_msaldototal"))
+digital = suma(raw("chomebanking_transacciones"), raw("cmobile_app_trx"))
+canales = suma(digital, raw("ccallcenter_transacciones"), raw("ccajas_transacciones"), raw("catm_trx"), raw("catm_trx_other"))
+payroll, payroll_ant = raw("cpayroll_trx"), anterior(raw("cpayroll_trx"))
+comision, comision_ant = raw("mcomisiones_mantenimiento"), anterior(raw("mcomisiones_mantenimiento"))
+productos_perdidos = np.zeros(len(base_values))
+for _cols in PRODUCTOS.values():
+    _estado = estado_producto(_cols)
+    productos_perdidos += (anterior(_estado) == 1) & (_estado == 0)
+productos_perdidos[~_prev_valid] = np.nan
+activos, deudas = suma(*[raw(c) for c in ACTIVOS]), suma(*[raw(c) for c in DEUDAS])
+patrimonio = np.where(np.isnan(activos) & np.isnan(deudas), np.nan, np.nan_to_num(activos) - np.nan_to_num(deudas))
+
+# [Anotación · líneas 534–550] Arma los 11 atributos nuevos: mfondos_pesos_total, ctc_transacciones_total,
+#   mtc_saldo_total, mmargen_activo_pasivo, mtc_pagominimo_total, rtc_saldo_limite (saldo de tarjetas sobre suma
+#   de límites de compra), rdigital_trx (transacciones digitales sobre el total de canales),
+#   cproductos_perdidos, tperdio_payroll (cpayroll_trx anterior > 0 y actual = 0), tinicio_comision (comisión de
+#   mantenimiento actual > 0 y anterior ≤ 0) y mpatrimonio_neto. Verifica que sean 11 y que no repitan nombres
+#   del dataset, los apila en una matriz float32 y reemplaza los infinitos por NA.
+NEW_FIELDS = {
+    "mfondos_pesos_total": suma(raw("mcaja_ahorro"), raw("mcuenta_corriente"), raw("mplazo_fijo_pesos")),
+    "ctc_transacciones_total": suma(raw("ctarjeta_visa_transacciones"), raw("ctarjeta_master_transacciones")),
+    "mtc_saldo_total": mtc_saldo,
+    "mmargen_activo_pasivo": suma(raw("mactivos_margen"), -raw("mpasivos_margen")),
+    "mtc_pagominimo_total": suma(raw("Visa_mpagominimo"), raw("Master_mpagominimo")),
+    "rtc_saldo_limite": ratio(mtc_saldo, suma(raw("Visa_mlimitecompra"), raw("Master_mlimitecompra"))),
+    "rdigital_trx": ratio(digital, canales),
+    "cproductos_perdidos": productos_perdidos,
+    "tperdio_payroll": bandera((payroll_ant > 0) & (payroll == 0), payroll_ant, payroll),
+    "tinicio_comision": bandera((comision > 0) & (comision_ant <= 0), comision, comision_ant),
+    "mpatrimonio_neto": patrimonio,
+}
+NEW_NAMES = list(NEW_FIELDS)
+assert len(NEW_NAMES) == 11 and not set(NEW_NAMES) & set(base_feature_names)
+new_values = np.column_stack([v.astype(np.float32) for v in NEW_FIELDS.values()])
+new_values[~np.isfinite(new_values)] = np.nan  # nada de infinitos
+
+# [Anotación · líneas 552–572] Controles con assert: rdigital_trx entre 0 y 1, las dos banderas sólo con 0 y
+#   1, cproductos_perdidos entre 0 y 8, y las tres variables que miran la observación anterior todas en NA en
+#   202103. Muestra una tabla con porcentaje de NA, media, mediana y medias de junio y agosto. Une los 152
+#   campos base y los 11 nuevos en field_values y libera los intermedios.
+# Controles: proporciones razonables y rangos esperados
+_months = pd.Series(row_months)
+_check = pd.DataFrame(new_values, columns=NEW_NAMES)
+assert np.nanmin(_check["rdigital_trx"]) >= 0 and np.nanmax(_check["rdigital_trx"]) <= 1
+assert set(np.unique(_check["tperdio_payroll"].dropna())) <= {0.0, 1.0}
+assert set(np.unique(_check["tinicio_comision"].dropna())) <= {0.0, 1.0}
+assert np.nanmin(_check["cproductos_perdidos"]) >= 0 and np.nanmax(_check["cproductos_perdidos"]) <= len(PRODUCTOS)
+assert _check.loc[_months.eq(202103).to_numpy(), ["cproductos_perdidos", "tperdio_payroll", "tinicio_comision"]].isna().all().all()
+_resumen = pd.DataFrame({"NA %": _check.isna().mean() * 100, "media": _check.mean(), "mediana": _check.median()})
+_resumen["media junio"] = _check[_months.eq(202106).to_numpy()].mean()
+_resumen["media agosto"] = _check[_months.eq(202108).to_numpy()].mean()
+display(_resumen.round(4))
+
+del NEW_FIELDS, mtc_saldo, digital, canales, payroll, payroll_ant, comision, comision_ant, productos_perdidos
+del activos, deudas, patrimonio, _check, _resumen, _months
+field_names = base_feature_names + NEW_NAMES
+field_values = np.hstack([base_values, new_values])
+field_pos = {name: j for j, name in enumerate(field_names)}
+del base_values, new_values
+release_memory()
+log(f"Atributos nuevos: {NEW_NAMES}")
+
+#%% celda 9 [texto]
+## Variables del modelo
+
+- Las 128 de `c9920`, con su mismo cálculo (los lags son el valor de la observación anterior del cliente; el delta, actual − lag).
+- Los 11 atributos nuevos con lag1, delta_lag1, lag2 y delta_lag2.
+- `_avg3`: promedio de los valores disponibles en t, t−1 y t−2 (mínimo 2). `_slope3`: pendiente de mínimos cuadrados de esos valores contra el mes (mínimo 2). Para los campos base de las 128 y los 11 nuevos.
+
+#%% celda 10 [código]
+# [Anotación · líneas 582–601] parse_feature() separa el nombre de una variable en campo, tipo (original, lag,
+#   delta, avg3 o slope3) y orden k según su sufijo. expand() genera, para una lista de campos, los nombres del
+#   original y de _lag1, _delta_lag1, _lag2 y _delta_lag2.
+def parse_feature(name):
+    """'campo', 'campo_lag1', 'campo_delta_lag2', 'campo_avg3', 'campo_slope3' -> (campo, tipo, k)."""
+    for suffix, kind in (("_avg3", "avg3"), ("_slope3", "slope3")):
+        if name.endswith(suffix):
+            return name[: -len(suffix)], kind, 0
+    for k in LAG_ORDERS:
+        if name.endswith(f"_delta_lag{k}"):
+            return name[: -len(f"_delta_lag{k}")], "delta", k
+        if name.endswith(f"_lag{k}"):
+            return name[: -len(f"_lag{k}")], "lag", k
+    return name, "original", 0
+
+
+def expand(fields):
+    """Original, lag1, delta_lag1, lag2, delta_lag2 (el orden de c9920)."""
+    names = list(fields)
+    for k in LAG_ORDERS:
+        for field in fields:
+            names += [f"{field}_lag{k}", f"{field}_delta_lag{k}"]
+    return names
+
+
+# [Anotación · líneas 604–628] window_stats() recibe los valores y los meses de t−2, t−1 y t y calcula, con
+#   los valores disponibles, el promedio y la pendiente de mínimos cuadrados del valor contra el mes. Devuelve
+#   NA si hay menos de 2 valores (y pendiente NA si los meses no varían). Sigue un assert con cinco filas
+#   escritas a mano.
+def window_stats(values, months):
+    """values, months: (n, 3) con t−2, t−1, t (NA donde falta). Devuelve promedio y pendiente con mínimo 2 valores."""
+    mask = np.isfinite(values)
+    count = mask.sum(axis=1)
+    safe = np.where(mask, values, 0.0)
+    x = np.where(mask, months, 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        y_mean = safe.sum(axis=1) / count
+        x_mean = x.sum(axis=1) / count
+        dx = np.where(mask, months - x_mean[:, None], 0.0)
+        dy = np.where(mask, values - y_mean[:, None], 0.0)
+        denominator = (dx * dx).sum(axis=1)
+        slope = (dx * dy).sum(axis=1) / denominator
+    ok = count >= 2
+    avg = np.where(ok, y_mean, np.nan)
+    slope = np.where(ok & (denominator > 0), slope, np.nan)
+    return avg, slope
+
+
+_v = np.array([[1, 2, 4], [np.nan, 2, 4], [np.nan, np.nan, 4], [3, np.nan, 7], [np.nan, np.nan, np.nan]], dtype=float)
+_m = np.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]], dtype=float)
+_avg, _slope = window_stats(_v, _m)
+assert np.allclose(_avg, [7 / 3, 3, np.nan, 5, np.nan], equal_nan=True), _avg
+assert np.allclose(_slope, [1.5, 2, np.nan, 2, np.nan], equal_nan=True), _slope
+del _v, _m, _avg, _slope
+
+# [Anotación · líneas 630–643] Verifica que cada nombre de la lista de c9920 corresponda a un campo base. Toma
+#   los campos base distintos que aparecen en esa lista más los 11 nuevos como campos con historia. La lista
+#   final de variables es: las de c9920 en su orden, los 11 nuevos expandidos con lags y deltas (55 columnas) y
+#   un _avg3 y un _slope3 por cada campo con historia. Verifica que no haya nombres repetidos y calcula una
+#   huella SHA-1 de 12 caracteres de la lista.
+unknown = [n for n in LIST_A if parse_feature(n)[0] not in base_feature_names or parse_feature(n)[1] in ("avg3", "slope3")]
+if unknown:
+    raise ValueError(f"La lista de c9920 tiene nombres que no reconozco: {unknown[:5]}")
+HIST_FIELDS = list(dict.fromkeys(parse_feature(n)[0] for n in LIST_A)) + NEW_NAMES
+N_BASE_FIELDS = len(HIST_FIELDS) - len(NEW_NAMES)
+NEW_COLUMNS = expand(NEW_NAMES)
+HIST_COLUMNS = [f"{f}_avg3" for f in HIST_FIELDS] + [f"{f}_slope3" for f in HIST_FIELDS]
+FEATURES = LIST_A + NEW_COLUMNS + HIST_COLUMNS  # las de c9920 primero, en su mismo orden
+if len(set(FEATURES)) != len(FEATURES):
+    raise ValueError("Hay nombres de variables repetidos")
+feature_index = {name: i for i, name in enumerate(FEATURES)}
+COLUMNS = list(range(len(FEATURES)))
+FEATURES_HASH = hashlib.sha1(",".join(FEATURES).encode()).hexdigest()[:12]
+assert len(FEATURES) == len(LIST_A) + 5 * len(NEW_NAMES) + 2 * len(HIST_FIELDS)
+
+# [Anotación · líneas 645–647] Separa las filas de entrenamiento (202103 a 202106, ordenadas por mes) y las de
+#   202108.
+fit_rows = np.flatnonzero(np.isin(row_months, FIT_MONTHS))
+fit_rows = fit_rows[np.argsort(row_months[fit_rows], kind="stable")]
+future_rows = np.flatnonzero(row_months == PREDICT_MONTH)
+
+
+# [Anotación · líneas 650–679] fill_columns() construye, en bloques de 20.000 filas, la matriz de las
+#   variables pedidas: el valor actual para las originales, el valor de la observación k lugares antes para los
+#   lags (NA si no existe), la resta actual − lag para los deltas, y promedio o pendiente de la ventana (lag2,
+#   lag1, actual) con window_stats() para _avg3 y _slope3, calculando cada campo una sola vez por bloque.
+def fill_columns(rows, names, block=20_000):
+    """Originales, lags y deltas igual que c9920; avg3 y slope3 sobre t−2, t−1, t."""
+    specs = [(field_pos[f], kind, k) for f, kind, k in (parse_feature(n) for n in names)]
+    out_all = np.empty((len(rows), len(names)), dtype=np.float32)
+    for start in range(0, len(rows), block):
+        block_rows = rows[start:start + block]
+        current = field_values[block_rows]
+        lagged, lag_period = {}, {}
+        for k in LAG_ORDERS:
+            position, valid = previous[k]
+            values = field_values[position[block_rows]]
+            values[~valid[block_rows]] = np.nan
+            lagged[k] = values
+            lag_period[k] = row_period[position[block_rows]]
+        months = np.column_stack([lag_period[2], lag_period[1], row_period[block_rows]])
+        out = out_all[start:start + len(block_rows)]
+        window_cache = {}
+        for i, (j, kind, k) in enumerate(specs):
+            if kind == "original":
+                out[:, i] = current[:, j]
+            elif kind == "lag":
+                out[:, i] = lagged[k][:, j]
+            elif kind == "delta":
+                out[:, i] = current[:, j] - lagged[k][:, j]
+            else:
+                if j not in window_cache:
+                    window = np.column_stack([lagged[2][:, j], lagged[1][:, j], current[:, j]]).astype(np.float64)
+                    window_cache[j] = window_stats(window, months)
+                out[:, i] = window_cache[j][0 if kind == "avg3" else 1]
+    return out_all
+
+
+# [Anotación · líneas 682–697] Construye R_fit (202103–202106) y R_pred (202108), guarda cliente, mes y clase
+#   de las filas de entrenamiento y los números de cliente de agosto. La clase binaria vale 1 cuando la clase
+#   ternaria no es CONTINUA (BAJA+1 o BAJA+2). Libera el panel y calcula huellas SHA-1 del orden de las filas de
+#   entrenamiento y de agosto, que se usan al retomar una corrida.
+R_fit = fill_columns(fit_rows, FEATURES)
+R_pred = fill_columns(future_rows, FEATURES)
+fit_info = panel_keys.loc[fit_rows, ["numero_de_cliente", "foto_mes", "clase_ternaria"]].reset_index(drop=True)
+future_ids = panel_keys.loc[future_rows, "numero_de_cliente"].to_numpy(dtype=np.int64)
+y_fit = (~fit_info["clase_ternaria"].eq("CONTINUA")).astype(np.int8).to_numpy()
+del panel_keys, field_values, previous, row_months, row_period
+
+
+def ids_hash(*arrays):
+    """Huella del orden de las filas: al retomar, solo se reusan predicciones guardadas con el mismo orden de clientes."""
+    return hashlib.sha1(b"".join(np.ascontiguousarray(a, dtype=np.int64).tobytes() for a in arrays)).hexdigest()[:12]
+
+
+FIT_IDS_HASH = ids_hash(fit_info["numero_de_cliente"].to_numpy(), fit_info["foto_mes"].to_numpy())
+AUG_IDS_HASH = ids_hash(future_ids)
+release_memory()
+
+# [Anotación · líneas 699–721] Ubica el bloque contiguo de filas de cada mes dentro de R_fit (corta con error
+#   si no es contiguo) y define las filas de la búsqueda (202103–202105), las de validación (202106) y todas.
+#   Arma dos máscaras de junio: positivos (BAJA+1 o BAJA+2) y sólo BAJA+2.
+fit_months = fit_info["foto_mes"].to_numpy()
+MONTH_SLICES = {}
+for month in FIT_MONTHS:
+    rows = np.flatnonzero(fit_months == month)
+    if len(rows) == 0 or rows[-1] - rows[0] + 1 != len(rows):
+        raise RuntimeError(f"Las filas de {month} no forman un bloque contiguo")
+    MONTH_SLICES[month] = slice(int(rows[0]), int(rows[-1]) + 1)
+del rows
+
+
+def months_slice(months):
+    months = sorted(months)
+    selector = slice(MONTH_SLICES[months[0]].start, MONTH_SLICES[months[-1]].stop)
+    if sorted(np.unique(fit_months[selector]).tolist()) != months:
+        raise RuntimeError(f"El bloque {months} no es contiguo")
+    return selector
+
+
+BO_ROWS = months_slice(BO_TRAIN_MONTHS)
+VALID_ROWS = MONTH_SLICES[VALID_MONTH]
+ALL_ROWS = slice(0, R_fit.shape[0])
+june_positive = y_fit[VALID_ROWS].astype(bool)
+june_baja2 = fit_info["clase_ternaria"].eq("BAJA+2").to_numpy(dtype=bool)[VALID_ROWS]
+
+# [Anotación · líneas 723–736] Controles con assert: todas las filas de entrenamiento tienen clase, los meses
+#   están ordenados, R_fit y R_pred tienen la misma cantidad de columnas, ccajas_depositos está en NA en 202105,
+#   mtc_saldo_total_lag2 está en NA en 202104, y _avg3 y _slope3 de mtc_saldo_total están en NA en 202103. En
+#   junio más de la mitad de las filas tiene valor en cuatro variables nuevas de muestra, y en agosto en
+#   mtc_saldo_total_avg3.
+# Controles
+assert fit_info["clase_ternaria"].notna().all()
+assert (np.diff(fit_months) >= 0).all()
+assert R_fit.shape[1] == R_pred.shape[1] == len(FEATURES)
+if "ccajas_depositos" in feature_index:
+    assert np.isnan(R_fit[MONTH_SLICES[202105], feature_index["ccajas_depositos"]]).all()
+assert np.isnan(R_fit[MONTH_SLICES[202104], feature_index["mtc_saldo_total_lag2"]]).all()  # abril no tiene lag2
+assert np.isnan(R_fit[MONTH_SLICES[202103], feature_index["mtc_saldo_total_avg3"]]).all()  # marzo no tiene historia
+assert np.isnan(R_fit[MONTH_SLICES[202103], feature_index["mtc_saldo_total_slope3"]]).all()
+_june = R_fit[VALID_ROWS]
+for _name in ("mtc_saldo_total_avg3", "mtc_saldo_total_slope3", "tperdio_payroll", "cproductos_perdidos_lag2"):
+    assert np.isfinite(_june[:, feature_index[_name]]).mean() > 0.5, _name
+assert np.isfinite(R_pred[:, feature_index["mtc_saldo_total_avg3"]]).mean() > 0.5
+del _june
+
+# [Anotación · líneas 738–750] Muestra una tabla con la cantidad de columnas por bloque (base de c9920, nuevas
+#   con lags y deltas, _avg3 y _slope3, total), escribe variables.json con la lista y su huella, y deja en el
+#   log la cantidad de registros por mes y clase, de filas y de variables.
+columns_table = pd.DataFrame([
+    {"bloque": "base c9920", "columnas": len(LIST_A)},
+    {"bloque": "11 atributos nuevos x 5 (con lags y deltas)", "columnas": len(NEW_COLUMNS)},
+    {"bloque": f"_avg3 y _slope3 ({N_BASE_FIELDS} campos base + {len(NEW_NAMES)} nuevos)", "columnas": len(HIST_COLUMNS)},
+    {"bloque": "total (más el mismo número de canaritos)", "columnas": len(FEATURES)},
+])
+display(columns_table)
+(OUT_DIR / "variables.json").write_text(json.dumps({"variables": FEATURES, "hash": FEATURES_HASH}, ensure_ascii=False,
+                                                  indent=2), encoding="utf-8")
+log(f"Clase: {fit_info.groupby(['foto_mes', 'clase_ternaria']).size().unstack().to_dict('index')}")
+log(f"Filas: {R_fit.shape[0]} de marzo a junio, {R_pred.shape[0]} de agosto | variables: {len(LIST_A)} de c9920 + "
+    f"{len(NEW_COLUMNS)} nuevas + {len(HIST_COLUMNS)} avg3/slope3 ({N_BASE_FIELDS} campos base) = {len(FEATURES)} | "
+    f"datos en {(time.perf_counter() - data_start) / 60:.1f} min")
+
+#%% celda 11 [texto]
+## Ranking con cero fijo (igual que `c9920`)
+
+Cada columna, por separado y por mes: 0 → 0, NA → NA, positivos en (0, 1], negativos en [−1, 0), empates con rango promedio.
+
+#%% celda 12 [código]
+# [Anotación · líneas 758–775] rank_cero_fijo() transforma un vector: el 0 queda en 0 y el NA en NA; los
+#   positivos se reemplazan por su rango promedio dividido por la cantidad de positivos, en (0, 1]; los
+#   negativos, por menos el rango de su valor absoluto dividido por la cantidad de negativos, en [−1, 0). Sigue
+#   un assert con un ejemplo de 10 valores.
+def rank_cero_fijo(values):
+    ranked = np.full(values.shape, np.nan, dtype=np.float32)
+    ranked[values == 0] = 0.0
+    positive = values > 0
+    negative = values < 0
+    n_positive = int(positive.sum())
+    n_negative = int(negative.sum())
+    if n_positive:
+        ranked[positive] = pd.Series(values[positive]).rank(method="average").to_numpy() / n_positive
+    if n_negative:
+        ranked[negative] = -pd.Series(-values[negative]).rank(method="average").to_numpy() / n_negative
+    return ranked
+
+
+_test = rank_cero_fijo(np.array([0, -50, 10, np.nan, 30, -5, 10, 1000, -50, -1], dtype=np.float32))
+_expected = np.array([0, -0.875, 0.375, np.nan, 0.75, -0.5, 0.375, 1, -0.875, -0.25], dtype=np.float32)
+assert np.allclose(_test, _expected, equal_nan=True), _test
+del _test, _expected
+
+# [Anotación · líneas 777–786] Aplica rank_cero_fijo() a cada columna por separado dentro de cada uno de los
+#   cuatro meses de R_fit y dentro de agosto en R_pred. Verifica que la cantidad de NA no cambie y que todo
+#   quede entre −1 y 1.
+rank_start = time.perf_counter()
+for matrix, selector in [*[(R_fit, MONTH_SLICES[m]) for m in FIT_MONTHS], (R_pred, slice(0, R_pred.shape[0]))]:
+    block = matrix[selector]
+    na_before = np.isnan(block).sum()
+    for j in range(block.shape[1]):
+        block[:, j] = rank_cero_fijo(block[:, j])
+    assert np.isnan(block).sum() == na_before
+    assert np.nanmin(block) >= -1.0 and np.nanmax(block) <= 1.0
+release_memory()
+log(f"Ranking listo en {time.perf_counter() - rank_start:.0f} s")
+
+#%% celda 13 [texto]
+## Funciones comunes
+
+Métricas de junio (AUC con BAJA+1 y BAJA+2 positivos, *average precision* con solo BAJA+2, ganancia suavizada), guardado seguro (escribe un temporal y lo renombra) y entrenamiento con canaritos 1 a 1 adelante.
+
+#%% celda 14 [código]
+# [Anotación · líneas 794–815] Funciones de guardado: save_atomic() escribe en un archivo .tmp y lo renombra;
+#   save_json() y save_npy() la usan; load_json() lee un JSON; canonical() pasa un objeto por JSON para
+#   compararlo con lo guardado.
+def save_atomic(path, write):
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as handle:
+        write(handle)
+    os.replace(tmp, path)
+
+
+def save_json(path, data):
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    save_atomic(path, lambda handle: handle.write(text.encode("utf-8")))
+
+
+def save_npy(path, array):
+    save_atomic(path, lambda handle: np.save(handle, array))
+
+
+def load_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def canonical(data):
+    return json.loads(json.dumps(data))
+
+
+# [Anotación · líneas 818–833] auc_score() calcula el AUC a partir de la suma de rangos de los positivos.
+#   average_precision() ordena de mayor a menor puntaje y promedia la precisión en la posición de cada positivo.
+def auc_score(positive, scores):
+    positive = np.asarray(positive, dtype=bool)
+    n_positive = int(positive.sum())
+    n_negative = len(positive) - n_positive
+    ranks = pd.Series(np.asarray(scores, dtype=np.float64)).rank(method="average").to_numpy()
+    return float((ranks[positive].sum() - n_positive * (n_positive + 1) / 2) / (n_positive * n_negative))
+
+
+def average_precision(positive, scores):
+    """Promedio de la precisión en la posición de cada positivo (lista ordenada de mayor a menor)."""
+    order = np.argsort(-np.asarray(scores, dtype=np.float64), kind="stable")
+    hits = np.asarray(positive, dtype=bool)[order]
+    if not hits.any():
+        return float("nan")
+    precision_at = np.cumsum(hits) / np.arange(1, len(hits) + 1)
+    return float(precision_at[hits].mean())
+
+
+# [Anotación · líneas 836–859] gain_curve() ordena por puntaje descendente, acumula +1,0725 por cada BAJA+2 y
+#   −0,0275 por cada otro registro, y suaviza la curva con una media móvil centrada de 501 posiciones.
+#   june_metrics() devuelve para junio el AUC (positivos BAJA+1 y BAJA+2), la average precision con sólo BAJA+2,
+#   el máximo de la ganancia suavizada, la posición donde ocurre y la ganancia suavizada en el corte 11.000.
+#   Siguen dos asserts con valores a mano.
+def gain_curve(baja2, scores):
+    order = np.argsort(-np.asarray(scores, dtype=np.float64), kind="stable")
+    cumulative = np.cumsum(np.where(baja2[order], GAIN_BAJA2, GAIN_OTHER))
+    smooth = pd.Series(cumulative).rolling(window=GAIN_WINDOW, center=True, min_periods=GAIN_WINDOW).mean().to_numpy()
+    return cumulative, smooth
+
+
+def june_metrics(scores):
+    _, smooth = gain_curve(june_baja2, scores)
+    best = int(np.nanargmax(smooth))
+    return {
+        "auc": auc_score(june_positive, scores),
+        "ap_baja2": average_precision(june_baja2, scores),
+        "ganancia_maxima": float(smooth[best]),
+        "mejor_corte": best + 1,
+        f"ganancia_corte_{CORTE_REF}": float(smooth[CORTE_REF - 1]),
+    }
+
+
+_positive = np.array([1, 0, 1, 0, 0, 1, 0, 0], dtype=bool)
+_scores = np.array([0.9, 0.8, 0.8, 0.5, 0.4, 0.4, 0.2, 0.1])
+assert np.isclose(auc_score(_positive, _scores), 12 / 15)
+assert np.isclose(average_precision(np.array([1, 0, 1, 0], dtype=bool), np.array([0.9, 0.8, 0.7, 0.1])), (1 + 2 / 3) / 2)
+del _positive, _scores
+
+
+# [Anotación · líneas 862–881] zlgb_params() arma los parámetros del modelo: objective binary, metric auc,
+#   boosting gbdt, canaritos igual a la cantidad de canaritos, learning_rate 0,005, feature_fraction 0,5,
+#   feature_fraction_bynode 0,2, min_data_in_leaf 0, max_bin 31, feature_pre_filter False, force_col_wise True,
+#   y num_leaves, min_sum_hessian_in_leaf y seed recibidos.
+def zlgb_params(values, n_canaries, seed):
+    """Fijos del profesor (como c9920) con canaritos 1 a 1. num_iterations va aparte."""
+    return {
+        "objective": "binary",
+        "metric": LGB_METRIC,
+        "boosting": "gbdt",
+        "canaritos": int(n_canaries),
+        "learning_rate": LEARNING_RATE,
+        "feature_fraction": FEATURE_FRACTION,
+        "feature_fraction_bynode": FEATURE_FRACTION_BYNODE,
+        "min_data_in_leaf": MIN_DATA_IN_LEAF,
+        "num_leaves": int(values["num_leaves"]),
+        "min_sum_hessian_in_leaf": float(values["min_sum_hessian_in_leaf"]),
+        "max_bin": MAX_BIN,
+        "num_threads": NUM_THREADS,
+        "feature_pre_filter": False,
+        "force_col_wise": True,
+        "verbose": -1,
+        "seed": int(seed),
+    }
+
+
+# [Anotación · líneas 884–906] with_canaries() arma la matriz de entrenamiento con n columnas de números
+#   uniformes al azar (generadas con la semilla) seguidas de las n variables reales. train_zlgb() entrena
+#   zLightGBM con esa matriz durante num_iterations rondas y corta con error si el modelo usó algún canarito en
+#   un corte.
+def with_canaries(real, columns, seed):
+    """Matriz [canaritos | variables reales], con un canarito por variable (zLightGBM los quiere adelante)."""
+    n = len(columns)
+    out = np.empty((real.shape[0], 2 * n), dtype=np.float32)
+    out[:, :n] = np.random.default_rng(seed).random((real.shape[0], n), dtype=np.float32)
+    out[:, n:] = real[:, columns]
+    return out
+
+
+def train_zlgb(columns, values, seed, train_rows):
+    """zLightGBM con las variables `columns` y n canaritos adelante. Verifica que no corte por canaritos."""
+    n = len(columns)
+    X = with_canaries(R_fit[train_rows], columns, seed)
+    names = [f"canarito_{i:04d}" for i in range(1, n + 1)] + [FEATURES[j] for j in columns]
+    dataset = lgb.Dataset(X, label=y_fit[train_rows], feature_name=names, free_raw_data=True,
+                          params=zlgb_params(values, n, seed))
+    booster = lgb.train(zlgb_params(values, n, seed), dataset, num_boost_round=int(values["num_iterations"]))
+    del X, dataset
+    release_memory()
+    canary_splits = int(booster.feature_importance("split")[:n].sum())
+    if canary_splits:
+        raise RuntimeError(f"El modelo cortó {canary_splits} veces por canaritos: zlightgbm no está podando")
+    return booster
+
+
+# [Anotación · líneas 909–922] predict_june() predice las filas de junio, con canaritos generados con semilla
+#   + 1. gain_by_group() calcula qué proporción del gain de las variables reales corresponde a cada bloque: base
+#   de c9920, nuevas y _avg3/_slope3.
+def predict_june(booster, columns, seed):
+    return booster.predict(with_canaries(R_fit[VALID_ROWS], columns, seed + 1))
+
+
+def gain_by_group(booster, n):
+    """Proporción del gain de las variables reales por bloque (base c9920, nuevas, avg3/slope3)."""
+    gain = booster.feature_importance("gain")[n:]
+    total = gain.sum()
+    groups = {"base": gain[:len(LIST_A)].sum(), "nuevas": gain[len(LIST_A):len(LIST_A) + len(NEW_COLUMNS)].sum(),
+              "avg3_slope3": gain[len(LIST_A) + len(NEW_COLUMNS):].sum()}
+    return {f"gain_{k}": round(float(v / total), 4) if total > 0 else 0.0 for k, v in groups.items()}
+
+
+log("Funciones listas")
+
+#%% celda 15 [texto]
+## 1. Optimización bayesiana
+
+Optuna (TPE multivariado): 25 corridas = 1 con los valores de `c9920` + 10 al azar + 14 guiadas. Cada corrida entrena un zLightGBM completo con marzo a mayo (semilla 101737), predice junio y se califica con el **AUC de junio**. Se guardan además la AP (solo BAJA+2), la ganancia y las predicciones de junio de cada corrida.
+
+El estudio (SQLite) vive en el disco local porque SQLite no funciona bien sobre el bucket; después de cada corrida se copia al bucket, y al empezar se recupera de ahí si la máquina es nueva. Con `CORTAR_BAYESIANA` en la carpeta del experimento termina la corrida en curso y sigue.
+
+#%% celda 16 [código]
+# [Anotación · líneas 932–948] Arma la configuración de la búsqueda (huellas de variables y filas, espacio,
+#   meses, semilla y parámetros fijos). Abre o crea el estudio de Optuna en un SQLite del disco local,
+#   recuperándolo del bucket si en el disco no está, con dirección maximize; corta con error si el estudio
+#   guardado es de otra configuración. El muestreador es TPESampler multivariado con 11 corridas iniciales y
+#   semilla 20261011 más la cantidad de corridas ya registradas.
+BO_CONFIG = canonical({"variables": FEATURES_HASH, "filas": FIT_IDS_HASH, "search_space": SEARCH_SPACE,
+                       "n_startup_trials": N_STARTUP_TRIALS, "meses": BO_TRAIN_MONTHS, "valida": VALID_MONTH,
+                       "seed": BO_SEED, "prueba": MODO_PRUEBA,
+                       "fijos": {k: v for k, v in zlgb_params(C9920_VALUES, 0, BO_SEED).items()
+                                 if k not in ("num_leaves", "min_sum_hessian_in_leaf", "canaritos", "num_threads")}})
+LOCAL_DB, BUCKET_DB = LOCAL_DIR / "estudio.db", BO_DIR / "estudio.db"
+if not LOCAL_DB.exists() and BUCKET_DB.exists():
+    shutil.copy(BUCKET_DB, LOCAL_DB)
+    log("Estudio recuperado del bucket")
+study = optuna.create_study(study_name=f"{EXP_ID}_bayesiana", storage=f"sqlite:///{LOCAL_DB.as_posix()}",
+                            direction="maximize", load_if_exists=True)
+if not study.trials:
+    study.set_user_attr("config", BO_CONFIG)
+elif study.user_attrs.get("config") != BO_CONFIG:
+    raise RuntimeError(f"{LOCAL_DB} es de otra configuración. Movelo (y el del bucket) para empezar de cero.")
+study.sampler = optuna.samplers.TPESampler(n_startup_trials=N_STARTUP_TRIALS, seed=SAMPLER_SEED + len(study.trials),
+                                           multivariate=True)
+
+
+# [Anotación · líneas 951–960] Encola como primera corrida los valores de c9920 si todavía no hay una corrida
+#   completa con ellos ni una en espera.
+def completed_trials():
+    return [t for t in study.trials if t.state == TrialState.COMPLETE]
+
+
+# Una corrida que quedó a medias (se cortó la máquina) queda como RUNNING y no cuenta: se vuelve a hacer otra.
+if not any(t.params == C9920_VALUES for t in completed_trials()) \
+        and not any(t.state == TrialState.WAITING for t in study.trials):
+    study.enqueue_trial(C9920_VALUES)
+
+bo_timing = []
+
+
+# [Anotación · líneas 963–990] Función objetivo: pide a Optuna num_iterations, num_leaves y
+#   min_sum_hessian_in_leaf dentro del espacio, entrena zLightGBM con todas las variables de la lista sobre
+#   202103–202105 con semilla 101737, predice junio, guarda las predicciones en un .npy y registra en la corrida
+#   las métricas de junio, el reparto del gain por bloque, la cantidad de árboles, los minutos y el tipo (c9920,
+#   azar o guiada). Devuelve el AUC de junio.
+def objective(trial):
+    values = {
+        "num_iterations": trial.suggest_int("num_iterations", *SEARCH_SPACE["num_iterations"]),
+        "num_leaves": trial.suggest_int("num_leaves", *SEARCH_SPACE["num_leaves"]),
+        "min_sum_hessian_in_leaf": trial.suggest_float("min_sum_hessian_in_leaf", *SEARCH_SPACE["min_sum_hessian_in_leaf"]),
+    }
+    n_before = len(completed_trials())
+    kind = "c9920" if values == C9920_VALUES else ("azar" if n_before < N_STARTUP_TRIALS else "guiada")
+    start = time.perf_counter()
+    booster = train_zlgb(COLUMNS, values, BO_SEED, BO_ROWS)
+    scores = predict_june(booster, COLUMNS, BO_SEED)
+    num_trees = int(booster.num_trees())
+    groups = gain_by_group(booster, len(COLUMNS))
+    del booster
+    metrics = june_metrics(scores)
+    minutes = (time.perf_counter() - start) / 60
+    save_npy(BO_DIR / f"junio_corrida_{trial.number:03d}.npy", scores)
+    for key, value in {**metrics, **groups, "num_trees": num_trees, "minutos": round(minutes, 1), "tipo": kind}.items():
+        trial.set_user_attr(key, value)
+    bo_timing.append((values["num_iterations"], minutes * 60))
+    per_iteration = sum(s for _, s in bo_timing) / sum(n for n, _ in bo_timing)
+    left = N_TRIALS - n_before - 1
+    log(f"  corrida {n_before + 1:2d}/{N_TRIALS} ({kind:6s}) iter {values['num_iterations']:4d} | hojas "
+        f"{values['num_leaves']:4d} | hessian {values['min_sum_hessian_in_leaf']:.5f} -> AUC {metrics['auc']:.5f} | "
+        f"AP {metrics['ap_baja2']:.4f} | ganancia {metrics['ganancia_maxima']:.1f} con {metrics['mejor_corte']} | "
+        f"{num_trees} árboles | gain nuevas {groups['gain_nuevas']:.0%} avg/slope {groups['gain_avg3_slope3']:.0%} | "
+        f"{minutes:.1f} min | faltan ~{left * per_iteration * sum(SEARCH_SPACE['num_iterations']) / 2 / 3600:.1f} h")
+    return metrics["auc"]
+
+
+# [Anotación · líneas 993–1008] trials_table() arma la tabla de corridas completas ordenada por AUC.
+#   checkpoint() se ejecuta después de cada corrida: escribe corridas.csv, copia el SQLite al bucket (si la
+#   copia da error sólo deja un aviso en el log) y detiene el estudio si existe el archivo CORTAR_BAYESIANA.
+def trials_table():
+    rows = [{"corrida": t.number, **t.params, **t.user_attrs} for t in completed_trials()]
+    table = pd.DataFrame(rows)
+    return table.sort_values("auc", ascending=False).reset_index(drop=True) if len(table) else table
+
+
+def checkpoint(study_, trial_):
+    try:  # un error pasajero del bucket no frena la noche: la copia se repite en la próxima corrida
+        trials_table().to_csv(BO_DIR / "corridas.csv", index=False)
+        shutil.copy(LOCAL_DB, BO_DIR / "estudio.db.tmp")
+        os.replace(BO_DIR / "estudio.db.tmp", BUCKET_DB)
+    except Exception as error:
+        log(f"[aviso] no pude copiar el estudio al bucket: {error!r}")
+    if STOP_BO_FILE.exists() and completed_trials():
+        log(f"Encontré {STOP_BO_FILE.name}: corto la bayesiana con {len(completed_trials())} corridas.")
+        study_.stop()
+
+
+# [Anotación · líneas 1011–1032] Ejecuta las corridas que faltan hasta 25 (ninguna si existe CORTAR_BAYESIANA
+#   y ya hay corridas completas). Guarda corridas.csv, toma la corrida de mayor AUC de junio y escribe sus tres
+#   valores y sus métricas en mejores_hiperparametros.json. Deja en el log, a título informativo, qué corrida
+#   tiene mayor average precision y cuál mayor ganancia.
+remaining = N_TRIALS - len(completed_trials())
+if STOP_BO_FILE.exists() and completed_trials():
+    log(f"{STOP_BO_FILE.name} existe: no corro más corridas de la bayesiana.")
+    remaining = 0
+log(f"Bayesiana: {len(completed_trials())} de {N_TRIALS} corridas hechas")
+if remaining > 0:
+    study.optimize(objective, n_trials=remaining, callbacks=[checkpoint])
+bo_table = trials_table()
+bo_table.to_csv(BO_DIR / "corridas.csv", index=False)
+display(bo_table.round(5))
+best_trial = study.best_trial
+BEST_VALUES = {"num_iterations": int(best_trial.params["num_iterations"]),
+               "num_leaves": int(best_trial.params["num_leaves"]),
+               "min_sum_hessian_in_leaf": float(best_trial.params["min_sum_hessian_in_leaf"])}
+save_json(BO_DIR / "mejores_hiperparametros.json", {"corrida": best_trial.number, "valores": BEST_VALUES,
+                                                   **best_trial.user_attrs})
+log("Mejores valores (AUC):", BEST_VALUES, f"| corrida {best_trial.number} | AUC junio {best_trial.value:.5f} | "
+    f"AP {best_trial.user_attrs['ap_baja2']:.4f} | ganancia {best_trial.user_attrs['ganancia_maxima']:.1f}")
+for _metric in ("ap_baja2", "ganancia_maxima"):
+    _row = bo_table.sort_values(_metric, ascending=False).iloc[0]
+    log(f"  (informativo) la mejor por {_metric} es la corrida {int(_row['corrida'])}: iter {int(_row['num_iterations'])}, "
+        f"hojas {int(_row['num_leaves'])}, hessian {_row['min_sum_hessian_in_leaf']:.5f}")
+
+#%% celda 17 [texto]
+## 2. Referencia de junio
+
+Los mejores valores, 3 semillas (marzo a mayo → junio): 101737 se reusa de la bayesiana, las otras dos se entrenan. Se compara contra la referencia de junio de `c9920` (mismas 3 semillas, su lista y sus valores), leída del bucket. Da la curva de ganancia de junio por corte, para elegir el corte y para validar ensambles.
+
+#%% celda 18 [código]
+# [Anotación · líneas 1040–1060] Referencia de junio con las semillas 101737, 303011 y 602909: para 101737
+#   reusa las predicciones de la corrida elegida; para las otras dos entrena con 202103–202105 y los valores
+#   elegidos y predice junio (o reusa lo guardado si la configuración coincide). Promedia las tres predicciones
+#   y guarda junio_ensamble.npy.
+june_scores = {}
+for seed in JUNE_SEEDS:
+    if seed == BO_SEED:
+        june_scores[seed] = np.load(BO_DIR / f"junio_corrida_{best_trial.number:03d}.npy")
+        continue
+    base = JUNE_DIR / f"junio_seed{seed}"
+    config = canonical({"seed": seed, "valores": BEST_VALUES, "bayesiana": BO_CONFIG})
+    if base.with_suffix(".npy").exists() and base.with_suffix(".json").exists() \
+            and load_json(base.with_suffix(".json")) == config:
+        june_scores[seed] = np.load(base.with_suffix(".npy"))
+        continue
+    start = time.perf_counter()
+    booster = train_zlgb(COLUMNS, BEST_VALUES, seed, BO_ROWS)
+    june_scores[seed] = predict_june(booster, COLUMNS, seed)
+    del booster
+    save_json(base.with_suffix(".json"), config)
+    save_npy(base.with_suffix(".npy"), june_scores[seed])
+    log(f"  referencia semilla {seed}: ganancia {june_metrics(june_scores[seed])['ganancia_maxima']:.1f} | "
+        f"{(time.perf_counter() - start) / 60:.1f} min")
+c9923_june = np.column_stack([june_scores[s] for s in JUNE_SEEDS]).mean(axis=1)
+save_npy(JUNE_DIR / "junio_ensamble.npy", c9923_june)
+
+# [Anotación · líneas 1062–1084] Carga, si existe, el promedio de junio de c9920 y lo usa sólo si tiene la
+#   misma cantidad de filas y un AUC mayor que 0,8 contra las clases de este junio. Para cada corte de 9.000 a
+#   15.000 toma la ganancia suavizada de junio de c9923 (y la de c9920 y su diferencia, si está). Escribe
+#   ganancia_junio_por_corte.csv y deja las métricas en el log.
+june_curves = {"c9923": c9923_june}
+_c9920_june_path = next((p for p in (C9920_DIR / "4_referencia_junio" / "junio_ensamble.npy",
+                                     C9920_DIR / "junio_ensamble.npy") if p.exists()), None)
+if _c9920_june_path is not None and len(np.load(_c9920_june_path)) == len(c9923_june):
+    _c9920_june = np.load(_c9920_june_path)
+    if auc_score(june_positive, _c9920_june) > 0.8:  # si el orden de filas no coincidiera, el AUC daría ~0,5
+        june_curves["c9920"] = _c9920_june
+    else:
+        log("  la referencia de c9920 no coincide fila a fila con este junio: no la comparo")
+else:
+    log("  no encontré la referencia de junio de c9920 (o es de otro tamaño, como en modo prueba): no la comparo")
+
+june_by_cut = pd.DataFrame({"corte": CORTES})
+for label, scores in june_curves.items():
+    _, smooth = gain_curve(june_baja2, scores)
+    june_by_cut[label] = [float(smooth[c - 1]) for c in CORTES]
+    m = june_metrics(scores)
+    log(f"  ensamble de {len(JUNE_SEEDS)} {label}: AUC {m['auc']:.5f} | AP {m['ap_baja2']:.4f} | "
+        f"ganancia máxima {m['ganancia_maxima']:.1f} con {m['mejor_corte']} | en {CORTE_REF}: {m[f'ganancia_corte_{CORTE_REF}']:.1f}")
+if "c9920" in june_by_cut:
+    june_by_cut["diferencia"] = june_by_cut["c9923"] - june_by_cut["c9920"]
+june_by_cut.to_csv(JUNE_DIR / "ganancia_junio_por_corte.csv", index=False)
+display(june_by_cut.round(1))
+
+#%% celda 19 [texto]
+## 3. Semillas de agosto y cortes
+
+Los mejores valores, marzo a junio → agosto, hasta `N_SEMILLAS_AGOSTO` semillas (primero las de `s0004`, después los primos de `s0005`). Cada semilla se guarda apenas termina y **enseguida se rehacen los cortes** (un CSV por corte en `5_cortes/`, con la ganancia de junio al lado, y las probabilidades del ensamble en `4_agosto/probabilidades_agosto.csv.gz`).
+
+Antes de cada semilla nueva mira si existe `PARAR` en la carpeta del experimento: si está, no empieza otra.
+
+#%% celda 20 [código]
+# [Anotación · líneas 1094–1105] Guarda los números de cliente de agosto. aug_config() describe la
+#   configuración de una semilla (semilla, huellas, valores, meses, configuración de la búsqueda) y
+#   saved_seeds() devuelve las semillas ya guardadas con esa misma configuración.
+save_npy(AUG_DIR / "ids_agosto.npy", future_ids)
+
+
+def aug_config(seed):
+    return canonical({"seed": seed, "variables": FEATURES_HASH, "ids_agosto": AUG_IDS_HASH, "valores": BEST_VALUES,
+                      "meses": FIT_MONTHS, "bayesiana": BO_CONFIG, "prueba": MODO_PRUEBA})
+
+
+def saved_seeds():
+    """Semillas de agosto guardadas con la configuración actual, en el orden de FINAL_SEEDS."""
+    return [s for s in FINAL_SEEDS if (AUG_DIR / f"seed_{s}.npy").exists() and (AUG_DIR / f"seed_{s}.json").exists()
+            and load_json(AUG_DIR / f"seed_{s}.json") == aug_config(s)]
+
+
+# [Anotación · líneas 1108–1140] write_cuts() promedia las probabilidades de agosto de las semillas guardadas,
+#   ordena los clientes de mayor a menor y, para cada corte (exige entre 8.000 y 15.000), escribe un CSV sin
+#   encabezado con los primeros números de cliente, uno por línea, con nombre
+#   c9923_<semillas>sem_corte<corte>.csv. Borra los CSV de cortes anteriores, escribe cortes.csv con la ganancia
+#   de junio de cada corte y guarda probabilidades_agosto.csv.gz con cliente y probabilidad promedio.
+def write_cuts():
+    """Promedia las semillas guardadas y reescribe un CSV por corte (escritura segura: temporal y renombre)."""
+    seeds = saved_seeds()
+    if not seeds:
+        log("Cortes: todavía no hay semillas de agosto")
+        return None
+    ids = np.load(AUG_DIR / "ids_agosto.npy")
+    assert ids_hash(ids) == AUG_IDS_HASH, "ids_agosto.npy no tiene el orden de clientes de esta corrida"
+    ensemble = np.column_stack([np.load(AUG_DIR / f"seed_{s}.npy") for s in seeds]).mean(axis=1)
+    assert len(ensemble) == len(ids) == len(np.unique(ids))
+    ranking = np.argsort(-ensemble, kind="stable")
+    june_gain = june_by_cut.set_index("corte")["c9923"]
+    written, rows = set(), []
+    for cut in CORTES:
+        if not MODO_PRUEBA and not 8_000 <= cut <= 15_000:
+            raise ValueError(f"El bot acepta entre 8.000 y 15.000 registros: {cut}")
+        chosen = ids[ranking[:cut]].astype(np.int64)
+        assert len(np.unique(chosen)) == cut
+        path = CUTS_DIR / f"{EXP_ID}_{len(seeds)}sem_corte{cut}.csv"
+        text = "\n".join(map(str, chosen)) + "\n"
+        save_atomic(path, lambda handle: handle.write(text.encode("utf-8")))
+        written.add(path.name)
+        rows.append({"corte": cut, "archivo": path.name, "ganancia_junio_c9923": round(float(june_gain[cut]), 1)})
+    for old in CUTS_DIR.glob("*.csv"):
+        if old.name not in written:
+            old.unlink()
+    cuts_table = pd.DataFrame(rows)
+    save_atomic(OUT_DIR / "cortes.csv", lambda handle: handle.write(cuts_table.to_csv(index=False).encode("utf-8")))
+    probabilities = pd.DataFrame({"numero_de_cliente": ids, "score": ensemble})
+    save_atomic(AUG_DIR / "probabilidades_agosto.csv.gz",
+                lambda handle: probabilities.to_csv(handle, index=False, compression={"method": "gzip"}))
+    log(f"  cortes al día: {len(CORTES)} CSV con {len(seeds)} semillas en {CUTS_DIR}")
+    return cuts_table
+
+
+# [Anotación · líneas 1143–1170] Recorre las semillas pendientes. Antes de cada una mira si existe el archivo
+#   PARAR y, si está, no empieza otra. Entrena zLightGBM con los valores elegidos sobre todas las filas de
+#   202103 a 202106, predice agosto (canaritos con semilla + 1), guarda seed_<semilla>.npy y su configuración, y
+#   rehace los cortes; un error al rehacerlos sólo queda como aviso en el log. Al terminar el ciclo vuelve a
+#   escribir los cortes y muestra la tabla.
+done = saved_seeds()
+pending = [s for s in FINAL_SEEDS if s not in done]
+log(f"Agosto: {len(done)} semillas guardadas, faltan {len(pending)} (tope {N_SEMILLAS_AGOSTO})")
+stopped = False
+aug_start = time.perf_counter()
+for i, seed in enumerate(pending):
+    if STOP_FILE.exists():
+        log(f"Encontré {STOP_FILE.name}: no empiezo más semillas ({len(saved_seeds())} terminadas).")
+        stopped = True
+        break
+    start = time.perf_counter()
+    booster = train_zlgb(COLUMNS, BEST_VALUES, seed, ALL_ROWS)
+    probabilities = booster.predict(with_canaries(R_pred, COLUMNS, seed + 1))
+    del booster
+    save_npy(AUG_DIR / f"seed_{seed}.npy", probabilities)
+    save_json(AUG_DIR / f"seed_{seed}.json", aug_config(seed))
+    per_seed = (time.perf_counter() - aug_start) / (i + 1)
+    left = len(pending) - i - 1
+    log(f"  [{len(done) + i + 1}/{len(FINAL_SEEDS)}] semilla {seed}: {(time.perf_counter() - start) / 60:.1f} min | "
+        f"si nadie lo para, faltan ~{left * per_seed / 3600:.1f} h")
+    try:  # un error pasajero del bucket no frena la noche: los cortes se rehacen con la próxima semilla
+        write_cuts()
+    except Exception as error:
+        log(f"[aviso] no pude rehacer los cortes: {error!r}")
+
+cuts_table = write_cuts()
+if cuts_table is not None:
+    display(cuts_table)
+
+#%% celda 21 [texto]
+## 4. Fin y apagado
+
+Si `APAGAR_AL_TERMINAR = True` y estás en una máquina virtual de la cátedra, la borra. Todo quedó en el bucket, en la carpeta que muestra la primera celda.
+
+#%% celda 22 [código]
+# [Anotación · líneas 1178–1181] Escribe en el log el fin de la corrida con la cantidad de semillas de agosto
+#   y, si la bandera está activa, borra la máquina virtual.
+log(f"{EXP_ID} terminado (modo prueba: {MODO_PRUEBA}{', parado con PARAR' if stopped else ''}). "
+    f"{len(saved_seeds())} semillas de agosto. Resultados en {OUT_DIR}")
+if APAGAR_AL_TERMINAR:
+    apagar_vm("fin del notebook")

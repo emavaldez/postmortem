@@ -1,0 +1,23 @@
+{
+  "run": "work/competencia_1/runs/20261011-041115_e034_comportamiento",
+  "experimento": "e034_comportamiento",
+  "commit_del_run": "39cd97f228f61e1b70f00ae2a0917c86a3c44653",
+  "commit_actual": "27084eb76ef3357a54928f94e6879356eb38fdf9",
+  "promovido": "2026-10-11T12:13:50-03:00",
+  "envios": 10000,
+  "modelo": "promedio",
+  "csv_original": "20261011-041115_e034_comportamiento_promedio_e10000.csv",
+  "sha256_esperado": "0a957ababbff26f9a858066ff0d371d36378aef20dfe4e5217dde98043c10e41",
+  "versiones": {
+    "python": "3.11.0",
+    "lightgbm": "4.7.0",
+    "optuna": "4.9.0",
+    "polars": "1.43.2",
+    "duckdb": "1.5.5",
+    "numpy": "2.4.6"
+  },
+  "resultado_publico": null,
+  "modelos_incluidos": 24,
+  "config_experimento": "competencia_1/configs/exp/e034_comportamiento.yaml",
+  "completo_automatico": true
+}

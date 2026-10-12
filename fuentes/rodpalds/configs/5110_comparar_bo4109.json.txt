@@ -1,0 +1,38 @@
+{
+  "experimento": 5110,
+  "nombre": "comparar_bo4109",
+  "sobrescribir": true,
+  "descripcion": "R4: Bayesiana limpia 4109 (elegida solo por la mitad A) contra la prueba 23 en la variante elegida por R3 (md20248, 580 arboles). Train 202103+202104, ds3003 con lag2, mitad B de 202106 (x2), 30 semillas, bootstrap pareado.",
+  "referencia": "bo4109",
+  "n_semillas": 30,
+  "candidatos": {
+    "bo4109": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4109_bo_limpia_profesor/4109_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ]
+    },
+    "p23": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ],
+      "min_data_in_leaf": 20248,
+      "arboles_lista": [
+        580
+      ]
+    }
+  }
+}

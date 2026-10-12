@@ -1,0 +1,218 @@
+#%% celda 1 [texto]
+# Canaritos asesinos con meses nuevos (202105 + 202106)
+
+Misma receta oficial (20% canaritos, un LightGBM, ids ordinales, corte media + sd de los ids de los canaritos),
+pero entrenando con **202105 y 202106** en vez de 202103 y 202104.
+
+Pregunta: ¿la lista de 358 sobrevivientes (2sd) es robusta al período, o cambia mucho?
+
+Para separar "cambio por período" de "cambio por azar de la semilla" corro la receta con **2 semillas** sobre los
+mismos meses nuevos y comparo: (a) semilla 1 vs semilla 2 (ruido puro), (b) lista nueva vs lista original (período).
+No usa submits.
+
+#%% celda 2 [texto]
+### Setup y carga de datos
+
+#%% celda 3 [código]
+rm(list = ls())
+gc()
+
+require("data.table")
+require("lightgbm")
+
+PARAM_carpeta_datasets <- "C:/Users/Laura/Documents/DMEyF/datasets/"
+PARAM_carpeta_exp <- "C:/Users/Laura/Documents/DMEyF/exp/"
+
+SEMILLA <- 585581
+
+t0 <- Sys.time()
+dataset <- fread(paste0(PARAM_carpeta_datasets, "competencia_01_con_lags_fe_historico_rankeado.csv.gz"))
+cat("Dataset cargado:", nrow(dataset), "filas x", ncol(dataset), "columnas en",
+    round(as.numeric(Sys.time()-t0, units="secs"),1), "seg\n")
+
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+#%% celda 4 [texto]
+### Variables compuestas por lógica de negocio (mismas 15 de siempre)
+
+#%% celda 5 [código]
+agregar_si_existen <- function(dt, nombre_nueva, columnas, fun_combinacion) {
+  presentes <- columnas[columnas %in% colnames(dt)]
+  if (length(presentes) < 2) return(invisible(NULL))
+  dt[, (nombre_nueva) := fun_combinacion(.SD), .SDcols = presentes]
+}
+suma_filas <- function(sd) Reduce(`+`, sd)
+
+agregar_si_existen(dataset, "consumo_tarjetas_total", c("mtarjeta_visa_consumo", "mtarjeta_master_consumo"), suma_filas)
+agregar_si_existen(dataset, "consumototal_tarjetas", c("Visa_mconsumototal", "Master_mconsumototal"), suma_filas)
+agregar_si_existen(dataset, "saldo_tarjetas_total", c("Visa_msaldototal", "Master_msaldototal"), suma_filas)
+agregar_si_existen(dataset, "limite_tarjetas_total", c("Visa_mlimitecompra", "Master_mlimitecompra"), suma_filas)
+agregar_si_existen(dataset, "pagado_tarjetas_total", c("Visa_mpagado", "Master_mpagado"), suma_filas)
+agregar_si_existen(dataset, "pagominimo_tarjetas_total", c("Visa_mpagominimo", "Master_mpagominimo"), suma_filas)
+agregar_si_existen(dataset, "descuentos_tarjetas_total",
+                    c("mcajeros_propios_descuentos", "mtarjeta_visa_descuentos", "mtarjeta_master_descuentos"), suma_filas)
+
+if (all(c("consumototal_tarjetas", "limite_tarjetas_total") %in% colnames(dataset))) {
+  dataset[, utilizacion_tarjetas := ifelse(limite_tarjetas_total == 0, 0,
+                                            consumototal_tarjetas / limite_tarjetas_total)]
+}
+if (all(c("Visa_status", "Master_status") %in% colnames(dataset))) {
+  dataset[, tarjetas_activas_count := as.integer(Visa_status == 0) + as.integer(Master_status == 0)]
+}
+
+agregar_si_existen(dataset, "ingresos_payroll_total", c("mpayroll", "mpayroll2"), suma_filas)
+agregar_si_existen(dataset, "prestamos_sin_personales_total",
+                    c("mprestamos_prendarios", "mprestamos_hipotecarios"), suma_filas)
+agregar_si_existen(dataset, "inversiones_totales",
+                    c("minversion1_pesos", "minversion1_dolares", "minversion2"), suma_filas)
+agregar_si_existen(dataset, "plazo_fijo_total", c("mplazo_fijo_dolares", "mplazo_fijo_pesos"), suma_filas)
+
+if (all(c("mtransferencias_recibidas", "mtransferencias_emitidas") %in% colnames(dataset))) {
+  dataset[, transferencias_netas := mtransferencias_recibidas - mtransferencias_emitidas]
+}
+agregar_si_existen(dataset, "comisiones_totales_manual", c("mcomisiones_mantenimiento", "mcomisiones_otras"), suma_filas)
+
+campos_compuestos <- c("consumo_tarjetas_total", "consumototal_tarjetas", "saldo_tarjetas_total",
+                        "limite_tarjetas_total", "pagado_tarjetas_total", "pagominimo_tarjetas_total",
+                        "descuentos_tarjetas_total", "utilizacion_tarjetas", "tarjetas_activas_count",
+                        "ingresos_payroll_total", "prestamos_sin_personales_total", "inversiones_totales",
+                        "plazo_fijo_total", "transferencias_netas", "comisiones_totales_manual")
+campos_compuestos <- campos_compuestos[campos_compuestos %in% colnames(dataset)]
+cat("Compuestas disponibles:", length(campos_compuestos), "de 15\n")
+
+#%% celda 6 [código]
+campos_no_usar <- c("numero_de_cliente", "foto_mes", "clase_ternaria", "clase01",
+                     "cprestamos_personales", "mprestamos_personales")
+
+campos_candidatos <- setdiff(colnames(dataset), campos_no_usar)
+dataset_train <- dataset[foto_mes %in% c(202105, 202106)]
+rm(dataset)
+gc(full = TRUE, verbose = FALSE)
+
+cat("Variables candidatas:", length(campos_candidatos), "\n")
+
+#%% celda 7 [texto]
+### Receta completa en una función (se corre con 2 semillas)
+
+#%% celda 8 [código]
+correr_canaritos <- function(semilla) {
+  set.seed(semilla)
+  N_COLUMNAS <- length(campos_candidatos)
+  N_CANARITOS <- round(0.20 * N_COLUMNAS)
+  dt <- copy(dataset_train[, c(campos_candidatos, "clase01"), with = FALSE])
+  for (i in 1:N_CANARITOS) dt[, paste0("canarito_", i) := runif(.N)]
+  campos_cc <- c(campos_candidatos, paste0("canarito_", 1:N_CANARITOS))
+
+  param_manual <- list(
+    boosting = "gbdt",
+    objective = "binary",
+    metric = "auc",
+    first_metric_only = TRUE,
+    boost_from_average = TRUE,
+    feature_pre_filter = FALSE,
+    verbosity = -100,
+    seed = semilla,
+  
+    learning_rate = 0.02,
+    feature_fraction = 0.1541961,
+    feature_fraction_bynode = 1,
+    min_data_in_leaf = 4000,
+    num_leaves = 1684,
+    max_depth = -1,
+    lambda_l1 = 1.520327,
+    lambda_l2 = 7.548036,
+    min_gain_to_split = 0.2158453,
+    max_delta_step = 0,
+    bagging_fraction = 0.8425105,
+    bagging_freq = 6,
+    min_sum_hessian_in_leaf = 0.001,
+    pos_bagging_fraction = 1,
+    neg_bagging_fraction = 1,
+    extra_trees = FALSE,
+    path_smooth = 0,
+    cat_l2 = 10,
+    cat_smooth = 10,
+    max_cat_to_onehot = 4,
+    use_missing = TRUE,
+    is_unbalance = FALSE,
+    num_iterations = 600,
+    early_stopping_rounds = 0,
+    max_bin = 31,
+    scale_pos_weight = 0.5,
+    force_row_wise = TRUE
+  )
+  
+  
+  m <- data.matrix(dt[, campos_cc, with = FALSE])
+  t0 <- Sys.time()
+  modelo <- lgb.train(data = lgb.Dataset(m, label = dt$clase01, free_raw_data = FALSE),
+                      param = param_manual, verbose = -1)
+  cat("Semilla", semilla, "- entrenado en", round(as.numeric(Sys.time()-t0, units="secs"),1), "seg\n")
+  rm(dt, m); gc(full = TRUE, verbose = FALSE)
+
+  imp <- as.data.table(lgb.importance(modelo))
+  imp[, id := .I]
+  imp[, es_canarito := grepl("^canarito_", Feature)]
+  mu <- mean(imp[es_canarito == TRUE, id]); s <- sd(imp[es_canarito == TRUE, id])
+  cat("  media ids canaritos:", round(mu,1), " sd:", round(s,1), "\n")
+  list(imp = imp,
+       sd1 = imp[es_canarito == FALSE & id < mu + s, Feature],
+       sd2 = imp[es_canarito == FALSE & id < mu + 2*s, Feature])
+}
+
+res <- list()
+for (sem in c(585581, 249449)) res[[as.character(sem)]] <- correr_canaritos(sem)
+
+for (sem in names(res)) {
+  cat("Semilla", sem, "-> sobreviven 1sd:", length(res[[sem]]$sd1), " 2sd:", length(res[[sem]]$sd2), "\n")
+  fwrite(data.table(variable = res[[sem]]$sd1), paste0(PARAM_carpeta_exp, "campos_canaritos_202105_06_s", sem, "_1sd.txt"))
+  fwrite(data.table(variable = res[[sem]]$sd2), paste0(PARAM_carpeta_exp, "campos_canaritos_202105_06_s", sem, "_2sd.txt"))
+  fwrite(res[[sem]]$imp[order(id)], paste0(PARAM_carpeta_exp, "importancia_canaritos_202105_06_s", sem, ".txt"))
+}
+
+#%% celda 9 [texto]
+### Comparación de listas (2sd): ruido de semilla vs cambio de período
+
+#%% celda 10 [código]
+orig <- fread(paste0(PARAM_carpeta_exp, "campos_canaritos_asesinos_2sd.txt"))$variable
+n1 <- res[[1]]$sd2; n2 <- res[[2]]$sd2
+
+jacc <- function(a, b) round(length(intersect(a, b)) / length(union(a, b)), 3)
+tabla <- data.table(
+  comparacion = c("original (202103-04) vs nueva semilla 1", "original vs nueva semilla 2",
+                  "nueva semilla 1 vs nueva semilla 2 (ruido puro)",
+                  "original vs interseccion de las 2 nuevas"),
+  en_comun = c(length(intersect(orig, n1)), length(intersect(orig, n2)),
+               length(intersect(n1, n2)), length(intersect(orig, intersect(n1, n2)))),
+  jaccard = c(jacc(orig, n1), jacc(orig, n2), jacc(n1, n2), jacc(orig, intersect(n1, n2)))
+)
+print(tabla)
+
+robustas <- intersect(orig, intersect(n1, n2))
+cat("\nRobustas (en la original y en las dos nuevas):", length(robustas), "\n")
+cat("Solo en la original (se caen con meses nuevos):", length(setdiff(orig, union(n1, n2))), "\n")
+cat("Nuevas en ambas semillas y NO en la original:", length(setdiff(intersect(n1, n2), orig)), "\n")
+
+#%% celda 11 [texto]
+### Por tipo de variable: qué se cae y qué entra
+
+#%% celda 12 [código]
+tipo_de <- function(v) fcase(
+  grepl("_ratio_avg$", v), "ratio_avg", grepl("_ratio_max$", v), "ratio_max", grepl("_tendencia$", v), "tendencia",
+  grepl("_avg3$", v), "avg3", grepl("_max3$", v), "max3", grepl("_min3$", v), "min3",
+  grepl("_delta1$", v), "delta1", grepl("_delta2$", v), "delta2", grepl("_lag1$", v), "lag1", grepl("_lag2$", v), "lag2",
+  default = "base / compuesta")
+solo_orig   <- setdiff(orig, union(n1, n2))
+solo_nuevas <- setdiff(intersect(n1, n2), orig)
+tipos <- data.table(tipo = sort(unique(tipo_de(c(orig, n1, n2)))))
+tipos[, original := sapply(tipo, function(t) sum(tipo_de(orig) == t))]
+tipos[, robustas := sapply(tipo, function(t) sum(tipo_de(robustas) == t))]
+tipos[, se_caen := sapply(tipo, function(t) sum(tipo_de(solo_orig) == t))]
+tipos[, entran := sapply(tipo, function(t) sum(tipo_de(solo_nuevas) == t))]
+print(tipos[order(-original)])
+
+cat("\nTop 15 que entran (nuevas en ambas semillas, no en la original):\n")
+print(head(res[[1]]$imp[Feature %in% solo_nuevas, .(Feature, id)], 15))
+cat("\nTop 15 que se caen (originales ausentes en las dos nuevas), por importancia en la original:\n")
+imp_orig <- fread(paste0(PARAM_carpeta_exp, "importancia_canaritos_asesinos_completo.txt"))
+print(head(imp_orig[Feature %in% solo_orig, .(Feature, id)], 15))

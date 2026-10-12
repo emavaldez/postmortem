@@ -1,0 +1,316 @@
+#%% celda 1 [texto]
+# Entrega final: LightGBM (2 modelos x 5 semillas) + ensemble
+
+Todo el flujo en un solo notebook.
+- **Parte 1 (runtime Python 3):** montar Drive y descargar el dataset. Son las dos primeras celdas.
+- **Parte 2 (runtime R):** Runtime -> Change runtime type -> R. Desde `clase_ternaria` hasta el final.
+
+Cada corrida (modelo, semilla) se guarda en Drive. Si Colab se desconecta, volvé a correr desde la celda de librerias y retoma donde quedo.
+
+#%% celda 2 [texto]
+## 1. Ambiente (runtime Python 3)
+
+#%% celda 3 [código]
+from google.colab import drive
+drive.mount('/content/.drive')
+
+#%% celda 4 [código]
+%%shell
+
+mkdir -p "/content/.drive/My Drive/dmeyf"
+mkdir -p "/content/buckets"
+ln -sfn  "/content/.drive/My Drive/dmeyf" /content/buckets/b1
+
+mkdir -p /content/buckets/b1/exp
+mkdir -p /content/buckets/b1/datasets
+mkdir -p /content/datasets
+
+descargar() {
+  carpeta_destino="/content/buckets/b1/datasets/"
+  url_origen="https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/"
+  archivo="$1"
+
+  if ! test -f "$carpeta_destino""$archivo"; then
+    wget  "$url_origen""$archivo"  -O "$carpeta_destino""$archivo"
+  fi
+
+  if ! test -f  "/content/datasets/""$archivo"; then
+    cp  "$carpeta_destino""$archivo"  "/content/datasets/""$archivo"
+  fi;
+}
+
+descargar  "competencia_01_crudo.csv"
+
+#%% celda 5 [texto]
+## 2. Clase ternaria (runtime R)
+
+#%% celda 6 [código]
+require("data.table")
+
+dataset <- fread("/content/datasets/competencia_01_crudo.csv")
+
+dsimple <- dataset[, list(
+    "pos" = .I,
+    numero_de_cliente,
+    periodo0 = as.integer(foto_mes/100)*12 + foto_mes%%100 ) ]
+
+setorder( dsimple, numero_de_cliente, periodo0 )
+
+periodo_ultimo <- dsimple[, max(periodo0) ]
+periodo_anteultimo <- periodo_ultimo - 1
+
+dsimple[, c("periodo1", "periodo2") :=
+    shift(periodo0, n=1:2, fill=NA, type="lead"),  numero_de_cliente ]
+
+dsimple[ periodo0 < periodo_anteultimo, clase_ternaria := "CONTINUA" ]
+
+dsimple[ periodo0 < periodo_ultimo &
+    ( is.na(periodo1) | periodo0 + 1 < periodo1 ),
+    clase_ternaria := "BAJA+1" ]
+
+dsimple[ periodo0 < periodo_anteultimo & (periodo0+1 == periodo1 )
+    & ( is.na(periodo2) | periodo0 + 2 < periodo2 ),
+    clase_ternaria := "BAJA+2" ]
+
+setorder( dsimple, pos )
+dataset[, clase_ternaria := dsimple$clase_ternaria ]
+
+fwrite( dataset, file = "/content/datasets/competencia_01.csv.gz", sep = "," )
+
+setorder( dataset, foto_mes, clase_ternaria, numero_de_cliente)
+dataset[, .N, list(foto_mes, clase_ternaria)]
+
+#%% celda 7 [texto]
+## 3. Librerias y parametros
+
+#%% celda 8 [código]
+rm(list=ls(all.names=TRUE))
+invisible(gc(full=TRUE, verbose=FALSE))
+
+library(data.table)
+if (!requireNamespace("lightgbm", quietly=TRUE)) install.packages("lightgbm")
+library(lightgbm)
+
+#%% celda 9 [código]
+PARAM <- list()
+PARAM$experimento <- "FINAL_ENSEMBLE"
+
+# semillas del ensemble (5)
+PARAM$semillas <- c(200723L, 100049L, 210707L, 362120L, 666119L)
+
+# mes con clase conocida donde se entrena, y mes SIN clase al que se le entrega la prediccion
+PARAM$train_final <- 202106
+PARAM$future      <- 202108
+
+# cantidad de clientes que reciben Predicted = 1
+PARAM$K <- 11000
+
+# 1.0 = todos los CONTINUA (como estaba en el notebook). Bajalo (ej 0.1) si queres replicar el undersampling de la BO
+PARAM$undersampling_final <- 1.0
+
+# En la BO, numero_de_cliente y foto_mes entraban como features (752 columnas).
+# FALSE = los saco (recomendado). TRUE = replica exactamente lo que validaste.
+PARAM$usar_id_y_mes <- FALSE
+
+LAGS <- c(1L, 2L)
+
+# dos modelos: hiperparametros distintos, mismo peso en el ensemble
+PARAM$modelos <- list(
+  sin_c = list(peso = 0.5,
+               hp = list(num_iterations          = 3541L,   # BO iter 13
+                         num_leaves              = 106L,
+                         min_sum_hessian_in_leaf = 0.0778)),
+  c     = list(peso = 0.5,
+               hp = list(num_iterations          = 4862L,   # 4052 x 1.2
+                         num_leaves              = 131L,
+                         min_sum_hessian_in_leaf = 0.18))
+)
+
+PARAM$lgbm_fijos <- list(
+  histogram_pool_size = 1024,
+  boosting = "gbdt",
+  objective = "binary",
+  feature_pre_filter = FALSE,
+  first_metric_only = FALSE,
+  boost_from_average = TRUE,
+  force_row_wise = TRUE,
+  deterministic = TRUE,
+  verbosity = -100,
+  max_depth = -1L,
+  min_gain_to_split = 0,
+  lambda_l1 = 0.0,
+  lambda_l2 = 0.1,
+  max_bin = 31L,
+  bagging_fraction = 1.0,
+  pos_bagging_fraction = 1.0,
+  neg_bagging_fraction = 1.0,
+  is_unbalance = FALSE,
+  scale_pos_weight = 1.0,
+  extra_trees = FALSE,
+  early_stopping = 0,
+  min_data_in_leaf = 0,
+  feature_fraction = 0.50,
+  learning_rate = 0.005
+)
+
+setwd("/content/buckets/b1/exp")
+dir.create(PARAM$experimento, showWarnings=FALSE)
+setwd(paste0("/content/buckets/b1/exp/", PARAM$experimento))
+carpeta <- getwd()
+
+#%% celda 10 [texto]
+## 4. Preprocesamiento (rankings con cero fijo + lags + deltas)
+
+#%% celda 11 [código]
+dataset <- fread("/content/datasets/competencia_01.csv.gz", stringsAsFactors= TRUE)
+
+# meses que se usan + meses previos necesarios para los lags
+meses_usados <- unique(c(PARAM$train_final, PARAM$future))
+per_usados   <- as.integer(meses_usados / 100) * 12L + meses_usados %% 100L
+per_nec      <- unique(as.vector(outer(per_usados, c(0L, LAGS), "-")))
+
+dataset[, periodo := as.integer(foto_mes / 100) * 12L + foto_mes %% 100L]
+dataset <- dataset[periodo %in% per_nec]
+setorder(dataset, numero_de_cliente, foto_mes)
+
+excluir <- c("numero_de_cliente", "foto_mes", "periodo", "clase_ternaria", "clase01",
+             "cprestamos_personales", "mprestamos_personales")
+vars_base <- setdiff(colnames(dataset)[sapply(dataset, is.numeric)], excluir)
+
+ids <- dataset[, list(numero_de_cliente, foto_mes, clase_ternaria)]
+cli <- ids$numero_de_cliente; mes <- ids$foto_mes; per <- dataset$periodo
+n   <- nrow(ids)
+B   <- as.matrix(dataset[, vars_base, with = FALSE])
+rm(dataset); invisible(gc(full = TRUE))
+cat("Variables base:", length(vars_base), "| filas:", n, "\n")
+
+# ranking con cero fijo:  x>0 -> (0,1] | x=0 -> 0 | x<0 -> [-1,0) | NA -> NA | empates: promedio
+rank_cero_fijo <- function(x) {
+  out <- rep(NA_real_, length(x))
+  pos <- which(x > 0); neg <- which(x < 0); zer <- which(x == 0)
+  if (length(zer)) out[zer] <- 0
+  if (length(pos)) out[pos] <-  frank(x[pos],  ties.method = "average") / length(pos)
+  if (length(neg)) out[neg] <- -frank(-x[neg], ties.method = "average") / length(neg)
+  out
+}
+
+# fila del mes t-L del MISMO cliente (NA si no existe ese mes consecutivo)
+idx_lag <- function(L) {
+  i <- seq_len(n) - L
+  valido <- i >= 1L
+  i[!valido] <- 1L
+  ok <- valido & (cli == cli[i]) & ((per - per[i]) == L)
+  i[!ok] <- NA_integer_
+  i
+}
+IDX     <- lapply(LAGS, idx_lag); names(IDX) <- as.character(LAGS)
+idx_mes <- split(seq_len(n), mes)
+filas   <- which(mes %in% meses_usados)
+
+cols    <- vector("list", length(vars_base) * (1L + 2L * length(LAGS)))
+nombres <- character(length(cols)); k <- 0L
+for (j in seq_along(vars_base)) {
+  x <- numeric(n)
+  for (ii in idx_mes) x[ii] <- rank_cero_fijo(B[ii, j])       # ranking DENTRO de cada foto_mes
+  k <- k + 1L; cols[[k]] <- x[filas]; nombres[k] <- paste0(vars_base[j], "_rank")
+  for (L in LAGS) {
+    lagv <- x[IDX[[as.character(L)]]]
+    k <- k + 1L; cols[[k]] <- lagv[filas];       nombres[k] <- paste0(vars_base[j], "_rank_lag", L)
+    k <- k + 1L; cols[[k]] <- (x - lagv)[filas]; nombres[k] <- paste0(vars_base[j], "_rank_delta", L)
+  }
+}
+names(cols) <- nombres
+
+dataset <- setDT(c(as.list(ids[filas]), cols))
+rm(B, ids, cli, mes, per, IDX, idx_mes, cols, nombres, filas, x); invisible(gc(full = TRUE))
+cat("dataset:", nrow(dataset), "filas x", ncol(dataset), "columnas\n")
+dataset[, .N, list(foto_mes, clase_ternaria)]
+
+#%% celda 12 [texto]
+## 5. Datos de training final y del futuro
+
+#%% celda 13 [código]
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+campos_buenos <- setdiff(colnames(dataset), c("clase_ternaria", "clase01"))
+if (!PARAM$usar_id_y_mes) campos_buenos <- setdiff(campos_buenos, c("numero_de_cliente", "foto_mes"))
+cat("features:", length(campos_buenos), "\n")
+
+dataset_train <- dataset[foto_mes == PARAM$train_final]
+if (PARAM$undersampling_final < 1) {
+  set.seed(PARAM$semillas[1], kind = "L'Ecuyer-CMRG")
+  dataset_train <- dataset_train[clase01 == 1L | runif(.N) <= PARAM$undersampling_final]
+}
+dfuture <- dataset[foto_mes == PARAM$future]
+
+# controles: el futuro NO debe tener clase
+stopifnot(nrow(dataset_train) > 0, nrow(dfuture) > 0, all(is.na(dfuture$clase_ternaria)))
+cat("train:", nrow(dataset_train), "| positivos:", sum(dataset_train$clase01),
+    "| future:", nrow(dfuture), "\n")
+
+X_train  <- data.matrix(dataset_train[, campos_buenos, with = FALSE])
+y_train  <- dataset_train$clase01
+X_future <- data.matrix(dfuture[, campos_buenos, with = FALSE])
+ids_future <- dfuture$numero_de_cliente
+
+rm(dataset, dataset_train, dfuture); invisible(gc(full = TRUE))
+
+#%% celda 14 [texto]
+## 6. Entrenamiento: 2 modelos x 5 semillas
+
+Guarda la probabilidad de **todos** los clientes del futuro en `prob_<modelo>_s<semilla>.csv`.
+Si el archivo ya existe lo saltea. Son 10 entrenamientos, tomate un rato.
+
+#%% celda 15 [código]
+for (m in names(PARAM$modelos)) {
+  for (s in PARAM$semillas) {
+    f <- file.path(carpeta, sprintf("prob_%s_s%d.csv", m, s))
+    if (file.exists(f)) { cat("ya existe:", basename(f), "\n"); next }
+
+    t0 <- Sys.time()
+    p <- modifyList(PARAM$lgbm_fijos, PARAM$modelos[[m]]$hp)
+    p$seed <- s
+
+    dtrain <- lgb.Dataset(data = X_train, label = y_train)
+    modelo <- lgb.train(data = dtrain, params = p)
+
+    prob <- predict(modelo, X_future)
+    fwrite(data.table(numero_de_cliente = ids_future, prob = prob), f)
+
+    rm(modelo, dtrain, prob); invisible(gc(full = TRUE))
+    cat(m, "semilla", s, "listo en", round(difftime(Sys.time(), t0, units = "mins"), 1), "min\n")
+  }
+}
+
+#%% celda 16 [texto]
+## 7. Ensemble
+
+Promedio de las 5 semillas dentro de cada modelo, despues promedio ponderado entre modelos (0.5 / 0.5), y top K con `Predicted = 1`.
+
+#%% celda 17 [código]
+p_mod <- sapply(names(PARAM$modelos), function(m) {
+  rowMeans(sapply(PARAM$semillas, function(s) {
+    x <- fread(file.path(carpeta, sprintf("prob_%s_s%d.csv", m, s)))
+    stopifnot(identical(x$numero_de_cliente, ids_future))
+    x$prob
+  }))
+})
+
+pesos <- sapply(PARAM$modelos, function(z) z$peso)
+prob  <- as.vector(p_mod %*% pesos) / sum(pesos)
+
+tb <- data.table(numero_de_cliente = ids_future, prob = prob)
+setorder(tb, -prob)
+tb[, Predicted := as.integer(seq_len(.N) <= PARAM$K)]
+
+# archivo con encabezado: numero_de_cliente,Predicted (todos los clientes)
+fwrite(tb[, list(numero_de_cliente, Predicted)], file.path(carpeta, "entrega_final.csv"))
+# archivo solo con los ids del top K, sin encabezado (como lo escribia tu script anterior)
+fwrite(tb[Predicted == 1L, list(numero_de_cliente)], file.path(carpeta, "entrega_final_solo_ids.csv"),
+       col.names = FALSE)
+
+cat("Clientes:", nrow(tb), "| Unos:", sum(tb$Predicted), "\n")
+cat("Correlacion entre modelos:", round(cor(p_mod[, 1], p_mod[, 2]), 4), "\n")
+top_m <- lapply(seq_len(ncol(p_mod)), function(j) ids_future[order(-p_mod[, j])[1:PARAM$K]])
+cat("Coincidencia top K entre modelos:", length(intersect(top_m[[1]], top_m[[2]])), "/", PARAM$K, "\n")
+stopifnot(sum(tb$Predicted) == PARAM$K, !anyDuplicated(tb$numero_de_cliente))

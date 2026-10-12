@@ -1,0 +1,152 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–20] Docstring del módulo: cada script define un diccionario PARAM, llama a
+#   iniciar_experimento al comienzo y a cerrar_experimento al final. Fija la numeración de los identificadores
+#   de 4 dígitos por familia: 1xxx datasets, 2xxx diagnósticos, 3xxx ingeniería de variables, 4xxx
+#   hiperparámetros, 5xxx modelo final y semillerío, 6xxx entregas.
+"""
+exp_utils.py
+DMEyF 2026 - utilidades comunes para que cada experimento quede trazable.
+
+Cada script define un diccionario PARAM y hace:
+
+    exp = iniciar_experimento(PARAM)          # crea exp/<id>_<nombre>/, guarda PARAM y copia el script
+    ...
+    tabla.to_csv(exp.ruta("ganancia_cortes", semilla=571369))   # -> 4101_ganancia_cortes_s571369.csv
+    ...
+    cerrar_experimento(exp, {"ganancia_max": 123, "envios_opt": 11000})
+
+Al cerrar se agrega una fila a exp/registro_experimentos.csv con PARAM + resultados,
+para poder comparar todos los experimentos en una sola tabla.
+
+Numeracion sugerida del id (4 digitos, el primero indica la familia):
+    1xxx preparacion de datasets      2xxx diagnosticos / drift
+    3xxx feature engineering          4xxx optimizacion de hiperparametros
+    5xxx modelo final / semillerio    6xxx entregas a Kaggle
+"""
+
+# [Anotación · líneas 22–36] Importa las librerías y define las rutas. ROOT sale de la variable de entorno
+#   DMEYF_ROOT y, si no está definida, de una ruta de Windows escrita en el código
+#   (C:\Users\rpalpa\Documents\Maestria\DMEyF\Primera_competencia); de ROOT cuelgan data/, exp/ y
+#   exp/registro_experimentos.csv.
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+
+ROOT = Path(os.environ.get("DMEYF_ROOT", r"C:\Users\rpalpa\Documents\Maestria\DMEyF\Primera_competencia"))
+DIR_DATA = ROOT / "data"
+DIR_EXP = ROOT / "exp"
+ARCH_REGISTRO = DIR_EXP / "registro_experimentos.csv"
+
+
+# [Anotación · líneas 39–49] Clase Experimento: guarda el PARAM, el id, la carpeta y la hora de inicio. Su
+#   método ruta() arma nombres de archivo con el id adelante y, si se pasa, la semilla (por ejemplo
+#   4101_ganancia_cortes_s571369.csv).
+class Experimento:
+    def __init__(self, param, carpeta):
+        self.param = param
+        self.id = str(param["experimento"])
+        self.carpeta = carpeta
+        self.inicio = time.time()
+
+    def ruta(self, nombre, semilla=None, ext="csv"):
+        """Nombre de archivo con el id (y la semilla si corresponde) adelante."""
+        s = f"_s{semilla}" if semilla is not None else ""
+        return self.carpeta / f"{self.id}_{nombre}{s}.{ext}"
+
+
+# [Anotación · líneas 52–58] _git_commit devuelve el hash corto del commit actual del repositorio, o el texto
+#   «sin_git» si el comando git no se puede ejecutar.
+def _git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                       cwd=Path(sys.argv[0]).resolve().parent,
+                                       stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return "sin_git"
+
+
+# [Anotación · líneas 61–92] iniciar_experimento exige las claves experimento, nombre y descripcion; crea
+#   exp/<id>_<nombre>/ y se detiene si la carpeta ya tiene archivos, salvo que PARAM traiga «sobrescribir» o
+#   «reanudar». Copia el script en ejecución como <id>_script.py, agrega a PARAM la fecha de inicio, el nombre
+#   del script y el commit, y lo graba en <id>_PARAM.json.
+def iniciar_experimento(param):
+    for clave in ("experimento", "nombre", "descripcion"):
+        if clave not in param:
+            raise ValueError(f"PARAM tiene que tener '{clave}'")
+
+    carpeta = DIR_EXP / f"{param['experimento']}_{param['nombre']}"
+    existe = carpeta.exists() and any(carpeta.iterdir())
+    if existe and not (param.get("sobrescribir", False) or param.get("reanudar", False)):
+        raise FileExistsError(
+            f"Ya existe {carpeta}.\nUsa otro numero de experimento, PARAM['reanudar'] = True para "
+            f"continuar uno interrumpido, o PARAM['sobrescribir'] = True si de verdad queres pisarlo.")
+    if existe and param.get("reanudar", False):
+        print(f"Reanudando experimento existente en {carpeta}")
+    carpeta.mkdir(parents=True, exist_ok=True)
+
+    exp = Experimento(param, carpeta)
+
+    # copia del script tal cual se corrio (reproducibilidad aunque despues lo edites)
+    script = Path(sys.argv[0]).resolve()
+    if script.suffix == ".py" and script.exists():
+        shutil.copy2(script, exp.ruta("script", ext="py"))
+
+    param["_fecha_inicio"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    param["_script"] = script.name
+    param["_git_commit"] = _git_commit()
+    with open(exp.ruta("PARAM", ext="json"), "w", encoding="utf-8") as f:
+        json.dump(param, f, indent=2, ensure_ascii=False, default=str)
+
+    print(f"=== Experimento {exp.id} - {param['nombre']} ===")
+    print(f"{param['descripcion']}")
+    print(f"Carpeta: {carpeta}\n")
+    return exp
+
+
+# [Anotación · líneas 95–106] _aplanar convierte un diccionario anidado en uno de un solo nivel con claves
+#   unidas por punto (lgbm.num_leaves) y pasa las listas a texto separado por espacios, para que entren en una
+#   fila del registro.
+def _aplanar(d, prefijo=""):
+    """{'lgbm': {'num_leaves': 31}} -> {'lgbm.num_leaves': 31}  (para el registro en una fila)."""
+    plano = {}
+    for k, v in d.items():
+        clave = f"{prefijo}{k}"
+        if isinstance(v, dict):
+            plano.update(_aplanar(v, clave + "."))
+        elif isinstance(v, (list, tuple)):
+            plano[clave] = " ".join(str(x) for x in v)
+        else:
+            plano[clave] = v
+    return plano
+
+
+# [Anotación · líneas 109–126] cerrar_experimento calcula los minutos transcurridos, graba
+#   <id>_resultados.json y agrega a exp/registro_experimentos.csv una fila con el PARAM aplanado y los
+#   resultados con prefijo «res.»; si el experimento ya estaba en el registro, reemplaza su fila.
+def cerrar_experimento(exp, resultados=None):
+    resultados = resultados or {}
+    minutos = round((time.time() - exp.inicio) / 60, 2)
+    resultados["_minutos"] = minutos
+
+    with open(exp.ruta("resultados", ext="json"), "w", encoding="utf-8") as f:
+        json.dump(resultados, f, indent=2, ensure_ascii=False, default=str)
+
+    fila = _aplanar(exp.param)
+    fila.update({f"res.{k}": v for k, v in resultados.items()})
+    nueva = pd.DataFrame([fila])
+    if ARCH_REGISTRO.exists():
+        registro = pd.read_csv(ARCH_REGISTRO, dtype=str)
+        registro = registro[registro["experimento"] != exp.id]       # si se re-corrio, queda la ultima
+        nueva = pd.concat([registro, nueva.astype(str)], ignore_index=True)
+    nueva.to_csv(ARCH_REGISTRO, index=False)
+
+    print(f"\n=== Fin experimento {exp.id} ({minutos} min). Registrado en {ARCH_REGISTRO.name} ===")

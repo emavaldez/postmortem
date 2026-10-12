@@ -1,0 +1,22 @@
+{
+  "datasets": {
+    "crudo": {
+      "archivo": "ds3001_crudo.parquet",
+      "columnas": 765,
+      "MB": 501
+    },
+    "mediana": {
+      "archivo": "ds3001_mediana.parquet",
+      "columnas": 765,
+      "MB": 535
+    },
+    "rank": {
+      "archivo": "ds3001_rank.parquet",
+      "columnas": 765,
+      "MB": 532
+    }
+  },
+  "variables": 152,
+  "montos": 73,
+  "_minutos": 1.44
+}

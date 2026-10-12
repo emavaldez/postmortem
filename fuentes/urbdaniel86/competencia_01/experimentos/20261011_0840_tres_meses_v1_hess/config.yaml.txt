@@ -1,0 +1,41 @@
+nombre: tres_meses_v1_hess
+pregunta: 'tres_meses_v4 sobre el dataset v1 y con el techo de min_sum_hessian_in_leaf
+  subido de 10 a 100: en tres_meses_v4 el mejor trial eligio 9.8 y el top 5 quedo
+  entre 4.2 y 9.8, contra el borde. v1 en vez de v4 por replicabilidad: los canaritos
+  solo sumaron 3 columnas, y v4 obliga a correr FE v2 + canaritos + armado de v4.
+  Train 202103-202105 -> test 202106, gap 1 con exclusion. Cambian dos cosas a la
+  vez (dataset y rango) por falta de tiempo.'
+dataset: ../data/competencia_01_fe.parquet
+meses_train:
+- 202103
+- 202104
+- 202105
+estrategia_meses: apilado
+mes_test: 202106
+semillas: 5
+trials: 40
+folds: 3
+test_size: 0.3
+top_n: 3
+max_bin: 31
+min_data_in_leaf: 0
+feature_fraction: 0.5
+feature_fraction_bynode: 0.2
+learning_rate: 0.005
+num_iterations:
+- 200
+- 10000
+num_leaves:
+- 4
+- 200
+min_sum_hessian_in_leaf:
+- 0.0001
+- 100.0
+meses_train_entrega:
+- 202103
+- 202104
+- 202105
+- 202106
+permitir_gap_corto: true
+excluir_positivos_del_train: true
+optuna_timeout_horas: 5

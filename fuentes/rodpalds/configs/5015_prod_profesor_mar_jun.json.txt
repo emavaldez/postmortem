@@ -1,0 +1,50 @@
+{
+  "dataset": "ds3003_rank_extra.parquet",
+  "clase": "clase_binaria2",
+  "escalar_min_data_in_leaf": true,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "modo": "produccion",
+  "meses_train": [
+    202103,
+    202104,
+    202105,
+    202106
+  ],
+  "mes_prediccion": 202108,
+  "experimento": 5015,
+  "nombre": "prod_profesor_mar_jun",
+  "variables": null,
+  "hiperparametros": {
+    "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+  },
+  "n_semillas": 50,
+  "descripcion": "Produccion con las indicaciones del profesor: entrena con TODOS los meses con clase (202103 a 202106) -> 202108. ds3003 con lag2, hiperparametros de 4107 (Bayesiana con marzo+abril y rangos del profesor), 50 semillas. min_data_in_leaf escalado por meses (4 / 2).",
+  "usar_lag2": true
+}

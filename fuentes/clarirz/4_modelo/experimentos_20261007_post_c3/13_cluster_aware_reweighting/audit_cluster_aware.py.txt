@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import sys
+
+import numpy as np
+
+HERE=Path(__file__).resolve().parent
+SF_CODE=HERE.parent/"05_superfinal100"
+if str(HERE) not in sys.path:
+    sys.path.insert(0,str(HERE))
+if str(SF_CODE) not in sys.path:
+    sys.path.insert(0,str(SF_CODE))
+
+import cluster_aware_common as A
+
+RUN="c1clusteraware01"
+PLAN=A.load_json(HERE/"plan.json")
+def _source_identity() -> str:
+    """Identidad del SUPERFINAL padre. Historica por defecto; con CLAW2_REPLICA=1 se toma la de la
+    corrida de SUPERFINAL presente en $HOME (su AUDITORIA_FINAL.json), para replicar en otra maquina."""
+    hist=PLAN["source_superfinal"]["identity"]
+    if os.environ.get("CLAW2_REPLICA")!="1":
+        return hist
+    audit=A.load_json(Path(os.environ.get("CLAW2_HOME",Path.home()))/"c1superfinal100v2/AUDITORIA_FINAL.json")
+    A.require(audit.get("status")=="AUDIT_OK","Modo replica: SUPERFINAL sin AUDIT_OK")
+    return str(audit["identity"])
+
+
+SOURCE_IDENTITY=_source_identity()
+SEEDS=[17,101,202,303,404,505,606,707,808,909,1001,1102,1203,1304,1405,1506,1607,1708,1809,1910]
+
+
+def expected_ids(ids: np.ndarray,scores: np.ndarray,n: int) -> np.ndarray:
+    order=np.lexsort((ids,-scores))
+    return np.sort(ids[order[:n]])
+
+
+def read_csv_ids(path: Path) -> np.ndarray:
+    lines=path.read_text(encoding="utf-8").splitlines()
+    A.require(lines and all(x.isdigit() and not x.startswith("0") for x in lines),f"CSV invalido {path}")
+    z=np.asarray([int(x) for x in lines],dtype=np.int64)
+    A.require(len(np.unique(z))==len(z),f"CSV duplicados {path}")
+    return z
+
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--home",type=Path,default=Path.home())
+    args=ap.parse_args()
+    home=args.home.resolve()
+    root=home/RUN
+
+    s0=A.load_json(root/"stage0_preflight/RESULT.json")
+    s1=A.load_json(root/"stage1_screen/RESULT.json")
+    s2=A.load_json(root/"stage2_confirm5/RESULT.json")
+    s3=A.load_json(root/"stage3_confirm20/RESULT.json")
+    s4=A.load_json(root/"stage4_august/RESULT.json")
+
+    A.require(s0.get("status")=="PREFLIGHT_OK","Preflight no OK")
+    A.require(s0.get("source_identity")==SOURCE_IDENTITY,"Source identity audit distinta")
+
+    if s4.get("status")!="READY_NOT_SUBMITTED":
+        delivery=root/"stage4_august/delivery"
+        csvs=list(delivery.glob("*.csv")) if delivery.exists() else []
+        A.require(not csvs,"Hay CSV final aunque no hubo promocion")
+        result={
+            "status":"AUDIT_STOP_OK",
+            "source_identity":SOURCE_IDENTITY,
+            "screen_status":s1.get("status"),
+            "confirm5_status":s2.get("status"),
+            "confirm20_status":s3.get("status"),
+            "august_status":s4.get("status"),
+            "submit_generated":False,
+        }
+        A.write_json(root/"AUDIT.json",result)
+        print("AUDIT_STOP_OK")
+        print(result)
+        return
+
+    A.require(s3.get("status")=="CONFIRM20_PASS","August listo sin confirm20 PASS")
+    A.require(int(s4.get("n"))==A.N_FIXED,"N final distinto de 13500")
+
+    delivery=root/"stage4_august/delivery"
+    manifest=A.load_json(delivery/"MANIFEST.json")
+    listo=A.load_json(root/"stage4_august/LISTO.json")
+    A.require(manifest==listo,"LISTO y MANIFEST difieren")
+    A.require(manifest.get("status")=="READY_NOT_SUBMITTED","Manifest no listo")
+    A.require(manifest.get("parent_superfinal_identity")==SOURCE_IDENTITY,"Parent identity final distinta")
+    A.require(manifest.get("cluster_labels_used_at_scoring") is False,"Clusters usados en scoring")
+    A.require(manifest.get("cluster_labels_used_only_for_historical_positive_weights") is True,
+              "Uso de clusters final inesperado")
+    A.require(manifest.get("automatic_submit") is False,"Auto-submit prohibido")
+    wd=manifest["weight_detail"]
+    before=float(wd["positive_mass_before"]); after=float(wd["positive_mass_after"])
+    A.require(np.isclose(before,after,rtol=0,atol=1e-10*max(1.0,before)),
+              "Masa positiva final no conservada")
+
+    modeldir=root/"stage4_august/models"
+    ids0=None; score_rows=[]; model_rows=[]
+    identity=str(s4["identity"])
+    for seed in SEEDS:
+        cp=modeldir/f"seed_{seed}.npz"
+        mp=modeldir/f"modelo_{seed}.txt"
+        A.require(cp.is_file() and mp.is_file(),f"Falta par final seed={seed}")
+        with np.load(cp,allow_pickle=False) as z:
+            A.require(str(z["identity"].item())==identity,f"Identity seed={seed}")
+            A.require(int(z["seed"].item())==seed,f"Seed interna {seed}")
+            A.require(str(z["arm"].item())==manifest["arm"],f"Arm seed={seed}")
+            ids=np.asarray(z["ids"],dtype=np.int64)
+            scores=np.asarray(z["scores"],dtype=np.float64)
+            A.require(str(z["model_sha256"].item())==A.digest(mp),f"Hash modelo seed={seed}")
+        A.require(scores.shape==ids.shape and np.isfinite(scores).all(),f"Scores seed={seed}")
+        if ids0 is None:
+            ids0=ids.copy()
+            A.require(len(ids0)==164647 and len(np.unique(ids0))==len(ids0),"IDs agosto invalidos")
+        else:
+            A.require(np.array_equal(ids0,ids),f"IDs distintos seed={seed}")
+        score_rows.append(scores.copy())
+        model_rows.append({
+            "seed":seed,"checkpoint_sha256":A.digest(cp),"model_sha256":A.digest(mp),
+        })
+
+    ensemble=np.vstack(score_rows).mean(axis=0,dtype=np.float64)
+    csvs=sorted(delivery.glob("*.csv"))
+    A.require(len(csvs)==1,f"Se esperaba 1 CSV; hay {len(csvs)}")
+    csv=csvs[0]
+    A.require(csv.name==manifest["file"]["file"],"Nombre CSV distinto al manifest")
+    A.require(A.digest(csv)==manifest["file"]["sha256"]==s4["sha256"],"SHA CSV inconsistente")
+    got=read_csv_ids(csv)
+    A.require(len(got)==A.N_FIXED,"Filas CSV distintas a 13500")
+    exp=expected_ids(ids0,ensemble,A.N_FIXED)
+    A.require(np.array_equal(got,exp),"CSV no corresponde al ensemble top-13500")
+
+    result={
+        "status":"AUDIT_OK",
+        "identity":identity,
+        "source_identity":SOURCE_IDENTITY,
+        "arm":manifest["arm"],
+        "n_models":20,
+        "n_august":164647,
+        "n_final":A.N_FIXED,
+        "csv":csv.name,
+        "csv_sha256":A.digest(csv),
+        "positive_mass_before":before,
+        "positive_mass_after":after,
+        "cluster_labels_used_at_scoring":False,
+        "automatic_submit":False,
+        "models":model_rows,
+    }
+    A.write_json(root/"AUDIT.json",result)
+    print("AUDIT_OK")
+    print(f"arm={manifest['arm']}")
+    print(f"N={A.N_FIXED}")
+    print(f"CSV={csv}")
+    print(manifest["submit_message"])
+
+
+if __name__=="__main__":
+    main()

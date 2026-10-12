@@ -1,0 +1,410 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–31] Celdas de texto de presentación. Indican que el notebook se usa para cada submit
+#   cambiando parámetros: entrena la configuración elegida con 202103–202106 y 20 semillas, predice 202108,
+#   escribe 20 CSV (uno por semilla) y uno de semillerío, verifica el formato y anota el submit. Describen cada
+#   parámetro y los controles que atan el nombre del submit a los valores elegidos.
+#%% celda 1 [texto]
+# 03 · Entrega: modelo final, predicción de `202108` y archivos para el bot
+
+Este notebook se usa **para cada submit**: el primero (línea base) y la entrega final, cambiando solo los parámetros.
+
+1. Entrena la configuración elegida en el `02` con **`202103`–`202106`** y **20 semillas**.
+2. Predice **`202108`**.
+3. Genera los archivos para el bot `@competencia-uno`:
+   - **20 CSV, uno por semilla**, con los N clientes de mayor probabilidad. Se suben juntos: el bot devuelve media y desvío, y eso evita la "maldición del ganador".
+   - **1 CSV de semillerío**, con el promedio de las 20 probabilidades. Es el candidato a **entrega definitiva**, que va sola como último submit.
+4. Verifica cada CSV con el checklist del CLAUDE.md §8.
+5. Anota el submit en `../entregas/registro_submits.md`.
+
+**N y la configuración salen del backtest (`02`, `04` o `05`)**, nunca del leaderboard público.
+
+#%% celda 2 [texto]
+## 1. Parámetros
+
+- **`CONFIG`:** la configuración elegida en el `02`, por ejemplo `'z601_bajas'`. La elige el usuario, y se anota en `decisiones.md`.
+- **`N_ENVIOS = 'auto'`:** aplica la decisión 5 de la etapa 2, el promedio de los N de la meseta en A y B, redondeado a 500 y acotado a 8.000–15.000. Lo lee del `resumen.csv` de la corrida completa del `02`. También acepta un número fijo.
+- **`VARIANTE` (obligatoria):**
+  - `'linea_base'`: el modelo del `02`;
+  - una variante del `04` (por ejemplo `'V4'`): aplica su limpieza (variables que se sacan y variables que pasan a `NA` en ciertos meses), y N sale del `resumen.csv` del `04`.
+
+  No tiene valor por defecto, para que siempre se elija a propósito.
+- **`BLOQUES` (opcional):** una corrida del `05`, por ejemplo `'B2+B3+B4'`. Usa el parquet de variables nuevas y **la lista exacta de variables** que guardó el `05` en `bloques.json`, y N sale del `resumen.csv` del `05`. Exige que `VARIANTE` sea la misma base que usó el `05`. Con `None`, el `03` funciona como antes.
+- **Control del nombre:** si `NOMBRE_SUBMIT` menciona una variante (`V1`…`V4`), tiene que ser la misma que `VARIANTE`. Con `'linea_base'`, el nombre no puede mencionar ninguna. Con `BLOQUES`, el nombre tiene que llevar su código: `'B2+B3+B4'` → `B234`, `'B2+B3+B4c+B5'` → `B234c5`; sin `BLOQUES`, no puede llevar ningún código de bloques.
+- **`MESES_FINAL`:** los meses de entrenamiento del modelo final. Por defecto, `202103`–`202106`. **Sin marzo** (`[202104, 202105, 202106]`) el nombre tiene que llevar `SinMar`, y al revés.
+- **`HIPER_OPTUNA`:** el número de una prueba elegida en el `08` (por ejemplo `42`): usa sus hiperparámetros (`../exp/08_optuna/hiperparametros_p<prueba>.json`) en lugar de los de `CONFIG`. Exige la misma configuración, base y bloques que usó el `08`, y que el nombre lleve `Opt<prueba>`. Con `None`, usa los de `CONFIG` y el nombre no puede llevar `Opt`.
+- **`JUEGO_SEMILLAS`:** `1` = las 20 semillas del `02` (por defecto). `2`, `3`, … = 20 primos de 6 dígitos nuevos por juego, sorteados con `default_rng([979201, juego])` sin repetir ninguna de los juegos anteriores. Sirve para sumar semillas a un modelo sin reentrenar las que ya están: después el `07` promedia los juegos. Con un juego distinto de 1, el nombre tiene que llevar `J<juego>`.
+- **`NOMBRE_SUBMIT`:** el nombre interno del submit, distinto en cada uno, sin espacios ni caracteres raros. Es también el prefijo de los archivos.
+
+# [Anotación · líneas 33–66] Importa las librerías y define los parámetros con los que está guardado el
+#   notebook: CONFIG = 'z470_bajas', VARIANTE = 'V5', N_ENVIOS = 12_000, BLOQUES = 'B2+B3+B4+B5', NOMBRE_SUBMIT
+#   = 'fe04z470bajasV5B2345Opt44', HIPER_OPTUNA = 44, JUEGO_SEMILLAS = 1, MESES_FINAL = 202103 a 202106 y
+#   MES_FUTURO = 202108. El README indica para la entrega HIPER_OPTUNA = 42 y los nombres
+#   'fe03z470bajasV5B2345Opt42' (juego 1) y 'fe03z470bajasV5B2345Opt42J2' (juego 2).
+#%% celda 3 [código]
+from pathlib import Path
+from datetime import datetime
+import json
+import re
+import time
+import warnings
+
+import duckdb
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings('ignore', message='.*ChainedAssignmentError.*')  # falso positivo pandas 2.2 + Py 3.14
+
+# --- Parámetros -------------------------------------------------------------
+CONFIG = 'z470_bajas'            # <- la elegida en el 02, por ejemplo 'z601_bajas'
+VARIANTE = 'V5'          # <- OBLIGATORIO: 'linea_base' o 'V1'…'V4' (del 04)
+N_ENVIOS = 12_000        # 'auto' (decisión 5 de la etapa 2) o un número entre 8.000 y 15.000
+BLOQUES = 'B2+B3+B4+B5'           # opcional: una corrida del 05, por ejemplo 'B2+B3+B4' (VARIANTE = la BASE del 05)
+NOMBRE_SUBMIT = 'fe04z470bajasV5B2345Opt44'     # <- por ejemplo 'lb01z601bajas' (único, sin espacios)
+HIPER_OPTUNA = 44       # None: los de CONFIG · un número: la prueba del 08 (el nombre lleva 'Opt<prueba>')
+JUEGO_SEMILLAS = 1       # 1: las 20 del 02 · 2, 3…: 20 semillas nuevas por juego (el nombre lleva 'J<juego>')
+
+BASE_PARQUET = Path('../data/competencia_01_base.parquet')
+EXP02 = Path('../exp/02_linea_base')
+EXP04 = Path('../exp/04_drift')
+EXP05 = Path('../exp/05_variables')
+EXP08 = Path('../exp/08_optuna')
+ENTREGAS = Path('../entregas')
+
+MESES_FINAL = [202103, 202104, 202105, 202106]   # marzo se queda (decidido el 2026-10-06); sin marzo: [202104, 202105, 202106] + 'SinMar'
+MES_FUTURO = 202108
+# -----------------------------------------------------------------------------
+
+# [Anotación · líneas 68–127] Validaciones con assert antes de entrenar: existen el parquet base y las salidas
+#   del 02; el nombre sólo tiene letras, números y guion bajo; el nombre menciona la variante, el código de
+#   bloques, 'SinMar' si no se entrena con 202103, 'J<n>' si el juego de semillas no es 1 y 'Opt<n>' si se usan
+#   hiperparámetros del 08; la base y la configuración de bloques.json y del JSON de hiperparámetros coinciden
+#   con CONFIG, VARIANTE y BLOQUES. Crea las carpetas de salida y no admite un nombre que ya tenga CSV.
+assert BASE_PARQUET.exists(), 'Falta el dataset base: correr 01_pipeline_base'
+assert (EXP02 / 'configuraciones.json').exists() and (EXP02 / 'semillas.json').exists(), \
+    'Falta la salida del 02: correrlo antes'
+assert isinstance(NOMBRE_SUBMIT, str) and re.fullmatch(r'[A-Za-z0-9_]+', NOMBRE_SUBMIT), \
+    'NOMBRE_SUBMIT: solo letras, números y guion bajo'
+
+# VARIANTE se elige siempre a propósito (2026-10-05: un submit salió con la línea base por dejarla vacía)
+variantes_04 = json.loads((EXP04 / 'variantes.json').read_text()) if (EXP04 / 'variantes.json').exists() else {}
+assert VARIANTE == 'linea_base' or VARIANTE in variantes_04, \
+    f"VARIANTE tiene que ser 'linea_base' o una de {sorted(variantes_04)}"
+mencionadas = set(re.findall(r'V\d+', NOMBRE_SUBMIT))
+if VARIANTE == 'linea_base':
+    assert not mencionadas, f'El nombre menciona {mencionadas} pero VARIANTE es la línea base'
+else:
+    assert mencionadas == {VARIANTE}, f'El nombre tiene que mencionar {VARIANTE} (menciona {mencionadas or "ninguna"})'
+# BLOQUES: una corrida del 05, con la misma base y la misma configuración
+codigos = set(re.findall(r'B[0-9c]+', NOMBRE_SUBMIT))
+if BLOQUES is None:
+    bloques_05 = None
+    assert not codigos, f'El nombre menciona bloques {codigos} pero BLOQUES es None'
+else:
+    assert (EXP05 / 'bloques.json').exists(), 'Falta la salida del 05'
+    bloques_05 = json.loads((EXP05 / 'bloques.json').read_text())
+    assert BLOQUES in bloques_05['variables'] and BLOQUES != 'base', \
+        f"BLOQUES tiene que ser una de {sorted(set(bloques_05['variables']) - {'base'})}"
+    assert bloques_05['base'] == VARIANTE and bloques_05['config'] == CONFIG, \
+        f"El 05 corrió con base {bloques_05['base']} y {bloques_05['config']}: VARIANTE y CONFIG tienen que coincidir"
+    codigo = 'B' + ''.join(re.findall(r'\d+c?', BLOQUES))     # 'B2+B3+B4c+B5' → 'B234c5'
+    assert codigos == {codigo}, f'El nombre tiene que llevar {codigo} (lleva {codigos or "ninguno"})'
+# MESES_FINAL: sin marzo, el nombre lo tiene que decir
+assert set(MESES_FINAL) <= {202103, 202104, 202105, 202106}, 'Solo meses con clase completa'
+assert (202103 not in MESES_FINAL) == ('SinMar' in NOMBRE_SUBMIT), \
+    "Sin marzo, el nombre lleva 'SinMar' (y con marzo, no)"
+# JUEGO_SEMILLAS: con un juego distinto de 1, el nombre lo tiene que decir
+assert isinstance(JUEGO_SEMILLAS, int) and JUEGO_SEMILLAS >= 1
+assert (JUEGO_SEMILLAS != 1) == bool(re.search(r'J\d+', NOMBRE_SUBMIT)) and \
+    (JUEGO_SEMILLAS == 1 or f'J{JUEGO_SEMILLAS}' in NOMBRE_SUBMIT), f"Con JUEGO_SEMILLAS = {JUEGO_SEMILLAS}, el nombre lleva 'J{JUEGO_SEMILLAS}' (con 1, ninguno)"
+# HIPER_OPTUNA: los hiperparámetros del 08, con la misma configuración, base y bloques
+assert HIPER_OPTUNA is None or (isinstance(HIPER_OPTUNA, int) and not isinstance(HIPER_OPTUNA, bool)), \
+    'HIPER_OPTUNA: None o el número de prueba del 08 (por ejemplo 42)'
+if HIPER_OPTUNA is not None:
+    archivo_h = EXP08 / f'hiperparametros_p{HIPER_OPTUNA}.json'
+    assert archivo_h.exists(), f'Falta {archivo_h.name}: en el 08, ELEGIDA = {HIPER_OPTUNA}'
+    hiper_08 = json.loads(archivo_h.read_text())
+    assert hiper_08['prueba'] == HIPER_OPTUNA
+    assert (hiper_08['config'], hiper_08['base'], hiper_08['bloques']) == (CONFIG, VARIANTE, BLOQUES), \
+        f"El 08 usó {hiper_08['config']} · {hiper_08['base']} · {hiper_08['bloques']}: CONFIG, VARIANTE y BLOQUES tienen que coincidir"
+    assert f"Opt{hiper_08['prueba']}" in NOMBRE_SUBMIT, f"El nombre tiene que llevar Opt{hiper_08['prueba']}"
+else:
+    hiper_08 = None
+    assert 'Opt' not in NOMBRE_SUBMIT, "El nombre lleva 'Opt' pero HIPER_OPTUNA es None"
+print(f'>>> VARIANTE: {VARIANTE} · BLOQUES: {BLOQUES or "—"} · MESES_FINAL: {MESES_FINAL} · '
+      f'hiperparámetros: {"Optuna prueba " + str(hiper_08["prueba"]) if hiper_08 else CONFIG} · NOMBRE_SUBMIT: {NOMBRE_SUBMIT}')
+
+SALIDA = ENTREGAS / NOMBRE_SUBMIT
+PROBS = Path('../exp/03_entrega') / NOMBRE_SUBMIT   # probabilidades por semilla (para retomar)
+assert not SALIDA.exists() or not any(SALIDA.glob('*.csv')), \
+    f'Ya hay CSV con el nombre {NOMBRE_SUBMIT}: elegir otro (los nombres no se repiten)'
+SALIDA.mkdir(parents=True, exist_ok=True)
+PROBS.mkdir(parents=True, exist_ok=True)
+
+# [Anotación · líneas 129–158] Lee configuraciones.json y las 20 semillas del 02. Para un juego de semillas 2
+#   o mayor sortea 20 primos de 6 dígitos que no estén entre los ya usados, con
+#   numpy.random.default_rng([979201, juego]). Guarda las semillas del juego en la carpeta de probabilidades del
+#   submit.
+#%% celda 4 [texto]
+## 2. Configuración, semillas y N (salen del `02`)
+
+Los hiperparámetros, las clases y las variables excluidas se leen de `configuraciones.json`, y las 20 semillas de `semillas.json`. Por construcción, el modelo final es **el mismo** que se evaluó en el backtest.
+
+#%% celda 5 [código]
+config = json.loads((EXP02 / 'configuraciones.json').read_text())
+SEMILLAS = json.loads((EXP02 / 'semillas.json').read_text())['semillas']
+assert len(SEMILLAS) == 20
+
+
+def primos_6_digitos():          # la misma criba del 02
+    criba = np.ones(1_000_000, dtype=bool)
+    criba[:2] = False
+    for i in range(2, 1_001):
+        if criba[i]:
+            criba[i * i::i] = False
+    return np.flatnonzero(criba[100_000:]) + 100_000
+
+
+usadas = list(SEMILLAS)
+for juego in range(2, JUEGO_SEMILLAS + 1):       # cada juego: 20 primos nuevos, sin repetir los anteriores
+    disponibles = np.setdiff1d(primos_6_digitos(), usadas)
+    nuevas = np.random.default_rng([979201, juego]).choice(disponibles, size=20, replace=False).tolist()
+    usadas += nuevas
+    if juego == JUEGO_SEMILLAS:
+        SEMILLAS = nuevas
+assert len(SEMILLAS) == 20 and len(set(usadas)) == len(usadas)
+print(f'Juego de semillas {JUEGO_SEMILLAS}: {SEMILLAS}')
+(PROBS / 'semillas.json').write_text(json.dumps({'juego': JUEGO_SEMILLAS, 'semillas': SEMILLAS}, indent=2))
+
+# [Anotación · líneas 160–193] Separa CONFIG en juego de hiperparámetros y esquema de clase. Los
+#   hiperparámetros salen del JSON del 08 si HIPER_OPTUNA tiene un número, o de configuraciones.json si es None.
+#   Suma a las variables excluidas las de la variante y toma sus pases a NA por mes. N es el número fijado o,
+#   con 'auto', el promedio de los N de meseta de A y B del resumen.csv correspondiente, redondeado a 500 y
+#   acotado a 8.000–15.000; verifica que N esté entre 8.000 y 15.000.
+assert isinstance(CONFIG, str) and '_' in CONFIG, "CONFIG: por ejemplo 'z601_bajas'"
+HIPER, CLASE = CONFIG.split('_', 1)
+assert HIPER in config['hiperparametros'] and CLASE in config['clases'], f'Configuración desconocida: {CONFIG}'
+PARAMS = dict(hiper_08['params']) if hiper_08 else dict(config['hiperparametros'][HIPER])
+POSITIVOS = config['clases'][CLASE]
+EXCLUIDAS = list(config['variables_excluidas'])
+NA_EN_MES = {}
+if VARIANTE != 'linea_base':
+    EXCLUIDAS += variantes_04[VARIANTE]['excluir']
+    NA_EN_MES = variantes_04[VARIANTE]['na_en_mes']
+GANANCIA_ACIERTO, COSTO_ESTIMULO = config['ganancia_acierto'], config['costo_estimulo']
+
+if N_ENVIOS == 'auto':
+    if BLOQUES is not None:
+        resumen = pd.read_csv(EXP05 / 'resumen.csv')
+        fila = resumen[(resumen['config'] == CONFIG) & (resumen['base'] == VARIANTE)
+                       & (resumen['nombre'] == BLOQUES)].set_index('prueba')
+    elif VARIANTE == 'linea_base':
+        resumen = pd.read_csv(EXP02 / 'resumen.csv')   # el de la corrida completa (no el rápido)
+        fila = resumen[resumen['config'] == CONFIG].set_index('prueba')
+    else:
+        resumen = pd.read_csv(EXP04 / 'resumen.csv')
+        fila = resumen[(resumen['config'] == CONFIG) & (resumen['variante'] == VARIANTE)].set_index('prueba')
+    assert {'A', 'B'} <= set(fila.index), f'No está {CONFIG} en resumen.csv'
+    assert (fila['semillas'] >= 10).all(), 'resumen.csv tiene que venir de la corrida completa (10 semillas)'
+    N = int(np.clip(round((fila.loc['A', 'N_meseta'] + fila.loc['B', 'N_meseta']) / 2 / 500) * 500, 8_000, 15_000))
+    print(f"N de la meseta: A = {fila.loc['A', 'N_meseta']:,} · B = {fila.loc['B', 'N_meseta']:,} → N = {N:,}")
+else:
+    N = int(N_ENVIOS)
+assert 8_000 <= N <= 15_000, 'El bot acepta entre 8.000 y 15.000 registros'
+
+print(f'Configuración: {CONFIG} · variante: {VARIANTE} · bloques: {BLOQUES or "—"} · positivos: {POSITIVOS} · N = {N:,}')
+print('Excluidas:', EXCLUIDAS, '· NA por mes:', NA_EN_MES or '—')
+print('Hiperparámetros:', PARAMS)
+
+# [Anotación · líneas 195–237] Lee el parquet de variables nuevas (o el base si no hay bloques) y toma la
+#   lista exacta de variables de bloques.json. Pasa a NA, en los meses indicados por la variante, la columna y
+#   las variables derivadas de ella. Entrenamiento: filas de MESES_FINAL con clase, etiqueta 1 si la clase está
+#   entre las positivas. Predicción: filas de 202108. Verifica con assert filas por mes, cantidad de positivos,
+#   164.647 clientes en 202108 sin clase e IDs únicos.
+#%% celda 6 [texto]
+## 3. Datos
+
+- **Entrenamiento:** `202103`–`202106`, solo las filas con clase.
+- **Predicción:** `202108`. `202107` no se usa.
+
+Las variables son las mismas del backtest. Con `BLOQUES`, se lee el parquet de variables nuevas (mismo orden de filas que el base) y la lista de variables de `bloques.json`, en el mismo orden. La limpieza de la variante alcanza también a las variables que salen de esa columna, igual que en el `05`.
+
+#%% celda 7 [código]
+t0 = time.time()
+PARQUET = Path(bloques_05['fe_parquet']) if BLOQUES else BASE_PARQUET
+df = duckdb.sql(f"select * from read_parquet('{PARQUET.as_posix()}')").df()
+if BLOQUES:
+    VARIABLES = bloques_05['variables'][BLOQUES]               # la lista exacta del 05, en su orden
+    assert not set(VARIABLES) & set(EXCLUIDAS), 'Hay variables excluidas por la variante'
+    fuentes = bloques_05['fuentes']
+else:
+    VARIABLES = [c for c in df.columns if c not in EXCLUIDAS]
+    fuentes = {}
+for columna, meses_na in NA_EN_MES.items():          # limpieza de la variante (misma regla que el 04 y el 05)
+    afectadas = [c for c in df.columns if c == columna or columna in fuentes.get(c, [])]
+    df.loc[df['foto_mes'].isin(meses_na), afectadas] = np.nan
+    print(f'{afectadas} → NA en {meses_na}')
+print(f'Parquet: {PARQUET.name} · {len(VARIABLES)} variables')
+
+es_train = df['foto_mes'].isin(MESES_FINAL) & df['clase_ternaria'].notna()
+es_futuro = df['foto_mes'] == MES_FUTURO
+X_train = df.loc[es_train, VARIABLES]
+y_train = df.loc[es_train, 'clase_ternaria'].isin(POSITIVOS).astype(int).to_numpy()
+X_futuro = df.loc[es_futuro, VARIABLES]
+ids_futuro = df.loc[es_futuro, 'numero_de_cliente'].to_numpy()
+
+print(f'Entrenamiento: {len(X_train):,} filas · {y_train.sum():,} positivos · '
+      f'futuro {MES_FUTURO}: {len(X_futuro):,} clientes · {time.time() - t0:.0f} s')
+
+# Controles: filas y positivos conocidos
+FILAS_MES = {202103: 162_900, 202104: 163_284, 202105: 163_768, 202106: 164_114}        # filas con clase
+POSITIVOS_MES = {'baja2': {202103: 960, 202104: 1_139, 202105: 870, 202106: 1_098},
+                 'bajas': {202103: 1_979, 202104: 2_103, 202105: 2_013, 202106: 1_972}}
+assert len(X_train) == sum(FILAS_MES[m] for m in MESES_FINAL) and len(X_futuro) == 164_647
+assert y_train.sum() == sum(POSITIVOS_MES[CLASE][m] for m in MESES_FINAL)
+assert df.loc[es_futuro, 'clase_ternaria'].isna().all()
+assert ids_futuro.dtype == np.int64 and len(np.unique(ids_futuro)) == len(ids_futuro)
+
+# [Anotación · líneas 239–263] Entrena un LightGBM por semilla con los mismos hiperparámetros (num_boost_round
+#   = num_iterations, seed = la semilla) sobre un único Dataset, predice 202108 y guarda las probabilidades en
+#   un .npy por semilla; si el archivo existe, saltea esa semilla. Al final apila las 20 predicciones en una
+#   matriz de 20 × 164.647.
+#%% celda 8 [texto]
+## 4. Modelo final con 20 semillas
+
+Cada semilla entrena un modelo con **los mismos hiperparámetros** y predice `202108`. Las probabilidades se guardan apenas termina cada una, así que si se corta la corrida, retoma desde donde quedó.
+
+**Nota para iterar:** los hiperparámetros se ajustaron con 1 o 2 meses de entrenamiento y acá se entrena con 4. `min_data_in_leaf` y la cantidad de árboles podrían necesitar un ajuste. Es un tema para una iteración (CLAUDE.md §4, el reescalado de `z494`), no para la línea base.
+
+#%% celda 9 [código]
+rondas = PARAMS['num_iterations']
+params_lgb = {k: v for k, v in PARAMS.items() if k != 'num_iterations'}  # se puede re-ejecutar la celda
+dtrain = lgb.Dataset(X_train, label=y_train, free_raw_data=False)
+
+t_total = time.time()
+for k, semilla in enumerate(SEMILLAS, 1):
+    archivo = PROBS / f'prob_s{semilla}.npy'
+    if archivo.exists():
+        continue
+    t0 = time.time()
+    modelo = lgb.train({**params_lgb, 'seed': semilla}, dtrain, num_boost_round=rondas)
+    np.save(archivo, modelo.predict(X_futuro))
+    print(f'[{k}/20] semilla {semilla} · {time.time() - t0:.0f} s')
+print(f'Listo en {(time.time() - t_total) / 60:.1f} min')
+
+probs = np.vstack([np.load(PROBS / f'prob_s{s}.npy') for s in SEMILLAS])   # 20 × 164.647
+assert probs.shape == (20, len(ids_futuro))
+
+# [Anotación · líneas 265–294] top_n devuelve los N numero_de_cliente de mayor probabilidad (orden estable).
+#   Escribe un CSV por semilla con su lista y un CSV de semillerío con los N de mayor promedio de las 20
+#   probabilidades; guarda también el vector promedio. Los CSV tienen una columna de enteros sin encabezado.
+#%% celda 10 [texto]
+## 5. Archivos para el bot
+
+- **Por semilla:** los N clientes con mayor probabilidad de esa semilla.
+- **Semillerío:** los N clientes con mayor **promedio** de las 20 probabilidades. Es lo estándar; nada de tomar el máximo (CLAUDE.md §9).
+
+Los CSV tienen una sola columna, sin encabezado, con IDs enteros.
+
+#%% celda 11 [código]
+def top_n(prob, n=N):
+    orden = np.argsort(-prob, kind='stable')
+    return ids_futuro[orden[:n]]
+
+
+def escribir(ids, ruta):
+    pd.Series(ids, dtype='int64').to_csv(ruta, index=False, header=False)
+
+
+archivos_semillas = []
+for semilla, prob in zip(SEMILLAS, probs):
+    ruta = SALIDA / f'{NOMBRE_SUBMIT}_s{semilla}.csv'
+    escribir(top_n(prob), ruta)
+    archivos_semillas.append(ruta)
+
+prob_semillerio = probs.mean(axis=0)
+archivo_semillerio = SALIDA / f'{NOMBRE_SUBMIT}_semillerio.csv'
+escribir(top_n(prob_semillerio), archivo_semillerio)
+np.save(PROBS / 'prob_semillerio.npy', prob_semillerio)
+
+print(f'{len(archivos_semillas)} archivos por semilla + 1 de semillerío en {SALIDA}')
+
+# [Anotación · líneas 296–325] Relee cada CSV como texto y verifica que todas las líneas sean enteros, que
+#   haya exactamente N, que no haya duplicados y que todos los IDs sean de 202108. Registra si 48000000 y
+#   31100000 aparecen en cada archivo.
+#%% celda 12 [texto]
+## 6. Checklist de cada CSV (CLAUDE.md §8)
+
+Se relee **cada archivo como texto**, igual que lo va a leer el bot, y se controla:
+- que no haya encabezado;
+- que cada línea sea un entero, sin notación científica;
+- que no haya duplicados;
+- que haya exactamente N líneas;
+- que todos los IDs sean de `202108`.
+
+Si `48000000` o `31100000` están en la lista, tienen que aparecer escritos así, completos.
+
+#%% celda 13 [código]
+ids_validos = set(ids_futuro.tolist())
+
+
+def verificar_csv(ruta):
+    lineas = ruta.read_text().splitlines()
+    assert all(re.fullmatch(r'\d+', l) for l in lineas), f'{ruta.name}: hay líneas que no son enteros (¿encabezado o 4.8e+07?)'
+    ids = [int(l) for l in lineas]
+    assert len(ids) == N, f'{ruta.name}: {len(ids)} líneas, se esperaban {N}'
+    assert len(set(ids)) == len(ids), f'{ruta.name}: IDs duplicados'
+    assert set(ids) <= ids_validos, f'{ruta.name}: hay IDs que no son de {MES_FUTURO}'
+    return {'archivo': ruta.name, 'lineas': len(ids),
+            '48000000': '48000000' in lineas, '31100000': '31100000' in lineas}
+
+
+control = pd.DataFrame([verificar_csv(r) for r in archivos_semillas + [archivo_semillerio]])
+print(f'Checklist OK en los {len(control)} archivos')
+control.tail(3)
+
+# [Anotación · líneas 327–336] Calcula qué porcentaje de los clientes de la lista de cada semilla está también
+#   en la lista del semillerío e imprime la media, el mínimo y el máximo.
+#%% celda 14 [texto]
+## 7. Estabilidad entre semillas
+
+Qué tanto coinciden las listas de las 20 semillas con la del semillerío: % de clientes en común. Si coinciden mucho, el resultado no depende de la suerte de una semilla. Es diagnóstico, no un criterio de decisión.
+
+#%% celda 15 [código]
+lista_semillerio = set(top_n(prob_semillerio).tolist())
+coincidencia = np.array([len(set(top_n(p).tolist()) & lista_semillerio) / N for p in probs])
+print(f'Coincidencia con el semillerío: media {100 * coincidencia.mean():.1f} % · '
+      f'mín {100 * coincidencia.min():.1f} % · máx {100 * coincidencia.max():.1f} %')
+
+# [Anotación · líneas 338–363] Agrega una fila a ../entregas/registro_submits.md (lo crea con encabezado si no
+#   existe) con fecha, nombre del submit, configuración, N, archivos y semillas, y deja para completar a mano
+#   las columnas de la respuesta del bot. Imprime el texto del mensaje 'submit <nombre>' y qué archivos
+#   adjuntar.
+#%% celda 16 [texto]
+## 8. Registro del submit
+
+Agrega una fila a `../entregas/registro_submits.md`. **Las columnas de la respuesta del bot** (media y desvío públicos) **las completa el usuario** al recibirla.
+
+**El mensaje al bot** es un mensaje privado a `@competencia-uno`:
+- **Cuerpo:** `submit <NOMBRE_SUBMIT>`.
+- **Primer submit (evaluación):** los 20 CSV por semilla adjuntos.
+- **Entrega definitiva:** solo el CSV del semillerío, y tiene que ser **el último submit**, antes de salir de viaje (CLAUDE.md §1.1).
+
+#%% celda 17 [código]
+REGISTRO = ENTREGAS / 'registro_submits.md'
+if not REGISTRO.exists():
+    REGISTRO.write_text(
+        '# Registro de submits\n\n'
+        'Cada submit: qué modelo, qué N y qué devolvió el bot. **El que vale es el último antes del cierre.**\n\n'
+        '| Fecha | Submit (`submit ...`) | Config | N | Archivos | Semillas | Media pública | Desvío público | Notas |\n'
+        '|---|---|---|---|---|---|---|---|---|\n')
+
+with REGISTRO.open('a') as f:
+    f.write(f"| {datetime.now():%Y-%m-%d %H:%M} | `{NOMBRE_SUBMIT}` | {CONFIG} · {VARIANTE}{' · ' + BLOQUES if BLOQUES else ''}{' · sin marzo' if 202103 not in MESES_FINAL else ''}{' · Optuna p' + str(hiper_08['prueba']) if hiper_08 else ''}{' · juego ' + str(JUEGO_SEMILLAS) if JUEGO_SEMILLAS != 1 else ''} | {N:,} | "
+            f"20 por semilla + semillerío (`{SALIDA.name}/`) | {'979201 → 20 primos' if JUEGO_SEMILLAS == 1 else f'juego {JUEGO_SEMILLAS}: 20 primos nuevos'} | *(completar)* | *(completar)* | |\n")
+
+print(f'Registrado en {REGISTRO}')
+print(f'\nMensaje para @competencia-uno:  submit {NOMBRE_SUBMIT}')
+print(f'Adjuntar los 20 archivos  {NOMBRE_SUBMIT}_s<semilla>.csv  de {SALIDA}/')

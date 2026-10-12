@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Auditoría del único CSV final de DMEyF Competencia 1; no entrena modelos.
+
+Uso:
+  python3 verificar_csv_final.py prediccion.csv --n 13500 \
+      --referencia archivo_ultimo_submit.csv --dataset competencia_01.csv
+  python3 verificar_csv_final.py prediccion.csv --sha256 HASH_HEX --n 13500
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+from pathlib import Path
+import re
+import sys
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def cargar_prediccion(path: Path) -> list[str]:
+    ids: list[str] = []
+    with path.open("r", newline="", encoding="utf-8") as file:
+        for rownum, row in enumerate(csv.reader(file), start=1):
+            if len(row) != 1:
+                raise ValueError(f"{path}: fila {rownum}: se esperaba una sola columna, sin encabezado")
+            value = row[0]
+            if not re.fullmatch(r"[0-9]+", value):
+                raise ValueError(f"{path}: fila {rownum}: numero_de_cliente no es entero decimal: {value!r}")
+            ids.append(value)
+    if not ids:
+        raise ValueError(f"{path}: archivo vacío")
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"{path}: hay IDs duplicados")
+    return ids
+
+
+def agosto_esperado(dataset: Path) -> set[str]:
+    agosto: set[str] = set()
+    nfilas = 0
+    with dataset.open("r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        needed = {"foto_mes", "numero_de_cliente"}
+        if reader.fieldnames is None or not needed.issubset(reader.fieldnames):
+            raise ValueError(f"{dataset}: faltan columnas: {needed - set(reader.fieldnames or [])}")
+        for row in reader:
+            if row["foto_mes"] == "202108":
+                numero = row["numero_de_cliente"]
+                if not re.fullmatch(r"[0-9]+", numero):
+                    raise ValueError(f"{dataset}: ID de agosto inválido: {numero!r}")
+                if numero in agosto:
+                    raise ValueError(f"{dataset}: numero_de_cliente duplicado en agosto: {numero}")
+                agosto.add(numero)
+                nfilas += 1
+    if not agosto:
+        raise ValueError(f"{dataset}: no hay clientes para foto_mes=202108")
+    print(f"Clientes elegibles de agosto en dataset: {nfilas:,}")
+    return agosto
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("csv_final", type=Path, help="CSV generado: una columna, sin encabezado")
+    parser.add_argument("--referencia", type=Path, help="CSV exacto adjuntado en el último submit")
+    parser.add_argument("--sha256", dest="sha_esperado", help="SHA-256 del CSV del último submit")
+    parser.add_argument("--n", type=int, help="Cantidad exacta de clientes de la entrega")
+    parser.add_argument("--dataset", type=Path, help="competencia_01.csv; chequea IDs de agosto")
+    args = parser.parse_args()
+
+    ids = cargar_prediccion(args.csv_final)
+    if args.n is not None and len(ids) != args.n:
+        raise ValueError(f"N distinto: generado={len(ids)} esperado={args.n}")
+    if not 8000 <= len(ids) <= 15000:
+        raise ValueError(f"N fuera del rango declarado por la competencia: {len(ids)}")
+    digest = sha256(args.csv_final)
+    print(f"Formato e IDs: OK | N={len(ids):,} | SHA256={digest}")
+
+    if args.dataset:
+        elegibles = agosto_esperado(args.dataset)
+        invalidos = set(ids) - elegibles
+        if invalidos:
+            raise ValueError(f"Hay {len(invalidos)} IDs que no pertenecen a agosto. Ej.: {sorted(invalidos)[:5]}")
+        print("Todos los IDs seleccionados pertenecen a agosto: OK")
+
+    if args.referencia:
+        ref_ids = cargar_prediccion(args.referencia)
+        if len(ref_ids) != len(ids):
+            raise ValueError(f"Referencia y generado tienen distinto N: {len(ref_ids)} vs {len(ids)}")
+        if set(ref_ids) != set(ids):
+            raise ValueError(f"Distintos clientes: solo generado={len(set(ids)-set(ref_ids))}; "
+                             f"solo referencia={len(set(ref_ids)-set(ids))}")
+        if ref_ids != ids:
+            raise ValueError("Los IDs coinciden como conjunto, pero no en el mismo orden")
+        ref_digest = sha256(args.referencia)
+        if ref_digest != digest:
+            raise ValueError("Mismo orden de IDs, pero distintos bytes: revisar saltos de línea/formato")
+        print("Reproducción bit a bit del CSV adjuntado al último submit: OK")
+
+    if args.sha_esperado is not None:
+        expected = args.sha_esperado.lower().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ValueError("--sha256 debe tener exactamente 64 dígitos hexadecimales")
+        if digest != expected:
+            raise ValueError(f"SHA256 diferente: generado={digest}; referencia={expected}")
+        print("SHA256 de referencia: OK")
+
+    if not args.referencia and not args.sha_esperado:
+        print("ADVERTENCIA: formato válido, pero la igualdad con el submit NO fue verificada")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

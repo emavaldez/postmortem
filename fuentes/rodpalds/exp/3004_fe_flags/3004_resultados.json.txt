@@ -1,0 +1,10 @@
+{
+  "archivo": "ds3004_flags.parquet",
+  "columnas": 787,
+  "MB": 542,
+  "nuevas": 22,
+  "orden": "lag_luego_rank",
+  "extras": "flags",
+  "rankear_extras": false,
+  "_minutos": 0.87
+}

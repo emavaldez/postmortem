@@ -1,0 +1,13 @@
+{
+  "pruebas": 40,
+  "eleccion": "4104 prueba_35",
+  "evidencia": {
+    "meseta_B_elegido_M": 423.6,
+    "referencia": "p117_4102",
+    "meseta_B_referencia_M": 413.0,
+    "meseta_B_z601_M": 377.3,
+    "mejor_retador_segun_A": "prueba_35",
+    "semillas_ganadas_por_el_retador": "8/10"
+  },
+  "_minutos": 28.42
+}

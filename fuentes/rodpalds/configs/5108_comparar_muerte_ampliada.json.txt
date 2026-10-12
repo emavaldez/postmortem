@@ -1,0 +1,33 @@
+{
+  "experimento": 5108,
+  "nombre": "comparar_muerte_ampliada",
+  "descripcion": "Proceso de muerte ampliado: ds3003 (6 variables, 16 productos) contra ds3006 (las 6 + 28 nuevas: conteo sobre ~45 productos, conteos por grupo, puntaje ponderado por lift de marzo-abril, 8 relativos al maximo de 3 meses). Indicaciones del profesor: train 202103 + 202104, lag2 incluido, eleccion de 4107 (prueba 23). Mitad B de 202106 (x2), 30 semillas, bootstrap pareado.",
+  "referencia": "muerte_3003",
+  "n_semillas": 30,
+  "candidatos": {
+    "muerte_3003": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ]
+    },
+    "muerte_ampliada_3006": {
+      "dataset": "ds3006_muerte_ampliada.parquet",
+      "variables": null,
+      "usar_lag2": true,
+      "hiperparametros": {
+        "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+      },
+      "meses_train": [
+        202103,
+        202104
+      ]
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "resumen": [
+    {
+      "modelo": "marzo_y_abril",
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": 766,
+      "hiper": "4106 p23_4104",
+      "arboles": 580,
+      "meses_train": "202103 202104",
+      "min_data_in_leaf": 20248,
+      "meseta_M": 443.1,
+      "maximo_M": 456.0,
+      "envios_optimos": 13500,
+      "envios_agosto_p25_p50_p75": "13,042 / 13,644 / 13,845",
+      "dif_vs_solo_abril_M": 4.8,
+      "IC90_M": "[-7.1 ; 16.4]",
+      "pct_remuestreos_gana": "75%"
+    },
+    {
+      "modelo": "solo_abril",
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": 766,
+      "hiper": "4106 p23_4104",
+      "arboles": 580,
+      "meses_train": "202104",
+      "min_data_in_leaf": 10124,
+      "meseta_M": 438.3,
+      "maximo_M": 454.3,
+      "envios_optimos": 13000,
+      "envios_agosto_p25_p50_p75": "12,842 / 13,243 / 13,544",
+      "dif_vs_solo_abril_M": NaN,
+      "IC90_M": NaN,
+      "pct_remuestreos_gana": NaN
+    }
+  ],
+  "_minutos": 39.23
+}

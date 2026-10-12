@@ -1,0 +1,11 @@
+{
+  "fuentes": [
+    "5005_prod_eleccion_4102",
+    "5011_prod_rank_bo4105"
+  ],
+  "coincidencia_12000": {
+    "comun_con_5005_pct": 95.0,
+    "comun_con_5011_pct": 94.7
+  },
+  "_minutos": 0.01
+}

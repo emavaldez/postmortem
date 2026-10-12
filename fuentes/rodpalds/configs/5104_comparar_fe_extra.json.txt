@@ -1,0 +1,25 @@
+{
+  "experimento": 5104,
+  "nombre": "comparar_fe_extra",
+  "descripcion": "Receta del profesor sin lag2 (ds3002) contra la misma receta con las 6 variables del proceso de muerte (ds3003), ambas con la eleccion de 4105 (p23 de 4104). Semillerio de 30, train 202104, mitad B de 202106 (x2), bootstrap pareado.",
+  "referencia": "rank_bo4105",
+  "n_semillas": 30,
+  "candidatos": {
+    "rank_bo4105": {
+      "dataset": "ds3002_rank_total.parquet",
+      "variables": null,
+      "usar_lag2": false,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    },
+    "rank_extra_bo4105": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": false,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    }
+  }
+}

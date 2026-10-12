@@ -1,0 +1,116 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–6] Importa `pathlib`, `argparse`, `urllib.request` y `duckdb`, y define la URL del CSV
+#   crudo de la competencia.
+from pathlib import Path
+import argparse
+import urllib.request
+import duckdb
+
+URL = "https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv"
+
+# [Anotación · líneas 8–20] Lee el argumento `--workdir` (por defecto `_cluster_work`), crea la carpeta y
+#   define tres rutas dentro de ella: el CSV crudo, el Parquet de salida y `target_counts.csv`. Si el CSV crudo
+#   no está, lo descarga de la URL.
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--workdir", type=Path, default=Path("_cluster_work"))
+    args = p.parse_args()
+    args.workdir.mkdir(parents=True, exist_ok=True)
+
+    raw = args.workdir / "competencia_01_crudo.csv"
+    out = args.workdir / "competencia_01.parquet"
+    counts = args.workdir / "target_counts.csv"
+
+    if not raw.exists():
+        print("Descargando dataset crudo...")
+        urllib.request.urlretrieve(URL, raw)
+
+# [Anotación · líneas 22–47] Abre DuckDB y empieza la consulta: lee el CSV entero con `numero_de_cliente` como
+#   entero de 64 bits, arma la lista de meses y la de clientes, hace el producto de ambas y marca en `mes_0`,
+#   con 1 o 0, si el cliente tiene fila en ese mes.
+    con = duckdb.connect()
+    print("Construyendo target...")
+    q = f"""
+    COPY (
+      WITH raw AS (
+        SELECT * REPLACE (CAST(numero_de_cliente AS BIGINT) AS numero_de_cliente)
+        FROM read_csv('{raw.as_posix()}', sample_size=-1)
+      ),
+      periodos AS (
+        SELECT DISTINCT foto_mes FROM raw
+      ),
+      clientes AS (
+        SELECT DISTINCT numero_de_cliente FROM raw
+      ),
+      todo AS (
+        SELECT numero_de_cliente, foto_mes
+        FROM clientes CROSS JOIN periodos
+      ),
+      presencia AS (
+        SELECT
+          t.numero_de_cliente,
+          t.foto_mes,
+          CASE WHEN r.numero_de_cliente IS NULL THEN 0 ELSE 1 END AS mes_0
+        FROM todo t
+        LEFT JOIN raw r USING (numero_de_cliente, foto_mes)
+      ),
+# [Anotación · líneas 48–70] Con `lead` por cliente calcula si está presente uno y dos meses después (`mes_1`,
+#   `mes_2`) y asigna `clase_ternaria` a las filas existentes: CONTINUA si falta el mes siguiente pero vuelve al
+#   subsiguiente, BAJA+1 si falta el mes siguiente, BAJA+2 si está el mes siguiente y falta el subsiguiente,
+#   CONTINUA si está en los dos, y NULL cuando no hay meses posteriores para decidir.
+      ventana AS (
+        SELECT
+          *,
+          lead(mes_0, 1) OVER (PARTITION BY numero_de_cliente ORDER BY foto_mes) AS mes_1,
+          lead(mes_0, 2) OVER (PARTITION BY numero_de_cliente ORDER BY foto_mes) AS mes_2
+        FROM presencia
+      ),
+      etiquetas AS (
+        SELECT
+          numero_de_cliente,
+          foto_mes,
+          CASE
+            -- Intermitente: falta el mes siguiente pero vuelve al subsiguiente.
+            -- Se conserva como CONTINUA para reproducir la base canónica usada en el EDA.
+            WHEN mes_1 = 0 AND mes_2 = 1 THEN 'CONTINUA'
+            WHEN mes_1 = 0 THEN 'BAJA+1'
+            WHEN mes_1 = 1 AND mes_2 = 0 THEN 'BAJA+2'
+            WHEN mes_1 = 1 AND mes_2 = 1 THEN 'CONTINUA'
+            ELSE NULL
+          END AS clase_ternaria
+        FROM ventana
+        WHERE mes_0 = 1
+      )
+# [Anotación · líneas 71–77] Une las etiquetas con las filas originales por cliente y mes, ordena por cliente
+#   y mes y escribe el resultado en `competencia_01.parquet` con compresión ZSTD.
+      SELECT r.*, e.clase_ternaria
+      FROM raw r
+      JOIN etiquetas e USING (numero_de_cliente, foto_mes)
+      ORDER BY numero_de_cliente, foto_mes
+    ) TO '{out.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+    """
+    con.execute(q)
+
+# [Anotación · líneas 79–96] Escribe en `target_counts.csv` la cantidad de filas por mes y clase, imprime esa
+#   misma tabla y la ruta del Parquet. Las dos últimas líneas llaman a `main()` cuando el archivo se ejecuta
+#   como script.
+    con.execute(f"""
+      COPY (
+        SELECT foto_mes, clase_ternaria, count(*) AS n
+        FROM read_parquet('{out.as_posix()}')
+        GROUP BY foto_mes, clase_ternaria
+        ORDER BY foto_mes, clase_ternaria
+      ) TO '{counts.as_posix()}' (HEADER, DELIMITER ',')
+    """)
+
+    print(con.execute(f"""
+      SELECT foto_mes, clase_ternaria, count(*) n
+      FROM read_parquet('{out.as_posix()}')
+      GROUP BY 1,2 ORDER BY 1,2
+    """).df().to_string(index=False))
+    print("Listo:", out)
+
+if __name__ == "__main__":
+    main()

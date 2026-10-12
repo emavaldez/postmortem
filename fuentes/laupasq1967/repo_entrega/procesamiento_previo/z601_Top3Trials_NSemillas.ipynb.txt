@@ -1,0 +1,142 @@
+#%% celda 1 [texto]
+# Top-3 trials de la BO, cada uno validado con N semillas (adaptado de z601_clases)
+
+Hasta acá se validaba con 10 semillas solo el **1 ganador** de la BO. Acá se toman los **3 mejores** trials (no solo el primero) y se valida CADA UNO con varias semillas -- para confirmar si el que ganó la búsqueda interna sigue siendo el mejor una vez que se promedia el ruido, o si alguno de los otros 2 lo supera en la validación real.
+
+Usa el `BO_log.txt` de la corrida HT4961 (Salsa Mágica); ajustar la ruta si el log está en otra carpeta.
+
+#%% celda 2 [texto]
+### Seteo del ambiente — versión LOCAL
+
+#%% celda 3 [código]
+PARAM_carpeta_datasets <- "C:/Users/Laura/Documents/DMEyF/datasets/"
+PARAM_carpeta_exp      <- "C:/Users/Laura/Documents/DMEyF/exp/"
+require("data.table")
+require("lightgbm")
+
+#%% celda 4 [texto]
+## 1. Leo el BO_log.txt y me quedo con los 3 mejores trials (por el `y` interno)
+
+#%% celda 5 [código]
+archivo_log <- paste0(PARAM_carpeta_exp, "HT4961/BO_log.txt")  # ajustar carpeta si hace falta
+
+bo_log <- fread(archivo_log)
+
+setorder(bo_log, -y)
+top3 <- head(bo_log, 3)
+
+cat("Los 3 mejores trials segun el y interno de la BO:\n")
+print(top3[, .(y, num_iterations, learning_rate, feature_fraction, num_leaves,
+                min_data_in_leaf, scale_pos_weight, min_gain_to_split,
+                lambda_l1, lambda_l2, bagging_fraction, bagging_freq)])
+
+#%% celda 6 [texto]
+## 2. Cargo el dataset y arm el pool undersampleado, una sola vez
+
+#%% celda 7 [código]
+dataset <- fread(paste0(PARAM_carpeta_datasets, "competencia_01.csv"), stringsAsFactors= TRUE)
+
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+campos_buenos <- setdiff(colnames(dataset), c("clase_ternaria", "clase01"))
+campos_buenos <- setdiff(campos_buenos, c("cprestamos_personales", "mprestamos_personales"))
+
+dataset_train <- dataset[foto_mes == 202104]
+dfuture <- dataset[foto_mes == 202106]
+
+param_fijos <- list(
+  boosting= "gbdt", objective= "binary", metric= "auc",
+  first_metric_only= FALSE, boost_from_average= TRUE, feature_pre_filter= FALSE,
+  force_row_wise= TRUE, verbosity= -100,
+  max_depth= -1L, max_bin= 31L,
+  pos_bagging_fraction= 1.0, neg_bagging_fraction= 1.0, is_unbalance= FALSE,
+  drop_rate= 0.1, max_drop= 50, skip_drop= 0.5, extra_trees= FALSE
+)
+
+cortes <- seq(4000, 19000, by= 500)
+
+#%% celda 8 [texto]
+## 3. Entreno cada uno de los 3 trials con N semillas, y barro los cortes en cada corrida
+
+#%% celda 9 [código]
+N_SEMILLAS <- 10
+set.seed(585581)
+semillas <- sample(100000:999999, N_SEMILLAS)
+
+resultados_top3 <- data.table(trial = integer(), semilla = integer(), mejor_corte = integer(), TOTAL = numeric())
+
+for (fila_i in 1:3) {
+
+  hp_trial <- top3[fila_i]
+
+  param_trial <- modifyList(param_fijos, list(
+    num_iterations = hp_trial$num_iterations,
+    learning_rate = hp_trial$learning_rate,
+    feature_fraction = hp_trial$feature_fraction,
+    num_leaves = hp_trial$num_leaves,
+    min_data_in_leaf = hp_trial$min_data_in_leaf,
+    scale_pos_weight = hp_trial$scale_pos_weight,
+    min_gain_to_split = hp_trial$min_gain_to_split,
+    lambda_l1 = hp_trial$lambda_l1,
+    lambda_l2 = hp_trial$lambda_l2,
+    bagging_fraction = hp_trial$bagging_fraction,
+    bagging_freq = hp_trial$bagging_freq
+  ))
+
+  for (semilla in semillas) {
+
+    param_trial$seed <- semilla
+
+    set.seed(semilla, "L'Ecuyer-CMRG")
+
+    dtrain <- lgb.Dataset(
+      data= data.matrix(dataset_train[, campos_buenos, with= FALSE]),
+      label= dataset_train[, clase01]
+    )
+
+    modelo <- lgb.train(data= dtrain, param= param_trial)
+
+    prediccion <- predict(modelo, data.matrix(dfuture[, campos_buenos, with= FALSE]))
+    tb_pred <- dfuture[, list(clase_ternaria)]
+    tb_pred[, prob := prediccion]
+    setorder(tb_pred, -prob)
+
+    mejor_ganancia <- -Inf
+    mejor_corte_local <- NA
+    for (envios in cortes) {
+      tb_pred[, Predicted := 0L]
+      tb_pred[1:envios, Predicted := 1L]
+      ganancia <- tb_pred[Predicted == 1L, sum(ifelse(clase_ternaria == "BAJA+2", 1072500, -27500))]
+      if (ganancia > mejor_ganancia) {
+        mejor_ganancia <- ganancia
+        mejor_corte_local <- envios
+      }
+    }
+
+    resultados_top3 <- rbindlist(list(resultados_top3,
+      data.table(trial = fila_i, semilla = semilla, mejor_corte = mejor_corte_local, TOTAL = mejor_ganancia)))
+
+    rm(modelo, dtrain)
+    gc(full= TRUE, verbose= FALSE)
+  }
+
+  cat("Trial", fila_i, "(y interno =", hp_trial$y, ") -- terminado\n")
+}
+
+#%% celda 10 [texto]
+## 4. Comparo los 3 trials — ¿el que ganó la BO sigue ganando en la validación real?
+
+#%% celda 11 [código]
+estadisticas_top3 <- resultados_top3[, .(
+  media = mean(TOTAL),
+  desvio = sd(TOTAL),
+  minimo = min(TOTAL),
+  maximo = max(TOTAL)
+), by = trial]
+
+setorder(estadisticas_top3, -media)
+print(estadisticas_top3)
+
+cat("\n¿El trial con mejor 'y' interno de la BO es tambien el mejor en la validacion real?\n")
+cat("Trial con mejor y interno:", top3[1, .(y)]$y, " (trial 1)\n")
+cat("Trial con mejor media validada:", estadisticas_top3[1, trial], "\n")

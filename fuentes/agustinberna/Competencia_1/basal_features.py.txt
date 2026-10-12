@@ -1,0 +1,148 @@
+"""Features basales, calidad, aguinaldo y signed ranks por drift de desarrollo."""
+import gc
+import json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import duckdb
+
+
+def signed_rank(series):
+    out=pd.Series(np.nan,index=series.index,dtype='float32')
+    out.loc[series.eq(0)]=0
+    for positive in [True,False]:
+        mask=series.gt(0) if positive else series.lt(0)
+        values=series.loc[mask] if positive else series.loc[mask].abs()
+        out.loc[mask]=(values.rank(method='average',pct=True)*(1 if positive else -1)).astype('float32')
+    return out
+
+
+def aguinaldo_flags(frame,previous,count_column,threshold,count_threshold=2.0):
+    result={}
+    for column,label in [('mpayroll','mpayroll'),(count_column,'cpayroll')]:
+        if column not in frame or column not in previous:
+            raise ValueError('Falta variable salarial: '+column)
+        pairs=frame[['numero_de_cliente',column]].merge(previous[['numero_de_cliente',column]],
+            on='numero_de_cliente',how='left',suffixes=('','_may'),sort=False,validate='one_to_one')
+        a=pairs[column];b=pairs[column+'_may']
+        known=np.isfinite(a) & np.isfinite(b) & b.gt(0)
+        limit=threshold if label=='mpayroll' else count_threshold
+        flag=(a.ge(b*limit)).astype('float32').where(known)
+        result[label+'_dup_junio']=flag.to_numpy()
+    pay=result['mpayroll_dup_junio'];count=result['cpayroll_dup_junio']
+    result['cobra_aguinaldo']=np.where((pay==1)|(count==1),1,
+        np.where((pay==0)&(count==0),0,np.nan)).astype('float32')
+    return result
+
+
+def prepare_basal(cfg,root):
+    from pipeline import q,ID,MES,CLASE,TARGET,EXCLUDED,quality_month,psi,write_json,LOG
+    if (root/'prepared.json').exists():
+        LOG.info('Preparación basal completa reutilizada');return
+    con=duckdb.connect(str(root/'features.duckdb'))
+    try:
+        con.execute(f"SET memory_limit='{cfg['duckdb_memory_gb']}GB'")
+        con.execute('SET threads='+str(cfg['threads']))
+        (root/'tmp_duckdb').mkdir(exist_ok=True)
+        con.execute('SET temp_directory=?',[str(root/'tmp_duckdb')])
+        con.execute('SET preserve_insertion_order=false')
+        con.execute('CREATE OR REPLACE TABLE raw AS SELECT * FROM read_csv_auto(?,sample_size=-1)',[cfg['raw_path']])
+        if con.execute(f'SELECT count(*) FROM (SELECT {q(ID)},{q(MES)} FROM raw GROUP BY ALL HAVING count(*)>1)').fetchone()[0]:
+            raise ValueError('Cliente/mes duplicado')
+        rawcols=[r[0] for r in con.execute('DESCRIBE raw').fetchall()]
+        if not {ID,MES,'mpayroll'}<=set(rawcols):raise ValueError('Faltan claves o sueldo')
+        count_column='cpayroll' if 'cpayroll' in rawcols else 'cpayroll_trx'
+        if count_column not in rawcols:raise ValueError('No existe cpayroll ni cpayroll_trx')
+        observed={r[0] for r in con.execute(f'SELECT DISTINCT {q(MES)} FROM raw').fetchall()}
+        if not set(cfg['months'])<=observed:raise ValueError('Faltan meses requeridos')
+        fields=','.join('r.'+q(c) for c in rawcols if c not in EXCLUDED-{ID,MES})
+        con.execute(f'''CREATE OR REPLACE TABLE labeled AS
+          WITH b AS (SELECT *,CAST({q(MES)}//100*12+{q(MES)}%100 AS INTEGER) AS __month FROM raw),
+          m AS (SELECT {fields},r.__month,CASE
+            WHEN NOT EXISTS(SELECT 1 FROM b z WHERE z.__month=r.__month+1)
+              OR NOT EXISTS(SELECT 1 FROM b z WHERE z.__month=r.__month+2) THEN NULL
+            WHEN a.{q(ID)} IS NULL THEN 'BAJA+1'
+            WHEN c.{q(ID)} IS NULL THEN 'BAJA+2' ELSE 'CONTINUA' END AS {q(CLASE)}
+          FROM b r LEFT JOIN b a ON a.{q(ID)}=r.{q(ID)} AND a.__month=r.__month+1
+          LEFT JOIN b c ON c.{q(ID)}=r.{q(ID)} AND c.__month=r.__month+2)
+          SELECT *,CASE WHEN {q(CLASE)} IS NULL THEN NULL
+            WHEN {q(CLASE)} IN ('BAJA+1','BAJA+2') THEN 1 ELSE 0 END AS {q(TARGET)} FROM m''')
+        rules = {'ccajas_depositos': [202105]}
+        reports=[]
+        may_raw=None
+        for month in cfg['months']:
+            LOG.info('Basal/DQ mes %s',month)
+            frame=con.execute(f'SELECT * FROM labeled WHERE {q(MES)}=? ORDER BY {q(ID)}',[month]).df()
+            if month==202105:may_raw=frame[[ID,'mpayroll',count_column]].copy()
+            flags=aguinaldo_flags(frame,may_raw,count_column,cfg['aguinaldo_ratio'],cfg['aguinaldo_count_ratio']) if month==202106 else {
+                name:np.zeros(len(frame),dtype='float32') for name in ['mpayroll_dup_junio','cpayroll_dup_junio','cobra_aguinaldo']}
+            # La duplicación se calcula sobre valores crudos, antes del IPC.
+            frame,report=quality_month(frame,cfg,rules);reports.extend(report)
+            for name,values in flags.items():frame[name]=values
+            for c in frame:
+                if c not in EXCLUDED:
+                    if not pd.api.types.is_numeric_dtype(frame[c]):raise ValueError('Predictor no numérico: '+c)
+                    frame[c]=frame[c].astype('float32').replace([np.inf,-np.inf],np.nan)
+            path=root/f'base_{month}.parquet';temp=path.with_suffix('.parquet.tmp')
+            frame.to_parquet(temp,index=False,compression='zstd');temp.replace(path)
+            del frame;gc.collect()
+        pd.DataFrame(reports).to_csv(root/'dq_corrections.csv',index=False)
+        may=pd.read_parquet(root/'base_202105.parquet');june=pd.read_parquet(root/'base_202106.parquet')
+        baseline=[c for c in rawcols if c not in EXCLUDED]
+        drift=[]
+        # Valores observados: NA no determina qué columnas se rankean.
+        for c in baseline:
+            if c in cfg['categorical_columns']:continue
+            a=may[c].dropna().to_numpy();b=june[c].dropna().to_numpy()
+            value=psi(a,b) if len(a) and len(b) else np.nan
+            drift.append(dict(feature=c,psi_observed_may_june=value,
+                missing_may=float(may[c].isna().mean()),missing_june=float(june[c].isna().mean())))
+        table=pd.DataFrame(drift).sort_values(['psi_observed_may_june','feature'],ascending=[False,True])
+        ranks=table.loc[table.psi_observed_may_june>cfg['drift_threshold'],'feature'].head(cfg['drift_rank_top_k']).tolist()
+        table['signed_rank_selected']=table.feature.isin(ranks);table.to_csv(root/'drift_rank_selection.csv',index=False)
+        write_json(root/'aguinaldo_report.json',dict(count_column=count_column,amount_threshold=cfg['aguinaldo_ratio'],count_threshold=cfg['aguinaldo_count_ratio'],
+            definition='raw June amount >= 1.5 * May OR count >= 2 * May; positive May; heuristic, not verified SAC',
+            flagged=int(june.cobra_aguinaldo.eq(1).sum()),unknown=int(june.cobra_aguinaldo.isna().sum())))
+        del may,june;gc.collect()
+        temporal=None
+        for month in cfg['months']:
+            frame=pd.read_parquet(root/f'base_{month}.parquet')
+            additions={'srank_'+c:signed_rank(frame[c]) for c in ranks}
+            frame=pd.concat([frame,pd.DataFrame(additions,index=frame.index)],axis=1)
+            con.register('month_frame',frame)
+            if temporal is None:
+                temporal=[c for c in frame if c not in EXCLUDED]
+                con.execute('CREATE OR REPLACE TABLE intrames AS SELECT * FROM month_frame')
+            else:con.execute('INSERT INTO intrames BY NAME SELECT * FROM month_frame')
+            con.unregister('month_frame');del frame;gc.collect()
+        expressions=[]
+        for c in temporal:
+            for k in (1,2):
+                expressions.extend([f'CAST(p{k}.{q(c)} AS FLOAT) AS {q(f"lag{k}_"+c)}',
+                    f'CAST(t.{q(c)}-p{k}.{q(c)} AS FLOAT) AS {q(f"delta{k}_"+c)}'])
+        features=None
+        for month in cfg['months']:
+            month_idx=int(month)//100*12+int(month)%100
+            LOG.info('Lags/deltas por mes %s',month)
+            # Filtrar los tres lados antes del join evita materializar todo el panel ancho.
+            con.execute(f'''CREATE OR REPLACE TABLE features AS SELECT t.*,{','.join(expressions)}
+                FROM (SELECT * FROM intrames WHERE __month={month_idx}) t
+                LEFT JOIN (SELECT * FROM intrames WHERE __month={month_idx-1}) p1
+                  ON p1.{q(ID)}=t.{q(ID)}
+                LEFT JOIN (SELECT * FROM intrames WHERE __month={month_idx-2}) p2
+                  ON p2.{q(ID)}=t.{q(ID)}''')
+            names=[r[0] for r in con.execute('DESCRIBE features').fetchall()]
+            if len(names)>cfg['max_columns']:raise ValueError('Se excede limite de columnas')
+            current=[c for c in names if c not in EXCLUDED]
+            if features is not None and current!=features:raise ValueError('Features distintas entre meses')
+            features=current
+            path=root/f'month_{month}.parquet';temp=path.with_suffix('.parquet.tmp')
+            con.execute(f'COPY (SELECT * FROM features ORDER BY {q(ID)}) TO ? (FORMAT PARQUET,COMPRESSION ZSTD)',[str(temp)])
+            temp.replace(path)
+            con.execute('DROP TABLE features')
+        write_json(root/'features.json',dict(features=features,baseline=baseline,signed_rank_sources=ranks,
+            drift_reference_months=[202105,202106],drift_is_development_selection=True,
+            removed_psi=[],total_generated=len(features),removed_constant=[]))
+        write_json(root/'prepared.json',dict(features=len(features),months=cfg['months']))
+        con.execute('CHECKPOINT')
+    finally:con.close()

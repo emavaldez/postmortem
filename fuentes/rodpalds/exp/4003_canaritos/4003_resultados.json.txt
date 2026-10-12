@@ -1,0 +1,30 @@
+{
+  "n_variables": {
+    "todas": 456,
+    "p95": 123,
+    "max": 120
+  },
+  "umbral_p95": 0.0008555629381425801,
+  "umbral_max": 0.000914764076913067,
+  "ranking": [
+    {
+      "conjunto": "todas",
+      "n_variables": 456,
+      "ganancia_media_M": 408.2,
+      "desvio_M": 8.0
+    },
+    {
+      "conjunto": "p95",
+      "n_variables": 123,
+      "ganancia_media_M": 403.7,
+      "desvio_M": 5.4
+    },
+    {
+      "conjunto": "max",
+      "n_variables": 120,
+      "ganancia_media_M": 402.3,
+      "desvio_M": 5.0
+    }
+  ],
+  "_minutos": 2.43
+}

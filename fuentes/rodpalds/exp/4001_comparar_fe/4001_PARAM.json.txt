@@ -1,0 +1,46 @@
+{
+  "experimento": 4001,
+  "nombre": "comparar_fe",
+  "descripcion": "Base sin lags vs lags/deltas (crudo, mediana, rank). LightGBM fijo (params del z601), train 202104 -> test 202106, 5 semillas.",
+  "datasets": {
+    "base": "ds1001_base.parquet",
+    "crudo": "ds3001_crudo.parquet",
+    "mediana": "ds3001_mediana.parquet",
+    "rank": "ds3001_rank.parquet"
+  },
+  "mes_train": 202104,
+  "mes_test": 202106,
+  "clase": "clase_binaria1",
+  "usar_lag2": false,
+  "semillas": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "num_boost_round": 250,
+  "lgbm": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "max_bin": 31,
+    "num_leaves": 16,
+    "learning_rate": 0.019868,
+    "min_data_in_leaf": 816,
+    "feature_fraction": 0.277155,
+    "bagging_fraction": 0.63413,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "verbose": -1
+  },
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "cortes": {
+    "desde": 2000,
+    "hasta": 20000,
+    "paso": 500
+  },
+  "_fecha_inicio": "2026-10-05 01:23:15",
+  "_script": "04_comparar_datasets.py",
+  "_git_commit": "sin_git"
+}

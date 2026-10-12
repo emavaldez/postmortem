@@ -1,0 +1,17 @@
+name: Tests sin datos
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.lock -r requirements-z501.txt
+      - run: python -m compileall -q 1_dataset 2_variables 3_grupos_baja2 4_modelo 5_prediccion_final
+      - run: cd 4_modelo/experimentos_20261007_post_c3/13_cluster_aware_reweighting && python test_cluster_aware.py
+      - run: cd 4_modelo/experimentos_20261007_post_c3/05_superfinal100 && python test_superfinal100_v2.py

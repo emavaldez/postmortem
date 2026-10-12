@@ -1,0 +1,53 @@
+{
+  "dataset": "ds3007_profesor.parquet",
+  "clase": "clase_binaria2",
+  "escalar_min_data_in_leaf": true,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "modo": "produccion",
+  "meses_train": [
+    202103,
+    202104,
+    202105,
+    202106
+  ],
+  "mes_prediccion": 202108,
+  "experimento": 5022,
+  "nombre": "prod_p23_ds3007",
+  "variables": null,
+  "hiperparametros": {
+    "eleccion": "4107_bo_profesor_mar_abr/4107_eleccion.json"
+  },
+  "n_semillas": 50,
+  "descripcion": "Como 5015 (prueba 23, marzo-junio, min_data_in_leaf escalado x2, 50 semillas) pero con el dataset del profesor ds3007 (1.1 ccajas_depositos NA en 202105, 1.3 flags _zero, 1.4 tend3/avg3). Solo se corre si 5114 (R8) lo adopta. Corte domingo 22:30 con al menos 20 semillas (el ultimo submit vale hasta las 23:59 del domingo).",
+  "usar_lag2": true,
+  "sobrescribir": true,
+  "hora_limite": "2026-10-11 22:30",
+  "min_semillas": 20
+}

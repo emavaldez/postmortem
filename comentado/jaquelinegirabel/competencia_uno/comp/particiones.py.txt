@@ -1,0 +1,100 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–20] Docstring (train = todos los meses de train juntos; test = el mes de test; regla M
+#   − 2) e imports. sumar_meses suma n meses a un AAAAMM.
+"""Arma el train y el test de un experimento.
+
+- Train: los meses de experimento.meses_train (todas sus filas juntas).
+- Test: experimento.mes_test, que solo se usa para medir la ganancia.
+
+Regla M - 2 (recomendada, no obligatoria): la BAJA+2 de un mes se conoce recien dos meses
+despues. Para que el test copie la situacion real de agosto, los meses de train deberian ser
+como mucho mes_test - 2. Si no, el experimento muestra un AVISO (ver Experimento.avisos).
+"""
+import lightgbm as lgb
+
+from . import config
+from .datos import separar
+
+
+def sumar_meses(mes, n):
+    """sumar_meses(202105, -2) -> 202103. Funciona cruzando anios."""
+    anio, m = divmod(mes, 100)
+    total = anio * 12 + (m - 1) + n
+    return (total // 12) * 100 + total % 12 + 1
+
+
+# [Anotación · líneas 23–37] etiqueta_entrenamiento devuelve la etiqueta BAJA+2 (clase 'baja2') o 1 para las
+#   clases de CLASES_OBJETIVO (BAJA+1 y BAJA+2 en 'baja1y2'). umbral_de_decision calcula 0.025 / s, con s =
+#   BAJA+2 / positivos de entrenamiento.
+def etiqueta_entrenamiento(y_baja2, clase, clase_objetivo='baja2'):
+    """El 1 con el que se entrena: BAJA+2 (modelo A) o BAJA+1 + BAJA+2 (modelo B)."""
+    if clase_objetivo == 'baja2':
+        return y_baja2
+    return clase.isin(config.CLASES_OBJETIVO[clase_objetivo]).astype('int64')
+
+
+def umbral_de_decision(y_baja2, y_entrenamiento):
+    """p >= UMBRAL / s, con s = BAJA+2 / positivos de entrenamiento.
+
+    Si el modelo predice "BAJA+1 o BAJA+2", solo una parte s de esos positivos paga; contactar
+    conviene cuando la chance de BAJA+2 (~ s * p) es >= 0.025. En el modelo A, s = 1: da 0.025.
+    """
+    s = y_baja2.sum() / y_entrenamiento.sum()
+    return config.UMBRAL / s
+
+
+# [Anotación · líneas 40–66] armar_particion verifica que los meses de train y el de test tengan
+#   clase_ternaria completa (si no, ValueError), separa X e y de train y de test y devuelve un diccionario con
+#   X_train, la etiqueta de entrenamiento, los BAJA+2 reales del train, el umbral, el lgb.Dataset de train,
+#   X_test, y_test (BAJA+2 reales), la etiqueta objetivo del test y su clase ternaria.
+def armar_particion(data, meses_de_train, mes_test, columnas_excluidas=(), clase_objetivo='baja2'):
+    """Train con meses_de_train, test con mes_test. Devuelve un dict con todo lo necesario.
+
+    y_train es la etiqueta con la que se entrena (segun clase_objetivo); y_train_baja2 e y_test
+    son siempre los BAJA+2 reales, con los que se cuenta la ganancia.
+    """
+    # Un mes sin BAJA+2 conocida (ej. 202107, 202108) quedaria con todo 0 sin avisar
+    for mes in list(meses_de_train) + [mes_test]:
+        if data.loc[data['foto_mes'] == mes, 'clase_ternaria'].isna().any():
+            raise ValueError(f'El mes {mes} no tiene la clase completa (BAJA+2 desconocida): no sirve para train ni test')
+    X_train, y_baja2_train, clase_train = separar(data, meses_de_train, columnas_excluidas)
+    y_train = etiqueta_entrenamiento(y_baja2_train, clase_train, clase_objetivo)
+    X_test, y_test, clase_test = separar(data, [mes_test], columnas_excluidas)
+    return {
+        'meses_train': list(meses_de_train),
+        'mes_test': mes_test,
+        'clase_objetivo': clase_objetivo,
+        'X_train': X_train,
+        'y_train': y_train,
+        'y_train_baja2': y_baja2_train,
+        'umbral': umbral_de_decision(y_baja2_train, y_train),
+        'train_lgb': lgb.Dataset(X_train, label=y_train),
+        'X_test': X_test,
+        'y_test': y_test,
+        'y_test_objetivo': etiqueta_entrenamiento(y_test, clase_test, clase_objetivo),
+        'clase_test': clase_test,
+    }
+
+
+# [Anotación · líneas 69–85] armar_particiones devuelve {mes_test: partición} para el experimento. describir
+#   imprime la cantidad de BAJA+2 y de filas de train y de test y, si la clase objetivo no es 'baja2', los
+#   positivos de entrenamiento y el umbral.
+def armar_particiones(data, experimento):
+    """{mes_test: particion}. Hay un solo mes de test; se devuelve como dict para que el resto
+    del codigo (modelos, ensamble, graficos) lo recorra igual."""
+    return {
+        experimento.mes_test: armar_particion(
+            data, experimento.meses_train, experimento.mes_test, experimento.columnas_excluidas,
+            experimento.clase_objetivo)
+    }
+
+
+def describir(particiones):
+    for mes, p in particiones.items():
+        print(f"Test {mes} ({p['y_test'].sum()} BAJA+2 de {len(p['y_test'])}) <- "
+              f"train {p['meses_train']} ({p['y_train_baja2'].sum()} BAJA+2 de {len(p['y_train'])})")
+        if p.get('clase_objetivo', 'baja2') != 'baja2':
+            print(f"  se entrena con {config.CLASES_OBJETIVO[p['clase_objetivo']]} = 1: {p['y_train'].sum()} positivos "
+                  f"| umbral de decision p >= {p['umbral']:.4f}")

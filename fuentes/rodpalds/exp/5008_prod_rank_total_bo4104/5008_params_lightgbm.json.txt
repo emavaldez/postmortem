@@ -1,0 +1,19 @@
+{
+  "origen": "eleccion: 4104 prueba_35",
+  "arboles": 238,
+  "params": {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "max_bin": 31,
+    "bagging_freq": 1,
+    "feature_pre_filter": false,
+    "deterministic": true,
+    "force_row_wise": true,
+    "verbose": -1,
+    "learning_rate": 0.06300497368040801,
+    "num_leaves": 14,
+    "min_data_in_leaf": 16977,
+    "feature_fraction": 0.20136660177949867,
+    "bagging_fraction": 0.2147798483846397
+  }
+}

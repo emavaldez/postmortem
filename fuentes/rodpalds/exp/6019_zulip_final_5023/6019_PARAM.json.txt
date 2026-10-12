@@ -1,0 +1,17 @@
+{
+  "experimento": 6019,
+  "nombre": "zulip_final_5023",
+  "descripcion": "Archivo para el bot de 5023 (5015 sin columnas rotas): 12.500 envios, mismo corte que la entrega vigente.",
+  "modo": "final",
+  "fuente": "5023_prod_5015_sin_rotas",
+  "envios": [
+    12500
+  ],
+  "max_archivos": 20,
+  "clientes_esperados": 164647,
+  "sobrescribir": true,
+  "_config": "6019_zulip_final_5023.json",
+  "_fecha_inicio": "2026-10-11 20:01:30",
+  "_script": "10_entrega_zulip.py",
+  "_git_commit": "sin_git"
+}

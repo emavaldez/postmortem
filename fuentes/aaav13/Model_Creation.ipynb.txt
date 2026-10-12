@@ -1,0 +1,145 @@
+#%% celda 1 [código]
+import pandas as pd
+import numpy as np
+import os
+
+DATA_PATH = "C:\\Users\\Admin\\Documents\\Maestria DM\\DM EyF\\churn_features_lightgbm.csv"
+
+def cargar_y_preprocesar():
+    print("Iniciando la carga del archivo CSV...")
+    
+    if not os.path.exists(DATA_PATH):
+        print(f"Error: No se encuentra el archivo en {DATA_PATH}. Verifica la ruta.")
+        return None
+
+    # Carga directa del CSV
+    df = pd.read_csv(DATA_PATH)
+    
+    print(f"Dimensiones originales del dataset: {df.shape[0]} filas, {df.shape[1]} columnas.")
+
+    print("Primeras columnas:", list(df.columns[:10]))
+
+    return df
+
+if __name__ == "__main__":
+    df_clientes = cargar_y_preprocesar()
+
+#%% celda 2 [código]
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import optuna
+import os
+import joblib
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score, confusion_matrix
+
+# Silenciar warnings excesivos de optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def calcular_ganancia(y_true, y_prob, threshold, ganancia_acierto=1_072_500, costo_estimulo=27_500):
+    y_pred = (y_prob >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    return (tp * (ganancia_acierto - costo_estimulo)) - (fp * costo_estimulo)
+
+def buscar_umbral_optimo(y_true, y_prob):
+    umbrales = np.arange(0.005, 0.25, 0.001)
+    mejor_ganancia = -np.inf
+    mejor_umbral = 0.05
+    for th in umbrales:
+        g = calcular_ganancia(y_true, y_prob, th)
+        if g > mejor_ganancia:
+            mejor_ganancia = g
+            mejor_umbral = th
+    return mejor_umbral, mejor_ganancia
+
+def entrenar_con_optuna(X, y, n_trials=30):
+    """
+    Función de optimización de hiperparámetros con Optuna usando validación cruzada.
+    """
+    def objective(trial):
+        params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'boosting_type': 'gbdt',
+            'random_state': 42,
+            'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 15, 63),
+            'max_depth': trial.suggest_int('max_depth', 3, 8),
+            'min_child_samples': trial.suggest_int('min_child_samples', 20, 200),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'verbose': -1,
+            'n_jobs': -1
+        }
+        
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        aucs = []
+        
+        for train_idx, val_idx in cv.split(X, y):
+            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            
+            # Seguridad: Verificar que y_train tenga ambas clases (0 y 1)
+            if len(np.unique(y_train)) < 2:
+                continue
+                
+            model = lgb.LGBMClassifier(**params)
+            model.fit(X_train, y_train)
+            
+            preds = model.predict_proba(X_val)[:, 1]
+            aucs.append(roc_auc_score(y_val, preds))
+            
+        if not aucs:
+            return 0.0
+            
+        return np.mean(aucs)
+
+    print("Iniciando la búsqueda de hiperparámetros con Optuna...")
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials)
+    
+    print("\n--- MEJORES HIPERPARÁMETROS ENCONTRADOS ---")
+    print(study.best_params)
+    print(f"Mejor AUC promedio en CV: {study.best_value:.4f}")
+    
+    return study.best_params
+
+def entrenar_modelo_final(X, y, best_params):
+    print("\nEntrenando modelo final con los mejores parámetros...")
+    modelo_final = lgb.LGBMClassifier(**best_params, random_state=42, n_jobs=-1)
+    modelo_final.fit(X, y)
+    return modelo_final
+
+if __name__ == "__main__":
+       
+    # 1. Limpiar filas con NaN en la variable objetivo
+    df_clientes = df_clientes.dropna(subset=['clase_ternaria'])
+    
+    # 2. Binarizar 'clase_ternaria' de forma segura para cualquier tipo (texto o número)
+    if pd.api.types.is_numeric_dtype(df_clientes['clase_ternaria']):
+        y = (df_clientes['clase_ternaria'] > 0).astype(int)
+    else:
+        y = (df_clientes['clase_ternaria'] != 'CONTINUA').astype(int)
+        
+    X = df_clientes.drop(columns=['numero_de_cliente', 'clase_ternaria'])
+    
+    best_params = entrenar_con_optuna(X, y, n_trials=30)
+    modelo = entrenar_modelo_final(X, y, best_params)
+    
+    # 3. Guardar el modelo y las columnas de entrenamiento en la carpeta especificada
+    dir_path = r'C:\Users\Admin\Documents\Maestria DM\DM EyF\Modelos'
+    os.makedirs(dir_path, exist_ok=True)
+    
+    # Guardar objeto modelo
+    model_path = os.path.join(dir_path, 'modelo_lgb_churn.pkl')
+    joblib.dump(modelo, model_path)
+    
+    # Guardar lista de features (vital para prevenir errores de columnas faltantes al predecir)
+    features_path = os.path.join(dir_path, 'features_entrenamiento.pkl')
+    joblib.dump(X.columns.tolist(), features_path)
+    
+    print(f"\n¡Modelo y features guardados con éxito!")
+    print(f" - Modelo: {model_path}")
+    print(f" - Features: {features_path}")

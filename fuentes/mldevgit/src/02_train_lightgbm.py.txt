@@ -1,0 +1,7 @@
+from common import args, train_family
+
+def main():
+    opts=args('5 seeds LightGBM FULL762 finales congeladas; orden cliente/mes').parse_args()
+    train_family(opts.output_dir,'lightgbm')
+
+if __name__=='__main__': main()

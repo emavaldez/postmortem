@@ -1,0 +1,144 @@
+"""005 — Optuna sobre LightGBM, dos estudios (M0 y M1) que se alternan trial a trial.
+
+M0 = 152 columnas originales + 26 `n_*` de negocio (178)      M1 = top150 con historia (pool de 345 columnas, selección por fold)
+Cada trial: sortea hiperparámetros + `r` (fracción de negativos que se conserva, 007), entrena en los folds A y B con 2 semillas
+de búsqueda (las dos primeras propias) y devuelve el ÍNDICE de ganancia = media de (ganancia_fold / referencia_fold), donde la
+ganancia de un fold es la media sobre los k=8000..15000 (así no se optimiza un único k) y las referencias son A=220M, B=360M
+(índice 1.000 ≈ baseline). Se usan dos folds con meses de validación distintos (202105 y 202106) para no sobreajustar a un mes.
+Los mejores trials se reevalúan después con otras semillas y los 3 folds (ver reevaluar.py): no confiar en el valor de la búsqueda.
+
+Uso (raíz del repo; deja correr, se puede cortar con Ctrl-C o creando el archivo STOP en esta carpeta):
+    caffeinate -i venv/bin/python competencia/experimentos/005_optuna/optuna_run.py --horas 8
+Progreso: `tail -f competencia/experimentos/005_optuna/optuna_log.txt`  o  `venv/bin/python competencia/experimentos/005_optuna/progreso.py`
+"""
+import argparse
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import lightgbm as lgb
+import numpy as np
+import optuna
+
+AQUI = Path(__file__).resolve().parent
+sys.path.insert(0, str(AQUI.parents[1] / "src")); sys.path.insert(0, str(AQUI.parents[0] / "004_seleccion_variables"))
+from config import RAIZ, SEMILLAS  # noqa: E402
+from ganancia import ganancia_acumulada  # noqa: E402
+from pool import cargar  # noqa: E402
+from validacion import KS, PARAMS_BASE, xy  # noqa: E402
+
+LOG = AQUI / "optuna_log.txt"
+DB = RAIZ / "artifacts" / "optuna" / "005_optuna.db"
+FOLDS = {"A": ([202103], 202105), "B": ([202103, 202104], 202106)}
+REFERENCIA = {"A": 220e6, "B": 360e6}
+SEMILLAS_BUSQUEDA = SEMILLAS[:2]
+CONJUNTOS = ["M0", "M1"]
+BASELINE_TRIAL = {"r": 0.2, "num_leaves": 31, "learning_rate": 0.05, "min_data_in_leaf": 200, "feature_fraction": 0.5,
+                  "bagging_fraction": 0.8, "lambda_l1": 1e-3, "lambda_l2": 1e-3, "num_boost_round": 300}
+# Ronda 1: rangos amplios. Ronda 2: rangos corridos hacia donde convergió la 1 (lr y rondas topaban con el borde) + max_bin.
+ESPACIOS = {
+    1: {"r": (0.05, 0.5), "num_leaves": (8, 256), "learning_rate": (0.01, 0.2), "min_data_in_leaf": (20, 1000),
+        "feature_fraction": (0.1, 1.0), "bagging_fraction": (0.4, 1.0), "lambda_l1": (1e-3, 10), "lambda_l2": (1e-3, 100),
+        "num_boost_round": (100, 800), "max_bin": None},
+    2: {"r": (0.03, 0.3), "num_leaves": (16, 400), "learning_rate": (0.003, 0.03), "min_data_in_leaf": (10, 300),
+        "feature_fraction": (0.05, 0.6), "bagging_fraction": (0.5, 1.0), "lambda_l1": (1e-3, 10), "lambda_l2": (1e-3, 100),
+        "num_boost_round": (300, 1800), "max_bin": (15, 31, 63, 127)},
+}
+es_hist = lambda c: "_lag1" in c or c.endswith(("_d1", "_r1")) or c.startswith("r_")  # noqa: E731
+
+
+def escribir(texto: str):
+    with open(LOG, "a") as f:
+        f.write(texto + "\n")
+
+
+def preparar_datos() -> dict:
+    """datos[conjunto][fold] = (Xt, yt, Xv, yv): ya recortados a las columnas del conjunto (ahorra memoria)."""
+    datos = {c: {} for c in CONJUNTOS}
+    for fold, (mt, mv) in FOLDS.items():
+        (Xt, yt), (Xv, yv) = xy(cargar(mt, negocio=True)), xy(cargar([mv], negocio=True))
+        cols = {"M0": [c for c in Xt.columns if not es_hist(c)],
+                "M1": (AQUI / "sel" / f"top150_{fold}.txt").read_text().split()}
+        for c in CONJUNTOS:
+            datos[c][fold] = (Xt[cols[c]].copy(), yt.values, Xv[cols[c]].copy(), yv.values)
+        del Xt, Xv
+        escribir(f"[datos] fold {fold}: M0 {len(cols['M0'])} cols, M1 {len(cols['M1'])} cols")
+    return datos
+
+
+def objetivo(trial: optuna.Trial, conjunto: str, datos: dict, ronda: int = 1) -> float:
+    e = ESPACIOS[ronda]
+    r = trial.suggest_float("r", *e["r"], log=True)
+    params = {**PARAMS_BASE,
+              "num_leaves": trial.suggest_int("num_leaves", *e["num_leaves"], log=True),
+              "learning_rate": trial.suggest_float("learning_rate", *e["learning_rate"], log=True),
+              "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", *e["min_data_in_leaf"], log=True),
+              "feature_fraction": trial.suggest_float("feature_fraction", *e["feature_fraction"]),
+              "bagging_fraction": trial.suggest_float("bagging_fraction", *e["bagging_fraction"]),
+              "lambda_l1": trial.suggest_float("lambda_l1", *e["lambda_l1"], log=True),
+              "lambda_l2": trial.suggest_float("lambda_l2", *e["lambda_l2"], log=True)}
+    if e["max_bin"]:
+        params["max_bin"] = trial.suggest_categorical("max_bin", list(e["max_bin"]))
+    rounds = trial.suggest_int("num_boost_round", *e["num_boost_round"], log=True)
+    indices = []
+    for paso, fold in enumerate(FOLDS):
+        Xt, yt, Xv, yv = datos[conjunto][fold]
+        gans = []
+        for s in SEMILLAS_BUSQUEDA:
+            keep = (yt == 1) | (np.random.RandomState(s).rand(len(yt)) < r)      # undersampling (007)
+            m = lgb.train({**params, "seed": s}, lgb.Dataset(Xt[keep], label=yt[keep]), num_boost_round=rounds)
+            acum = ganancia_acumulada(yv, m.predict(Xv))
+            gans.append(np.mean([acum[k - 1] for k in KS]))
+        g = float(np.mean(gans))
+        trial.set_user_attr(f"gan_{fold}", g / 1e6)
+        indices.append(g / REFERENCIA[fold])
+        trial.report(float(np.mean(indices)), paso)                               # el pruner puede cortar tras el fold A
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+    return float(np.mean(indices))
+
+
+def callback(study: optuna.Study, trial: optuna.trial.FrozenTrial):
+    seg = (trial.datetime_complete - trial.datetime_start).total_seconds()
+    ok = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    mejor = f"mejor {study.best_value:.4f} (#{study.best_trial.number})" if ok else "mejor -"
+    p = trial.params
+    resumen = " ".join(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}" for k, v in p.items())
+    val = f"{trial.value:.4f}" if trial.value is not None else "  -   "
+    gan = f"A {trial.user_attrs.get('gan_A', float('nan')):.1f}M B {trial.user_attrs.get('gan_B', float('nan')):.1f}M"
+    escribir(f"{datetime.now():%m-%d %H:%M:%S} {study.study_name} #{trial.number:<4} {trial.state.name:<8} índice {val} ({gan}) {seg:4.0f}s | {mejor} | "
+             f"{len(ok)} ok/{len(study.trials)} total | {resumen}")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("--horas", type=float, default=8.0)
+    ap.add_argument("--ronda", type=int, default=1, choices=[1, 2], help="2 = rangos corridos; estudios M0_r2/M1_r2, arranca con los mejores de la ronda 1")
+    ap.add_argument("--db", default=str(DB), help="base SQLite (para pruebas, usar otra)"); ap.add_argument("--log", default=str(LOG))
+    args = ap.parse_args(); DB, LOG = Path(args.db), Path(args.log)
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    escribir(f"\n===== inicio {datetime.now():%Y-%m-%d %H:%M} | presupuesto {args.horas} h | semillas de búsqueda {SEMILLAS_BUSQUEDA} =====")
+    datos = preparar_datos()
+    estudios = {}
+    sufijo = "" if args.ronda == 1 else f"_r{args.ronda}"
+    for c in CONJUNTOS:
+        e = optuna.create_study(study_name=c + sufijo, storage=f"sqlite:///{DB}", load_if_exists=True, direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=SEMILLAS[1], multivariate=True, n_startup_trials=25),
+                                pruner=optuna.pruners.PercentilePruner(75.0, n_startup_trials=15, n_warmup_steps=0))
+        if len(e.trials) == 0 and args.ronda == 1:
+            e.enqueue_trial(BASELINE_TRIAL)       # el primer trial es el baseline con undersampling 0.2: sirve de referencia
+        elif len(e.trials) == 0:                  # ronda 2: se re-evalúan los 5 mejores de la ronda 1 (con las mismas semillas de búsqueda) como ancla
+            e1 = optuna.load_study(study_name=c, storage=f"sqlite:///{DB}")
+            mejores = sorted([t for t in e1.trials if t.state == optuna.trial.TrialState.COMPLETE], key=lambda t: -t.value)[:5]
+            for t in mejores:
+                e.enqueue_trial({**t.params, "max_bin": 31})
+        estudios[c] = e
+    fin = time.time() + args.horas * 3600
+    try:
+        while time.time() < fin and not (AQUI / "STOP").exists():
+            for c, e in estudios.items():
+                e.optimize(lambda t, c=c: objetivo(t, c[:2], datos, args.ronda), n_trials=1, callbacks=[callback])
+    except KeyboardInterrupt:
+        pass
+    escribir(f"===== fin {datetime.now():%Y-%m-%d %H:%M} =====")

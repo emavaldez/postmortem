@@ -1,0 +1,284 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–4] Monta Google Drive en /content/.drive con google.colab.drive.
+#%% celda 1 [código]
+# Montaje del Drive
+from google.colab import drive
+drive.mount('/content/.drive')
+
+# [Anotación · líneas 6–28] Celda de bash: crea la carpeta dmeyf en el Drive y /content/buckets, enlaza
+#   /content/buckets/b1 a esa carpeta del Drive y crea las subcarpetas exp y datasets y la carpeta
+#   /content/datasets. Si competencia_01_crudo.csv no está en /content/buckets/b1/datasets lo descarga con wget
+#   desde storage.googleapis.com/open-courses/dmeyf2026-9c6f, y si no está en /content/datasets lo copia allí.
+#%% celda 2 [código]
+%%bash
+# Replicación de la estructura de carpetas
+mkdir -p "/content/.drive/My Drive/dmeyf"
+mkdir -p "/content/buckets"
+ln -sfn "/content/.drive/My Drive/dmeyf" /content/buckets/b1
+
+mkdir -p /content/buckets/b1/exp
+mkdir -p /content/buckets/b1/datasets
+mkdir -p /content/datasets
+
+# Descarga condicional del crudo
+FILE_DRIVE="/content/buckets/b1/datasets/competencia_01_crudo.csv"
+FILE_LOCAL="/content/datasets/competencia_01_crudo.csv"
+URL="https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv"
+
+if [ ! -f "$FILE_DRIVE" ]; then
+  wget "$URL" -O "$FILE_DRIVE"
+fi
+
+if [ ! -f "$FILE_LOCAL" ]; then
+  cp "$FILE_DRIVE" "$FILE_LOCAL"
+fi
+
+# [Anotación · líneas 30–40] Instala optuna con pip, sin versión fijada, e importa pandas, numpy, optuna,
+#   LGBMClassifier de lightgbm y roc_auc_score de scikit-learn; desactiva los warnings.
+#%% celda 3 [código]
+!pip install optuna
+
+#%% celda 4 [código]
+import pandas as pd
+import numpy as np
+import optuna
+from lightgbm import LGBMClassifier
+from sklearn.metrics import roc_auc_score
+import warnings
+warnings.filterwarnings("ignore")
+
+# [Anotación · líneas 42–91] Define aplicar_rank_cero_fijo(df, columnas_a_rankear), que trabaja sobre una
+#   copia del DataFrame. Para cada columna separa los valores positivos y los negativos y, dentro de cada
+#   foto_mes, reemplaza cada valor por su rank denso reescalado linealmente: los positivos al intervalo [0.001,
+#   1.0] y los negativos a [-1.0, -0.001]. Los ceros y los NaN no se tocan. Si en un mes hay un único valor
+#   distinto, el grupo recibe el extremo superior del intervalo (1.0 en positivos, -0.001 en negativos).
+# =============================================================================
+# 1. FUNCIÓN: RANKING CON CERO FIJO Y ESCALADO SIMÉTRICO
+# =============================================================================
+def aplicar_rank_cero_fijo(df, columnas_a_rankear):
+    """
+    Convierte variables numéricas a pseudo-percentiles por 'foto_mes' manteniendo el 0:
+    - Positivos: Escalados proporcionalmente entre 0.001 y 1.0.
+    - Negativos: Escalados proporcionalmente entre -1.0 y -0.001.
+    - Ceros y NaNs: Se mantienen intactos.
+    """
+    df_out = df.copy()
+
+    def escalar_rangos(s, val_min, val_max):
+        if s.empty:
+            return s
+
+        # rank(method='dense') asigna rangos enteros consecutivos
+        r = s.rank(method='dense')
+        r_min, r_max = r.min(), r.max()
+
+        # Si hay un único valor en la distribución del mes, se le asigna el máximo (en magnitud)
+        if r_min == r_max:
+            return pd.Series(val_max, index=s.index)
+
+        # Escalado Min-Max a un rango [0, 1] y luego proyección al intervalo [val_min, val_max]
+        p = (r - r_min) / (r_max - r_min)
+        return val_min + p * (val_max - val_min)
+
+    for col in columnas_a_rankear:
+        # Máscaras booleanas (los NaN evalúan como False en ambas comparaciones)
+        mask_pos = df_out[col] > 0
+        mask_neg = df_out[col] < 0
+
+        # Aplicar escalado a los positivos agrupados por foto_mes
+        if mask_pos.any():
+            df_out.loc[mask_pos, col] = (
+                df_out.loc[mask_pos]
+                .groupby('foto_mes')[col]
+                .transform(lambda x: escalar_rangos(x, 0.001, 1.0))
+            )
+
+        # Aplicar escalado a los negativos agrupados por foto_mes
+        if mask_neg.any():
+            df_out.loc[mask_neg, col] = (
+                df_out.loc[mask_neg]
+                .groupby('foto_mes')[col]
+                .transform(lambda x: escalar_rangos(x, -1.0, -0.001))
+            )
+
+    return df_out
+# [Anotación · líneas 92–125] Lee /content/datasets/competencia_01_crudo.csv con pandas. Calcula periodo0 =
+#   año × 12 + mes, ordena por cliente y período y obtiene con shift(-1) y shift(-2) el período de las dos filas
+#   siguientes del mismo cliente. Asigna CONTINUA a las filas de períodos anteriores al anteúltimo, y BAJA si el
+#   cliente no tiene fila en el período siguiente (filas anteriores al último período) o si la tiene en el
+#   siguiente pero no dos períodos después (filas anteriores al anteúltimo). Elimina las columnas auxiliares y
+#   las filas que quedaron sin clase, y crea target = 1 para BAJA y 0 para el resto.
+# =============================================================================
+# 2. CARGA Y CREACIÓN DE LA CLASE BINARIA
+# =============================================================================
+print("Cargando dataset...")
+dataset = pd.read_csv("/content/datasets/competencia_01_crudo.csv")
+
+# Cálculo de meses consecutivos para ubicar bajas
+dataset['periodo0'] = (dataset['foto_mes'] // 100) * 12 + (dataset['foto_mes'] % 100)
+dataset.sort_values(['numero_de_cliente', 'periodo0'], inplace=True)
+
+# Leads para mirar hacia el futuro
+dataset['periodo1'] = dataset.groupby('numero_de_cliente')['periodo0'].shift(-1)
+dataset['periodo2'] = dataset.groupby('numero_de_cliente')['periodo0'].shift(-2)
+
+periodo_ultimo = dataset['periodo0'].max()
+periodo_anteultimo = periodo_ultimo - 1
+
+dataset['clase_binaria'] = np.nan
+dataset.loc[dataset['periodo0'] < periodo_anteultimo, 'clase_binaria'] = 'CONTINUA'
+
+# Lógica BAJA (Agrupa BAJA+1 y BAJA+2 en una sola etiqueta)
+mask_baja1 = (dataset['periodo0'] < periodo_ultimo) & \
+             (dataset['periodo1'].isna() | (dataset['periodo0'] + 1 < dataset['periodo1']))
+
+mask_baja2 = (dataset['periodo0'] < periodo_anteultimo) & \
+             (dataset['periodo0'] + 1 == dataset['periodo1']) & \
+             (dataset['periodo2'].isna() | (dataset['periodo0'] + 2 < dataset['periodo2']))
+
+dataset.loc[mask_baja1 | mask_baja2, 'clase_binaria'] = 'BAJA'
+
+# Limpieza y Target numérico
+dataset.drop(columns=['periodo0', 'periodo1', 'periodo2'], inplace=True)
+dataset.dropna(subset=['clase_binaria'], inplace=True) # Excluye meses 202107/08 sin clase
+dataset['target'] = np.where(dataset['clase_binaria'] == 'BAJA', 1, 0)
+
+# [Anotación · líneas 127–134] Arma features_base con todas las columnas menos numero_de_cliente, foto_mes,
+#   clase_binaria y target, y les aplica aplicar_rank_cero_fijo.
+# =============================================================================
+# 3. APLICACIÓN DE RANKING (Previo a la creación de deltas/lags)
+# =============================================================================
+print("Aplicando Ranking Cero Fijo a las variables base...")
+features_base = [c for c in dataset.columns if c not in ['numero_de_cliente', 'foto_mes', 'clase_binaria', 'target']]
+
+# Se rankean primero las variables originales
+dataset = aplicar_rank_cero_fijo(dataset, features_base)
+
+# [Anotación · líneas 136–169] Ordena por cliente y foto_mes y crea periodo_temp (año × 12 + mes). Para cada
+#   variable de features_base genera <variable>_LAG1 y <variable>_LAG2 con shift(1) y shift(2) por cliente, y
+#   pone NaN en el lag cuando la fila desplazada no está exactamente a 1 o 2 períodos de distancia. Genera
+#   <variable>_DELTA-LAG1 y <variable>_DELTA-LAG2 como valor actual menos cada lag. Elimina periodo_temp y
+#   define features_totales con las variables originales más las cuatro derivadas de cada una.
+# =============================================================================
+# 4. FEATURE ENGINEERING: LAGS Y DELTAS (Sobre variables rankeadas)
+# =============================================================================
+print("Calculando Lags y Deltas...")
+# Garantizar el orden estrictamente temporal
+dataset.sort_values(['numero_de_cliente', 'foto_mes'], inplace=True)
+
+# Recreamos un período continuo para validar distancias exactas de meses
+dataset['periodo_temp'] = (dataset['foto_mes'] // 100) * 12 + (dataset['foto_mes'] % 100)
+
+for col in features_base:
+    # Lags crudos usando el desplazamiento de filas por cliente
+    dataset[f'{col}_LAG1'] = dataset.groupby('numero_de_cliente')[col].shift(1)
+    dataset[f'{col}_LAG2'] = dataset.groupby('numero_de_cliente')[col].shift(2)
+
+    # Desplazamiento del período para verificar la temporalidad estricta
+    periodo_lag1 = dataset.groupby('numero_de_cliente')['periodo_temp'].shift(1)
+    periodo_lag2 = dataset.groupby('numero_de_cliente')['periodo_temp'].shift(2)
+
+    # Si la fila anterior no es exactamente el mes pasado (diferencia != 1), forzar NaN
+    dataset.loc[dataset['periodo_temp'] - periodo_lag1 != 1, f'{col}_LAG1'] = np.nan
+
+    # Si dos filas atrás no son exactamente hace dos meses (diferencia != 2), forzar NaN
+    dataset.loc[dataset['periodo_temp'] - periodo_lag2 != 2, f'{col}_LAG2'] = np.nan
+
+    # Deltas: Si alguno de los componentes es NaN, pandas devuelve NaN automáticamente
+    dataset[f'{col}_DELTA-LAG1'] = dataset[col] - dataset[f'{col}_LAG1']
+    dataset[f'{col}_DELTA-LAG2'] = dataset[col] - dataset[f'{col}_LAG2']
+
+# Limpieza de la columna temporal de soporte
+dataset.drop(columns=['periodo_temp'], inplace=True)
+
+# Actualizamos las features_totales para incluir las 4 nuevas variables por columna
+features_totales = [c for c in dataset.columns if c not in ['numero_de_cliente', 'foto_mes', 'clase_binaria', 'target']]
+# [Anotación · líneas 170–181] Separa por mes: X_train e y_train con las filas de 202103 y 202104; X_test e
+#   y_test con las de 202106. Imprime las dimensiones de las dos matrices.
+# =============================================================================
+# 5. SPLIT TEMPORAL (Train: 202103/04 - Test: 202106)
+# =============================================================================
+train_mask = dataset['foto_mes'].isin([202103, 202104])
+X_train = dataset.loc[train_mask, features_totales]
+y_train = dataset.loc[train_mask, 'target']
+
+test_mask = dataset['foto_mes'] == 202106
+X_test = dataset.loc[test_mask, features_totales]
+y_test = dataset.loc[test_mask, 'target']
+
+print(f"Dimensiones Train: {X_train.shape} | Dimensiones Test: {X_test.shape}")
+
+# [Anotación · líneas 183–226] Define la función objetivo de Optuna. En cada trial propone n_estimators entre
+#   64 y 4096, num_leaves entre 16 y 2048 y min_sum_hessian_in_leaf entre 1e-06 y 0.1, los tres en escala
+#   logarítmica; el resto queda fijo: learning_rate 0.005, min_child_samples 0, colsample_bytree 0.50, max_depth
+#   -1, min_split_gain 0.0, reg_alpha 0.0, reg_lambda 0.0, max_bin 31, subsample 1.0, is_unbalance False,
+#   scale_pos_weight 1.0, extra_trees False, boosting_type gbdt, objective binary, feature_pre_filter False,
+#   deterministic True, random_state 331613. Entrena un LGBMClassifier con X_train, predice la probabilidad de
+#   la clase 1 en X_test (202106) y devuelve el AUC.
+# =============================================================================
+# 6. OPTIMIZACIÓN BAYESIANA CON OPTUNA (Algoritmo TPE para LightGBM)
+# =============================================================================
+def objective(trial):
+    # Espacio de búsqueda de hiperparámetros (LightGBM)
+    params = {
+        # --- 1. Hiperparámetros a optimizar (Búsqueda Logarítmica) ---
+        'n_estimators': trial.suggest_int('n_estimators', 64, 4096, log=True),
+        'num_leaves': trial.suggest_int('num_leaves', 16, 2048, log=True),
+        'min_sum_hessian_in_leaf': trial.suggest_float('min_sum_hessian_in_leaf', 1e-06, 0.1, log=True),
+
+        # --- 2. Parámetros fijos ---
+        'learning_rate': 0.005,
+        'min_child_samples': 0,        # Equivale a min_data_in_leaf (CERO fijo)
+        'colsample_bytree': 0.50,      # Equivale a feature_fraction
+        'max_depth': -1,
+        'min_split_gain': 0.0,         # Equivale a min_gain_to_split
+        'reg_alpha': 0.0,              # Equivale a lambda_l1
+        'reg_lambda': 0.0,             # Equivale a lambda_l2
+        'max_bin': 31,
+        'subsample': 1.0,              # Equivale a bagging_fraction
+        'is_unbalance': False,
+        'scale_pos_weight': 1.0,
+        'extra_trees': False,
+        'boosting_type': 'gbdt',
+        'objective': 'binary',
+        'feature_pre_filter': False,
+        'deterministic': True,
+        'verbosity': -100,
+        'random_state': 331613,        # Semilla actualizada
+        'n_jobs': -1
+    }
+
+    # Instanciamos LightGBM
+    clf = LGBMClassifier(**params)
+    clf.fit(X_train, y_train)
+
+    # Predecir probabilidades de BAJA (clase 1) en el mes de validación
+    y_pred_proba = clf.predict_proba(X_test)[:, 1]
+
+    # Métrica a maximizar: Área bajo la curva ROC
+    auc = roc_auc_score(y_test, y_pred_proba)
+
+    return auc
+
+# [Anotación · líneas 228–244] Crea un sampler TPE con 10 trials iniciales y seed 331613 y un estudio llamado
+#   HT_LightGBM_Optuna con dirección maximize; ejecuta 20 trials e imprime el AUC más alto y los hiperparámetros
+#   del trial que lo obtuvo.
+print("Iniciando búsqueda bayesiana de hiperparámetros...")
+
+# Implementación del sampler TPE configurado con 10 trials de startup y la nueva semilla
+sampler = optuna.samplers.TPESampler(n_startup_trials=10, seed=331613)
+
+study = optuna.create_study(
+    direction='maximize',
+    study_name="HT_LightGBM_Optuna",
+    sampler=sampler
+)
+study.optimize(objective, n_trials=20)
+
+print("\n================ RESULTADOS ================")
+print(f"Mejor AUC: {study.best_value}")
+print("Mejores hiperparámetros identificados:")
+for k, v in study.best_params.items():
+    print(f"  {k}: {v}")

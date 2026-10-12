@@ -1,0 +1,1721 @@
+# Tomás Roel — entrega de la Primera Competencia DMEyF 2026
+
+- Usuario de GitHub: tomasroel
+- Repositorio: https://github.com/tomasroel/DMeyf_Competencias
+- Link posteado: https://github.com/tomasroel/DMeyf_Competencias
+- Commit: ab5eb705943df2540020e097f9ecc9414b686d2b
+- Estado de la lectura: verificada
+- Página: https://emavaldez.github.io/postmortem/entregas/tomasroel/
+- Datos: https://emavaldez.github.io/postmortem/data/entregas/tomasroel.json
+
+## Resumen
+
+La entrega contiene un notebook de R (8_0_competencia1_gcp_entrega.ipynb), un README y el registro de una optimización bayesiana (BO_log.txt). El notebook descarga el dataset crudo, calcula clase_ternaria, pasa ccajas_depositos a NA en 202105, crea variables nuevas dentro del mes (prefijos new_, new2_ y new3_), lags y deltas de orden 1 y 2, tendencia y promedio de 3 meses para 39 variables, y reemplaza cada variable por su ranking con cero fijo dentro de cada mes. Con un detector LightGBM cruzado en dos mitades marca como outliers a los CONTINUA con probabilidad mayor a 0,5 y los quita del entrenamiento. Optimiza num_iterations, num_leaves y min_sum_hessian_in_leaf con 20 evaluaciones de mlr3mbo sobre 202103+202104 (AUC en validación), mide la ganancia en 202106 con 10 semillas y entrena 50 modelos LightGBM con 202103 a 202106, clase binaria (BAJA+1 y BAJA+2 positivos) y submuestreo 0,1 de CONTINUA. Promedia las 50 probabilidades de 202108 y graba un archivo por cada uno de 14 cortes; según el README, la entrega final es el del ensamble con 12.500 clientes.
+
+**Qué entrega.** Un CSV sin encabezado con los numero_de_cliente de los 12.500 clientes de 202108 con mayor probabilidad promedio de 50 semillas: ensamble/8_0_competencia1_gcp_ensamble_m12500.csv (según el README). El notebook genera además, para 14 cortes entre 8.000 y 15.000, un archivo del ensamble y un archivo por semilla.
+
+**Cómo se ejecuta.** Según el README: un solo notebook con kernel R que se corre de arriba hacia abajo, sin scripts previos, en una VM de Google Cloud configurada según las instrucciones de la materia. Baja el dataset a ~/buckets/b1/datasets/ si no está y deja todo en ~/buckets/b1/outputs/base_080/. Para saltear la optimización bayesiana se copia antes BO_log.txt a esa carpeta. Si la corrida se corta, se vuelve a correr desde arriba y sigue desde donde quedó.
+
+## Ficha
+
+- **Lenguajes:** R
+- **Modelos:** LightGBM
+- **Clase que entrena:** Binaria (clase01): 1 para BAJA+1 y BAJA+2, 0 para CONTINUA. La clase_ternaria se calcula en el notebook a partir del dataset crudo.
+- **Meses de entrenamiento:** 202103, 202104, 202105, 202106
+- **Meses de validación:** 202103, 202104, 202106
+- **Mes que predice:** 202108
+- **Submuestreo:** Se entrena con todas las filas BAJA+1 y BAJA+2 y una fracción 0,1 de los CONTINUA (PARAM$trainingstrategy$undersampling), en la BO (sobre el fold de training), en el Testing y en Producción. En Testing y Producción el sorteo se hace con la semilla de cada modelo. El detector de outliers usa también 0,1 (PARAM$outliers$undersampling).
+- **Calidad de datos:** ccajas_depositos pasa a NA en 202105 (PARAM$rotas). Además se quitan del entrenamiento las filas CONTINUA con probabilidad cruzada mayor a 0,5 según un detector LightGBM entrenado en dos mitades (num_iterations 2180, num_leaves 30, min_sum_hessian_in_leaf 0,1141634103, submuestreo 0,1): las de 202103+202104 para la BO y el Testing, y las de 202103 a 202106 para Producción.
+- **Drifting:** Ranking con cero fijo calculado por foto_mes: los positivos pasan a (0, 1], los negativos a [-1, 0), los ceros quedan en 0 y los NA en NA; empates con ties.method 'first'. Se aplica a todas las columnas (originales, nuevas, lags, deltas y tendencias) menos numero_de_cliente, clase_ternaria y las que empiezan con foto_mes.
+- **Variables dentro del mes:** 39 sumas por fila con NA como cero (32 con prefijo new_ y 7 con prefijo new3_), 3 variables new_ adicionales (saldo en pesos, diferencia compra-venta de divisas, proporción del margen de activos), 19 new2_ (estado de tarjetas, uso del límite, pago sobre pago mínimo, ticket promedio, egresos sobre ingresos, productos sin uso, proporción digital, fechas de tarjetas) y 17 new3_ (patrimonio neto, canales usados, cantidad de 'anclas', cocientes sobre límite, payroll y edad, flujos netos).
+- **Variables históricas:** Lag 1 y lag 2, delta1 (actual − lag1) y delta2 (lag1 − lag2) de todas las columnas menos numero_de_cliente y clase_ternaria; new2_dejo_sueldo y tres cocientes contra el lag 1 (ctrx_quarter, mcuentas_saldo, new_total_payroll); para las 39 variables de PARAM$tendencia, _tend3 = (actual − lag2) / 2 y _avg3 = promedio de actual, lag1 y lag2.
+- **Selección de variables:** No se observa en el código: entran al modelo todas las columnas menos clase_ternaria, clase01, fold, azar y training (incluye numero_de_cliente y foto_mes). La importancia por gain se calcula y se graba, sin usarse para filtrar variables.
+- **Optimización de hiperparámetros:** Optimización bayesiana con mlr3mbo y bbotk: 20 evaluaciones, modelo sustituto de kriging (regr.km), adquisición expected improvement optimizada por búsqueda al azar de 1.000 puntos. Busca num_iterations en [64, 4096], num_leaves en [16, 2048] y min_sum_hessian_in_leaf en [1e-06, 0,1]. Entrena en el fold de training de 202103+202104 (con submuestreo 0,1 y sin outliers) y maximiza el AUC en validación. Si BO_log.txt ya tiene 20 evaluaciones, la BO no se ejecuta.
+- **Hiperparámetros finales:** La fila de mayor 'metrica' de BO_log.txt. En el BO_log.txt incluido en el repositorio es la evaluación 19: num_iterations 2263, num_leaves 214, min_sum_hessian_in_leaf 0,00636079845394755 (AUC 0,933071). Fijos en el código: learning_rate 0,005, feature_fraction 0,5, min_data_in_leaf 0, max_bin 31, max_depth -1, lambda_l1 0, lambda_l2 0, bagging_fraction 1, boosting gbdt, objective binary.
+- **Semillas:** Semilla primigenia 911341. Con ella se sortean 50 números primos de 6 cifras (criba de Eratóstenes, set.seed con L'Ecuyer-CMRG). El Testing usa los primeros 10 y Producción los 50. Cada semilla fija el seed de LightGBM y el sorteo del submuestreo de su modelo.
+- **Cantidad de semillas:** 50
+- **Ensamble:** Promedio por cliente (prob_media) de las probabilidades de 50 modelos LightGBM con los mismos hiperparámetros, cada uno con su semilla y su muestra del 10% de los CONTINUA.
+- **Corte:** Se graban archivos para 14 cantidades de envíos (8.000, 9.000 y de 9.500 a 15.000 cada 500, en PARAM$cortes). Según el README, la entrega final es el archivo del ensamble con 12.500 envíos. No se observa en el código la regla que elige ese corte.
+- **Validación:** BO: partición aleatoria 70/30 estratificada por clase_ternaria sobre 202103+202104; se mide AUC sobre todas las filas con training = 0 (el fold del 30% y los CONTINUA del fold del 70% que no entraron en la muestra de 0,1). Testing: 10 semillas entrenadas en 202103+202104 y evaluadas en 202106 completo con la ganancia (1.072.500 por BAJA+2 enviado y −27.500 por cualquier otro envío): curva por semilla, media, desvío y curva del ensamble, tabla en los 14 cortes y máximo de la curva.
+- **Salidas:** En ~/buckets/b1/outputs/base_080/: BO_log.txt, outliers_train.csv, outliers_produccion.csv, carpetas testing/ y produccion/ (prob_s#.csv e importancia_s#.csv por semilla), testing_probabilidades.csv, testing_ganancia.txt, testing_importancia.txt, produccion_importancia.txt, prediccion_202108.csv (prob_s1 a prob_s50 y prob_media), una carpeta m<corte>/ por corte con un csv por semilla y la carpeta ensamble/ con un csv por corte.
+
+## Técnicas en el camino de la entrega
+
+- LightGBM (`modelo.lightgbm`)
+- Clase binaria: positivo = BAJA+1 o BAJA+2 (`clase.binaria_baja1_baja2`)
+- Submuestreo de la clase CONTINUA (`datos.submuestreo_continua`)
+- Variables rotas en algún mes pasadas a NA o corregidas (`datos.variables_rotas_a_na`)
+- Rank con cero fijo (`drifting.rank_cero_fijo`)
+- Variables nuevas dentro del mes (sumas, cocientes, combinaciones) (`variables.intra_mes`)
+- Lags (`variables.lags`)
+- Deltas (diferencia con meses anteriores) (`variables.deltas`)
+- Tendencias (pendiente en una ventana) (`variables.tendencias`)
+- Promedios móviles o de ventana (`variables.promedios_ventana`)
+- Cocientes contra valores anteriores o contra la ventana (`variables.ratios_historia`)
+- Optimización bayesiana (mlrMBO, mlr3mbo, bbotk, skopt u otra) (`hiperparametros.optimizacion_bayesiana`)
+- Partición aleatoria de entrenamiento y validación (`validacion.particion_aleatoria`)
+- Validación en un mes posterior al entrenamiento (`validacion.mes_futuro`)
+- Usa la ganancia de la competencia como métrica (`validacion.ganancia_como_metrica`)
+- Promedio de varias semillas del mismo modelo (`ensamble.semillerio`)
+- Envía una cantidad fija de clientes (`corte.cantidad_fija`)
+- Genera archivos con varios cortes (`corte.varios_cortes`)
+- El modelo final se reentrena sumando los meses usados para validar (`final.reentrena_con_todo`)
+
+## Reproducibilidad (hechos)
+
+- Tiene README o texto de presentación: sí
+- Explica cómo ejecutar: sí
+- Declara versiones o dependencias: no
+- Fija las semillas: sí
+- Usa rutas absolutas o de una máquina: sí
+- Incluye datos o predicciones: no
+- Sale de un solo script o notebook: sí
+- Entorno declarado: Según el README: VM de Google Cloud con 8 vCPU y 62 GB de RAM, configurada según las instrucciones de la materia, kernel R; la corrida completa tarda unas 7 horas y media. El notebook lista 9 paquetes de R que instala si faltan, sin versiones. No se declaran versiones de R ni de los paquetes.
+
+## Pasos del camino de la entrega
+
+1. **Parámetros de la corrida.** La lista PARAM reúne el nombre del experimento (base_080), la semilla primigenia 911341, los meses de cada etapa, la variable rota, las 39 variables con tendencia, el submuestreo 0,1, los parámetros del detector de outliers, las 20 evaluaciones de la BO, la cantidad de semillas (10 y 50), los 14 cortes, los parámetros fijos de LightGBM y el espacio de búsqueda. (`8_0_competencia1_gcp_entrega.ipynb` líneas 88–214)
+2. **Semillas.** Se generan los primos de 6 cifras y se sortean 50 con la semilla primigenia; el Testing usa los primeros 10 y Producción los 50. (`8_0_competencia1_gcp_entrega.ipynb` líneas 221–235)
+3. **Descarga, lectura y clase_ternaria.** Descarga competencia_01_crudo.csv al bucket si no está, lo lee y calcula clase_ternaria (CONTINUA, BAJA+1, BAJA+2) según los meses siguientes en los que aparece cada cliente. (`8_0_competencia1_gcp_entrega.ipynb` líneas 240–262; `8_0_competencia1_gcp_entrega.ipynb` líneas 323–358)
+4. **Variables rotas a NA.** ccajas_depositos pasa a NA en 202105, antes de crear variables nuevas y lags. (`8_0_competencia1_gcp_entrega.ipynb` líneas 105–108; `8_0_competencia1_gcp_entrega.ipynb` líneas 367–373)
+5. **Variables nuevas dentro del mes.** Crea 39 sumas por fila con NA como cero y variables calculadas con prefijos new_ (3), new2_ (19) y new3_ (17): diferencias, cocientes con dividir() (NA si el denominador es cero, negativo o NA), conteos de productos y canales, y mínimos y máximos entre las dos tarjetas. (`8_0_competencia1_gcp_entrega.ipynb` líneas 389–549)
+6. **Lags, deltas y variables contra el mes anterior.** Agrega lag 1 y lag 2 de todas las columnas menos numero_de_cliente y clase_ternaria, y los deltas actual − lag1 y lag1 − lag2. Con esos lags crea new2_dejo_sueldo y tres cocientes contra el mes anterior. (`8_0_competencia1_gcp_entrega.ipynb` líneas 565–594; `8_0_competencia1_gcp_entrega.ipynb` líneas 606–613)
+7. **Tendencia y promedio de 3 meses.** Para las 39 variables de PARAM$tendencia calcula _tend3 = (actual − lag2) / 2 y _avg3 = (actual + lag1 + lag2) / 3, con NA si falta algún mes. (`8_0_competencia1_gcp_entrega.ipynb` líneas 119–133; `8_0_competencia1_gcp_entrega.ipynb` líneas 627–645)
+8. **Ranking con cero fijo por mes.** Conserva 202103 a 202106 y 202108 y reemplaza cada variable, dentro de cada foto_mes, por su ranking entre −1 y 1 con los ceros en 0 y los NA en NA. No se rankean numero_de_cliente, clase_ternaria ni las columnas que empiezan con foto_mes. (`8_0_competencia1_gcp_entrega.ipynb` líneas 647–653; `8_0_competencia1_gcp_entrega.ipynb` líneas 677–694; `8_0_competencia1_gcp_entrega.ipynb` líneas 700–709)
+9. **Partición y submuestreo para la BO.** Con 202103 y 202104 arma una partición 70/30 estratificada por clase, crea clase01 (BAJA+1 y BAJA+2 = 1) y marca como training las bajas y el 10% de los CONTINUA del fold 1. Define las variables predictoras: todas menos la clase y las columnas auxiliares. (`8_0_competencia1_gcp_entrega.ipynb` líneas 738–769; `8_0_competencia1_gcp_entrega.ipynb` líneas 779–782)
+10. **Detección de outliers, etapa 1.** Un detector LightGBM entrenado en dos mitades asigna a cada fila de 202103 y 202104 la probabilidad del modelo que no la vio. Los CONTINUA con probabilidad mayor a 0,5 se quitan del training de la BO; la validación queda completa. (`8_0_competencia1_gcp_entrega.ipynb` líneas 794–842; `8_0_competencia1_gcp_entrega.ipynb` líneas 867–890)
+11. **Optimización bayesiana.** 20 evaluaciones con mlr3mbo (kriging y expected improvement) sobre num_iterations, num_leaves y min_sum_hessian_in_leaf, maximizando el AUC en validación. Cada evaluación se registra en BO_log.txt; si el archivo ya tiene 20, la BO no se ejecuta. (`8_0_competencia1_gcp_entrega.ipynb` líneas 896–954; `8_0_competencia1_gcp_entrega.ipynb` líneas 960–998; `8_0_competencia1_gcp_entrega.ipynb` líneas 1004–1010)
+12. **Hiperparámetros de mayor AUC.** Toma de BO_log.txt la fila de mayor metrica y combina sus tres hiperparámetros con los parámetros fijos en param_final, que se usa en Testing y en Producción. (`8_0_competencia1_gcp_entrega.ipynb` líneas 1035–1042)
+13. **Testing en 202106 con 10 semillas.** Entrena 10 modelos con 202103+202104 sin los outliers de la etapa 1 y submuestreo 0,1 sorteado por semilla, predice 202106 y calcula la curva de ganancia de cada semilla y del promedio de las 10, con la tabla en los 14 cortes. También promedia la importancia de variables. (`8_0_competencia1_gcp_entrega.ipynb` líneas 1056–1072; `8_0_competencia1_gcp_entrega.ipynb` líneas 1088–1122; `8_0_competencia1_gcp_entrega.ipynb` líneas 1133–1171; `8_0_competencia1_gcp_entrega.ipynb` líneas 1197–1221)
+14. **Outliers de los 4 meses y entrenamiento de Producción.** Repite la detección cruzada sobre 202103 a 202106 y entrena 50 modelos con esos 4 meses sin los outliers de la etapa 2, con submuestreo 0,1 sorteado por semilla y los hiperparámetros del Testing. Cada modelo predice 202108 y graba sus probabilidades. (`8_0_competencia1_gcp_entrega.ipynb` líneas 1255–1269; `8_0_competencia1_gcp_entrega.ipynb` líneas 1283–1296; `8_0_competencia1_gcp_entrega.ipynb` líneas 1299–1332)
+15. **Promedio de las 50 semillas.** Junta las 50 columnas de probabilidad por cliente de 202108, calcula prob_media y graba prediccion_202108.csv. (`8_0_competencia1_gcp_entrega.ipynb` líneas 1355–1365)
+16. **Archivos de envío.** Para cada uno de los 14 cortes graba, sin encabezado, los numero_de_cliente de mayor probabilidad: un csv por semilla en la carpeta m<corte> y un csv del ensamble en ensamble/. Según el README, la entrega final es ensamble/8_0_competencia1_gcp_ensamble_m12500.csv. (`8_0_competencia1_gcp_entrega.ipynb` líneas 1376–1401; `README.md` líneas 46–52)
+
+## Archivos
+
+- `BO_log.txt` · configuracion · Texto · 21 líneas — [texto](https://emavaldez.github.io/postmortem/fuentes/tomasroel/BO_log.txt.txt) — Registro de la optimización bayesiana que, según el README, sale de este mismo notebook: 20 evaluaciones con fecha 20261011, una por fila, con todos los parámetros de LightGBM, el número de evaluación y la métrica (AUC entre 0,922532 y 0,933071). El notebook lee de este archivo los hiperparámetros de mayor métrica.
+- `README.md` · explicacion · Markdown · 52 líneas — [texto](https://emavaldez.github.io/postmortem/fuentes/tomasroel/README.md.txt) — Presenta el objetivo y el contenido del repositorio, las instrucciones de corrida con los 6 pasos que ejecuta el notebook, la carpeta de salida, la máquina usada y el tiempo de corrida, cómo usar BO_log.txt para saltear la BO y cuál es el archivo de la entrega final.
+- `8_0_competencia1_gcp_entrega.ipynb` · principal · Jupyter (R) · 1404 líneas — [texto](https://emavaldez.github.io/postmortem/fuentes/tomasroel/8_0_competencia1_gcp_entrega.ipynb.txt) — Notebook de R con 94 celdas (57 de código) que hace todo el camino: descarga del dataset, preprocesamiento, detección de outliers, optimización bayesiana, testing en 202106, entrenamiento de 50 semillas con 202103 a 202106 y archivos de envío para 202108. El notebook del repositorio no trae salidas de ejecución guardadas.
+
+## Código principal con anotaciones
+
+Las líneas que empiezan con `# [Anotación …]` no son del autor: las agrega esta página para describir cada bloque.
+
+### 8_0_competencia1_gcp_entrega.ipynb
+
+Notebook de R con 94 celdas (57 de código) que hace todo el camino: descarga del dataset, preprocesamiento, detección de outliers, optimización bayesiana, testing en 202106, entrenamiento de 50 semillas con 202103 a 202106 y archivos de envío para 202108. El notebook del repositorio no trae salidas de ejecución guardadas.
+
+```r
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–50] Celda de texto de presentación. Enumera las técnicas del notebook (variables rotas
+#   a NA, variables nuevas, lags y deltas de orden 1 y 2, tendencias, ranking con cero fijo, quita de outliers
+#   con umbral 0,5, BO en 202103 y 202104, testeo en 202106, producción con 202103 a 202106 y 50 semillas),
+#   describe el detector de outliers cruzado y sus dos etapas, lista las secciones 0 a 4 y explica qué se saltea
+#   cuando la corrida se reanuda.
+#%% celda 1 [texto]
+# Iteración 8.0 - Competencia 1
+
+Qué técnicas y metodologías aplica este script para predecir?
+
+* Se ponen en NA las variables-mes rotas detectadas.
+* Se crean variables nuevas: interacciones lógicas y con sentido entre variables existentes.
+* Se calculan lags y deltas de orden 1 y 2 y se calculan las features de tendencia.
+* Se transforman todas las variables utilizando la técnica de 'ranking cero fijo'.
+* Se quitan outliers, utilizando modelos cruzados para scorear y fijando un ubral el 0.5 (configurado en `PARAM$outliers$umbral`).
+* Se optimizan hiperparámetros con BO en 202103 y 202104.
+* Se testea en 202106.
+* En producción, se entrena con 202103 a 202106 y se predice utilizando 50 semillas distintas para dar origen a un ensemble de predicciones de 50 valores por customer id.
+
+IMPORTANTE: se trabaja con un undersampling del 0.1. Se hicieron experimentos trabajando con undersampling de 1 y las diferencias no fueron significativas. Trabajar con 0.1 permitió realizar 50 ajustes que, promediados, dieron un buen resultado contra el bot en zulip.
+
+**El detector** de outliers es el de la cátedra, aplicado en forma cruzada:
+
+* Los meses se parten al azar en dos mitades. Se entrena un LightGBM en una mitad y se predice la otra, y viceversa. Así ninguna fila es predicha por un modelo que la vio.
+* Es un modelo chico, con los hiperparámetros de la cátedra: 2180 iteraciones, 30 hojas, `min_sum_hessian_in_leaf` 0,114.
+* Entrena con undersampling 0,1 (todas las bajas y el 10% de los CONTINUA de su mitad) y el umbral es 0,5. Por el undersampling las probabilidades salen infladas: un 0,5 del detector equivale a una probabilidad real cercana a 0,09.
+
+**Dónde se sacan:**
+
+* **Etapa 1 (sección 2.3):** outliers de 202103 + 202104. No entran al training de la BO ni al del Testing. La validación de la BO y el testeo en 202106 no se tocan.
+* **Etapa 2 (sección 4.1):** outliers de los 4 meses, 202103 a 202106. No entran al training de Producción.
+
+**Hiperparámetros:** corre su propia BO (20 evaluaciones), sobre el training sin outliers. El notebook no depende de ningún otro experimento: su único insumo es el dataset.
+
+
+| Sección | Qué hace |
+|---|---|
+| **0. Setup** | librerías, parámetros, semillas, carpetas y dataset |
+| **1. Preprocesamiento** | clase, variables rotas, features nuevas, lags y deltas, tendencias, ranking |
+| **2. Hyperparameter Optimization** | outliers de 202103 + 202104 y la BO: 20 evaluaciones, con undersampling 0,1 y sin outliers en el training |
+| **3. Testing** | 10 semillas entrenadas en 202103 + 202104 sin outliers, con undersampling 0,1; ganancia en 202106 completo e importancia de variables |
+| **4. Producción** | outliers de los 4 meses, 50 semillas entrenadas sin ellos con undersampling 0,1, importancia de variables, predicción de 202108 y csv del submit |
+
+**Cómo correrlo:** en la VM de Google Cloud, con kernel **R**, de arriba hacia abajo.
+
+**Dónde queda todo:** en `~/buckets/b1/outputs/<experimento>/`. Los archivos son los mismos del `7_0`, más `outliers_train.csv` y `outliers_produccion.csv` (la probabilidad del detector para cada cliente y mes).
+
+**Si la corrida se corta:** se vuelve a correr desde arriba y sigue desde donde quedó.
+
+* Testing y Producción saltean las semillas que ya terminaron.
+* La detección de outliers no se repite si ya está grabado su archivo (`outliers_train.csv` y `outliers_produccion.csv`).
+* La BO no se repite si `BO_log.txt` ya tiene las 20 evaluaciones. Si se cortó antes, arranca de cero (12 iniciales + 8), pero las evaluaciones ya hechas siguen en el log y cuentan para elegir los mejores hiperparámetros.
+
+**Si cambiás algo del preprocesamiento o de los parámetros (incluidos los del detector):** cambiá `PARAM$experimento`. Si no, se reutilizan los archivos de outliers, el `BO_log.txt` y las semillas de la corrida anterior.
+
+# [Anotación · líneas 51–82] Muestra la hora de inicio, borra los objetos de la sesión, instala desde
+#   cloud.r-project.org los paquetes de una lista de 9 que no estén instalados (data.table, R.utils, rlist,
+#   bbotk, mlr3, mlr3mbo, mlr3learners, DiceKriging, lightgbm) y los carga.
+#%% celda 2 [texto]
+## 0. Setup
+
+#%% celda 3 [texto]
+### 0.1 Inicio y librerías
+
+#%% celda 4 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+#%% celda 5 [código]
+# limpio la memoria
+rm(list= ls(all.names= TRUE))
+gc(full= TRUE, verbose= FALSE)
+
+#%% celda 6 [código]
+# instalo solo lo que no este en la imagen de la VM
+paquetes <- c("data.table", "R.utils", "rlist", "bbotk", "mlr3", "mlr3mbo", "mlr3learners", "DiceKriging", "lightgbm")
+faltan <- setdiff(paquetes, rownames(installed.packages()))
+if (length(faltan) > 0) install.packages(faltan, repos= "https://cloud.r-project.org")
+
+#%% celda 7 [código]
+library(data.table)
+library(R.utils)
+library(rlist)
+library(bbotk)
+library(mlr3)
+library(mlr3mbo)
+library(mlr3learners)
+# library(paradox)
+library(DiceKriging)
+library(lightgbm)
+
+# [Anotación · líneas 83–133] Crea la lista PARAM: experimento 'base_080', prefijo de archivos
+#   '8_0_competencia1_gcp' y semilla primigenia 911341; meses de la BO y del Testing 202103 y 202104, mes de
+#   medición 202106, meses de producción 202103 a 202106 y mes a predecir 202108. Define la variable rota
+#   (ccajas_depositos en 202105), el método de empates del ranking ('first') y la lista de 39 variables a las
+#   que se les calcula tendencia y promedio de 3 meses.
+#%% celda 8 [texto]
+### 0.2 Parámetros
+
+Todo lo que se puede cambiar está en estas tres celdas. Los parámetros de la BO y de LightGBM se llaman igual que en el `1_0`.
+
+#%% celda 9 [código]
+PARAM <- list()
+
+# nombre del experimento: subcarpeta de ~/buckets/b1/outputs donde queda todo
+PARAM$experimento <- "base_080"
+# prefijo de los csv del submit
+PARAM$nombre_script <- "8_0_competencia1_gcp"
+
+PARAM$semilla_primigenia <- 911341
+
+# meses (train, train_final y future son los nombres del 1_0)
+PARAM$train <- c(202103, 202104)                             # meses de la BO
+PARAM$train_final <- c(202103, 202104)                       # meses de entrenamiento del testing
+PARAM$future <- c(202106)                                    # mes del testing: donde se mide la ganancia
+PARAM$meses_produccion <- c(202103, 202104, 202105, 202106)  # entrenamiento de produccion
+PARAM$mes_prediccion <- 202108                               # mes del submit
+
+# variables rotas: variable = meses en los que se pasa a NA
+PARAM$rotas <- list(
+  ccajas_depositos = c(202105)
+)
+
+# ranking: que hacer con los clientes que tienen el mismo valor
+#  "first"   = quedan equiespaciados, en el orden de numero_de_cliente
+#  "average" = quedan todos con el mismo puntaje
+PARAM$ranking_empates <- "first"
+
+# tendencias: variables a las que se les calcula _tend3 y _avg3 (seccion 1.4)
+#  son las mas importantes del 6_0 para las que una tendencia tiene sentido:
+#  quedan afuera edad, antiguedad, fechas en dias, estados de tarjeta y new2_ctrx_quarter_norm (duplica a ctrx_quarter)
+#  para sacar una, se borra de la lista; con character(0) no se crea ninguna
+PARAM$tendencia <- c(
+  "ctrx_quarter", "new_ingresos_totales", "new3_fondos_totales",
+  "mcuentas_saldo", "new3_deuda_total", "mrentabilidad_annual",
+  "new2_rentabilidad_vs_promedio", "mcaja_ahorro", "new3_cant_anclas",
+  "mpasivos_margen", "new3_ctrx_mes", "new_msaldo_pesos",
+  "new3_ctrx_mes_sobre_quarter", "mcuenta_corriente", "new_monto_prestamos",
+  "new3_payroll_sobre_edad", "mprestamos_personales", "new_monto_consumos_tarjcredito",
+  "new3_patrimonio_neto", "cpayroll_trx", "mactivos_margen",
+  "ccomisiones_mantenimiento", "new_share_margen_activos", "cproductos",
+  "mrentabilidad", "ctarjeta_debito", "mcomisiones_mantenimiento",
+  "new2_share_digital", "Master_mfinanciacion_limite", "new2_ticket_visa",
+  "new3_share_limite_visa", "new_cant_consumos_tarjcredito", "ccomisiones_otras",
+  "new_total_margen", "new2_productos_dormidos", "mcomisiones",
+  "new3_canales_usados", "cdescubierto_preacordado", "ccaja_ahorro"
+)
+
+# [Anotación · líneas 135–159] Fija el submuestreo de CONTINUA en 0,1 para BO, Testing y Producción; los
+#   parámetros del detector de outliers (activo, submuestreo 0,1, umbral 0,5, num_iterations 2180, num_leaves
+#   30, min_sum_hessian_in_leaf 0,1141634103); la partición 70/30 y las 20 evaluaciones de la BO; 10 semillas de
+#   Testing y 50 de Producción; y 14 cortes de envíos entre 8.000 y 15.000.
+# undersampling: fraccion de los CONTINUA con la que se entrena. Vale para BO, Testing y Produccion
+#  1.0 = sin undersampling
+PARAM$trainingstrategy$undersampling <- 0.1
+
+# outliers: CONTINUA con probabilidad de baja mayor al umbral, segun un detector que no los vio
+PARAM$outliers$activo <- TRUE                     # FALSE = no se saca a nadie (queda igual al 7_0)
+PARAM$outliers$undersampling <- 0.1               # fraccion de los CONTINUA con la que entrena el detector
+PARAM$outliers$umbral <- 0.5                      # sobre la probabilidad del detector (inflada por su undersampling)
+# hiperparametros del detector: los de la catedra (modelo chico)
+PARAM$outliers$hp <- list(
+  num_iterations= 2180,
+  num_leaves= 30,
+  min_sum_hessian_in_leaf= 0.1141634103
+)
+
+# BO (nombres del 1_0)
+PARAM$training_pct <- 70                          # 70% training, 30% validation
+PARAM$hyperparametertuning$iteraciones <- 20      # 12 iniciales + 8 inteligentes
+
+# cantidad de semillas (un modelo por semilla)
+PARAM$semillas_test <- 10
+PARAM$semillas_produccion <- 50
+
+# cortes: cantidad de envios
+PARAM$cortes <- c(8000, 9000, 9500, 10000, 10500, 11000, 11500, 12000, 12500, 13000, 13500, 14000, 14500, 15000)
+
+# [Anotación · líneas 161–214] Define los parámetros fijos de LightGBM (boosting gbdt, objective binary,
+#   metric auc, max_bin 31, learning_rate 0,005, feature_fraction 0,5, min_data_in_leaf 0, max_depth -1,
+#   lambda_l1 y lambda_l2 en 0, fracciones de bagging en 1, early_stopping 0) y el espacio de búsqueda de la BO:
+#   num_iterations entre 64 y 4096, num_leaves entre 16 y 2048 y min_sum_hessian_in_leaf entre 1e-06 y 0,1.
+#%% celda 10 [código]
+# Parametros LightGBM
+
+# parametros fijos del LightGBM que se pisaran con la parte variable de la BO
+PARAM$lgbm$param_fijos <-  list(
+  boosting= "gbdt", # puede ir  dart  , ni pruebe random_forest
+  objective= "binary",
+  metric= "auc",
+  feature_pre_filter= FALSE,
+  first_metric_only= FALSE,
+  boost_from_average= TRUE,
+  force_row_wise= TRUE,
+  deterministic= TRUE,
+  verbosity= -100,
+
+  seed= PARAM$semilla_primigenia,
+
+  max_depth= -1L,
+  min_gain_to_split= 0,
+  lambda_l1= 0.0,
+  lambda_l2= 0.0,
+  max_bin= 31L,
+
+  bagging_fraction= 1.0,
+  pos_bagging_fraction= 1.0,
+  neg_bagging_fraction= 1.0,
+  is_unbalance= FALSE,
+  scale_pos_weight= 1.0,
+
+  drop_rate= 0.1,
+  max_drop= 50,
+  skip_drop= 0.5,
+
+  extra_trees= FALSE,
+
+  early_stopping= 0,
+  min_data_in_leaf= 0,     # fijo, esto es FUNDAMENTAL
+  feature_fraction= 0.50,  # fijo
+  learning_rate= 0.005,    # fijo
+
+  num_iterations= 20000,     # se modificara
+  num_leaves= 1024,          # se modificara
+  min_sum_hessian_in_leaf= 1e-06  # se modificara
+)
+
+#%% celda 11 [código]
+# Aqui se cargan los bordes de los hiperparametros de la BO
+#  es vital entender que se optimiza min_sum_hessian_in_leaf y que  min_data_in_leaf se deja fijo en CERO
+
+PARAM$hypeparametertuning$hs <- ps(
+  num_iterations= p_int(lower= 64L,  upper= 4096L),
+  num_leaves= p_int(lower= 16L,  upper= 2048L),
+  min_sum_hessian_in_leaf= p_dbl( lower=1e-06, upper=0.1)
+)
+
+# [Anotación · líneas 216–235] Genera los números primos de 6 cifras con una criba de Eratóstenes y sortea 50
+#   de ellos con set.seed(911341, kind 'L'Ecuyer-CMRG'); quedan en PARAM$semillas y se muestran.
+#%% celda 12 [texto]
+### 0.3 Semillas
+
+50 números primos de 6 cifras, sorteados con la semilla primigenia. Testing usa las primeras 10 y Producción las 50. Las primeras 20 son las mismas que con `PARAM$semillas_produccion <- 20`.
+
+#%% celda 13 [código]
+# numeros primos de 6 cifras (criba de Eratostenes)
+es_primo <- rep(TRUE, 999999)
+es_primo[1] <- FALSE
+for (i in 2:999) {
+  if (es_primo[i]) es_primo[seq(i * i, 999999, by= i)] <- FALSE
+}
+primos <- which(es_primo)
+primos <- primos[primos >= 100000]
+
+# sorteo las semillas: dependen solo de la semilla primigenia
+set.seed(PARAM$semilla_primigenia, kind= "L'Ecuyer-CMRG")
+PARAM$semillas <- sample(primos, PARAM$semillas_produccion)
+
+PARAM$semillas
+
+# [Anotación · líneas 237–262] Crea las carpetas ~/buckets/b1/datasets y ~/buckets/b1/outputs, descarga
+#   competencia_01_crudo.csv desde storage.googleapis.com si todavía no está en el bucket y fija como carpeta de
+#   trabajo ~/buckets/b1/outputs/base_080.
+#%% celda 14 [texto]
+### 0.4 Carpetas y dataset
+
+#%% celda 15 [código]
+# carpetas en el bucket: persisten aunque se apague la VM
+dir.create("~/buckets/b1/datasets", showWarnings= FALSE, recursive= TRUE)
+dir.create("~/buckets/b1/outputs", showWarnings= FALSE, recursive= TRUE)
+
+# bajo el dataset crudo solo si todavia no esta en el bucket
+archivo_crudo <- path.expand("~/buckets/b1/datasets/competencia_01_crudo.csv")
+
+if (!file.exists(archivo_crudo)) {
+  options(timeout= 3600)
+  temporal <- tempfile(fileext= ".csv")
+  download.file(
+    "https://storage.googleapis.com/open-courses/dmeyf2026-9c6f/competencia_01_crudo.csv",
+    destfile= temporal, mode= "wb"
+  )
+  file.copy(temporal, archivo_crudo)
+  unlink(temporal)
+}
+
+# carpeta de trabajo: todo lo que se graba queda en outputs/<experimento>
+dir.create(paste0("~/buckets/b1/outputs/", PARAM$experimento), showWarnings= FALSE)
+setwd(paste0("~/buckets/b1/outputs/", PARAM$experimento))
+getwd()
+
+# [Anotación · líneas 264–313] Define particionar(), que agrega una columna con el número de fold sorteado en
+#   las proporciones indicadas dentro de cada grupo (partición estratificada), y loguear(), que agrega a un
+#   archivo una línea separada por tabuladores con la fecha y hora y todos los valores de una lista, escribiendo
+#   antes los títulos si el archivo no existe.
+#%% celda 16 [texto]
+### 0.5 Funciones del `1_0`
+
+`particionar()` y `loguear()`, sin cambios.
+
+#%% celda 17 [código]
+# particionar agrega una columna llamada fold a un dataset
+#   que consiste en una particion estratificada segun agrupa
+# particionar( data=dataset, division=c(70,30),
+#  agrupa=clase_ternaria, seed=semilla)   crea una particion 70, 30
+
+particionar <- function(data, division, agrupa= "", campo= "fold", start= 1, seed= NA) {
+  if (!is.na(seed)) set.seed(seed, "L'Ecuyer-CMRG")
+
+  bloque <- unlist(mapply(
+    function(x, y) {rep(y, x)},division, seq(from= start, length.out= length(division))))
+
+  data[, (campo) := sample(rep(bloque,ceiling(.N / length(bloque))))[1:.N],by= agrupa]
+}
+
+#%% celda 18 [código]
+# logueo al archivo BO_log.txt
+loguear  <- function( preg, arch=NA, verbose=TRUE )
+{
+  t0 <- Sys.time()
+  reg <- copy( preg )
+  if( "feature_contri" %in%  names(reg) ) {
+    reg$feature_contri <- reg$feature_contri[1]
+  }
+  archivo <- arch
+  if( is.na(arch) ) archivo <- paste0( folder, substitute( reg), ext )
+
+
+  if( !file.exists( archivo ) )
+  {
+    # Escribo los titulos
+    linea  <- paste0( "fecha\t",
+                      paste( list.names(reg), collapse="\t" ), "\n" )
+
+    cat( linea, file=archivo )
+  }
+
+  # escribo el registro
+  linea  <- paste0( format(t0, "%Y%m%d.%H%M%S"),  "\t",     # la fecha y hora
+                    gsub( ", ", "\t", toString( reg ) ),  "\n" )
+
+  cat( linea, file=archivo, append=TRUE )  # grabo al archivo
+
+  if( verbose )  cat( linea )   # imprimo por pantalla
+}
+
+# [Anotación · líneas 315–358] Lee el dataset crudo con fread y calcula clase_ternaria: numera los meses de
+#   corrido, obtiene para cada cliente los dos períodos siguientes en los que aparece y asigna CONTINUA, BAJA+1
+#   (no está en el mes siguiente) o BAJA+2 (está en el siguiente y no en el subsiguiente). Las filas del último
+#   mes quedan sin clase y las del anteúltimo sólo pueden recibir BAJA+1. Muestra el conteo por mes y clase.
+#%% celda 19 [texto]
+## 1. Preprocesamiento
+
+#%% celda 20 [texto]
+### 1.1 Lectura y `clase_ternaria`
+
+Igual que en el `1_0`. La clase queda completa hasta 202106.
+
+#%% celda 21 [código]
+dataset <- fread(archivo_crudo, stringsAsFactors= TRUE)
+
+# periodo0: numero de mes de corrido
+dsimple <- dataset[, list(
+  pos= .I,
+  numero_de_cliente,
+  periodo0= as.integer(foto_mes / 100) * 12 + foto_mes %% 100
+)]
+
+setorder(dsimple, numero_de_cliente, periodo0)
+
+periodo_ultimo <- dsimple[, max(periodo0)]
+periodo_anteultimo <- periodo_ultimo - 1
+
+# los dos proximos meses en los que aparece cada cliente
+dsimple[, c("periodo1", "periodo2") := shift(periodo0, n= 1:2, fill= NA, type= "lead"), numero_de_cliente]
+
+# CONTINUA: esta en los dos meses siguientes
+dsimple[periodo0 < periodo_anteultimo, clase_ternaria := "CONTINUA"]
+
+# BAJA+1: no esta en el mes siguiente
+dsimple[periodo0 < periodo_ultimo & (is.na(periodo1) | periodo0 + 1 < periodo1),
+  clase_ternaria := "BAJA+1"]
+
+# BAJA+2: esta en el mes siguiente pero no en el subsiguiente
+dsimple[periodo0 < periodo_anteultimo & (periodo0 + 1 == periodo1) &
+  (is.na(periodo2) | periodo0 + 2 < periodo2),
+  clase_ternaria := "BAJA+2"]
+
+# pego la clase en el dataset, en el orden original de las filas
+setorder(dsimple, pos)
+dataset[, clase_ternaria := dsimple$clase_ternaria]
+rm(dsimple)
+
+dataset[, .N, keyby= list(foto_mes, clase_ternaria)]
+
+# [Anotación · líneas 360–373] Para cada variable de PARAM$rotas pasa a NA sus valores en los meses indicados
+#   (ccajas_depositos en 202105) y muestra la cantidad de NA por mes de esa variable.
+#%% celda 22 [texto]
+### 1.2 Variables rotas
+
+Cada variable de `PARAM$rotas` pasa a `NA` en sus meses rotos. Va primero para que el valor roto no llegue a las features nuevas ni a los lags de los meses siguientes.
+
+`new_actividad_cajas` suma `ccajas_depositos`: en 202105 queda como la suma de las otras tres variables de cajas.
+
+#%% celda 23 [código]
+for (campo in names(PARAM$rotas)) {
+  dataset[foto_mes %in% PARAM$rotas[[campo]], (campo) := NA]
+}
+
+# control: cantidad de NA por mes de cada variable rota
+dataset[, lapply(.SD, function(x) sum(is.na(x))), keyby= foto_mes, .SDcols= names(PARAM$rotas)]
+
+# [Anotación · líneas 375–397] Define dividir(), que devuelve NA cuando el denominador es cero, negativo o NA,
+#   y tiene(), que vale 1 si el valor es mayor a cero y 0 si es cero, negativo o NA.
+#%% celda 24 [texto]
+### 1.3 Features nuevas
+
+Tres tandas, cada una con su prefijo:
+
+* `new_`: las 35 de las versiones anteriores, sin cambios.
+* `new2_`: las 19 de las versiones anteriores, sin cambios.
+* `new3_`: las sugeridas en esta versión. Cada una es una línea: para sacar una, se borra su línea.
+
+Reglas que se repiten:
+
+* En las **sumas**, un `NA` cuenta como cero (en general significa que el cliente no tiene ese producto).
+* En los **ratios**, si el denominador es cero, negativo o `NA`, el resultado es `NA`.
+
+#%% celda 25 [código]
+# division segura: si el denominador es cero, negativo o NA, el resultado es NA
+dividir <- function(numerador, denominador) {
+  fifelse(!is.na(denominador) & denominador > 0,
+    as.numeric(numerador) / as.numeric(denominador), NA_real_)
+}
+
+# 1 si el valor es mayor a cero; 0 si es cero, negativo o NA
+tiene <- function(x) as.integer(!is.na(x) & x > 0)
+
+# [Anotación · líneas 399–452] Declara una lista de 39 variables que son sumas por fila (32 con prefijo new_ y
+#   7 con prefijo new3_): márgenes, cuentas, consumos, saldos y límites de tarjetas Visa y Master, préstamos,
+#   plazos fijos e inversiones, seguros, payroll, débitos automáticos, pagos de servicios, descuentos,
+#   comisiones, egresos, ingresos, actividad en cajas y cajeros, fondos totales, deuda total y transacciones del
+#   mes. Las calcula en orden con rowSums y na.rm= TRUE, de modo que un NA suma cero y una suma puede usar otra
+#   definida antes.
+#%% celda 26 [código]
+# features que son sumas: nombre = variables que se suman
+#  se calculan en este orden, asi que una suma puede usar otra que este mas arriba
+sumas <- list(
+  # ---- new_
+  new_total_margen                 = c("mactivos_margen", "mpasivos_margen"),
+  new_monto_cc                     = c("mcuenta_corriente", "mcuenta_corriente_adicional"),
+  new_cant_cuentas                 = c("ccaja_ahorro", "ccuenta_corriente"),
+  new_cant_consumos_tarjcredito    = c("ctarjeta_visa_transacciones", "ctarjeta_master_transacciones"),
+  new_monto_consumos_tarjcredito   = c("mtarjeta_visa_consumo", "mtarjeta_master_consumo"),
+  new_cant_prestamos               = c("cprestamos_personales", "cprestamos_prendarios", "cprestamos_hipotecarios"),
+  new_monto_prestamos              = c("mprestamos_personales", "mprestamos_prendarios", "mprestamos_hipotecarios"),
+  new_monto_pf                     = c("mplazo_fijo_dolares", "mplazo_fijo_pesos"),
+  new_monto_inv                    = c("minversion1_pesos", "minversion1_dolares", "minversion2"),
+  new_cant_inv_total               = c("cplazo_fijo", "cinversion1", "cinversion2"),
+  new_cant_seguros                 = c("cseguro_vida", "cseguro_auto", "cseguro_vivienda", "cseguro_accidentes_personales"),
+  new_total_payroll                = c("mpayroll", "mpayroll2"),
+  new_cant_debitos_aut             = c("ccuenta_debitos_automaticos", "ctarjeta_visa_debitos_automaticos", "ctarjeta_master_debitos_automaticos"),
+  new_monto_debitos_aut            = c("mcuenta_debitos_automaticos", "mttarjeta_visa_debitos_automaticos", "mttarjeta_master_debitos_automaticos"),
+  new_cant_pagos_servicios         = c("cpagodeservicios", "cpagomiscuentas"),
+  new_monto_pagos_servicios        = c("mpagodeservicios", "mpagomiscuentas"),
+  new_cant_descuentos_beneficios   = c("ccajeros_propios_descuentos", "ctarjeta_visa_descuentos", "ctarjeta_master_descuentos"),
+  new_monto_descuentos_beneficios  = c("mcajeros_propios_descuentos", "mtarjeta_visa_descuentos", "mtarjeta_master_descuentos"),
+  new_monto_comisiones_mant        = c("mcomisiones_mantenimiento", "mcomisiones_otras"),
+  new_egresos_totales              = c("mtransferencias_emitidas", "mcheques_emitidos", "mextraccion_autoservicio"),
+  new_actividad_cajas              = c("ccajas_transacciones", "ccajas_depositos", "ccajas_extracciones", "ccajas_otras"),
+  new_actividad_atm                = c("catm_trx", "catm_trx_other"),
+  new_monto_atm                    = c("matm", "matm_other"),
+  new_delinquency_cards            = c("Master_delinquency", "Visa_delinquency"),
+  new_limite_financiacion_tarjetas = c("Master_mfinanciacion_limite", "Visa_mfinanciacion_limite"),
+  new_saldo_tarjetas               = c("Master_msaldototal", "Visa_msaldototal"),
+  new_consumos_tarjetas            = c("Master_mconsumospesos", "Master_mconsumosdolares", "Visa_mconsumospesos", "Visa_mconsumosdolares"),
+  new_limite_compras_combinado     = c("Master_mlimitecompra", "Visa_mlimitecompra"),
+  new_adelantos_tarjetas           = c("Master_madelantopesos", "Master_madelantodolares", "Visa_madelantopesos", "Visa_madelantodolares"),
+  new_pagos_combinado              = c("Master_mpagado", "Visa_mpagado"),
+  new_cant_consumos_tarjetas       = c("Master_cconsumos", "Visa_cconsumos"),
+  new_ingresos_totales             = c("mtransferencias_recibidas", "new_total_payroll", "mcheques_depositados"),
+
+  # ---- new3_ (sugeridas)
+  new3_tarjetas_msaldopesos        = c("Master_msaldopesos", "Visa_msaldopesos"),
+  new3_tarjetas_msaldodolares      = c("Master_msaldodolares", "Visa_msaldodolares"),
+  new3_tarjetas_mpagominimo        = c("Master_mpagominimo", "Visa_mpagominimo"),
+  new3_cant_payroll                = c("cpayroll_trx", "cpayroll2_trx"),
+  new3_fondos_totales              = c("mcuentas_saldo", "new_monto_pf", "new_monto_inv"),
+  new3_deuda_total                 = c("new_monto_prestamos", "new_saldo_tarjetas"),
+  new3_ctrx_mes                    = c("ctarjeta_debito_transacciones", "ctarjeta_visa_transacciones", "ctarjeta_master_transacciones",
+                                       "chomebanking_transacciones", "cmobile_app_trx", "ccallcenter_transacciones",
+                                       "ccajas_transacciones", "catm_trx", "catm_trx_other",
+                                       "ctransferencias_emitidas", "cpagodeservicios", "cpagomiscuentas")
+)
+
+for (nueva in names(sumas)) {
+  dataset[, (nueva) := rowSums(.SD, na.rm= TRUE), .SDcols= sumas[[nueva]]]
+}
+
+# [Anotación · líneas 454–458] Calcula tres variables new_ que no son sumas: saldo en pesos (mcuentas_saldo
+#   menos mcaja_ahorro_dolares), diferencia entre mforex_buy y mforex_sell y proporción del margen de activos
+#   sobre el margen total (NA si el total es cero).
+#%% celda 27 [código]
+# ---- new_ que no son sumas
+dataset[, new_msaldo_pesos := mcuentas_saldo - mcaja_ahorro_dolares]
+dataset[, new_diff_buy_sell := mforex_buy - mforex_sell]
+dataset[, new_share_margen_activos := fifelse(new_total_margen == 0, NA_real_, mactivos_margen / new_total_margen)]
+
+# [Anotación · líneas 460–515] Calcula 19 variables new2_: máximo y mínimo del estado de las tarjetas,
+#   ctrx_quarter multiplicado por 5, 2 o 1,2 para clientes con antigüedad 1, 2 o 3, uso del límite de compra
+#   (Master, Visa y total), pago sobre pago mínimo, ticket promedio de Visa, Master y débito, egresos sobre
+#   ingresos, saldo sobre payroll, rentabilidad del mes menos un doceavo de la anual, cantidad de productos que
+#   el cliente tiene y no usó en el mes (sobre 5), proporción de transacciones por homebanking y app sobre el
+#   total con cajas y cajeros, mínimo y máximo de la fecha de vencimiento de las tarjetas y máximo de la fecha
+#   de inicio de mora.
+#%% celda 28 [código]
+# ---- new2_
+
+# estado de las tarjetas: 0 abierta, 6 y 7 en proceso de cierre, 9 cerrada
+dataset[, new2_status_max := pmax(Master_status, Visa_status, na.rm= TRUE)]
+dataset[, new2_status_min := pmin(Master_status, Visa_status, na.rm= TRUE)]
+
+# actividad del trimestre, ajustada para los clientes con menos de 3 meses completos
+dataset[, new2_ctrx_quarter_norm := as.numeric(ctrx_quarter) * fcase(
+  cliente_antiguedad == 1, 5,
+  cliente_antiguedad == 2, 2,
+  cliente_antiguedad == 3, 1.2,
+  default= 1
+)]
+
+# uso del limite de compra
+dataset[, new2_uso_limite_master := dividir(Master_msaldototal, Master_mlimitecompra)]
+dataset[, new2_uso_limite_visa := dividir(Visa_msaldototal, Visa_mlimitecompra)]
+dataset[, new2_uso_limite_total := dividir(new_saldo_tarjetas, new_limite_compras_combinado)]
+
+# pago sobre el pago minimo
+dataset[, new2_pago_minimo_master := dividir(Master_mpagado, Master_mpagominimo)]
+dataset[, new2_pago_minimo_visa := dividir(Visa_mpagado, Visa_mpagominimo)]
+
+# ticket promedio
+dataset[, new2_ticket_visa := dividir(mtarjeta_visa_consumo, ctarjeta_visa_transacciones)]
+dataset[, new2_ticket_master := dividir(mtarjeta_master_consumo, ctarjeta_master_transacciones)]
+dataset[, new2_ticket_debito := dividir(mautoservicio, ctarjeta_debito_transacciones)]
+
+# egresos sobre ingresos y saldo medido en sueldos
+dataset[, new2_egresos_sobre_ingresos := dividir(new_egresos_totales, new_ingresos_totales)]
+dataset[, new2_saldo_en_sueldos := dividir(mcuentas_saldo, new_total_payroll)]
+
+# rentabilidad del mes contra el promedio mensual del ultimo año
+dataset[, new2_rentabilidad_vs_promedio := mrentabilidad - mrentabilidad_annual / 12]
+
+# productos dormidos: los tiene y no los uso en el mes
+dormido <- function(tiene, uso) as.integer(!is.na(tiene) & tiene > 0 & !is.na(uso) & uso == 0)
+dataset[, new2_productos_dormidos :=
+  dormido(ctarjeta_debito, ctarjeta_debito_transacciones) +
+  dormido(ctarjeta_visa, ctarjeta_visa_transacciones) +
+  dormido(ctarjeta_master, ctarjeta_master_transacciones) +
+  dormido(thomebanking, chomebanking_transacciones) +
+  dormido(tmobile_app, cmobile_app_trx)]
+
+# share digital: transacciones por homebanking y app sobre el total con cajas y cajeros
+digitales <- c("chomebanking_transacciones", "cmobile_app_trx")
+presenciales <- c("ccajas_transacciones", "catm_trx", "catm_trx_other")
+dataset[, new2_share_digital := dividir(
+  rowSums(.SD[, digitales, with= FALSE], na.rm= TRUE), rowSums(.SD, na.rm= TRUE)),
+  .SDcols= c(digitales, presenciales)]
+
+# fechas de las tarjetas
+dataset[, new2_fvencimiento_min := pmin(Master_Fvencimiento, Visa_Fvencimiento, na.rm= TRUE)]
+dataset[, new2_fvencimiento_max := pmax(Master_Fvencimiento, Visa_Fvencimiento, na.rm= TRUE)]
+dataset[, new2_finiciomora_max := pmax(Master_Finiciomora, Visa_Finiciomora, na.rm= TRUE)]
+
+# [Anotación · líneas 517–549] Calcula 17 variables new3_: patrimonio neto (fondos menos deuda), transacciones
+#   del mes sobre ctrx_quarter, cantidad de canales usados (sobre 6), cantidad de 'anclas' (préstamos, seguros,
+#   inversiones, caja de seguridad, débitos automáticos, payroll), tarjetas con estado 0, fechas de alta máxima
+#   y mínima, cocientes sobre el límite de compra, sobre el saldo de tarjetas, sobre el payroll y sobre la edad,
+#   transferencias netas, flujo neto y antigüedad sobre edad. Imprime la cantidad de columnas.
+#%% celda 29 [código]
+# ---- new3_ (sugeridas)
+
+# plata y deuda
+dataset[, new3_patrimonio_neto := new3_fondos_totales - new3_deuda_total]
+
+# actividad
+dataset[, new3_ctrx_mes_sobre_quarter := dividir(new3_ctrx_mes, ctrx_quarter)]
+dataset[, new3_canales_usados := tiene(chomebanking_transacciones) + tiene(cmobile_app_trx) + tiene(ccallcenter_transacciones) + tiene(ccajas_transacciones) + tiene(catm_trx) + tiene(catm_trx_other)]
+dataset[, new3_cant_anclas := tiene(new_cant_prestamos) + tiene(new_cant_seguros) + tiene(new_cant_inv_total) + tiene(ccaja_seguridad) + tiene(new_cant_debitos_aut) + tiene(new3_cant_payroll)]
+
+# tarjetas
+dataset[, new3_tarjetas_abiertas := (Master_status %in% 0) + (Visa_status %in% 0)]
+dataset[, new3_tarjetas_fechaalta_max := pmax(Master_fechaalta, Visa_fechaalta, na.rm= TRUE)]
+dataset[, new3_tarjetas_fechaalta_min := pmin(Master_fechaalta, Visa_fechaalta, na.rm= TRUE)]
+dataset[, new3_share_limite_visa := dividir(Visa_mlimitecompra, new_limite_compras_combinado)]
+dataset[, new3_consumo_sobre_limite := dividir(new_consumos_tarjetas, new_limite_compras_combinado)]
+dataset[, new3_pagado_sobre_saldo := dividir(new_pagos_combinado, new_saldo_tarjetas)]
+dataset[, new3_pagominimo_sobre_limite := dividir(new3_tarjetas_mpagominimo, new_limite_compras_combinado)]
+
+# sueldo
+dataset[, new3_payroll_sobre_edad := dividir(new_total_payroll, cliente_edad)]
+dataset[, new3_consumo_sobre_payroll := dividir(new_monto_consumos_tarjcredito + mautoservicio, new_total_payroll)]
+dataset[, new3_prestamos_sobre_payroll := dividir(new_monto_prestamos, new_total_payroll)]
+
+# flujo de plata
+dataset[, new3_transferencias_neto := mtransferencias_recibidas - mtransferencias_emitidas]
+dataset[, new3_flujo_neto := new_ingresos_totales - new_egresos_totales]
+
+# cliente
+dataset[, new3_antiguedad_sobre_edad := dividir(cliente_antiguedad, cliente_edad * 12)]
+
+cat("Columnas del dataset:", ncol(dataset), "\n")
+
+# [Anotación · líneas 551–594] Para todas las columnas menos numero_de_cliente y clase_ternaria agrega el
+#   valor del mismo cliente uno y dos meses atrás (_lag1 y _lag2), uniendo la tabla consigo misma por cliente y
+#   número de período corrido, y calcula _delta1 (actual menos lag1) y _delta2 (lag1 menos lag2). Imprime la
+#   cantidad de variables con lag y de columnas.
+#%% celda 30 [texto]
+### 1.4 Lags y deltas
+
+Para **todas** las variables menos `numero_de_cliente` y `clase_ternaria` (`foto_mes` entra):
+
+* `_lag1`: valor del mismo cliente el mes anterior.
+* `_lag2`: valor del mismo cliente dos meses atrás.
+* `_delta1`: mes actual − `lag1`.
+* `_delta2`: `lag1` − `lag2`.
+
+Los deltas son la diferencia en nivel, con signo: negativo es caída, positivo es suba.
+
+Si el cliente no estaba en el banco en ese mes, el lag queda en `NA`. Por eso 202103 no tiene ningún lag, y 202104 no tiene `lag2` ni `delta2`.
+
+#%% celda 31 [código]
+# variables con lag y delta: todas menos el id del cliente y la clase
+campos_lag <- setdiff(colnames(dataset), c("numero_de_cliente", "clase_ternaria"))
+
+# numero de mes de corrido: restar un mes es restar 1
+dataset[, periodo := as.integer(foto_mes %/% 100) * 12L + as.integer(foto_mes %% 100)]
+
+# pega en cada fila los valores del mismo cliente k meses atras, como <variable>_lag<k>
+agregar_lag <- function(datos, k) {
+  atras <- datos[, c("numero_de_cliente", "periodo", campos_lag), with= FALSE]
+  atras[, periodo := periodo + k]     # el mes t queda como "k meses atras" del mes t + k
+  setnames(atras, campos_lag, paste0(campos_lag, "_lag", k))
+  merge(datos, atras, by= c("numero_de_cliente", "periodo"), all.x= TRUE)
+}
+
+dataset <- agregar_lag(dataset, 1)
+dataset <- agregar_lag(dataset, 2)
+
+# deltas
+for (campo in campos_lag) {
+  lag1 <- dataset[[paste0(campo, "_lag1")]]
+  lag2 <- dataset[[paste0(campo, "_lag2")]]
+  dataset[, (paste0(campo, c("_delta1", "_delta2"))) := list(get(campo) - lag1, lag1 - lag2)]
+}
+
+dataset[, periodo := NULL]
+rm(lag1, lag2)
+
+cat("Variables con lag y delta:", length(campos_lag), "\n")
+cat("Columnas del dataset:", ncol(dataset), "\n")
+
+# [Anotación · líneas 596–613] Con los lags ya calculados crea new2_dejo_sueldo (1 si el mes anterior tuvo
+#   cpayroll_trx mayor a cero y el actual tiene cero; NA si falta alguno) y tres cocientes contra el mes
+#   anterior: ctrx_quarter, mcuentas_saldo y new_total_payroll sobre su lag1.
+#%% celda 32 [texto]
+**Features que comparan contra el mes anterior.** Necesitan los lags, por eso van acá. No tienen lag ni delta propios.
+
+| Feature | Cálculo | Qué busca captar |
+|---|---|---|
+| `new2_dejo_sueldo` | el mes anterior tuvo acreditaciones de sueldo y este no | se llevó el sueldo a otro banco |
+| `new2_ctrx_quarter_var` | `ctrx_quarter` / su `lag1` | variación relativa de la actividad (menos de 1 es caída) |
+| `new3_saldo_var` | `mcuentas_saldo` / su `lag1` | variación relativa del saldo |
+| `new3_payroll_var` | sueldo / su `lag1` | variación relativa del sueldo |
+
+#%% celda 33 [código]
+dataset[, new2_dejo_sueldo := fifelse(is.na(cpayroll_trx) | is.na(cpayroll_trx_lag1), NA_integer_,
+  as.integer(cpayroll_trx_lag1 > 0 & cpayroll_trx == 0))]
+dataset[, new2_ctrx_quarter_var := dividir(ctrx_quarter, ctrx_quarter_lag1)]
+
+# sugeridas
+dataset[, new3_saldo_var := dividir(mcuentas_saldo, mcuentas_saldo_lag1)]
+dataset[, new3_payroll_var := dividir(new_total_payroll, new_total_payroll_lag1)]
+
+# [Anotación · líneas 615–645] Verifica que las 39 variables de PARAM$tendencia tengan lag y, para cada una,
+#   calcula _tend3 = (actual − lag2) / 2 y _avg3 = (actual + lag1 + lag2) / 3; ambas quedan en NA si falta
+#   alguno de los tres meses.
+#%% celda 34 [texto]
+**Tendencia y promedio de los últimos 3 meses.** Para cada variable de `PARAM$tendencia`, con el valor actual y sus dos lags:
+
+| Columna | Cálculo | Qué busca captar |
+|---|---|---|
+| `<variable>_tend3` | `(actual − lag2) / 2` | hacia dónde viene la variable: positiva si sube, negativa si cae |
+| `<variable>_avg3` | `(actual + lag1 + lag2) / 3` | el nivel de la variable, sin el ruido de un mes puntual |
+
+* La tendencia es la pendiente de la recta de cuadrados mínimos sobre los 3 meses, la misma que calcula la función de la cátedra. Con 3 puntos equiespaciados esa pendiente es `(actual − lag2) / 2`.
+* Si falta alguno de los 3 meses, las dos quedan en `NA`. Por eso 202103 y 202104 no las tienen.
+* Van acá, después de los lags, para que no tengan lag ni delta propios; y antes del ranking, para calcularse sobre los valores originales.
+
+#%% celda 35 [código]
+# chequeo: todas tienen que ser variables con lag
+stopifnot(all(PARAM$tendencia %in% campos_lag))
+
+for (campo in PARAM$tendencia) {
+  actual <- dataset[[campo]]
+  lag1 <- dataset[[paste0(campo, "_lag1")]]
+  lag2 <- dataset[[paste0(campo, "_lag2")]]
+
+  # solo si estan los 3 meses
+  completa <- !is.na(actual) & !is.na(lag1) & !is.na(lag2)
+
+  dataset[, (paste0(campo, "_tend3")) := fifelse(completa, (actual - lag2) / 2, NA_real_)]
+  dataset[, (paste0(campo, "_avg3")) := fifelse(completa, (actual + lag1 + lag2) / 3, NA_real_)]
+}
+rm(actual, lag1, lag2, completa)
+
+cat("Variables con tendencia y promedio:", length(PARAM$tendencia), "\n")
+cat("Columnas del dataset:", ncol(dataset), "\n")
+
+# [Anotación · líneas 647–661] Conserva las filas de 202103 a 202106 y de 202108, ordena por foto_mes y
+#   numero_de_cliente y muestra por mes la cantidad de filas y el porcentaje de clientes sin lag1, sin lag2 y
+#   sin tendencia.
+#%% celda 36 [código]
+# me quedo con los meses que se usan: 202107 solo hacia falta para los lags de 202108
+dataset <- dataset[foto_mes %in% c(PARAM$meses_produccion, PARAM$mes_prediccion)]
+
+# orden fijo de las filas: por mes y, dentro del mes, por numero_de_cliente
+setorder(dataset, foto_mes, numero_de_cliente)
+invisible(gc())
+
+# control: filas por mes y porcentaje de clientes sin lag y sin tendencia (la de ctrx_quarter, como ejemplo)
+dataset[, list(
+  filas= .N,
+  pct_sin_lag1= round(100 * mean(is.na(foto_mes_lag1)), 1),
+  pct_sin_lag2= round(100 * mean(is.na(foto_mes_lag2)), 1),
+  pct_sin_tendencia= round(100 * mean(is.na(ctrx_quarter_tend3)), 1)
+), keyby= foto_mes]
+
+# [Anotación · líneas 663–697] Define rankear(): los NA quedan en NA y los ceros en 0; los positivos reciben
+#   (n − posición + 1) / n, con posición 1 para el mayor, y los negativos el mismo cálculo con signo negativo,
+#   con posición 1 para el más negativo; los empates se resuelven con el método de PARAM$ranking_empates
+#   ('first'). Evalúa la función sobre un vector de ejemplo de 6 valores.
+#%% celda 37 [texto]
+### 1.5 Ranking con cero fijo
+
+Cada variable se reemplaza, **mes por mes**, por su ranking entre −1 y 1. Conserva el nombre.
+
+* **Positivos:** se ordenan de mayor a menor y el puntaje es `(n − posición + 1) / n`. El máximo queda en 1.
+* **Ceros:** quedan en 0.
+* **Negativos:** lo mismo en espejo. El más negativo queda en −1.
+* **`NA`:** quedan en `NA`, fuera del ranking.
+* **Empates:** con `"first"` no comparten puntaje: quedan uno atrás del otro en el orden de `numero_de_cliente`, así los puntajes de cada lado quedan equiespaciados.
+
+Se rankean todas las variables (originales, nuevas, lags, deltas y tendencias) menos `numero_de_cliente`, `clase_ternaria` y `foto_mes` con sus lags y deltas, que valen lo mismo para todos los clientes del mes.
+
+#%% celda 38 [código]
+rankear <- function(x) {
+  r <- rep(NA_real_, length(x))     # los NA quedan en NA
+  r[which(x == 0)] <- 0             # los ceros quedan en 0
+
+  # positivos: posicion 1 = el mas grande
+  pos <- which(x > 0)
+  n <- length(pos)
+  posicion <- frank(-x[pos], ties.method= PARAM$ranking_empates)
+  r[pos] <- (n - posicion + 1) / n
+
+  # negativos: posicion 1 = el mas negativo
+  neg <- which(x < 0)
+  n <- length(neg)
+  posicion <- frank(x[neg], ties.method= PARAM$ranking_empates)
+  r[neg] <- -(n - posicion + 1) / n
+
+  r
+}
+
+# prueba con el ejemplo: tiene que dar 1, 0.667, 0.333, 0, -0.5, -1
+round(rankear(c(10000, 2000, 500, 0, -100, -2000)), 3)
+
+# [Anotación · líneas 699–719] Convierte a numérico y reemplaza por su ranking, mes por mes, todas las
+#   columnas menos numero_de_cliente, clase_ternaria y las que empiezan con foto_mes. Muestra mínimo, máximo,
+#   cantidad de ceros y de NA de mcuentas_saldo por mes.
+#%% celda 39 [código]
+# variables que se rankean
+campos_rank <- setdiff(colnames(dataset),
+  c("numero_de_cliente", "clase_ternaria", grep("^foto_mes", colnames(dataset), value= TRUE)))
+
+# el ranking tiene decimales: paso todas las columnas a numero con decimales
+dataset[, (campos_rank) := lapply(.SD, as.numeric), .SDcols= campos_rank]
+
+# rankeo mes por mes: cada variable se pisa con su ranking
+dataset[, (campos_rank) := lapply(.SD, rankear), by= foto_mes, .SDcols= campos_rank]
+invisible(gc())
+
+cat("Variables rankeadas:", length(campos_rank), "\n")
+
+# control con una variable: minimo, maximo y cantidad de ceros por mes
+dataset[, list(
+  minimo= min(mcuentas_saldo, na.rm= TRUE),
+  maximo= max(mcuentas_saldo, na.rm= TRUE),
+  ceros= sum(mcuentas_saldo == 0, na.rm= TRUE),
+  nas= sum(is.na(mcuentas_saldo))
+), keyby= foto_mes]
+
+# [Anotación · líneas 721–769] Arma dataset_train con 202103 y 202104, lo parte 70/30 en forma estratificada
+#   por clase_ternaria con la semilla 911341, crea clase01 (1 para BAJA+1 y BAJA+2, 0 para CONTINUA) y marca
+#   training = 1 en las filas del fold 1 que son bajas o cuyo número al azar es menor o igual a 0,1; el resto
+#   queda con training = 0.
+#%% celda 40 [texto]
+## 2. Hyperparameter Optimization
+
+#%% celda 41 [texto]
+El código de esta sección es el del `1_0`: mismas funciones, misma función objetivo, mismo `BO_log.txt` (una fila por evaluación, con todos los parámetros) y misma salida en pantalla. Los agregados son dos: la sección 2.3, que detecta los outliers y los saca del training de la BO, y un `if` en la celda de corrida (2.6), que saltea la BO si el log ya está completo.
+
+Lo único distinto son los valores de los parámetros, definidos en 0.2:
+
+* meses: 202103 + 202104 (`PARAM$train`)
+* undersampling 0,1 (`PARAM$trainingstrategy$undersampling <- 0.1`): entrena con todas las bajas y el 10% de los CONTINUA del fold de training. La validación es todo el resto, sin undersampling.
+* métrica: `auc`
+* 20 evaluaciones
+
+#%% celda 42 [texto]
+### 2.1 Training y validation
+
+#%% celda 43 [código]
+dataset_train <- dataset[foto_mes %in% PARAM$train]
+
+#%% celda 44 [código]
+  particionar(dataset_train,
+    division= c(PARAM$training_pct, 100L -PARAM$training_pct),
+    agrupa= "clase_ternaria",
+    seed= PARAM$semilla_primigenia # aqui se usa SU semilla
+  )
+
+#%% celda 45 [código]
+# paso la clase a binaria que tome valores {0,1}  enteros
+#  BAJA+1 y BAJA+2  son  1,   CONTINUA es 0
+#  a partir de ahora ya NO puedo cortar  por prob(BAJA+2) > 1/40
+
+dataset_train[,
+  clase01 := ifelse(clase_ternaria %in% c("BAJA+2","BAJA+1"), 1L, 0L)
+]
+
+#%% celda 46 [código]
+# defino los datos que forma parte del training
+# aqui se hace el undersampling de los CONTINUA
+# notar que para esto utilizo la SEGUNDA semilla
+
+set.seed(PARAM$semilla_primigenia, kind = "L'Ecuyer-CMRG")
+dataset_train[, azar := runif(nrow(dataset_train))]
+dataset_train[, training := 0L]
+
+dataset_train[
+  foto_mes %in%  PARAM$train &  fold==1 &
+    (azar <= PARAM$trainingstrategy$undersampling | clase_ternaria %in% c("BAJA+1", "BAJA+2")),
+  training := 1L
+]
+
+# [Anotación · líneas 771–782] Define campos_buenos: todas las columnas menos clase_ternaria, clase01, fold,
+#   azar y training; numero_de_cliente y foto_mes quedan incluidas.
+#%% celda 47 [texto]
+### 2.2 Variables predictoras
+
+Todas las columnas menos la clase y las auxiliares. Entran `numero_de_cliente` y `foto_mes`.
+
+#%% celda 48 [código]
+# los campos que se van a utilizar
+
+campos_buenos <- setdiff(
+  colnames(dataset_train),
+  c("clase_ternaria", "clase01", "fold", "azar", "training")
+)
+
+# [Anotación · líneas 784–842] Define probabilidad_cruzada(meses, archivo): si el archivo existe lo lee; si
+#   no, parte las filas de esos meses en dos mitades estratificadas por mes y clase, entrena un LightGBM en cada
+#   mitad (todas las bajas y el 10% de los CONTINUA, con los parámetros fijos más los de PARAM$outliers$hp) y
+#   predice la otra mitad completa. Graba numero_de_cliente, foto_mes, clase_ternaria y prob en el csv.
+#%% celda 49 [texto]
+### 2.3 Outliers de 202103 + 202104
+
+**Probabilidad cruzada.** `probabilidad_cruzada()` le pone a cada fila la probabilidad de baja que le da un detector que no la vio: parte los meses en dos mitades al azar (estratificadas por mes y clase), entrena en una y predice la otra, y viceversa.
+
+Son dos entrenamientos. Cada uno usa todas las bajas de su mitad y una fracción de sus CONTINUA (`PARAM$outliers$undersampling`), y predice **todas** las filas de la otra mitad.
+
+El resultado se graba en un csv. Si el csv ya existe, se lee y no se vuelve a entrenar.
+
+#%% celda 50 [código]
+probabilidad_cruzada <- function(meses, archivo) {
+  if (file.exists(archivo)) {
+    cat("Ya estaba calculado:", archivo, "\n")
+    return(fread(archivo))
+  }
+
+  # filas de esos meses y una tabla chica con su id, mes y clase
+  filas <- dataset[, which(foto_mes %in% meses)]
+  tb <- dataset[filas, list(numero_de_cliente, foto_mes, clase_ternaria)]
+  tb[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+  # dos mitades al azar, estratificadas por mes y clase
+  particionar(tb, division= c(50, 50), agrupa= c("foto_mes", "clase_ternaria"),
+    campo= "mitad", seed= PARAM$semilla_primigenia)
+
+  # undersampling del detector: todas las bajas y una fraccion de los CONTINUA
+  set.seed(PARAM$semilla_primigenia, kind= "L'Ecuyer-CMRG")
+  tb[, entrena := clase01 == 1L | runif(.N) <= PARAM$outliers$undersampling]
+
+  # parametros del detector: los fijos mas los hiperparametros de PARAM$outliers$hp
+  param_detector <- modifyList(PARAM$lgbm$param_fijos, PARAM$outliers$hp)
+
+  tb[, prob := NA_real_]
+
+  for (m in 1:2) {
+    cat(format(Sys.time(), "%d/%m/%Y %H:%M:%S"), "- detector: entreno en la mitad", m, "y predigo la otra\n")
+    flush.console()
+
+    entreno <- tb$mitad == m & tb$entrena      # la mitad m, con undersampling
+    predigo <- tb$mitad != m                   # la otra mitad, completa
+
+    modelo <- lgb.train(
+      data= lgb.Dataset(
+        data= data.matrix(dataset[filas[entreno], campos_buenos, with= FALSE]),
+        label= tb$clase01[entreno]
+      ),
+      params= param_detector
+    )
+
+    prob_otra_mitad <- predict(modelo, data.matrix(dataset[filas[predigo], campos_buenos, with= FALSE]))
+    tb[predigo, prob := prob_otra_mitad]
+  }
+
+  cat(format(Sys.time(), "%d/%m/%Y %H:%M:%S"), "- detector listo\n")
+
+  tb <- tb[, list(numero_de_cliente, foto_mes, clase_ternaria, prob)]
+  fwrite(tb, archivo)
+  tb
+}
+
+# [Anotación · líneas 844–859] Define ver_umbrales(), que para los umbrales 0,10, 0,25, 0,50, 0,75 y 0,90
+#   informa la probabilidad equivalente sin submuestreo, la cantidad y el porcentaje de CONTINUA por encima del
+#   umbral y la cantidad de bajas por encima del umbral.
+# cuantos clientes quedan por encima de cada umbral de probabilidad
+#  outliers = los CONTINUA sobre el umbral; al lado, cuantas bajas reales hay en esa misma zona
+#  prob_real_aprox = a que probabilidad sin undersampling equivale ese umbral
+ver_umbrales <- function(tb) {
+  us <- PARAM$outliers$undersampling
+  umbrales <- sort(unique(c(0.10, 0.25, 0.50, 0.75, 0.90, PARAM$outliers$umbral)))
+  rbindlist(lapply(umbrales, function(u) {
+    tb[, list(
+      umbral= u,
+      prob_real_aprox= round(u * us / (u * us + 1 - u), 3),
+      outliers= sum(clase_ternaria == "CONTINUA" & prob > u),
+      pct_de_los_continua= round(100 * sum(clase_ternaria == "CONTINUA" & prob > u) / sum(clase_ternaria == "CONTINUA"), 2),
+      bajas_sobre_umbral= sum(clase_ternaria != "CONTINUA" & prob > u)
+    )]
+  }))
+}
+
+# [Anotación · líneas 861–890] Etapa 1: calcula la probabilidad cruzada de 202103 y 202104
+#   (outliers_train.csv), toma como outliers a los CONTINUA con probabilidad mayor a 0,5, identificados por
+#   cliente y mes, y elimina de dataset_train los que tienen training = 1. Muestra filas y bajas por valor de
+#   training.
+#%% celda 51 [texto]
+**Etapa 1.** Outliers de 202103 + 202104: los CONTINUA con probabilidad cruzada mayor a `PARAM$outliers$umbral`. Se identifican con su `numero_de_cliente` y su `foto_mes`.
+
+La tabla muestra cuántos saldrían con cada umbral, para tener la referencia.
+
+#%% celda 52 [código]
+outliers_train <- character(0)      # claves "numero_de_cliente foto_mes" de los outliers
+
+if (PARAM$outliers$activo) {
+  tb_cruzada <- probabilidad_cruzada(unique(c(PARAM$train, PARAM$train_final)), "outliers_train.csv")
+
+  outliers_train <- tb_cruzada[clase_ternaria == "CONTINUA" & prob > PARAM$outliers$umbral,
+    paste(numero_de_cliente, foto_mes)]
+
+  print(ver_umbrales(tb_cruzada))
+}
+
+cat("Outliers con umbral", PARAM$outliers$umbral, ":", length(outliers_train), "\n")
+
+#%% celda 53 [texto]
+**Se sacan del training de la BO.** Solo de las filas con `training == 1`. La validación (`training == 0`) queda completa.
+
+#%% celda 54 [código]
+es_outlier <- dataset_train[, paste(numero_de_cliente, foto_mes)] %in% outliers_train
+cat("Outliers sacados del training de la BO:", dataset_train[, sum(training == 1L & es_outlier)], "\n")
+
+dataset_train <- dataset_train[!(training == 1L & es_outlier)]
+
+# control: filas y bajas que quedan en training (1) y en validation (0)
+dataset_train[, list(filas= .N, bajas= sum(clase01)), keyby= training]
+
+# [Anotación · líneas 892–954] Lee de BO_log.txt, si existe, el número de la última evaluación. Define
+#   Estimar_lightgbm(), que combina los parámetros fijos con los propuestos, entrena con dtrain usando dvalidate
+#   como conjunto de validación, registra best_score (AUC) en BO_log.txt y lo devuelve. Arma dtrain con las
+#   filas training = 1 y dvalidate con todas las filas training = 0.
+#%% celda 55 [texto]
+### 2.4 Función objetivo
+
+#%% celda 56 [código]
+giter <- 0
+
+if( file.exists("BO_log.txt") ){
+  tb_BO <- fread("BO_log.txt")
+  giter <- tb_BO[, max(iter)]
+}
+
+#%% celda 57 [código]
+# En el argumento x llegan los parametros de la bayesiana
+
+Estimar_lightgbm <- function(xs) {
+
+  flush.console()
+  giter <<- giter + 1
+
+  # x pisa (o agrega) a param_fijos
+  param_completo <- modifyList(PARAM$lgbm$param_fijos, xs)
+  xx <- copy(param_completo)
+
+  # entreno LightGBM
+  modelo <- lgb.train(
+    data= dtrain,
+    valids= list( "val"=dvalidate),
+    param= param_completo
+  )
+
+
+  # obtengo la ganancia
+  xx$iter <- giter
+  xx$metrica <- modelo$best_score
+
+  loguear( xx, "BO_log.txt")
+  set.seed(PARAM$semilla_primigenia, kind = "L'Ecuyer-CMRG")  # le reordeno a mlr3MBO
+
+  return( list( metrica = xx$metrica) )
+}
+
+#%% celda 58 [código]
+# dejo los datos de training en el formato que necesita LightGBM
+
+dtrain <- lgb.Dataset(
+  data= data.matrix(dataset_train[training == 1L, campos_buenos, with= FALSE]),
+  label= dataset_train[training == 1L, clase01],
+  free_raw_data= FALSE
+)
+
+nrow(dtrain)
+ncol(dtrain)
+
+#%% celda 59 [código]
+# datos de validatin en el formato que necesita LightGBM
+dvalidate <- lgb.Dataset(
+  data= data.matrix(dataset_train[training == 0L, campos_buenos, with= FALSE]),
+  label= dataset_train[training == 0L, clase01],
+  free_raw_data= FALSE
+)
+
+nrow(dvalidate)
+ncol(dvalidate)
+
+# [Anotación · líneas 956–998] Configura la optimización con bbotk y mlr3mbo: objetivo a maximizar sobre el
+#   espacio de 3 hiperparámetros, terminación a las 20 evaluaciones, modelo sustituto de kriging (regr.km con
+#   BFGS y nugget estimado), función de adquisición expected improvement y optimizador de la adquisición por
+#   búsqueda al azar con 1.000 evaluaciones, en el lazo bayesopt_ego. Define kbayesiana ('bayesiana.RDATA'),
+#   nombre que no vuelve a usarse en el notebook.
+#%% celda 60 [texto]
+### 2.5 Configuración de la BO
+
+#%% celda 61 [código]
+# Aqui comienza la configuracion de la Bayesian Optimization
+
+# en este archivo quedan la evolucion binaria de la BO
+kbayesiana <- "bayesiana.RDATA"
+
+funcion_optimizar <- Estimar_lightgbm # la funcion que voy a maximizar
+
+objective <- ObjectiveRFun$new(
+  fun= funcion_optimizar,
+  domain= PARAM$hypeparametertuning$hs,
+  codomain= ps(metrica = p_dbl(tags="maximize")),
+  id= "BO_lightgbm"
+)
+
+
+instance <- OptimInstanceBatchSingleCrit$new(
+  objective= objective,
+  terminator=  trm("evals", n_evals = PARAM$hyperparametertuning$iteraciones)
+)
+
+
+surrogate <- srlrn(lrn("regr.km",
+  optim.method = "BFGS",
+  nugget.estim = TRUE,
+  control= list(trace = FALSE)))
+
+acq_function  <- acqf("ei")                 # expected improvement
+
+acq_optimizer  <- acqo(
+  optimizer  = opt("random_search", batch_size= 1000),
+  terminator = trm("evals", n_evals= 1000)
+)
+
+optimizer <- opt("mbo",
+  loop_function = bayesopt_ego,
+  surrogate= surrogate,
+  acq_function= acq_function,
+  acq_optimizer= acq_optimizer
+)
+
+# [Anotación · líneas 1000–1016] Ejecuta la optimización sólo si BO_log.txt tiene menos de 20 evaluaciones; en
+#   caso contrario informa que ya está completa. Muestra la hora.
+#%% celda 62 [texto]
+### 2.6 Corrida de la BO
+
+#%% celda 63 [código]
+# si BO_log.txt ya tiene todas las evaluaciones, la BO no se vuelve a correr
+#  (unico cambio sobre el 1_0 en esta seccion: el if)
+if (giter < PARAM$hyperparametertuning$iteraciones) {
+  bayesiana_salida <- optimizer$optimize(instance)
+} else {
+  cat("La BO ya esta completa:", giter, "evaluaciones en BO_log.txt. No se vuelve a correr.\n")
+}
+
+#%% celda 64 [texto]
+Luego de este punto, en la carpeta del experimento quedó el archivo `BO_log.txt` con todas las iteraciones de la Bayesian Optimization.
+
+#%% celda 65 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+
+# [Anotación · líneas 1018–1042] Libera la memoria de la BO, lee BO_log.txt, lo ordena por metrica descendente
+#   y toma num_iterations, num_leaves y min_sum_hessian_in_leaf de la primera fila; los combina con los
+#   parámetros fijos en param_final y muestra la tabla de evaluaciones.
+#%% celda 66 [texto]
+## 3. Testing
+
+#%% celda 67 [texto]
+### 3.1 Mejores hiperparámetros
+
+Los de mayor AUC de `BO_log.txt`. Se usan en Testing y en Producción.
+
+#%% celda 68 [código]
+# libero la memoria de la BO
+rm(dtrain, dvalidate, dataset_train)
+invisible(gc())
+
+# de aca en adelante los numeros grandes se muestran completos, sin notacion cientifica
+options(scipen= 999)
+
+#%% celda 69 [código]
+# mejores hiperparametros: la fila de mayor metrica del log de la BO
+tb_bayesiana <- fread("BO_log.txt")
+setorder(tb_bayesiana, -metrica)
+
+mejores_hp <- as.list(tb_bayesiana[1, list(num_iterations, num_leaves, min_sum_hessian_in_leaf)])
+param_final <- modifyList(PARAM$lgbm$param_fijos, mejores_hp)
+
+tb_bayesiana[, list(iter, num_iterations, num_leaves, min_sum_hessian_in_leaf, metrica)]
+
+# [Anotación · líneas 1044–1085] Crea clase01 en todo el dataset, arma la matriz de entrenamiento con 202103 y
+#   202104, la marca de outliers de la etapa 1 por fila y la matriz de 202106. Define grabar_resumen(), que
+#   escribe un csv con los identificadores y una columna prob_s# por cada semilla cuyo archivo ya existe.
+#%% celda 70 [texto]
+### 3.2 Un modelo por semilla
+
+Cada modelo entrena con 202103 + 202104 **sin los outliers de la etapa 1**, con el mismo undersampling de la BO (todas las bajas y el 10% de los CONTINUA), y predice 202106 completo.
+
+La muestra de CONTINUA se sortea con la semilla de cada modelo: cada semilla ve un 10% distinto, así que el ensamble aprovecha más datos que cualquier modelo solo. El sorteo es el mismo del `7_0`; después se sacan los outliers que hayan caído en la muestra.
+
+Al terminar cada semilla se graban sus probabilidades y su importancia de variables en la carpeta `testing/`. Si la corrida se corta, al volver a correr se saltean las semillas que ya están.
+
+Además, al terminar cada semilla se actualiza `testing_probabilidades.csv`: una fila por cliente de 202106, con `numero_de_cliente`, `clase_ternaria` y una columna `prob_s#` por cada semilla ya corrida.
+
+#%% celda 71 [código]
+# clase binaria sobre todo el dataset: BAJA+1 y BAJA+2 valen 1, CONTINUA vale 0
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+# training: los dos meses (el undersampling se hace despues, por semilla)
+mtrain <- data.matrix(dataset[foto_mes %in% PARAM$train_final, campos_buenos, with= FALSE])
+label_train <- dataset[foto_mes %in% PARAM$train_final, clase01]
+
+# outliers de la etapa 1: una marca por fila de training
+es_outlier_train <- dataset[foto_mes %in% PARAM$train_final, paste(numero_de_cliente, foto_mes)] %in% outliers_train
+
+# testing: 202106
+dtest <- dataset[foto_mes %in% PARAM$future]
+mtest <- data.matrix(dtest[, campos_buenos, with= FALSE])
+
+cat("Training:", nrow(mtrain), "filas y", ncol(mtrain), "variables\n")
+cat("Outliers que no entran al training:", sum(es_outlier_train), "\n")
+cat("Testing:", nrow(mtest), "filas\n")
+
+#%% celda 72 [código]
+# graba un csv con los ids y una columna prob_s# por cada semilla que ya termino
+#  base: tabla con los ids / carpeta: donde estan los prob_s#.csv / salida: nombre del csv
+#  se llama al terminar cada semilla, asi el csv se va actualizando durante la corrida
+grabar_resumen <- function(base, carpeta, salida) {
+  tb <- copy(base)
+  for (s in seq_len(max(PARAM$semillas_test, PARAM$semillas_produccion))) {
+    archivo <- paste0(carpeta, "/prob_s", s, ".csv")
+    if (file.exists(archivo)) tb[, (paste0("prob_s", s)) := fread(archivo)$prob]
+  }
+  fwrite(tb, salida)
+}
+
+# [Anotación · líneas 1087–1122] Para cada una de las primeras 10 semillas, si su archivo no existe: fija el
+#   seed de LightGBM, sortea con esa semilla el 10% de los CONTINUA, agrega todas las bajas, quita los outliers,
+#   entrena con param_final, graba la importancia de variables y las probabilidades de 202106 en testing/ y
+#   actualiza testing_probabilidades.csv.
+#%% celda 73 [código]
+dir.create("testing", showWarnings= FALSE)
+
+for (s in seq_len(PARAM$semillas_test)) {
+  archivo <- paste0("testing/prob_s", s, ".csv")
+
+  # esta semilla ya se corrio: la salteo
+  if (file.exists(archivo)) {
+    cat("semilla", s, "de", PARAM$semillas_test, "- ya estaba hecha\n")
+    next
+  }
+
+  cat(format(Sys.time(), "%d/%m/%Y %H:%M:%S"), "- arranca la semilla", s, "de", PARAM$semillas_test, "\n")
+  flush.console()
+
+  param_final$seed <- PARAM$semillas[s]
+
+  # undersampling: todas las bajas y una fraccion de los CONTINUA, sorteada con la semilla del modelo
+  #  el sorteo es el del 7_0; despues se sacan los outliers
+  set.seed(PARAM$semillas[s], kind= "L'Ecuyer-CMRG")
+  filas_s <- which((label_train == 1L | runif(length(label_train)) <= PARAM$trainingstrategy$undersampling) & !es_outlier_train)
+
+  modelo <- lgb.train(
+    data= lgb.Dataset(data= mtrain[filas_s, ], label= label_train[filas_s]),
+    params= param_final
+  )
+
+  fwrite(lgb.importance(modelo), paste0("testing/importancia_s", s, ".csv"))
+  fwrite(list(prob= predict(modelo, mtest)), archivo)
+
+  # actualizo el resumen: ids, clase y la probabilidad de cada semilla corrida hasta ahora
+  grabar_resumen(dtest[, list(numero_de_cliente, clase_ternaria)], "testing", "testing_probabilidades.csv")
+
+  cat(format(Sys.time(), "%d/%m/%Y %H:%M:%S"), "- termino la semilla", s, "de", PARAM$semillas_test, "\n")
+  flush.console()
+}
+
+# [Anotación · líneas 1124–1171] Reúne las probabilidades de las 10 semillas y su promedio (ensamble). Calcula
+#   la ganancia acumulada ordenando de mayor a menor probabilidad, con 1.072.500 por cada BAJA+2 y −27.500 por
+#   cualquier otro envío. Graba testing_ganancia.txt con la ganancia en los 14 cortes por semilla, su media, su
+#   desvío y la del ensamble, e imprime el máximo de la curva media y el de la curva del ensamble con su
+#   cantidad de envíos.
+#%% celda 74 [texto]
+### 3.3 Ganancia en 202106
+
+* Una curva de ganancia por semilla.
+* La curva del **ensamble**: se promedian las probabilidades de las 10 semillas y con ese promedio se arma una sola curva.
+
+Cada BAJA+2 acertado suma 1.072.500 y cualquier otro envío resta 27.500.
+
+#%% celda 75 [código]
+# junto las probabilidades de todas las semillas
+tb_test <- dtest[, list(numero_de_cliente, clase_ternaria)]
+for (s in seq_len(PARAM$semillas_test)) {
+  tb_test[, (paste0("s", s)) := fread(paste0("testing/prob_s", s, ".csv"))$prob]
+}
+
+# ensamble: promedio de las probabilidades de las semillas
+cols_semillas <- paste0("s", seq_len(PARAM$semillas_test))
+tb_test[, ensamble := rowMeans(.SD), .SDcols= cols_semillas]
+
+# ganancia acumulada: ordeno de mayor a menor probabilidad y acumulo
+#  el elemento m del resultado es la ganancia de enviar a los m clientes con mas probabilidad
+ganancia_acumulada <- function(prob) {
+  gan <- ifelse(tb_test$clase_ternaria == "BAJA+2", 1072500, -27500)
+  cumsum(gan[order(-prob)])
+}
+
+# una curva por semilla (una columna cada una) y la del ensamble
+curvas <- sapply(cols_semillas, function(columna) ganancia_acumulada(tb_test[[columna]]))
+curva_ensamble <- ganancia_acumulada(tb_test$ensamble)
+
+#%% celda 76 [código]
+# ganancia en cada corte: por semilla, media y desvio de las semillas, y ensamble
+tb_ganancia <- data.table(
+  envios= PARAM$cortes,
+  curvas[PARAM$cortes, ],
+  media= rowMeans(curvas[PARAM$cortes, ]),
+  desvio= apply(curvas[PARAM$cortes, ], 1, sd),
+  ensamble= curva_ensamble[PARAM$cortes]
+)
+fwrite(tb_ganancia, "testing_ganancia.txt", sep= "\t")
+
+# maximo de toda la curva
+curva_media <- rowMeans(curvas)
+cat("Maximo de la media de las semillas:", round(max(curva_media) / 1e6, 1), "M con", which.max(curva_media), "envios\n")
+cat("Maximo del ensamble:", round(max(curva_ensamble) / 1e6, 1), "M con", which.max(curva_ensamble), "envios\n")
+
+# la tabla en millones
+tb_ganancia[, lapply(.SD, function(x) round(x / 1e6, 1)), by= envios]
+
+# [Anotación · líneas 1173–1187] Grafica entre 4.000 y 20.000 envíos la curva de ganancia de cada semilla y la
+#   del ensamble, con líneas verticales en los cortes de PARAM$cortes.
+#%% celda 77 [código]
+# curvas de ganancia: una por semilla (gris) y la del ensamble (azul)
+envios <- 4000:20000
+
+options(repr.plot.width= 12, repr.plot.height= 6)
+matplot(envios, curvas[envios, ] / 1e6,
+  type= "l", lty= 1, col= "grey70",
+  ylim= range(curvas[envios, ], curva_ensamble[envios]) / 1e6,
+  xlab= "Cantidad de envios", ylab= "Ganancia (millones)",
+  main= paste("Ganancia en", PARAM$future, "-", PARAM$experimento)
+)
+lines(envios, curva_ensamble[envios] / 1e6, col= "steelblue", lwd= 2)
+abline(v= PARAM$cortes, lty= 3, col= "grey50")
+legend("bottom", legend= c("ensamble", "cada semilla", "cortes"), horiz= TRUE,
+  col= c("steelblue", "grey70", "grey50"), lty= c(1, 1, 3), lwd= c(2, 1, 1), bty= "n")
+
+# [Anotación · líneas 1189–1244] Define leer_importancia(), que promedia el gain de cada variable entre las
+#   semillas de una carpeta, ordena de mayor a menor y clasifica cada variable como lag, delta, tendencia o del
+#   mes según su sufijo. La aplica a testing/, graba testing_importancia.txt, muestra el porcentaje de gain por
+#   tipo y grafica las 50 variables de mayor gain. Libera la memoria del Testing.
+#%% celda 78 [texto]
+### 3.4 Importancia de variables
+
+Promedio de las semillas. La medida es el *gain*: qué parte de la mejora total del modelo aporta cada variable.
+
+Las de tendencia no aparecen acá: en 202103 y 202104 son todo `NA`, así que estos modelos no las pueden usar. Se ven en la importancia de Producción (sección 4.3).
+
+#%% celda 79 [código]
+# junta la importancia de todas las semillas de una carpeta y la promedia
+#  devuelve una fila por variable, de mayor a menor gain, con su puesto y su tipo
+leer_importancia <- function(carpeta, n_semillas) {
+  tb <- rbindlist(lapply(seq_len(n_semillas),
+    function(s) fread(paste0(carpeta, "/importancia_s", s, ".csv"))))
+
+  tb <- tb[, list(gain= sum(Gain) / n_semillas), by= list(variable= Feature)]
+  setorder(tb, -gain)
+  tb[, puesto := .I]
+
+  # tipo de variable: lag, delta, tendencia o del mes
+  tb[, tipo := fcase(
+    grepl("_lag[12]$", variable), "lag",
+    grepl("_delta[12]$", variable), "delta",
+    grepl("_(tend|avg)3$", variable), "tendencia",
+    default= "del mes"
+  )]
+  tb[]
+}
+
+tb_importancia <- leer_importancia("testing", PARAM$semillas_test)
+fwrite(tb_importancia, "testing_importancia.txt", sep= "\t")
+
+# cuanto pesa cada tipo
+tb_importancia[, list(variables= .N, gain_pct= round(100 * sum(gain), 1)), keyby= tipo]
+
+#%% celda 80 [código]
+# las 50 variables mas importantes, con los lags, los deltas y las tendencias en otro color
+colores <- c("del mes"= "steelblue", "lag"= "darkorange", "delta"= "seagreen", "tendencia"= "firebrick")
+
+top <- head(tb_importancia, 50)[.N:1]     # el barplot dibuja de abajo hacia arriba
+
+options(repr.plot.width= 12, repr.plot.height= 14)
+par(mar= c(4, 18, 3, 1))
+barplot(100 * top$gain,
+  names.arg= top$variable, horiz= TRUE, las= 1, cex.names= 0.75,
+  col= colores[top$tipo], border= NA,
+  xlab= "Importancia (% del gain total)",
+  main= paste("Top 50 variables -", PARAM$experimento)
+)
+legend("bottomright", legend= names(colores), fill= colores, border= NA, bty= "n")
+
+#%% celda 81 [código]
+# libero la memoria del testing
+rm(mtrain, label_train, es_outlier_train, dtest, mtest)
+invisible(gc())
+
+format(Sys.time(), "%a %b %d %X %Y")
+
+# [Anotación · líneas 1246–1269] Etapa 2: calcula la probabilidad cruzada de 202103 a 202106
+#   (outliers_produccion.csv), toma como outliers a los CONTINUA con probabilidad mayor a 0,5 y muestra la tabla
+#   de umbrales y la cantidad de outliers por mes.
+#%% celda 82 [texto]
+## 4. Producción
+
+#%% celda 83 [texto]
+### 4.1 Outliers de los 4 meses
+
+**Etapa 2.** Se repite la detección sobre 202103 a 202106, con el mismo detector cruzado. Los outliers de esta etapa no entran al training de Producción.
+
+#%% celda 84 [código]
+outliers_produccion <- character(0)
+
+if (PARAM$outliers$activo) {
+  tb_cruzada <- probabilidad_cruzada(PARAM$meses_produccion, "outliers_produccion.csv")
+
+  outliers_produccion <- tb_cruzada[clase_ternaria == "CONTINUA" & prob > PARAM$outliers$umbral,
+    paste(numero_de_cliente, foto_mes)]
+
+  print(ver_umbrales(tb_cruzada))
+
+  # outliers por mes
+  print(tb_cruzada[, list(outliers= sum(clase_ternaria == "CONTINUA" & prob > PARAM$outliers$umbral)), keyby= foto_mes])
+}
+
+cat("Outliers con umbral", PARAM$outliers$umbral, ":", length(outliers_produccion), "\n")
+
+# [Anotación · líneas 1271–1296] Arma la matriz de entrenamiento con 202103 a 202106, la marca de outliers de
+#   la etapa 2 por fila y la matriz de 202108 a predecir; imprime las dimensiones.
+#%% celda 85 [texto]
+### 4.2 Un modelo por semilla
+
+Cada modelo entrena con los 4 meses (202103 a 202106) **sin los outliers de la etapa 2**, con undersampling 0,1 (todas las bajas y el 10% de los CONTINUA, sorteado con la semilla de cada modelo), con los mismos hiperparámetros del Testing, y predice 202108.
+
+Como la BO, el Testing y la Producción usan el mismo undersampling, los hiperparámetros se aplican en las mismas condiciones en que se eligieron. Las probabilidades salen infladas respecto de la escala real, pero el submit se arma por ranking y cantidad de envíos, así que no lo afecta.
+
+Al terminar cada semilla se graban sus probabilidades y su importancia de variables en la carpeta `produccion/`. Si la corrida se corta, al volver a correr se saltean las semillas que ya están.
+
+Además, al terminar cada semilla se actualiza `prediccion_202108.csv`: una fila por cliente de 202108, con `numero_de_cliente` y una columna `prob_s#` por cada semilla ya corrida.
+
+#%% celda 86 [código]
+# training: los 4 meses (el undersampling se hace despues, por semilla)
+mtrain <- data.matrix(dataset[foto_mes %in% PARAM$meses_produccion, campos_buenos, with= FALSE])
+label_train <- dataset[foto_mes %in% PARAM$meses_produccion, clase01]
+
+# outliers de la etapa 2: una marca por fila de training
+es_outlier_train <- dataset[foto_mes %in% PARAM$meses_produccion, paste(numero_de_cliente, foto_mes)] %in% outliers_produccion
+
+# mes a predecir: 202108
+dfuture <- dataset[foto_mes == PARAM$mes_prediccion]
+mfuture <- data.matrix(dfuture[, campos_buenos, with= FALSE])
+
+cat("Training:", nrow(mtrain), "filas y", ncol(mtrain), "variables\n")
+cat("Outliers que no entran al training:", sum(es_outlier_train), "\n")
+cat("A predecir:", nrow(mfuture), "clientes\n")
+
+# [Anotación · líneas 1298–1332] Para cada una de las 50 semillas, si su archivo no existe: fija el seed de
+#   LightGBM, sortea con esa semilla el 10% de los CONTINUA, agrega todas las bajas, quita los outliers, entrena
+#   con param_final, graba la importancia de variables y las probabilidades de 202108 en produccion/ y actualiza
+#   prediccion_202108.csv.
+#%% celda 87 [código]
+dir.create("produccion", showWarnings= FALSE)
+
+for (s in seq_len(PARAM$semillas_produccion)) {
+  archivo <- paste0("produccion/prob_s", s, ".csv")
+
+  # esta semilla ya se corrio: la salteo
+  if (file.exists(archivo)) {
+    cat("semilla", s, "de", PARAM$semillas_produccion, "- ya estaba hecha\n")
+    next
+  }
+
+  cat(format(Sys.time(), "%d/%m/%Y %H:%M:%S"), "- arranca la semilla", s, "de", PARAM$semillas_produccion, "\n")
+  flush.console()
+
+  param_final$seed <- PARAM$semillas[s]
+
+  # undersampling: todas las bajas y una fraccion de los CONTINUA, sorteada con la semilla del modelo
+  set.seed(PARAM$semillas[s], kind= "L'Ecuyer-CMRG")
+  filas_s <- which((label_train == 1L | runif(length(label_train)) <= PARAM$trainingstrategy$undersampling) & !es_outlier_train)
+
+  modelo <- lgb.train(
+    data= lgb.Dataset(data= mtrain[filas_s, ], label= label_train[filas_s]),
+    params= param_final
+  )
+
+  fwrite(lgb.importance(modelo), paste0("produccion/importancia_s", s, ".csv"))
+  fwrite(list(prob= predict(modelo, mfuture)), archivo)
+
+  # actualizo el resumen: ids y la probabilidad de cada semilla corrida hasta ahora
+  grabar_resumen(dfuture[, list(numero_de_cliente)], "produccion", paste0("prediccion_", PARAM$mes_prediccion, ".csv"))
+
+  cat(format(Sys.time(), "%d/%m/%Y %H:%M:%S"), "- termino la semilla", s, "de", PARAM$semillas_produccion, "\n")
+  flush.console()
+}
+
+# [Anotación · líneas 1334–1347] Promedia la importancia de las 50 semillas, graba produccion_importancia.txt
+#   y muestra el porcentaje de gain por tipo de variable y las 20 variables de tendencia de mayor gain con su
+#   puesto general.
+#%% celda 88 [texto]
+### 4.3 Importancia de variables en Producción
+
+Acá sí pueden pesar las tendencias: 202105 y 202106 las tienen completas. La primera tabla muestra cuánto del gain se lleva cada tipo de variable; la segunda, las 20 de tendencia más usadas con su puesto en el ranking general.
+
+#%% celda 89 [código]
+tb_importancia_prod <- leer_importancia("produccion", PARAM$semillas_produccion)
+fwrite(tb_importancia_prod, "produccion_importancia.txt", sep= "\t")
+
+# cuanto pesa cada tipo
+print(tb_importancia_prod[, list(variables= .N, gain_pct= round(100 * sum(gain), 1)), keyby= tipo])
+
+# las de tendencia mas usadas
+head(tb_importancia_prod[tipo == "tendencia", list(puesto, variable, gain_pct= round(100 * gain, 3))], 20)
+
+# [Anotación · líneas 1349–1365] Reúne las columnas prob_s1 a prob_s50, agrega prob_media (promedio por fila
+#   de las 50) y graba prediccion_202108.csv. Muestra los 10 clientes de mayor prob_media.
+#%% celda 90 [texto]
+### 4.4 Resumen de probabilidades
+
+Versión final de `prediccion_202108.csv`, que se fue armando durante la corrida: una fila por cliente, con las 50 probabilidades (`prob_s1` a `prob_s50`) y, ahora, `prob_media`, que es la media simple de las 50: el ensamble.
+
+#%% celda 91 [código]
+tb_prediccion <- dfuture[, list(numero_de_cliente)]
+for (s in seq_len(PARAM$semillas_produccion)) {
+  tb_prediccion[, (paste0("prob_s", s)) := fread(paste0("produccion/prob_s", s, ".csv"))$prob]
+}
+
+cols_semillas <- paste0("prob_s", seq_len(PARAM$semillas_produccion))
+tb_prediccion[, prob_media := rowMeans(.SD), .SDcols= cols_semillas]
+
+fwrite(tb_prediccion, paste0("prediccion_", PARAM$mes_prediccion, ".csv"))
+
+tb_prediccion[order(-prob_media)][1:10]
+
+# [Anotación · líneas 1367–1404] Define grabar_envios(), que escribe sin encabezado los numero_de_cliente de
+#   los m clientes de mayor probabilidad. Para cada uno de los 14 cortes graba en la carpeta m<corte> un csv por
+#   semilla (50) y en ensamble/ un csv armado con prob_media. Muestra la cantidad de archivos por carpeta y la
+#   hora de finalización.
+#%% celda 92 [texto]
+### 4.5 Archivos del submit
+
+Formato de siempre: solo los `numero_de_cliente` de los envíos, sin encabezado.
+
+* Una carpeta por corte (`m8000`, `m9000`, ...), cada una con 50 csv, uno por semilla: `<script>_s<semilla>_m<corte>.csv`.
+* Una carpeta `ensamble`, con un csv por corte armado con `prob_media`.
+
+#%% celda 93 [código]
+# graba los m clientes con mayor probabilidad: solo el id, sin encabezado
+grabar_envios <- function(prob, m, archivo) {
+  ids <- tb_prediccion$numero_de_cliente[order(-prob)][1:m]
+  fwrite(list(sprintf("%.0f", as.numeric(ids))), archivo, col.names= FALSE)
+}
+
+dir.create("ensamble", showWarnings= FALSE)
+
+for (m in PARAM$cortes) {
+  # una carpeta por corte, con un csv por semilla
+  carpeta <- paste0("m", m)
+  dir.create(carpeta, showWarnings= FALSE)
+
+  for (s in seq_len(PARAM$semillas_produccion)) {
+    grabar_envios(tb_prediccion[[paste0("prob_s", s)]], m,
+      paste0(carpeta, "/", PARAM$nombre_script, "_s", s, "_m", m, ".csv"))
+  }
+
+  # el ensamble de todas las semillas
+  grabar_envios(tb_prediccion$prob_media, m,
+    paste0("ensamble/", PARAM$nombre_script, "_ensamble_m", m, ".csv"))
+}
+
+# control: cantidad de csv en cada carpeta
+carpetas <- c(paste0("m", PARAM$cortes), "ensamble")
+data.table(carpeta= carpetas, archivos= sapply(carpetas, function(carpeta) length(list.files(carpeta))))
+
+#%% celda 94 [código]
+format(Sys.time(), "%a %b %d %X %Y")
+```
+
+
+## Explicaciones del alumno (texto original)
+
+### README.md
+
+> # DMEyF 2026 — Competencia 1
+>
+> Objetivo: predicción de clientes BAJA+2 para 202108. Meses disponibles en base de datos: desde 202103 a 202108.
+>
+> Contenido del repositorio:
+>
+> | Archivo | Qué es |
+> |------------------------------------|------------------------------------|
+> | `8_0_competencia1_gcp_entrega.ipynb` | Notebook único que genera el csv con ids de clients para la entrega |
+> | `BO_log.txt` | Resultado de la Bayesian Optimization de ese mismo notebook |
+>
+> ## 1. Instrucciones de corrida
+>
+> Es un solo notebook que hace todo. Se corre de punta a punta, con kernel **R**, de arriba hacia abajo, sin ningún script previo. Está configurado para correr sobra una VM configurada según las instrucciones de los profesores de esta materia.
+>
+> Pasos que ejecuta:
+>
+> 1.  Baja el dataset `competencia_01_crudo.csv` a `~/buckets/b1/datasets/` si todavía no está ahí.
+> 2.  Preprocesa: clase ternaria, features nuevas, lags y deltas, tendencias y ranking.
+> 3.  Detecta outliers y corre su propia Bayesian Optimization (20 evaluaciones) sobre 202103 + 202104.
+> 4.  Testea en 202106 con 10 semillas.
+> 5.  Entrena sobre los 4 meses (202103 a 202106) con 50 semillas y predice 202108.
+> 6.  Graba las predicciones según los cortes definidos en `PARAM$cortes`.
+>
+> Todo queda en `~/buckets/b1/outputs/base_080/`:
+>
+> - `m<corte>/`: una carpeta por corte, con un csv por semilla.
+> - `ensamble/`: un csv por corte, armado con el promedio de las 50 semillas.
+>
+> Se corrió en una VM de Google Cloud con 8 vCPU y 62 GB de RAM. La corrida completa tarda unas 7 horas y media.
+>
+> Si la corrida se corta, se vuelve a correr desde arriba y sigue desde donde quedó.
+>
+> ## 2. Resultado de la BO
+>
+> Se incluye `BO_log.txt` por si se quiere saltear esa parte. Ese archivo sale de este mismo notebook.
+>
+> Para usarlo, copiarlo antes de correr a:
+>
+> ```         
+> ~/buckets/b1/outputs/base_080/BO_log.txt
+> ```
+>
+> El notebook detecta que el log ya tiene las 20 evaluaciones, no vuelve a correr la BO y toma de ahí los mejores hiperparámetros.
+>
+> ## 3. Entrega final
+>
+> De todos los csv que genera el notebook, la entrega final corresponde a:
+>
+> ```         
+> ensamble/8_0_competencia1_gcp_ensamble_m12500.csv
+> ```
+

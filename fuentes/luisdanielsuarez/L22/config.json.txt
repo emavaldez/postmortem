@@ -1,0 +1,83 @@
+{
+ "dataset": "/home/ds/dmeyf/datasets/L20_dataset.parquet",
+ "hiperparametros": "/home/ds/dmeyf/exp/L20/L20_e1_hiperparametros.json",
+ "mejores_hiperparametros": {
+  "num_iterations": 1856,
+  "num_leaves": 556,
+  "min_sum_hessian_in_leaf": 0.03686919557819343
+ },
+ "params_fijos": {
+  "boosting": "gbdt",
+  "objective": "binary",
+  "metric": "auc",
+  "first_metric_only": false,
+  "boost_from_average": true,
+  "force_row_wise": true,
+  "deterministic": true,
+  "verbosity": -1,
+  "max_depth": -1,
+  "min_gain_to_split": 0.0,
+  "lambda_l1": 0.0,
+  "lambda_l2": 0.0,
+  "max_bin": 31,
+  "bagging_fraction": 1.0,
+  "pos_bagging_fraction": 1.0,
+  "neg_bagging_fraction": 1.0,
+  "is_unbalance": false,
+  "scale_pos_weight": 1.0,
+  "drop_rate": 0.1,
+  "max_drop": 50,
+  "skip_drop": 0.5,
+  "extra_trees": false,
+  "min_data_in_leaf": 0,
+  "feature_fraction": 0.5,
+  "feature_fraction_bynode": 0.2,
+  "learning_rate": 0.005,
+  "feature_pre_filter": false
+ },
+ "meses_entrenamiento": [
+  202103,
+  202104,
+  202105,
+  202106
+ ],
+ "mes_prediccion": 202108,
+ "rango_semillas": {
+  "desde": 0,
+  "hasta_sin_incluir": 200,
+  "primera": 878443,
+  "ultima": 2044214
+ },
+ "primeras_semillas": [
+  878443,
+  455471,
+  178447,
+  235397,
+  409027,
+  507928,
+  515847,
+  523766,
+  531685,
+  539604,
+  547523,
+  555442,
+  563361,
+  571280,
+  579199,
+  587118,
+  595037,
+  602956,
+  610875,
+  618794,
+  626713,
+  634632,
+  642551,
+  650470,
+  658389
+ ],
+ "n_semillas_tope": 200,
+ "versiones": {
+  "lightgbm": "4.7.0",
+  "pandas": "2.3.3"
+ }
+}

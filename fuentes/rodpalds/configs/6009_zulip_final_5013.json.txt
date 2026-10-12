@@ -1,0 +1,15 @@
+{
+  "experimento": 6009,
+  "nombre": "zulip_final_5013",
+  "modo": "final",
+  "fuente": "5013_prod_receta_muerte_lag2",
+  "envios": [
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500
+  ],
+  "descripcion": "Archivos finales de la receta completa del profesor (5013, sin ensamble): 11.000 a 13.500 envios."
+}

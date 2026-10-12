@@ -1,0 +1,79 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–10] Celda de texto que indica que el notebook toma probabilidades_20_semillas.txt y
+#   produce el archivo de una columna subido al bot, sin reentrenar. Carga data.table y desactiva la notación
+#   científica con options(scipen = 999).
+#%% celda 1 [texto]
+# **Exp_51 -- Ensamble y seleccion de corte (genera el CSV final submiteado)**
+
+Este notebook toma `probabilidades_20_semillas.txt` (generado por `Exp_51_entrega_final.ipynb`, o el que se provee junto a esta carpeta como atajo) y produce el archivo final de 1 columna que fue subido al bot de la competencia.
+
+**No hace falta reentrenar nada para correr este notebook** -- alcanza con tener el archivo de probabilidades en la misma carpeta.
+
+#%% celda 2 [código]
+library(data.table)
+options(scipen = 999)
+
+# [Anotación · líneas 12–22] Parámetros: archivo de entrada probabilidades_20_semillas.txt, CORTE_FINAL 11100
+#   (cantidad de clientes a enviar, ordenados por probabilidad descendente) y archivo de salida
+#   entrega_final.csv.
+#%% celda 3 [texto]
+## Parametros
+
+#%% celda 4 [código]
+# archivo de probabilidades agrupadas (20 semillas), generado por Exp_51_entrega_final.ipynb
+ARCHIVO_PROBABILIDADES <- "probabilidades_20_semillas.txt"
+
+# CORTE elegido como entrega final -- cuantos clientes se envian, ordenados por probabilidad desc.
+CORTE_FINAL <- 11100   # <-- EDITAR ACA con el corte definitivo que se decida
+
+ARCHIVO_SALIDA <- "entrega_final.csv"
+
+# [Anotación · líneas 24–35] Lee el archivo de probabilidades, toma como columnas de probabilidad todas menos
+#   numero_de_cliente y foto_mes, imprime cuántas son y calcula prob_ensamble como el promedio por fila de esas
+#   columnas, sin ponderar.
+#%% celda 5 [texto]
+## Lectura de probabilidades y armado del ensamble
+
+#%% celda 6 [código]
+tb <- fread(ARCHIVO_PROBABILIDADES)
+
+# las columnas de probabilidad son todas menos numero_de_cliente y foto_mes
+cols_prob <- setdiff(colnames(tb), c("numero_de_cliente", "foto_mes"))
+cat("Cantidad de semillas/modelos en el ensamble:", length(cols_prob), "\n")
+
+# ensamble = promedio simple de probabilidades (sin ponderar)
+tb[, prob_ensamble := rowMeans(.SD), .SDcols = cols_prob]
+
+# [Anotación · líneas 37–46] Ordena la tabla por prob_ensamble de mayor a menor, verifica que CORTE_FINAL no
+#   supere la cantidad de filas y toma los numero_de_cliente de las primeras 11.100 filas.
+#%% celda 7 [texto]
+## Ranking por probabilidad y seleccion del corte
+
+#%% celda 8 [código]
+setorder(tb, -prob_ensamble)
+
+stopifnot(CORTE_FINAL <= nrow(tb))
+
+clientes_entrega <- as.integer(tb[1:CORTE_FINAL, numero_de_cliente])
+cat("Clientes seleccionados:", length(clientes_entrega), "de", nrow(tb), "totales\n")
+
+# [Anotación · líneas 48–58] Graba entrega_final.csv con esos números de cliente en una columna sin encabezado
+#   e imprime el nombre del archivo y la cantidad de clientes.
+#%% celda 9 [texto]
+## Exportacion del CSV final (1 columna, sin header -- formato exigido por el bot)
+
+#%% celda 10 [código]
+fwrite(
+  data.table(numero_de_cliente = clientes_entrega),
+  file = ARCHIVO_SALIDA,
+  col.names = FALSE
+)
+
+cat("Archivo final generado:", ARCHIVO_SALIDA, "con", length(clientes_entrega), "clientes\n")
+
+# [Anotación · líneas 60–61] Celda marcada como código cuyo contenido es la frase "El ensemble mejor obtenido
+#   es de 11100 clientes."; en el notebook original la celda conserva como salida un error de sintaxis de R.
+#%% celda 11 [código]
+El ensemble mejor obtenido es de 11100 clientes.

@@ -1,0 +1,72 @@
+{
+ "CFG": {
+  "espacio": {
+   "num_iterations": [
+    64,
+    4096
+   ],
+   "num_leaves": [
+    16,
+    2048
+   ],
+   "min_sum_hessian_in_leaf": [
+    1e-06,
+    0.1
+   ]
+  },
+  "n_trials": 10,
+  "n_startup_trials": 12,
+  "semilla_bo": 878443,
+  "n_semillas": 10,
+  "prop_baja_artificial": 0.01251,
+  "ganancia_baja2": 1072500,
+  "costo": -27500
+ },
+ "params_fijos": {
+  "boosting": "gbdt",
+  "objective": "binary",
+  "metric": "auc",
+  "first_metric_only": false,
+  "boost_from_average": true,
+  "force_row_wise": true,
+  "deterministic": true,
+  "verbosity": -1,
+  "max_depth": -1,
+  "min_gain_to_split": 0.0,
+  "lambda_l1": 0.0,
+  "lambda_l2": 0.0,
+  "max_bin": 31,
+  "bagging_fraction": 1.0,
+  "pos_bagging_fraction": 1.0,
+  "neg_bagging_fraction": 1.0,
+  "is_unbalance": false,
+  "scale_pos_weight": 1.0,
+  "drop_rate": 0.1,
+  "max_drop": 50,
+  "skip_drop": 0.5,
+  "extra_trees": false,
+  "min_data_in_leaf": 0,
+  "feature_fraction": 0.5,
+  "feature_fraction_bynode": 0.2,
+  "learning_rate": 0.005,
+  "feature_pre_filter": false
+ },
+ "dataset": "/home/ds/dmeyf/datasets/L20_dataset.parquet",
+ "clase_artificial": "/home/ds/dmeyf/exp/L20/L20_clase_artificial.parquet",
+ "semillas": [
+  878443,
+  455471,
+  178447,
+  235397,
+  409027,
+  507928,
+  515847,
+  523766,
+  531685,
+  539604
+ ],
+ "versiones": {
+  "lightgbm": "4.7.0",
+  "pandas": "2.3.3"
+ }
+}

@@ -1,0 +1,21 @@
+# Entorno congelado con el que se generó la entrega (Python 3.11).
+# Instalar:  python -m pip install -r requirements-lock.txt
+Mako==1.4.1
+MarkupSafe==3.0.3
+PyYAML==6.0.3
+SQLAlchemy==2.0.52
+alembic==1.19.1
+colorama==0.4.6
+colorlog==6.12.0
+duckdb==1.5.5
+greenlet==3.5.5
+lightgbm==4.7.0
+narwhals==2.25.0
+numpy==2.4.6
+optuna==4.9.0
+packaging==26.3
+polars-runtime-32==1.43.2
+polars==1.43.2
+scipy==1.17.1
+tqdm==4.70.0
+typing_extensions==4.16.0

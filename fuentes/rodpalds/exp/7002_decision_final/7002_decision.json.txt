@@ -1,0 +1,8 @@
+{
+  "usa": "p23",
+  "meseta_B_bo4109_M": 432.5,
+  "meseta_B_p23_M": 443.1,
+  "min_data_in_leaf_final": 40496,
+  "arboles": 580,
+  "dentro_del_rango_profesor": false
+}

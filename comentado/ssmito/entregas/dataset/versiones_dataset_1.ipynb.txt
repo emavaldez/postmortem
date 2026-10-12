@@ -1,0 +1,387 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–35] Carga pandas y numpy, importa ternaria desde funciones/ternaria.py y define rutas
+#   en el directorio de trabajo: competencia_01_crudo.csv de entrada y competencia_01_ternaria_lags.csv de
+#   salida.
+#%% celda 1 [texto]
+# Libraries
+
+#%% celda 2 [código]
+import os
+import pandas as pd
+import numpy as np
+
+#%% celda 3 [código]
+# dispongo la carpeta con funciones e importo ternara. 
+from pathlib import Path
+import sys
+import importlib
+
+# Obtiene la ruta del directorio actual y sube un nivel (.parent)
+raiz_proyecto = Path().resolve().parent
+# Agrega la ruta al sistema si no está ya incluida
+if str(raiz_proyecto) not in sys.path:
+  sys.path.append(str(raiz_proyecto))
+
+# Importa tu librería o módulo
+from funciones.ternaria import ternaria
+
+#%% celda 4 [texto]
+# URLs y Constantes
+
+#%% celda 5 [código]
+DATA_FOLDER = os.getcwd()
+DATA_CRUDO_URL = os.path.join(DATA_FOLDER, 'competencia_01_crudo.csv')
+DATA_TERNARIA_URL = os.path.join(DATA_FOLDER, 'competencia_01_ternaria.csv')
+DATA_LAGS_URL = os.path.join(DATA_FOLDER, 'competencia_01_ternaria_lags.csv')
+DATA_DICT_URL= os.path.join(DATA_FOLDER, 'data_dict.csv')
+
+SEED = 230047
+SEEDS =[230047, 230059, 230063, 230077, 230081]
+
+# [Anotación · líneas 37–65] Lee el archivo crudo, agrega la columna ternaria y muestra las primeras filas. El
+#   guardado de competencia_01_ternaria.csv está comentado.
+#%% celda 6 [texto]
+# LEEMOS DATOS CRUDOS
+
+#%% celda 7 [código]
+df_crudo = pd.read_csv(
+    DATA_CRUDO_URL,
+    dtype={'numero_de_cliente': 'int32', 'foto_mes': 'int32'}
+)
+
+#%% celda 8 [código]
+df_crudo.head()
+
+#%% celda 9 [texto]
+# VERSIONES
+
+#%% celda 10 [texto]
+## Agregamos TERNARIA
+
+#%% celda 11 [código]
+df_ternaria = ternaria(df_crudo)
+
+#%% celda 12 [código]
+df_ternaria.head()
+
+#%% celda 13 [texto]
+### GUARDAMOS
+
+#%% celda 14 [código]
+# df_ternaria.to_csv(DATA_TERNARIA_URL, index=False)
+
+# [Anotación · líneas 67–112] Copia el dataset, corta si hay más de una fila por cliente y mes, ordena por
+#   cliente y mes, crea un índice mensual continuo y define las columnas base: todas menos numero_de_cliente,
+#   foto_mes, clase_ternaria y el índice auxiliar (la columna ternaria queda incluida).
+#%% celda 15 [texto]
+## LAGs
+
+#%% celda 16 [código]
+df_trabajo = df_ternaria.copy()
+
+#%% celda 17 [código]
+# Debe existir una sola fila por cliente y mes
+claves = ["numero_de_cliente", "foto_mes"]
+
+if df_trabajo.duplicated(claves).any():
+    raise ValueError("Hay más de una fila para algún cliente y foto_mes")
+
+df_trabajo = (
+    df_trabajo
+    .sort_values(claves)
+    .reset_index(drop=True)
+    .copy()
+)
+
+#%% celda 18 [código]
+
+# Índice mensual: permite controlar correctamente pasos como 202112 -> 202201
+foto_mes_num = pd.to_numeric(df_trabajo["foto_mes"])
+
+anio = foto_mes_num // 100
+mes = foto_mes_num % 100
+
+if not mes.between(1, 12).all():
+    raise ValueError("foto_mes contiene meses inválidos")
+
+df_trabajo["_mes_idx"] = anio * 12 + mes
+
+# Columnas sobre las que se generan los lags
+columnas_excluidas = {
+    "numero_de_cliente",
+    "foto_mes",
+    "clase_ternaria",
+    "_mes_idx"
+}
+
+columnas_base = [
+    columna
+    for columna in df_trabajo.columns
+    if columna not in columnas_excluidas
+]
+
+# [Anotación · líneas 114–141] Para cada columna base toma el valor de la fila anterior del mismo cliente y lo
+#   anula cuando esa fila no es exactamente el mes anterior (sufijo _lag1). Para las columnas numéricas calcula
+#   la diferencia entre el valor actual y el lag (sufijo _delta1). Une todo y quita el índice auxiliar.
+#%% celda 19 [código]
+
+agrupado = df_trabajo.groupby("numero_de_cliente", sort=False)
+
+# Valor de la fila anterior para el mismo cliente
+lags = agrupado[columnas_base].shift(1)
+mes_anterior = agrupado["_mes_idx"].shift(1)
+
+# Sólo es válido si corresponde exactamente al mes anterior
+mes_consecutivo = (df_trabajo["_mes_idx"] - mes_anterior).eq(1)
+lags.loc[~mes_consecutivo, :] = np.nan
+
+# Delta únicamente para variables numéricas
+columnas_numericas = (
+    df_trabajo[columnas_base]
+    .select_dtypes(include="number")
+    .columns
+)
+
+deltas = df_trabajo[columnas_numericas] - lags[columnas_numericas]
+
+lags.columns = [f"{columna}_lag1" for columna in lags.columns]
+deltas.columns = [f"{columna}_delta1" for columna in deltas.columns]
+
+df_lags = pd.concat(
+    [df_trabajo, lags, deltas],
+    axis=1
+).drop(columns="_mes_idx")
+
+# [Anotación · líneas 143–157] Muestra filas de control (un cliente y la variable mrentabilidad) y guarda el
+#   dataset en competencia_01_ternaria_lags.csv, que es el archivo que lee bo/lag009_replica.ipynb.
+#%% celda 20 [código]
+df_lags.head(20)
+
+#%% celda 21 [código]
+# pd.Series(df_lags.columns)[pd.Series(df_lags.columns).str.contains('mrentabilidad') ]
+df_lags.loc[df_lags['numero_de_cliente']==12159858][['foto_mes','mrentabilidad','mrentabilidad_lag1', 'mrentabilidad_delta1']]
+# df_lags.loc[df_lags['numero_de_cliente']==12159858][['foto_mes','mcomisiones','mcomisiones_lag1', 'mcomisiones_delta1']]
+# df_lags.loc[df_lags['numero_de_cliente']==12159858]
+
+#%% celda 22 [texto]
+### GUARDAMOS
+
+#%% celda 23 [código]
+# guardamos como csv
+df_lags.to_csv(DATA_LAGS_URL, index=False)
+
+# [Anotación · líneas 159–368] Sección de lags fraccionarios completamente comentada: las funciones
+#   generar_pesos y agregar_lags_ponderados y el guardado de competencia_01_ternaria_lf_k6_perdida4.csv no se
+#   ejecutan.
+#%% celda 24 [texto]
+## LAGs fracionarios
+
+#%% celda 25 [código]
+# df_trabajo = df_ternaria.copy()
+
+#%% celda 26 [código]
+
+
+# def generar_pesos(K, factor_perdida):
+#     """
+#     factor_perdida indica qué proporción de importancia se pierde
+#     por cada mes adicional hacia atrás.
+#     """
+#     if K < 1:
+#         raise ValueError("K debe ser mayor o igual a 1")
+
+#     if not 0 <= factor_perdida < 1:
+#         raise ValueError("factor_perdida debe estar entre 0 y 1")
+
+#     retencion = 1 - factor_perdida
+#     pesos = retencion ** np.arange(K, dtype=float)
+
+#     return pesos / pesos.sum()
+
+
+# def agregar_lags_ponderados(
+#     df,
+#     K=6,
+#     factor_perdida=0.4,
+#     columnas=None,
+#     tam_bloque=20
+# ):
+#     df = df.copy()
+
+#     claves = ["numero_de_cliente", "foto_mes"]
+
+#     if df.duplicated(claves).any():
+#         raise ValueError("Hay más de una fila para algún cliente y mes")
+
+#     # Convierto YYYYMM a un índice mensual continuo.
+#     foto_mes = pd.to_numeric(df["foto_mes"], errors="raise").astype("int64")
+#     mes = foto_mes % 100
+
+#     if not mes.between(1, 12).all():
+#         raise ValueError("foto_mes contiene meses inválidos")
+
+#     df["_mes_idx"] = (foto_mes // 100) * 12 + mes
+
+#     # El cálculo necesita los registros ordenados cronológicamente.
+#     df = (
+#         df.sort_values(
+#             ["numero_de_cliente", "_mes_idx"],
+#             kind="stable"
+#         )
+#         .reset_index(drop=True)
+#     )
+
+#     if columnas is None:
+#         excluidas = {
+#             "numero_de_cliente",
+#             "foto_mes",
+#             "clase_ternaria",
+#             "_mes_idx"
+#         }
+
+#         columnas = [
+#             columna
+#             for columna in df.select_dtypes(include=np.number).columns
+#             if columna not in excluidas
+#             and not columna.endswith("_lag_pond")
+#             and not columna.endswith("_delta_lag_pond")
+#         ]
+
+#     no_numericas = [
+#         columna
+#         for columna in columnas
+#         if not pd.api.types.is_numeric_dtype(df[columna])
+#     ]
+
+#     if no_numericas:
+#         raise TypeError(
+#             f"Las siguientes columnas no son numéricas: {no_numericas}"
+#         )
+
+#     pesos = generar_pesos(K, factor_perdida)
+#     n_filas = len(df)
+
+#     # Peso correspondiente a cada observación histórica.
+#     # Se usa la distancia real entre meses, no simplemente la fila anterior.
+#     pesos_por_fila = np.zeros((n_filas, K), dtype=np.float64)
+
+#     grupo_mes = df.groupby(
+#         "numero_de_cliente",
+#         sort=False
+#     )["_mes_idx"]
+
+#     for desplazamiento in range(1, K + 1):
+#         mes_anterior = grupo_mes.shift(desplazamiento)
+#         distancia = df["_mes_idx"] - mes_anterior
+
+#         valido = distancia.between(1, K)
+#         posiciones = distancia.loc[valido].astype(int).to_numpy() - 1
+
+#         pesos_por_fila[
+#             valido.to_numpy(),
+#             desplazamiento - 1
+#         ] = pesos[posiciones]
+
+#     nuevas_columnas = []
+
+#     # Se procesa por bloques para limitar el uso de memoria.
+#     for inicio in range(0, len(columnas), tam_bloque):
+#         bloque = columnas[inicio:inicio + tam_bloque]
+
+#         numerador = np.zeros((n_filas, len(bloque)), dtype=np.float64)
+#         denominador = np.zeros_like(numerador)
+
+#         grupo = df[bloque].groupby(
+#             df["numero_de_cliente"],
+#             sort=False
+#         )
+
+#         for desplazamiento in range(1, K + 1):
+#             valores_pasados = grupo.shift(desplazamiento).to_numpy(
+#                 dtype=np.float64,
+#                 na_value=np.nan
+#             )
+
+#             peso = pesos_por_fila[
+#                 :, desplazamiento - 1
+#             ][:, None]
+
+#             disponible = valores_pasados.notna() if False else ~np.isnan(
+#                 valores_pasados
+#             )
+
+#             numerador += np.where(
+#                 disponible,
+#                 valores_pasados * peso,
+#                 0.0
+#             )
+
+#             denominador += disponible * peso
+
+#         lag_ponderado = np.divide(
+#             numerador,
+#             denominador,
+#             out=np.full_like(numerador, np.nan),
+#             where=denominador > 0
+#         )
+
+#         valores_actuales = df[bloque].to_numpy(
+#             dtype=np.float64,
+#             na_value=np.nan
+#         )
+
+#         delta_ponderado = valores_actuales - lag_ponderado
+
+#         nuevas_columnas.append(
+#             pd.DataFrame(
+#                 lag_ponderado,
+#                 columns=[f"{c}_lag_pond" for c in bloque]
+#             )
+#         )
+
+#         nuevas_columnas.append(
+#             pd.DataFrame(
+#                 delta_ponderado,
+#                 columns=[f"{c}_delta_lag_pond" for c in bloque]
+#             )
+#         )
+
+#     df = pd.concat([df, *nuevas_columnas], axis=1)
+
+#     return df.drop(columns="_mes_idx")
+
+#%% celda 27 [código]
+# df_trabajo.shape
+
+#%% celda 28 [código]
+# k = 6
+# factor_perdida = .4
+# print(generar_pesos(3, 0.4))
+# df_lags_fraccionarios = agregar_lags_ponderados(
+#     df_trabajo,
+#     K=k,
+#     factor_perdida=factor_perdida
+# )
+
+#%% celda 29 [código]
+# df_lags_fraccionarios
+
+#%% celda 30 [código]
+# df_lags_fraccionarios.columns
+
+#%% celda 31 [código]
+
+# df_lags_fraccionarios.loc[df_lags_fraccionarios['numero_de_cliente']==12159858][['foto_mes','mrentabilidad','mrentabilidad_lag_pond', 'mrentabilidad_delta_lag_pond']]
+# # df_lags_fraccionarios.loc[df_lags_fraccionarios['numero_de_cliente']==12159858]
+
+#%% celda 32 [texto]
+### GUARDAMOS
+
+#%% celda 33 [código]
+# filename = f'competencia_01_ternaria_lf_k{k}_perdida{factor_perdida*10:.0f}.csv'
+# df_lags_fraccionarios.to_csv(os.path.join(DATA_FOLDER, filename), index=False)
+
+#%% celda 34 [código]
+# df_lags_fraccionarios

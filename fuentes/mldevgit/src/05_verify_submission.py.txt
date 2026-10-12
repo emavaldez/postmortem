@@ -1,0 +1,38 @@
+"""Verificación byte a byte y pertenencia a August; sin librerías de modelos."""
+import argparse, hashlib, re
+from pathlib import Path
+import pandas as pd
+EXPECTED='00534f4c23bb87c5e0962ee615a0f81740cf1e2f3e64232c7af5bc83aae697a0'
+NAME='submit_z636_c25_full762_n12000.csv'
+
+def verify(path,features_path):
+    if not path.is_file(): raise ValueError('Archivo inexistente')
+    raw=path.read_bytes(); lines=raw.splitlines()
+    if len(lines)!=12000 or any(re.fullmatch(rb'[0-9]+',x) is None for x in lines):
+        raise ValueError('Se requieren 12000 líneas de un ID entero sin header/index')
+    if len({int(x) for x in lines})!=12000: raise ValueError('IDs duplicados')
+    # Proyección sólo de IDs; nunca cargar target August.
+    august=pd.read_parquet(features_path,columns=['numero_de_cliente'],
+                           filters=[('foto_mes','==',202108)],engine='pyarrow')
+    if len(august)!=164647 or not august.numero_de_cliente.is_unique:
+        raise ValueError('Universo August inválido')
+    if not {int(x) for x in lines}.issubset(set(august.numero_de_cliente)):
+        raise ValueError('IDs ajenos a August')
+    digest=hashlib.sha256(raw).hexdigest()
+    print('SHA256:',digest)
+    if digest!=EXPECTED: raise ValueError('SHA256 diferente del oficial')
+    return digest
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--output-dir',type=Path,default=Path(__file__).resolve().parents[1]/'output')
+    p.add_argument('--submission',type=Path)
+    p.add_argument('--features',type=Path)
+    opts=p.parse_args()
+    try: verify(opts.submission or opts.output_dir/NAME,
+                opts.features or opts.output_dir/'competencia_01_historico_lag1.parquet')
+    except (OSError,ValueError) as error:
+        print('FINAL REPRODUCIBILITY: FAIL'); p.exit(1,str(error)+'\n')
+    print('FINAL REPRODUCIBILITY: PASS')
+
+if __name__=='__main__': main()

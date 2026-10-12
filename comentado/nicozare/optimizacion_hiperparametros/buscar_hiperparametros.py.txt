@@ -1,0 +1,148 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–11] Docstring del módulo: indica que los valores de
+#   modelos/mejores_hiperparametros.json salen de esta búsqueda ya corrida, que no se ejecuta al generar la
+#   submission y que usa los meses con clase conocida menos el más reciente, StratifiedShuffleSplit de 5
+#   particiones y 30 iteraciones de Optuna (TPE).
+"""Búsqueda de hiperparámetros de LightGBM con Optuna.
+
+Los valores que terminan en `modelos/mejores_hiperparametros.json` (los que
+usa el pipeline de entrega) salen de esta búsqueda, ya corrida. No se vuelve
+a correr automáticamente al generar la submission: este script es para
+quien quiera reproducir la búsqueda desde cero o revisarla.
+
+Entrena con todos los meses de clase conocida excepto el más reciente
+(se lo reserva como medición), evaluando la ganancia real con
+StratifiedShuffleSplit de 5 particiones. 30 iteraciones de Optuna (TPE).
+"""
+# [Anotación · líneas 12–34] Importa json, lightgbm, numpy, optuna, pandas y StratifiedShuffleSplit. Define la
+#   ruta de data/dataset_features.csv, la semilla 100081, los valores de ganancia (1.072.500 y 27.500), el
+#   umbral de probabilidad 27.500 / (27.500 + 1.072.500) = 0,025, las columnas que no son variables, 30 trials y
+#   el nombre del estudio, lgbm_drift_aguinaldo.
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import lightgbm as lgb
+import numpy as np
+import optuna
+import pandas as pd
+from sklearn.model_selection import StratifiedShuffleSplit
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+DATASET_FE_CSV_PATH = REPO_DIR / "data" / "dataset_features.csv"
+
+SEMILLA = 100081
+GANANCIA_ACIERTO = 1_072_500
+COSTO_ESTIMULO = 27_500
+UMBRAL_ESTIMULO = COSTO_ESTIMULO / (COSTO_ESTIMULO + GANANCIA_ACIERTO)
+COLUMNAS_NO_FEATURE = ["numero_de_cliente", "foto_mes", "clase_ternaria", "clase_binaria"]
+
+N_TRIALS = 30
+STUDY_NAME = "lgbm_drift_aguinaldo"
+
+# [Anotación · líneas 35–40] Versión propia de detectar_meses: devuelve los meses de entrenamiento (todos
+#   menos los dos últimos) y el holdout (el último de ellos).
+
+def detectar_meses(foto_mes_unicos: list[int]) -> tuple[list[int], int]:
+    meses = sorted(foto_mes_unicos)
+    meses_entrenamiento = meses[:-2] if len(meses) > 2 else meses[:-1]
+    return meses_entrenamiento, meses_entrenamiento[-1]
+
+# [Anotación · líneas 41–51] cargar_train lee el dataset de variables, crea clase_binaria con positivo =
+#   BAJA+2 únicamente, se queda con los meses de entrenamiento menos el holdout y devuelve la matriz de
+#   variables, la etiqueta y la lista de variables. No aplica submuestreo.
+
+def cargar_train() -> tuple[pd.DataFrame, pd.Series, list[str]]:
+    data = pd.read_csv(DATASET_FE_CSV_PATH, low_memory=False)
+    data["clase_binaria"] = np.where(data["clase_ternaria"] == "BAJA+2", 1, 0)
+    meses_entrenamiento, mes_holdout = detectar_meses(sorted(data["foto_mes"].unique()))
+    meses_fit = [m for m in meses_entrenamiento if m != mes_holdout]
+    train = data[data["foto_mes"].isin(meses_fit)]
+    feats = [c for c in data.columns if c not in COLUMNAS_NO_FEATURE]
+    print(f"Entrenando búsqueda sobre {meses_fit} ({len(train):,} filas, {len(feats)} features)", flush=True)
+    return train[feats], train["clase_binaria"], feats
+
+# [Anotación · líneas 52–57] ganancia_prob_lgm es la métrica propia para LightGBM: asigna 1.072.500 a los
+#   positivos y −27.500 a los negativos, suma la ganancia de las filas con probabilidad mayor o igual a 0,025 y
+#   la divide por prop = 0,3. Se declara como métrica a maximizar.
+
+def ganancia_prob_lgm(y_pred, dataset, prop=0.3):
+    y_true = dataset.get_label()
+    ganancia = np.where(y_true == 1, GANANCIA_ACIERTO, 0) - np.where(y_true == 0, COSTO_ESTIMULO, 0)
+    return "gan_prob", ganancia[y_pred >= UMBRAL_ESTIMULO].sum() / prop, True
+
+# [Anotación · líneas 58–63] main carga los datos, arma el lgb.Dataset y define un StratifiedShuffleSplit de 5
+#   particiones con 30 % de prueba y random_state 100081.
+
+def main() -> None:
+    X_train, y_train, feats = cargar_train()
+    train_lgb = lgb.Dataset(X_train, label=y_train)
+    sss = StratifiedShuffleSplit(n_splits=5, test_size=0.3, random_state=SEMILLA)
+
+# [Anotación · líneas 64–84] objective define un trial: muestrea num_leaves entre 8 y 100, learning_rate entre
+#   0,005 y 0,3, min_data_in_leaf entre 1 y 1000, y feature_fraction y bagging_fraction entre 0,1 y 1,0, con
+#   max_bin 31 fijo. Corre lgb.cv sobre las 5 particiones con hasta 1000 rondas, early stopping de int(50 + 5 /
+#   learning_rate) rondas y la métrica de ganancia. Devuelve el máximo de la ganancia media entre particiones y
+#   guarda la ronda en que ocurre como atributo best_iter.
+    def objective(trial: optuna.Trial) -> float:
+        params = {
+            "objective": "binary", "metric": "custom", "boosting_type": "gbdt",
+            "first_metric_only": True, "boost_from_average": True, "feature_pre_filter": False,
+            "max_bin": 31,
+            "num_leaves": trial.suggest_int("num_leaves", 8, 100),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 1, 1000),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.1, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.1, 1.0),
+            "seed": SEMILLA, "verbose": -1,
+        }
+        cv_results = lgb.cv(
+            params, train_lgb, num_boost_round=1000,
+            callbacks=[lgb.early_stopping(stopping_rounds=int(50 + 5 / params["learning_rate"]), verbose=False)],
+            feval=ganancia_prob_lgm, folds=sss.split(X_train, y_train), seed=SEMILLA,
+        )
+        max_gan = max(cv_results["valid gan_prob-mean"])
+        trial.set_user_attr("best_iter", cv_results["valid gan_prob-mean"].index(max_gan) + 1)
+        return max_gan
+
+# [Anotación · líneas 85–91] Crea o reabre (load_if_exists=True) el estudio de Optuna con dirección maximize
+#   en la base SQLite optimizacion_lgbm.db de la misma carpeta, sin indicar sampler, y corre 30 trials.
+    study = optuna.create_study(
+        direction="maximize", study_name=STUDY_NAME,
+        storage=f"sqlite:///{Path(__file__).resolve().parent / 'optimizacion_lgbm.db'}",
+        load_if_exists=True,
+    )
+    study.optimize(objective, n_trials=N_TRIALS)
+
+# [Anotación · líneas 92–104] Toma del trial de mayor valor los 5 hiperparámetros y el atributo best_iter como
+#   num_boost_round, e imprime la ganancia, los hiperparámetros y la cantidad de rondas.
+    mejores = {
+        "num_leaves": study.best_trial.params["num_leaves"],
+        "learning_rate": study.best_trial.params["learning_rate"],
+        "min_data_in_leaf": study.best_trial.params["min_data_in_leaf"],
+        "feature_fraction": study.best_trial.params["feature_fraction"],
+        "bagging_fraction": study.best_trial.params["bagging_fraction"],
+    }
+    num_boost_round = study.best_trial.user_attrs["best_iter"]
+
+    print(f"\nMejor ganancia CV: {study.best_value:,.0f}", flush=True)
+    print(f"Mejores hiperparámetros: {mejores}", flush=True)
+    print(f"num_boost_round sugerido: {num_boost_round}", flush=True)
+
+# [Anotación · líneas 105–115] Escribe optimizacion_hiperparametros/resultado_busqueda.json con las claves
+#   hiperparametros, num_boost_round y ganancia_cv. Las dos últimas líneas ejecutan main() cuando el archivo se
+#   corre como script.
+    destino = Path(__file__).resolve().parent / "resultado_busqueda.json"
+    destino.write_text(
+        json.dumps({"hiperparametros": mejores, "num_boost_round": num_boost_round, "ganancia_cv": study.best_value},
+                   indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"Guardado en {destino}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

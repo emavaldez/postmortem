@@ -1,0 +1,69 @@
+{
+  "experimento": 5104,
+  "nombre": "comparar_fe_extra",
+  "descripcion": "Receta del profesor sin lag2 (ds3002) contra la misma receta con las 6 variables del proceso de muerte (ds3003), ambas con la eleccion de 4105 (p23 de 4104). Semillerio de 30, train 202104, mitad B de 202106 (x2), bootstrap pareado.",
+  "mitades": "4102_bo_fuera_de_tiempo/4102_mitades_junio.csv",
+  "referencia": "rank_bo4105",
+  "candidatos": {
+    "rank_bo4105": {
+      "dataset": "ds3002_rank_total.parquet",
+      "variables": null,
+      "usar_lag2": false,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    },
+    "rank_extra_bo4105": {
+      "dataset": "ds3003_rank_extra.parquet",
+      "variables": null,
+      "usar_lag2": false,
+      "hiperparametros": {
+        "eleccion": "4105_bo_rank_ampliada/4105_eleccion.json"
+      }
+    }
+  },
+  "mes_train": 202104,
+  "mes_test": 202106,
+  "clase": "clase_binaria2",
+  "n_semillas": 30,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    8000,
+    8500,
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000,
+    15500,
+    16000,
+    16500,
+    17000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "n_bootstrap": 1000,
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "clientes_agosto": 164647,
+  "_config": "5104_comparar_fe_extra.json",
+  "_fecha_inicio": "2026-10-09 10:55:05",
+  "_script": "11_comparar_pipelines.py",
+  "_git_commit": "sin_git"
+}

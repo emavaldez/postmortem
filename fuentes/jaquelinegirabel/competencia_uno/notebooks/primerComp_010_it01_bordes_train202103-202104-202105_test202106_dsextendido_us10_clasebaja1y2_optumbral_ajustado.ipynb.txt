@@ -1,0 +1,406 @@
+#%% celda 1 [texto]
+> **Experimento 010: `it01_bordes_train202103-202104-202105_test202106_dsextendido_us10_clasebaja1y2_optumbral_ajustado`**, creado el 2026-10-07 desde `primerComp_001.ipynb` con `nuevo_experimento.py`. No cambiar los flags acá: para otra combinación, crear otro experimento.
+
+#%% celda 2 [texto]
+# primerComp_001 — Modelo A (BAJA+2 vs resto)
+
+Modelo binario: `BAJA+2 -> 1`, `BAJA+1` y `CONTINUA -> 0`. Toda la lógica vive en `comp/`; acá solo se configura, se llama y se grafica.
+
+**Esta es la plantilla.** Con los flags tal como están reproduce `z601_clases_final_csv.ipynb` (todo se carga del disco). Para un experimento nuevo no se edita esta: se crea una copia numerada con `.venv/bin/python nuevo_experimento.py --espacio ... [--meses-train ...] [--mes-test ...] [--sin-id] [--dataset ...]` (ver `EXPERIMENTOS.md`).
+
+**Cómo funciona:** los flags de la celda de abajo definen el experimento. Cada combinación de flags es un *experimento* con su propio nombre y sus propias carpetas, así que nunca se pisan resultados:
+- trials de Optuna: `db/<experimento>.db`
+- modelos: `modelos/<experimento>/`
+- tablas y predicciones: `resultados/<experimento>/`
+
+Lo que ya está calculado se carga del disco y no se vuelve a correr. Para recalcular algo, borrar su archivo.
+
+**Cómo entrena (igual que el notebook de clase, con los meses que elijas):**
+1. Optuna elige los parámetros **solo con los meses de train** (5 particiones 70/30).
+2. Con esos parámetros se entrena con todos los meses de train.
+3. La ganancia se mide en el **mes de test**, que no se usa para elegir nada.
+
+**Para reproducir `z601_clases_final_csv.ipynb`:** `DATASET = 'final'`, `ESPACIO_BUSQUEDA = 'it00_z601'`, `MESES_TRAIN = [202103]`, `MES_TEST = 202105`, `DROP_NUMERO_CLIENTE = False`.
+
+#%% celda 3 [código]
+# ============================ CONFIGURACIÓN ============================
+# Dataset. Están definidos en comp/config.py (DATASETS), ver FEATURES.md:
+#   'final'     -> competencia_01_final (195 columnas)
+#   'extendido' -> final + ranks por inflación + lags y deltas de 1 y 2 meses
+DATASET = 'extendido'
+
+# Espacio de búsqueda de Optuna. Están definidos en comp/optimizacion_optuna.py (ESPACIOS):
+#   'it00_z601'   -> el del notebook de clase z601 (para reproducirlo)
+#   'it01_bordes' -> rangos ampliados donde z601 tocaba los bordes, bagging activo, regularización
+ESPACIO_BUSQUEDA = 'it01_bordes'
+
+# Meses con los que se entrena. Optuna elige los parámetros solo con estos meses.
+MESES_TRAIN = [202103, 202104, 202105]
+
+# Mes donde se mide la ganancia. No se usa para elegir nada.
+# Recomendado: meses de train <= MES_TEST - 2 (si no, el notebook muestra un AVISO).
+MES_TEST = 202106
+
+# True: numero_de_cliente no se usa como variable
+DROP_NUMERO_CLIENTE = False
+
+# Undersampling: fracción de los no-BAJA+2 (CONTINUA + BAJA+1) que se queda en el TRAIN.
+# None: todos. Ej. 0.1 = se queda el 10%. Todos los BAJA+2 se quedan siempre.
+# Solo se reduce lo que el modelo usa para aprender: el 30% con el que Optuna mide y el mes de
+# test tienen a todos los clientes. Las probabilidades se corrigen solas.
+UNDERSAMPLING = 0.1
+
+# Clase con la que se ENTRENA (la ganancia siempre se cuenta con los BAJA+2 reales):
+#   'baja2'   -> modelo A: BAJA+2 = 1; BAJA+1 y CONTINUA = 0 (por defecto)
+#   'baja1y2' -> modelo B: BAJA+1 y BAJA+2 = 1; CONTINUA = 0
+CLASE_OBJETIVO = 'baja1y2'
+
+# Cómo puntúa Optuna cada trial (y cómo se miden el top 3 y la prueba de semillas):
+#   'umbral'          -> ganancia con p >= 0.025 (por defecto: así se corrió todo hasta ahora)
+#   'umbral_ajustado' -> ganancia con p >= 0.025 / s (s = BAJA+2 / positivos del train; pensado para el modelo B)
+#   'franja'          -> ganancia promedio enviando al top 5%, 6%, 7%, 8% y 9% de los clientes
+METRICA_OPTUNA = 'umbral_ajustado'
+
+# Trials de Optuna para este experimento (None: usa config.N_TRIALS)
+N_TRIALS = None
+
+# Semillas: en comp/config.py (N_SEMILLAS)
+# =======================================================================
+
+#%% celda 4 [código]
+import sys
+from pathlib import Path
+
+# Permitir importar el paquete comp/ estando dentro de notebooks/
+root_dir = Path.cwd().parent.resolve() if Path.cwd().name == 'notebooks' else Path.cwd().resolve()
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
+
+import lightgbm as lgb
+from IPython.display import display
+from optuna.visualization import plot_optimization_history, plot_param_importances, plot_slice, plot_contour
+
+from comp import config, datos, ensamble, graficos, metricas, modelos, optimizacion_optuna
+from comp.experimento import Experimento
+from comp.particiones import armar_particiones, describir as describir_particiones
+
+exp = Experimento(
+    espacio=ESPACIO_BUSQUEDA,
+    meses_train=tuple(MESES_TRAIN),
+    mes_test=MES_TEST,
+    drop_numero_cliente=DROP_NUMERO_CLIENTE,
+    dataset=DATASET,
+    undersampling=UNDERSAMPLING,
+    clase_objetivo=CLASE_OBJETIVO,
+    metrica_optuna=METRICA_OPTUNA,
+)
+exp.describir()
+
+semillas = config.generar_semillas(exp.semilla)
+n_trials = N_TRIALS if N_TRIALS is not None else config.N_TRIALS
+print(f'  trials de Optuna: {n_trials}')
+
+#%% celda 5 [texto]
+## Datos: train y test
+
+#%% celda 6 [código]
+data = datos.cargar_datos(exp.dataset)
+data = datos.agregar_clase_binaria(data)
+
+particiones = armar_particiones(data, exp)  # dict {mes_test: datos}; hay un solo mes de test
+describir_particiones(particiones)
+
+#%% celda 7 [texto]
+## Optimización de hiperparámetros (Optuna)
+
+Cada trial se puntúa con 5 particiones 70/30 **dentro de los meses de train** (como el notebook de clase). El mes de test no se mira.
+
+La ganancia de cada trial se mide según `METRICA_OPTUNA` (por defecto p ≥ 0.025), siempre contando los BAJA+2 reales. Con esa misma métrica se miden el top 3 y la prueba de semillas.
+
+#%% celda 8 [código]
+study = optimizacion_optuna.cargar_estudio(exp)
+objective = optimizacion_optuna.crear_objetivo(exp, particiones, semillas[0])
+study = optimizacion_optuna.optimizar_hasta(study, objective, n_trials_total=n_trials)
+
+#%% celda 9 [código]
+plot_optimization_history(study)
+
+#%% celda 10 [código]
+plot_param_importances(study)
+
+#%% celda 11 [código]
+plot_slice(study)
+
+#%% celda 12 [código]
+plot_contour(study)
+
+#%% celda 13 [código]
+plot_contour(study, params=['learning_rate', 'min_data_in_leaf'])
+
+#%% celda 14 [texto]
+## Mejor trial: entrenado con todo su train, evaluado en el mes de test
+
+#%% celda 15 [código]
+best = study.best_trial
+arboles_best = modelos.cantidad_arboles(exp, best.user_attrs['best_iter'])
+params_best = optimizacion_optuna.armar_params(best.params, semillas[0], exp.espacio)
+print(f"Mejor trial: {best.number} | best_iter en Optuna: {best.user_attrs['best_iter']} | árboles usados: {arboles_best}")
+
+modelos_best = {}
+for mes, p in particiones.items():
+    modelos_best[mes] = modelos.entrenar_o_cargar(
+        exp.modelos_dir / f'lgb_mejor_trial_{mes}.txt', params_best, modelos.datos_train(p, exp, semillas[0]), arboles_best)
+    print(f"Ganancia LGBM en {mes}:", modelos.ganancia_experimento(modelos.predecir(modelos_best[mes], p['X_test'], exp), p, exp))
+
+#%% celda 16 [código]
+mes_ultimo = list(particiones)[-1]
+print('Importancia de variables, modelo del mes', mes_ultimo)
+modelos.importancia(modelos_best[mes_ultimo], particiones[mes_ultimo]['X_train'].columns.tolist())
+
+#%% celda 17 [texto]
+## Top 3 trials (según Optuna), medidos en el mes de test
+
+#%% celda 18 [código]
+df_top3 = modelos.evaluar_top_trials(optimizacion_optuna.top_trials(study, 3), particiones, exp, semillas[0])
+df_top3
+
+#%% celda 19 [texto]
+## Estabilidad: cada uno de los 3 modelos con varias semillas
+
+¿El mejor lo es por los parámetros o por suerte de la semilla?
+
+#%% celda 20 [código]
+df_semillas = modelos.evaluar_semillas(df_top3, particiones, exp, semillas[:config.N_SEMILLAS])
+estadisticas = modelos.estadisticas_semillas(df_semillas)
+estadisticas
+
+#%% celda 21 [código]
+graficos.box_semillas(df_semillas, estadisticas)
+
+#%% celda 22 [texto]
+## Modelo elegido y sus métricas
+
+**Cómo elegir:**
+1. Correr todo el notebook (lo ya calculado se carga del disco).
+2. Mirar los boxplots de la prueba de semillas.
+3. Si querés otro trial, poner su número en `TRIAL_ELEGIDO` en la celda de abajo y **correr desde esa celda hacia abajo**. Lo de arriba no hace falta volver a correrlo.
+
+Con `TRIAL_ELEGIDO = None` se elige solo, según `CRITERIO_ELEGIDO`:
+- `'semillas'`: de los 3 mejores, el de **caja más alta y concentrada** (mayor Q1, el borde de abajo de la caja). Se elige mirando el mes de test, pero solo entre 3; el ensayo en otro mes (más abajo) es el control limpio.
+- `'optuna'`: el mejor trial de Optuna (elegido solo con los meses de train).
+
+Reproduciendo el notebook de clase se usan sus parámetros fijos (`model_params`) y `TRIAL_ELEGIDO` no se usa.
+
+#%% celda 23 [código]
+# ---------- Elegir el modelo DESPUÉS de mirar los boxplots de arriba ----------
+# None: automático según CRITERIO_ELEGIDO. Un número (ej. 30): ese trial de Optuna, elegido a mano.
+TRIAL_ELEGIDO = None
+# Automático: 'semillas' = la caja más alta y concentrada (mayor Q1) | 'optuna' = el mejor trial de Optuna
+CRITERIO_ELEGIDO = 'semillas'
+# -------------------------------------------------------------------------------
+
+if exp.es_original:
+    params_elegido = {
+        **config.PARAMS_FIJOS,
+        'num_leaves': 16,
+        'learning_rate': 0.019868,
+        'min_data_in_leaf': 816,
+        'feature_fraction': 0.277155,
+        'bagging_fraction': 0.634130,
+        'seed': semillas[0],
+        'verbose': -1,
+    }
+    arboles_elegido = config.NUM_BOOST_ROUND
+    id_elegido = ''  # nombres de archivo del notebook original
+    print('Modelo elegido: parámetros fijos del notebook original')
+else:
+    if TRIAL_ELEGIDO is not None:
+        t = study.trials[TRIAL_ELEGIDO]
+        if t.state.name != 'COMPLETE':
+            raise ValueError(f'El trial {TRIAL_ELEGIDO} no terminó (estado {t.state.name})')
+        fila = {**t.params, 'trial': t.number,
+                'best_iter': modelos.cantidad_arboles(exp, t.user_attrs.get('best_iter'))}
+        print(f'Trial elegido a mano: {TRIAL_ELEGIDO}')
+    elif CRITERIO_ELEGIDO == 'semillas':
+        fila = modelos.elegir_por_semillas(df_top3, estadisticas)  # mayor Q1 entre semillas
+    elif CRITERIO_ELEGIDO == 'optuna':
+        fila = df_top3[df_top3['orden'] == 1].iloc[0]  # el mejor de Optuna
+    else:
+        raise ValueError(f"CRITERIO_ELEGIDO tiene que ser 'semillas' u 'optuna', no {CRITERIO_ELEGIDO!r}")
+    params_elegido = optimizacion_optuna.armar_params(fila, semillas[0], exp.espacio)
+    arboles_elegido = int(fila['best_iter'])
+    id_elegido = f"_trial{int(fila['trial'])}"  # el trial va en los nombres de archivo
+    print(f"Modelo elegido ({'a mano' if TRIAL_ELEGIDO is not None else CRITERIO_ELEGIDO}): trial {int(fila['trial'])} ({arboles_elegido} árboles)")
+
+predicciones = {}
+resumenes = {}
+for mes, p in particiones.items():
+    modelo = modelos.entrenar_o_cargar(
+        exp.modelos_dir / f'lgb_elegido{id_elegido}_{mes}.txt', params_elegido, modelos.datos_train(p, exp, semillas[0]), arboles_elegido)
+    predicciones[mes] = modelos.predecir(modelo, p['X_test'], exp)
+
+#%% celda 24 [código]
+for mes, p in particiones.items():
+    resumen, figuras = graficos.todas_las_metricas(
+        predicciones[mes], p['y_test'], p['clase_test'], umbral=p['umbral'],
+        y_objetivo=p['y_test_objetivo'] if exp.clase_objetivo != 'baja2' else None)
+    resumenes[mes] = resumen
+    print(f"===== Test {mes} =====")
+    print(f"KS = {resumen['ks']:.4f}")
+    tasa = resumen.get('tasa_real_objetivo', resumen['tasa_real_baja2'])
+    print(f"Probabilidad media predicha: {resumen['prob_media']:.4f} | tasa real de la clase objetivo: {tasa:.4f}")
+    print(f"Máxima ganancia: {resumen['mejor_ganancia']:.2f} en el corte {resumen['mejor_corte']}, "
+          f"con probabilidad de corte p = {resumen['p_corte']:.4f}")
+    for figura in figuras.values():
+        figura.show()
+
+#%% celda 25 [texto]
+## Ensamble: promedio de las predicciones del modelo elegido con varias semillas
+
+Mismo modelo, entrenado `config.N_SEMILLAS` veces cambiando solo la semilla; se promedian las probabilidades.
+
+#%% celda 26 [código]
+comparacion = []
+for mes, p in particiones.items():
+    y_ens = ensamble.predecir_promedio_semillas(
+        params_elegido, arboles_elegido, p['train_lgb'], p['X_test'], semillas[:config.N_SEMILLAS],
+        archivo=exp.resultados_dir / f'pred_ensamble{id_elegido}_{mes}_{config.N_SEMILLAS}semillas.npy',
+        y_train=p['y_train'], undersampling=exp.undersampling,
+    )
+    resumen_ens, figuras_ens = graficos.todas_las_metricas(
+        y_ens, p['y_test'], p['clase_test'], umbral=p['umbral'],
+        y_objetivo=p['y_test_objetivo'] if exp.clase_objetivo != 'baja2' else None)
+    comparacion.append({'mes': mes, 'modelo': 'una semilla', **resumenes[mes]})
+    comparacion.append({'mes': mes, 'modelo': f'ensamble {config.N_SEMILLAS} semillas', **resumen_ens})
+    figuras_ens['ganancia'].update_layout(title=f'Ganancia acumulada - ensamble {config.N_SEMILLAS} semillas - {mes}')
+    figuras_ens['ganancia'].show()
+
+import pandas as pd
+pd.DataFrame(comparacion)
+
+#%% celda 27 [texto]
+## Regla p ≥ 0.025 contra el mejor corte
+
+Para el modelo elegido (una semilla) y el ensamble:
+- **p ≥ umbral**: la regla que se puede aplicar en agosto (no necesita saber las respuestas). Es 0.025 en el modelo A; en el modelo B, 0.025 / s (ver `CLASE_OBJETIVO`).
+- **ganancia_franja**: la ganancia promedio enviando al top 5% a 9% de los clientes.
+- **mejor corte**: la cantidad de clientes que hubiera dado la máxima ganancia, elegida **mirando las respuestas reales** de este mes. No se puede aplicar en agosto; sirve como techo.
+- **pérdida**: cuánto deja de ganar la regla p ≥ 0.025 frente a ese techo.
+
+En los gráficos: rombo verde = p ≥ 0.025, punto rojo = mejor corte.
+
+#%% celda 28 [código]
+import pandas as pd
+
+comparacion_umbral = []
+for mes, p in particiones.items():
+    y_ens = ensamble.predecir_promedio_semillas(
+        params_elegido, arboles_elegido, p['train_lgb'], p['X_test'], semillas[:config.N_SEMILLAS],
+        archivo=exp.resultados_dir / f'pred_ensamble{id_elegido}_{mes}_{config.N_SEMILLAS}semillas.npy',
+        y_train=p['y_train'], undersampling=exp.undersampling,
+    )
+    for modelo, y in [('una semilla', predicciones[mes]), (f'ensamble {config.N_SEMILLAS} semillas', y_ens)]:
+        r = metricas.umbral_vs_mejor_corte(y, p['y_test'], umbral=p['umbral'], con_franja=True)
+        comparacion_umbral.append({'mes': mes, 'modelo': modelo, **r})
+        graficos.curva_ganancia(
+            metricas.ganancia_acumulada(y, p['y_test']),
+            titulo=f"{modelo} - {mes}: p ≥ {p['umbral']:.4g} (verde) contra el mejor corte (rojo)",
+            envios_umbral=r['envios_umbral'], umbral=round(p['umbral'], 4),
+        ).show()
+
+tabla_umbral = pd.DataFrame(comparacion_umbral)
+for c in ['ganancia_umbral', 'ganancia_mejor_corte', 'perdida']:
+    tabla_umbral[c] = (tabla_umbral[c] / 1e6).round(1)  # en millones
+tabla_umbral.round({'p_mejor_corte': 4, 'perdida_pct': 1})
+
+#%% celda 29 [texto]
+## Reentrenar con más meses y medir en otro mes (con ensamble)
+
+Toma **el mismo modelo elegido** (los mismos parámetros y la misma cantidad de árboles, sin volver a correr Optuna), lo entrena con los meses de `MESES_TRAIN_EXTRA` y mide la ganancia en `MES_TEST_EXTRA`, con el ensamble de semillas.
+
+Sirve para ver dos cosas:
+1. **¿Reentrenar con más meses ayuda?** Es el mismo paso que se haría para agosto (reentrenar con los meses disponibles), ensayado en un mes con respuestas.
+2. **Comparar experimentos en el mismo mes**, aunque sus parámetros se hayan elegido con otro train.
+
+Regla recomendada: meses de train ≤ mes de test − 2 (para junio, hasta abril). Si se usa mayo, el AVISO lo recuerda.
+
+#%% celda 30 [código]
+MESES_TRAIN_EXTRA = [202103, 202104, 202105]
+MES_TEST_EXTRA = 202106
+
+from comp.particiones import armar_particion, sumar_meses
+
+for m in MESES_TRAIN_EXTRA:
+    if m > sumar_meses(MES_TEST_EXTRA, -2):
+        print(f'AVISO: train {m} rompe la regla M - 2 (su BAJA+2 se conoce recién en {sumar_meses(m, 2)}, '
+              f'después de {MES_TEST_EXTRA}): la ganancia puede ser optimista.')
+
+p_extra = armar_particion(data, MESES_TRAIN_EXTRA, MES_TEST_EXTRA, exp.columnas_excluidas, exp.clase_objetivo)
+print(f"Train {MESES_TRAIN_EXTRA} ({p_extra['y_train'].sum()} BAJA+2 de {len(p_extra['y_train'])}) -> "
+      f"test {MES_TEST_EXTRA} ({p_extra['y_test'].sum()} BAJA+2 de {len(p_extra['y_test'])})")
+
+sufijo = 'train' + '-'.join(map(str, MESES_TRAIN_EXTRA)) + f'_test{MES_TEST_EXTRA}'
+modelo_extra = modelos.entrenar_o_cargar(
+    exp.modelos_dir / f'lgb_elegido{id_elegido}_{sufijo}.txt', params_elegido, modelos.datos_train(p_extra, exp, semillas[0]), arboles_elegido)
+y_una = modelos.predecir(modelo_extra, p_extra['X_test'], exp)
+y_ens_extra = ensamble.predecir_promedio_semillas(
+    params_elegido, arboles_elegido, p_extra['train_lgb'], p_extra['X_test'], semillas[:config.N_SEMILLAS],
+    archivo=exp.resultados_dir / f'pred_ensamble{id_elegido}_{sufijo}_{config.N_SEMILLAS}semillas.npy',
+    y_train=p_extra['y_train'], undersampling=exp.undersampling,
+)
+
+filas = []
+for modelo_nombre, y in [('una semilla', y_una), (f'ensamble {config.N_SEMILLAS} semillas', y_ens_extra)]:
+    r = metricas.umbral_vs_mejor_corte(y, p_extra['y_test'], umbral=p_extra['umbral'], con_franja=True)
+    filas.append({'modelo': modelo_nombre, 'ks': metricas.ks(y, p_extra['y_test'])['ks'], **r})
+    graficos.curva_ganancia(
+        metricas.ganancia_acumulada(y, p_extra['y_test']),
+        titulo=f"{modelo_nombre} - train {MESES_TRAIN_EXTRA} -> test {MES_TEST_EXTRA}: p ≥ {p_extra['umbral']:.4g} (verde) contra el mejor corte (rojo)",
+        envios_umbral=r['envios_umbral'], umbral=round(p_extra['umbral'], 4),
+    ).show()
+
+tabla_extra = pd.DataFrame(filas)
+for c in ['ganancia_umbral', 'ganancia_mejor_corte', 'perdida']:
+    tabla_extra[c] = (tabla_extra[c] / 1e6).round(1)  # en millones
+tabla_extra.round({'ks': 4, 'p_mejor_corte': 4, 'perdida_pct': 1})
+
+#%% celda 31 [texto]
+## Predicción de agosto y archivo de submit
+
+Entrena **el modelo elegido** (mismos parámetros y árboles) con `MESES_TRAIN_FINAL`, predice `MES_PREDICCION` con el ensamble de semillas y guarda el archivo para la plataforma en `submits/`:
+- solo los `numero_de_cliente` a estimular, uno por línea, sin encabezado, como enteros;
+- entre 8000 y 15000 clientes (si el corte da otra cantidad, el archivo no se guarda y avisa);
+- el nombre lleva el experimento, el trial, el corte y la fecha-hora, así **nunca se repite**. Cada vez que se corre con `GUARDAR_SUBMIT = True` se crea un archivo nuevo, anotado en `submits/registro.md`.
+
+`CORTE`: `'umbral'` (p ≥ 0.025 en el modelo A; el umbral ajustado en el modelo B) o una cantidad de clientes (ej. `12000`, los de mayor probabilidad). La tabla de abajo muestra cuántos clientes da cada opción, para decidir con el ensayo de junio.
+
+#%% celda 32 [código]
+MESES_TRAIN_FINAL = [202103, 202104, 202105, 202106]
+MES_PREDICCION = 202108
+CORTE = 12058        # 'umbral' (p >= 0.025) o una cantidad de clientes, ej. 12000
+GUARDAR_SUBMIT = True   # False: solo muestra cuántos clientes daría cada corte
+
+from comp import entrega
+
+pred = entrega.armar_prediccion(data, MESES_TRAIN_FINAL, MES_PREDICCION, exp.columnas_excluidas, exp.clase_objetivo)
+print(f"Train {MESES_TRAIN_FINAL} ({pred['y_train'].sum()} BAJA+2 de {len(pred['y_train'])}) -> "
+      f"predicción {MES_PREDICCION} ({len(pred['ids'])} clientes)")
+
+sufijo_final = 'train' + '-'.join(map(str, MESES_TRAIN_FINAL)) + f'_pred{MES_PREDICCION}'
+y_pred_final = entrega.predecir(
+    params_elegido, arboles_elegido, pred, semillas[:config.N_SEMILLAS], undersampling=exp.undersampling,
+    archivo=exp.resultados_dir / f'pred_ensamble{id_elegido}_{sufijo_final}_{config.N_SEMILLAS}semillas.npy',
+)
+print(f'Probabilidad media predicha en {MES_PREDICCION}: {y_pred_final.mean():.4f}')
+print(f"Umbral de decisión: p >= {pred['umbral']:.4f}")
+display(entrega.resumen_cortes(y_pred_final, umbral=pred['umbral']).round(4))
+
+ids_submit = entrega.clientes_a_contactar(pred['ids'], y_pred_final, CORTE, umbral=pred['umbral'])
+print(f'Corte {CORTE!r}: {len(ids_submit)} clientes a estimular')
+
+if GUARDAR_SUBMIT:
+    nombre_corte = 'umbral' if CORTE == 'umbral' else f'top{CORTE}'
+    archivo_submit = entrega.guardar_submit(ids_submit, f'{exp.tag}{id_elegido}_{nombre_corte}')
+    entrega.anotar_en_registro(archivo_submit, exp.tag, id_elegido.replace('_trial', '') or 'fijo', CORTE,
+                               ids_submit, y_pred_final, MESES_TRAIN_FINAL)
+    print('Submit guardado en', archivo_submit)

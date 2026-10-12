@@ -1,0 +1,50 @@
+{
+  "dataset": "ds3006_muerte_ampliada.parquet",
+  "clase": "clase_binaria2",
+  "escalar_min_data_in_leaf": true,
+  "semillas_base": [
+    571369,
+    849571,
+    355049,
+    655531,
+    700103
+  ],
+  "envios": [
+    9000,
+    9500,
+    10000,
+    10500,
+    11000,
+    11500,
+    12000,
+    12500,
+    13000,
+    13500,
+    14000,
+    14500,
+    15000
+  ],
+  "meseta": [
+    12000,
+    17000
+  ],
+  "ganancia_acierto": 1072500,
+  "costo_estimulo": 27500,
+  "modo": "produccion",
+  "meses_train": [
+    202103,
+    202104,
+    202105,
+    202106
+  ],
+  "mes_prediccion": 202108,
+  "experimento": 5017,
+  "nombre": "prod_muerte_ampliada_bo4108",
+  "variables": null,
+  "hiperparametros": {
+    "eleccion": "4108_bo_muerte_ampliada/4108_eleccion.json"
+  },
+  "n_semillas": 50,
+  "descripcion": "Produccion con ds3006 (proceso de muerte ampliado) e hiperparametros reoptimizados por 4108; indicaciones del profesor: train 202103 a 202106, lag2, 50 semillas.",
+  "usar_lag2": true
+}

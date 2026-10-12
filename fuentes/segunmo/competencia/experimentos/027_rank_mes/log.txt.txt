@@ -1,0 +1,33 @@
+
+===== 027 2026-10-09 11:24 | 5 semillas =====
+[A] columnas 150: continuas 125, de monto 53
+[A s=676057] V0 231.1 | V1 -1.6 | V2 +0.3 (3 min)
+[A s=482687] V0 237.9 | V1 -2.2 | V2 +0.1 (6 min)
+[A s=399221] V0 239.0 | V1 -3.2 | V2 +0.6 (9 min)
+[A s=121109] V0 235.9 | V1 -3.7 | V2 -1.2 (12 min)
+[A s=292131] V0 243.2 | V1 -8.2 | V2 -3.9 (15 min)
+[B] columnas 150: continuas 142, de monto 74
+[B s=676057] V0 406.7 | V1 -20.5 | V2 -6.1 (18 min)
+[B s=482687] V0 404.7 | V1 -14.3 | V2 -7.3 (21 min)
+[B s=399221] V0 405.5 | V1 -16.9 | V2 -7.0 (24 min)
+[B s=121109] V0 403.7 | V1 -26.0 | V2 -5.1 (27 min)
+[B s=292131] V0 408.5 | V1 -18.6 | V2 -3.8 (31 min)
+[Bh] columnas 150: continuas 147, de monto 84
+[Bh s=676057] V0 392.7 | V1 -17.7 | V2 -4.3 (33 min)
+[Bh s=482687] V0 393.8 | V1 -19.0 | V2 -10.4 (36 min)
+[Bh s=399221] V0 393.4 | V1 -15.5 | V2 -8.1 (39 min)
+[Bh s=121109] V0 388.0 | V1 -23.2 | V2 -11.4 (42 min)
+[Bh s=292131] V0 395.6 | V1 -14.6 | V2 -1.4 (45 min)
+
+Niveles (M ARS):
+fold                A      B     Bh
+variante                           
+V0_crudas       237.4  405.8  392.7
+V1_rank_todas   233.6  386.6  374.7
+V2_rank_montos  236.6  400.0  385.6
+
+Diferencias pareadas vs crudas:
+           variante  A_delta  B_delta  Bh_delta  A_ee  B_ee  Bh_ee pares_positivos
+ V1_rank_todas - V0    -3.79   -19.25    -18.01  1.17  1.97   1.52            0/15
+V2_rank_montos - V0    -0.82    -5.86     -7.12  0.82  0.63   1.89            3/15
+[027] terminado

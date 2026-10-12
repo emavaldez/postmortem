@@ -1,0 +1,248 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–11] Importa gc, numpy y pandas. Define la carpeta de datos, el archivo de entrada
+#   competencia_01.csv y la salida competencia_01_exp4.parquet, y lee el CSV completo con pandas.
+# -*- coding: utf-8 -*-
+"""Limpieza + Lags/Deltas + Ranking + imputacion faltantes + flags para ceros"""
+
+import gc
+import numpy as np
+import pandas as pd
+
+dataset_path = "/home/laura/----(modificar).../DMEyF/datos/"
+dataset_file = "competencia_01.csv"
+output_path = ("/home/laura/----(modificar).../DMEyF/datos/competencia_01_exp4.parquet")
+data = pd.read_csv(dataset_path + dataset_file)
+
+# [Anotación · líneas 13–15] Copia el dataset y asigna NaN a ccajas_depositos en las filas de 202105.
+# 1. NaN en la columna ccajas_depositos de Mayo
+data_1 = data.copy()
+data_1.loc[data_1["foto_mes"] == 202105, "ccajas_depositos"] = np.nan
+
+
+# [Anotación · líneas 18–47] Define imputacion_general_dataset y la aplica. Ordena por cliente y mes y, para
+#   cada columna salvo numero_de_cliente, foto_mes, clase_ternaria, cliente_vip e internet, toma el valor del
+#   registro anterior y del siguiente del mismo cliente; donde el valor es nulo y ambos vecinos no lo son, lo
+#   reemplaza por el promedio de los dos. El resultado queda en data_limpia.
+# 2. Imputación general con promedio entre mes siguiente y mes previo
+def imputacion_general_dataset(df, cols_excluir=None):
+  if cols_excluir is None:
+    cols_excluir = [
+        "numero_de_cliente",
+        "foto_mes",
+        "clase_ternaria",
+        "cliente_vip",
+        "internet",
+    ]
+
+  df_clean = df.copy()
+  df_clean = df_clean.sort_values(
+      by=["numero_de_cliente", "foto_mes"]
+  ).reset_index(drop=True)
+  cols_a_imputar = [c for c in df_clean.columns if c not in cols_excluir]
+
+  print(f"Procesando {len(cols_a_imputar)} variables para interpolación...")
+  for col in cols_a_imputar:
+    lag = df_clean.groupby("numero_de_cliente")[col].shift(1)
+    lead = df_clean.groupby("numero_de_cliente")[col].shift(-1)
+    mask_nan = df_clean[col].isnull() & lag.notnull() & lead.notnull()
+    if mask_nan.sum() > 0:
+      df_clean.loc[mask_nan, col] = (lag[mask_nan] + lead[mask_nan]) / 2.0
+
+  print("¡Limpieza completa!")
+  return df_clean
+
+
+data_limpia = imputacion_general_dataset(data_1)
+
+
+# [Anotación · líneas 50–75] Empieza agregar_lags_y_deltas_por_bloques: ordena por cliente y mes, pasa las
+#   columnas float64 a float32, arma la lista de variables (todas salvo las mismas cinco columnas excluidas) e
+#   inicia la lista de resultados con el dataset base.
+# 3. Creación de columnas con deltas y lags por bloques
+def agregar_lags_y_deltas_por_bloques(
+    df, cols_excluir=None, batch_size=20, eps=1e-5
+):
+  if cols_excluir is None:
+    cols_excluir = [
+        "numero_de_cliente",
+        "foto_mes",
+        "clase_ternaria",
+        "cliente_vip",
+        "internet",
+    ]
+
+  df_base = df.sort_values(by=["numero_de_cliente", "foto_mes"]).reset_index(
+      drop=True
+  )
+  cols_float = df_base.select_dtypes(include=["float64"]).columns
+  df_base[cols_float] = df_base[cols_float].astype("float32")
+
+  cols_features = [c for c in df_base.columns if c not in cols_excluir]
+  print(
+      f"Calculando lags y deltas para {len(cols_features)} variables en bloques"
+      f" de {batch_size}..."
+  )
+
+  lista_df_resultados = [df_base]
+
+# [Anotación · líneas 77–108] Recorre las variables en bloques de 20. Para cada una calcula lag1 y lag2 (valor
+#   del registro anterior y del segundo anterior del mismo cliente), delta1 (valor menos lag1) y ratio1 ((valor
+#   − lag1) dividido por |lag1| + 0,00001). Cada bloque se guarda como float32 y al final se concatena todo por
+#   columnas. Se aplica a data_limpia y deja data_completa.
+  for i in range(0, len(cols_features), batch_size):
+    batch_cols = cols_features[i : i + batch_size]
+    dict_batch = {}
+
+    for col in batch_cols:
+      dict_batch[f"{col}_lag1"] = df_base.groupby("numero_de_cliente")[
+          col
+      ].shift(1)
+      dict_batch[f"{col}_lag2"] = df_base.groupby("numero_de_cliente")[
+          col
+      ].shift(2)
+
+    for col in batch_cols:
+      lag1 = dict_batch[f"{col}_lag1"]
+      dict_batch[f"{col}_delta1"] = df_base[col] - lag1
+      dict_batch[f"{col}_ratio1"] = (df_base[col] - lag1) / (
+          np.abs(lag1) + eps
+      )
+
+    df_batch = pd.DataFrame(dict_batch, index=df_base.index).astype("float32")
+    lista_df_resultados.append(df_batch)
+    del dict_batch, df_batch
+    gc.collect()
+
+  df_final = pd.concat(lista_df_resultados, axis=1)
+  del lista_df_resultados
+  gc.collect()
+  print(f"¡Lags y deltas listos! Forma actual: {df_final.shape}")
+  return df_final
+
+
+data_completa = agregar_lags_y_deltas_por_bloques(data_limpia, batch_size=20)
+
+
+# [Anotación · líneas 111–138] Empieza agregar_ranking_cero_fijo_por_bloques: pasa float64 a float32 y arma la
+#   lista de columnas a rankear: las numéricas que no están entre las cinco excluidas y cuyo nombre no termina
+#   en _zero (variables originales, lag1, lag2, delta1 y ratio1).
+# 4. Creación del ranking de cero fijo mes a mes
+def agregar_ranking_cero_fijo_por_bloques(df, cols_excluir=None, batch_size=20):
+  if cols_excluir is None:
+    cols_excluir = [
+        "numero_de_cliente",
+        "foto_mes",
+        "clase_ternaria",
+        "cliente_vip",
+        "internet",
+    ]
+
+  cols_float = df.select_dtypes(include=["float64"]).columns
+  if len(cols_float) > 0:
+    df[cols_float] = df[cols_float].astype("float32")
+
+  cols_features = [
+      c
+      for c in df.columns
+      if c not in cols_excluir
+      and not c.endswith("_zero")
+      and pd.api.types.is_numeric_dtype(df[c])
+  ]
+  print(
+      f"Calculando ranking de cero fijo para {len(cols_features)} variables en"
+      f" bloques de {batch_size}..."
+  )
+
+  lista_df_resultados = [df]
+
+# [Anotación · líneas 140–177] En bloques de 20 columnas crea {columna}_rank. La serie arranca en 0 y, dentro
+#   de cada foto_mes, los valores positivos reciben su rank percentil entre los positivos del mes y los
+#   negativos reciben, con signo menos, el rank percentil de su valor absoluto entre los negativos del mes;
+#   ceros y nulos quedan en 0. Concatena los bloques y deja data_con_ranks.
+  for i in range(0, len(cols_features), batch_size):
+    batch_cols = cols_features[i : i + batch_size]
+    dict_batch = {}
+
+    for col in batch_cols:
+      serie_rank = pd.Series(0.0, index=df.index, dtype="float32")
+      for mes, idx_mes in df.groupby("foto_mes").groups.items():
+        sub_datos = df.loc[idx_mes, col]
+
+        mask_pos = sub_datos > 0
+        if mask_pos.any():
+          serie_rank.loc[idx_mes[mask_pos]] = (
+              sub_datos[mask_pos].rank(pct=True).astype("float32")
+          )
+
+        mask_neg = sub_datos < 0
+        if mask_neg.any():
+          serie_rank.loc[idx_mes[mask_neg]] = (
+              -(sub_datos[mask_neg].abs().rank(pct=True))
+          ).astype("float32")
+
+      dict_batch[f"{col}_rank"] = serie_rank
+
+    df_batch = pd.DataFrame(dict_batch, index=df.index).astype("float32")
+    lista_df_resultados.append(df_batch)
+    del dict_batch, df_batch
+    gc.collect()
+
+  df_final = pd.concat(lista_df_resultados, axis=1)
+  del lista_df_resultados
+  gc.collect()
+  print(f"¡Ranking completo! shape actual: {df_final.shape}")
+  return df_final
+
+
+data_con_ranks = agregar_ranking_cero_fijo_por_bloques(
+    data_completa, batch_size=20
+)
+
+
+# [Anotación · líneas 180–216] Define agregar_variables_zero_final y la aplica. Para cada variable numérica de
+#   data_limpia (las originales, sin las cinco excluidas) crea {columna}_zero: 1 si el valor es 0, NaN si el
+#   valor es nulo y 0 en el resto. Las agrega al dataset con los ranks y deja data_final.
+# 5. Agregar las banderas _zero SOLAMENTE sobre las variables numéricas originales
+def agregar_variables_zero_final(df, cols_excluir=None):
+  if cols_excluir is None:
+    cols_excluir = [
+        "numero_de_cliente",
+        "foto_mes",
+        "clase_ternaria",
+        "cliente_vip",
+        "internet",
+    ]
+
+  cols_base_numericas = [
+      c
+      for c in data_limpia.columns
+      if c not in cols_excluir and pd.api.types.is_numeric_dtype(data_limpia[c])
+  ]
+  print(
+      f"Agregando banderas _zero estáticas solo para"
+      f" {len(cols_base_numericas)} variables base numéricas..."
+  )
+
+  dict_zero = {}
+  for col in cols_base_numericas:
+    s = data_limpia[col]
+    zero_col = pd.Series(0.0, index=df.index, dtype="float32")
+    zero_col[s.isna()] = np.nan
+    zero_col[s == 0] = 1.0
+    dict_zero[f"{col}_zero"] = zero_col
+
+  df_final = pd.concat([df, pd.DataFrame(dict_zero, index=df.index)], axis=1)
+  del dict_zero
+  gc.collect()
+  print(f"¡Feature Engineering completo! Forma final: {df_final.shape}")
+  return df_final
+
+
+data_final = agregar_variables_zero_final(data_con_ranks)
+
+# [Anotación · líneas 218–220] Guarda data_final en competencia_01_exp4.parquet e imprime la ruta.
+# Guardar dataset final
+data_final.to_parquet(output_path, index=False)
+print(f"¡Dataset guardado exitosamente en: {output_path}")

@@ -1,0 +1,173 @@
+# Copia con anotaciones agregadas por la página del postmortem (no son del autor). Los números de línea de cada
+# anotación son los del archivo original, sin estas líneas agregadas.
+
+# [Anotación · líneas 1–16] Celdas de texto de presentación. El notebook no entrena: junta las probabilidades
+#   por semilla guardadas por el 03 para varios submits y arma un archivo con el promedio de todos los modelos
+#   cortado en N (llamado 'locro') y 20 archivos con promedios de 20 modelos sorteados.
+#%% celda 1 [texto]
+# 07 · Ensamble final ("el locro")
+
+**Paso 3 del orden vigente** (CLAUDE.md §7). Junta las probabilidades por semilla que guardó el `03` para varios submits (`../exp/03_entrega/<ORIGEN>/`) y arma, **sin entrenar**:
+
+1. **El locro:** el promedio de **todos** los modelos (todas las semillas de todos los orígenes), cortado en N. Es **un solo archivo**: el candidato a entrega final. El bot evalúa en el privado el mejor archivo del público del último submit, así que la entrega final tiene que ser un solo archivo (CLAUDE.md §1.2).
+2. **La distribución de ensambles** (sugerencia de Bolaños en la tutoría): 20 archivos, cada uno el promedio de 20 modelos sorteados entre todos. Mandados juntos, el bot devuelve la media y el desvío **de ensambles**, en vez de semillas sueltas.
+
+Los orígenes tienen que usar **la misma clase** (por ejemplo, `bajas`): así sus probabilidades están en la misma escala y se pueden promediar. Promediar con un modelo `baja2` sería "mezclar peras con bananas" (Bolaños).
+
+#%% celda 2 [texto]
+## 1. Parámetros
+
+- **`ORIGENES`:** los `NOMBRE_SUBMIT` de submits hechos con el `03`, con la misma configuración.
+- **`N`:** los envíos. Decidido el 2026-10-05: 12.000, el centro de la meseta del público.
+- **`NOMBRE`:** prefijo de los archivos y de los dos submits: `<NOMBRE>` (el locro, un archivo) y `<NOMBRE>Dist` (los 20 ensambles).
+
+# [Anotación · líneas 18–48] Parámetros: ORIGENES = 'fe03z470bajasV5B2345Opt42' y
+#   'fe03z470bajasV5B2345Opt42J2', N = 12.000, NOMBRE = 'final01fe03x40N12000', 20 ensambles de 20 modelos y
+#   semilla de sorteo 979201. Verifica que N esté entre 8.000 y 15.000, que la carpeta de salida no exista y que
+#   estén las probabilidades de cada origen.
+#%% celda 3 [código]
+from pathlib import Path
+from datetime import datetime
+import json
+import re
+
+import duckdb
+import numpy as np
+import pandas as pd
+
+# --- Parámetros -------------------------------------------------------------
+ORIGENES = ['fe03z470bajasV5B2345Opt42', 'fe03z470bajasV5B2345Opt42J2']
+N = 12_000                                                    
+NOMBRE = 'final01fe03x40N12000'                               # <- único, sin espacios
+ENSAMBLES, MODELOS_POR_ENSAMBLE = 20, 20                     # distribución de ensambles (Bolaños)
+SEMILLA_SORTEO = 979201                                      # la semilla primigenia
+
+BASE_PARQUET = Path('../data/competencia_01_base.parquet')
+EXP02 = Path('../exp/02_linea_base')
+EXP03 = Path('../exp/03_entrega')
+ENTREGAS = Path('../entregas')
+MES_FUTURO = 202108
+# -----------------------------------------------------------------------------
+
+assert 8_000 <= N <= 15_000, 'El bot acepta entre 8.000 y 15.000 registros'
+assert re.fullmatch(r'[A-Za-z0-9_]+', NOMBRE)
+SALIDA = ENTREGAS / NOMBRE
+assert not SALIDA.exists(), f'Ya existe {SALIDA}: los nombres no se repiten'
+for origen in ORIGENES:
+    assert (EXP03 / origen).exists(), f'No están las probabilidades de {origen}'
+print(f'Orígenes: {ORIGENES} · N = {N:,} · submits: {NOMBRE} (1 archivo) y {NOMBRE}Dist ({ENSAMBLES} archivos)')
+
+# [Anotación · líneas 50–87] Lee del parquet base los 164.647 numero_de_cliente de 202108. Para cada origen
+#   carga sus 20 vectores de probabilidad (con las semillas guardadas por el 03 en esa carpeta o, si no hay
+#   archivo, las del 02) y verifica que su promedio coincide con el semillerío guardado y que el corte de ese
+#   promedio reproduce el CSV de semillerío del origen. Apila todos los modelos en una matriz.
+#%% celda 4 [texto]
+## 2. Probabilidades
+
+Se cargan las 20 semillas de cada origen (las del `semillas.json` que guardó el `03` en su carpeta, si existe; si no, las del `02`), en el orden de las filas de `202108` del parquet base.
+
+**Controles:**
+- el promedio de cada origen tiene que ser **idéntico** al semillerío que guardó el `03`;
+- y el semillerío de cada origen, cortado en su N original, tiene que reproducir exactamente su CSV de semillerío. Si coinciden, los clientes están en el orden correcto.
+
+#%% celda 5 [código]
+SEMILLAS = json.loads((EXP02 / 'semillas.json').read_text())['semillas']
+assert len(SEMILLAS) == 20
+ids_futuro = duckdb.sql(f'''select numero_de_cliente from read_parquet('{BASE_PARQUET.as_posix()}')
+                            where foto_mes = {MES_FUTURO}''').df()['numero_de_cliente'].to_numpy()
+assert ids_futuro.dtype == np.int64 and len(ids_futuro) == 164_647
+
+
+def top_n(prob, n=N):
+    return ids_futuro[np.argsort(-prob, kind='stable')[:n]]
+
+
+bloques_probs, etiquetas = [], []
+for origen in ORIGENES:
+    # las semillas de cada origen: las que guardó el 03 (juegos de semillas), o las del 02
+    archivo_sem = EXP03 / origen / 'semillas.json'
+    semillas_o = json.loads(archivo_sem.read_text())['semillas'] if archivo_sem.exists() else SEMILLAS
+    p = np.vstack([np.load(EXP03 / origen / f'prob_s{s}.npy') for s in semillas_o])
+    assert p.shape == (20, len(ids_futuro))
+    assert np.allclose(p.mean(axis=0), np.load(EXP03 / origen / 'prob_semillerio.npy')), f'{origen}: el promedio no coincide'
+    csv_sem = ENTREGAS / origen / f'{origen}_semillerio.csv'
+    ids_sem = np.loadtxt(csv_sem, dtype=np.int64)
+    assert np.array_equal(ids_sem, top_n(p.mean(axis=0), len(ids_sem))), f'{origen}: el semillerío no se reproduce'
+    bloques_probs.append(p)
+    etiquetas += [f'{origen}_s{s}' for s in semillas_o]
+    print(f'{origen}: 20 semillas · media de probabilidad {p.mean():.4f} · control OK')
+
+MODELOS = np.vstack(bloques_probs)          # (20 × orígenes) × 164.647
+print(f'{MODELOS.shape[0]} modelos en la olla')
+
+# [Anotación · líneas 89–108] Calcula el promedio de todos los modelos y su lista de los N clientes de mayor
+#   probabilidad. Sortea 20 subconjuntos de 20 modelos sin reposición con default_rng(979201) y arma la lista de
+#   cada uno. Imprime cuántos clientes comparte la lista general con el semillerío de cada origen y con cada
+#   subconjunto.
+#%% celda 6 [texto]
+## 3. El locro y la distribución de ensambles
+
+- **Locro:** el promedio de todos los modelos. Cada origen pesa lo mismo, porque todos tienen 20 semillas.
+- **Distribución:** `ENSAMBLES` sorteos sin reposición de `MODELOS_POR_ENSAMBLE` modelos, con `SEMILLA_SORTEO`. Cada ensamble es el promedio de sus modelos.
+
+Se muestra cuánto se parece la lista del locro a la de cada origen, en N.
+
+#%% celda 7 [código]
+locro = MODELOS.mean(axis=0)
+lista_locro = top_n(locro)
+
+rng = np.random.default_rng(SEMILLA_SORTEO)
+sorteos = [np.sort(rng.choice(len(MODELOS), MODELOS_POR_ENSAMBLE, replace=False)) for _ in range(ENSAMBLES)]
+listas_dist = [top_n(MODELOS[idx].mean(axis=0)) for idx in sorteos]
+
+en_comun = {o: len(set(top_n(p.mean(axis=0)).tolist()) & set(lista_locro.tolist())) for o, p in zip(ORIGENES, bloques_probs)}
+print('Clientes del locro que también están en el semillerío de cada origen (en N):', en_comun)
+coincid = [len(set(l.tolist()) & set(lista_locro.tolist())) / N for l in listas_dist]
+print(f'Ensambles de la distribución contra el locro: media {100 * np.mean(coincid):.1f} % · mín {100 * min(coincid):.1f} %')
+
+# [Anotación · líneas 110–134] Escribe <NOMBRE>_locro.csv y los 20 archivos <NOMBRE>Dist_eXX.csv; cada archivo
+#   se relee y se verifica que tenga N líneas enteras, sin duplicados y con IDs de 202108. Guarda el vector
+#   promedio en prob_locro.npy y la composición (orígenes, N, modelos, sorteos y semilla) en composicion.json.
+#%% celda 8 [texto]
+## 4. Archivos y checklist (CLAUDE.md §8)
+
+#%% celda 9 [código]
+ids_validos = set(ids_futuro.tolist())
+
+
+def escribir(ids, ruta):
+    pd.Series(ids, dtype='int64').to_csv(ruta, index=False, header=False)
+    lineas = ruta.read_text().splitlines()
+    assert all(re.fullmatch(r'\d+', l) for l in lineas), f'{ruta.name}: hay líneas que no son enteros'
+    v = [int(l) for l in lineas]
+    assert len(v) == N and len(set(v)) == N and set(v) <= ids_validos, ruta.name
+
+
+SALIDA.mkdir(parents=True)
+escribir(lista_locro, SALIDA / f'{NOMBRE}_locro.csv')
+for k, lista in enumerate(listas_dist, 1):
+    escribir(lista, SALIDA / f'{NOMBRE}Dist_e{k:02d}.csv')
+(EXP03 / NOMBRE).mkdir(parents=True, exist_ok=True)
+np.save(EXP03 / NOMBRE / 'prob_locro.npy', locro)
+(EXP03 / NOMBRE / 'composicion.json').write_text(json.dumps({
+    'origenes': ORIGENES, 'N': N, 'modelos': etiquetas,
+    'sorteos': [[etiquetas[i] for i in idx] for idx in sorteos], 'semilla_sorteo': SEMILLA_SORTEO}, indent=2))
+print(f'Checklist OK: 1 locro + {ENSAMBLES} ensambles en {SALIDA}')
+
+# [Anotación · líneas 136–150] Agrega dos filas a registro_submits.md, una para los 20 ensambles y otra para
+#   el archivo único, e imprime los dos mensajes de submit con los archivos a adjuntar.
+#%% celda 10 [texto]
+## 5. Registro y mensajes para el bot
+
+- **`submit <NOMBRE>Dist`** con los 20 archivos `_e01` … `_e20`: la media y el desvío **de ensambles**.
+- **`submit <NOMBRE>`** con **solo** el archivo `_locro.csv`: un punto. Es el candidato a **entrega final**, que tiene que ser el **último** submit.
+
+#%% celda 11 [código]
+REGISTRO = ENTREGAS / 'registro_submits.md'
+with REGISTRO.open('a') as f:
+    f.write(f"| {datetime.now():%Y-%m-%d %H:%M} | `{NOMBRE}Dist` | ensamble (07): {ENSAMBLES} ensambles de {MODELOS_POR_ENSAMBLE} modelos de {' + '.join(ORIGENES)} | {N:,} | "
+            f"{ENSAMBLES}: `{NOMBRE}Dist_eXX.csv` | sorteo con {SEMILLA_SORTEO} | *(completar)* | *(completar)* | |\n")
+    f.write(f"| {datetime.now():%Y-%m-%d %H:%M} | `{NOMBRE}` | locro (07): promedio de los {len(MODELOS)} modelos de {' + '.join(ORIGENES)} | {N:,} | "
+            f"1: `{NOMBRE}_locro.csv` | 979201 → 20 primos por origen | *(completar)* | 0 (un archivo) | |\n")
+print(f'submit {NOMBRE}Dist   → adjuntar los {ENSAMBLES} archivos {NOMBRE}Dist_eXX.csv de {SALIDA}/')
+print(f'submit {NOMBRE}       → adjuntar SOLO {NOMBRE}_locro.csv de {SALIDA}/')

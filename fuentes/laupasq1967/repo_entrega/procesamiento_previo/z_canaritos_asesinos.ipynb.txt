@@ -1,0 +1,235 @@
+#%% celda 1 [texto]
+# Poda "Canaritos Asesinos" -- receta oficial de Denicolay
+
+Implementación literal de la receta que dio el profe en Zulip:
+
+1. Agregar un 20% de canaritos (respecto a la cantidad de columnas)
+2. Entrenar un LightGBM razonable
+3. Calcular el Feature Importance de ese modelo
+4. Asignar a cada variable un id ordinal (1 = más importante, 2 = segunda, etc.)
+5. Calcular la media de los ids de los canaritos
+6. Calcular el desvío estándar de los ids de los canaritos
+7. Punto de asesinato = media + desvío, o media + 2*desvío
+8. Matar toda variable real con id mayor al punto de asesinato
+9. Quedarse con las reales con id MENOR al punto de asesinato
+
+Diferencia clave con mis dos podas anteriores: acá se corta por **posición en el ranking** (ordinal), no por
+**valor** de importancia (gain). Y la cantidad de canaritos es proporcional al tamaño del dataset (20%), no un
+número fijo.
+
+Corre sobre el mismo dataset que las podas anteriores (FE histórico rankeado + las 15 variables compuestas de
+negocio, para que sigan compitiendo en igualdad de condiciones). Un solo modelo (la receta no pide promediar
+varios -- si querés robustecerlo después, se puede repetir con varias semillas).
+
+#%% celda 2 [texto]
+### Setup y carga de datos
+
+#%% celda 3 [código]
+rm(list = ls())
+gc()
+
+require("data.table")
+require("lightgbm")
+
+PARAM_carpeta_datasets <- "C:/Users/Laura/Documents/DMEyF/datasets/"
+PARAM_carpeta_exp <- "C:/Users/Laura/Documents/DMEyF/exp/"
+
+SEMILLA <- 585581
+
+t0 <- Sys.time()
+dataset <- fread(paste0(PARAM_carpeta_datasets, "competencia_01_con_lags_fe_historico_rankeado.csv.gz"))
+cat("Dataset cargado:", nrow(dataset), "filas x", ncol(dataset), "columnas en",
+    round(as.numeric(Sys.time()-t0, units="secs"),1), "seg\n")
+
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+#%% celda 4 [texto]
+### Variables compuestas por lógica de negocio (mismas 15 de siempre)
+
+#%% celda 5 [código]
+agregar_si_existen <- function(dt, nombre_nueva, columnas, fun_combinacion) {
+  presentes <- columnas[columnas %in% colnames(dt)]
+  if (length(presentes) < 2) return(invisible(NULL))
+  dt[, (nombre_nueva) := fun_combinacion(.SD), .SDcols = presentes]
+}
+suma_filas <- function(sd) Reduce(`+`, sd)
+
+agregar_si_existen(dataset, "consumo_tarjetas_total", c("mtarjeta_visa_consumo", "mtarjeta_master_consumo"), suma_filas)
+agregar_si_existen(dataset, "consumototal_tarjetas", c("Visa_mconsumototal", "Master_mconsumototal"), suma_filas)
+agregar_si_existen(dataset, "saldo_tarjetas_total", c("Visa_msaldototal", "Master_msaldototal"), suma_filas)
+agregar_si_existen(dataset, "limite_tarjetas_total", c("Visa_mlimitecompra", "Master_mlimitecompra"), suma_filas)
+agregar_si_existen(dataset, "pagado_tarjetas_total", c("Visa_mpagado", "Master_mpagado"), suma_filas)
+agregar_si_existen(dataset, "pagominimo_tarjetas_total", c("Visa_mpagominimo", "Master_mpagominimo"), suma_filas)
+agregar_si_existen(dataset, "descuentos_tarjetas_total",
+                    c("mcajeros_propios_descuentos", "mtarjeta_visa_descuentos", "mtarjeta_master_descuentos"), suma_filas)
+
+if (all(c("consumototal_tarjetas", "limite_tarjetas_total") %in% colnames(dataset))) {
+  dataset[, utilizacion_tarjetas := ifelse(limite_tarjetas_total == 0, 0,
+                                            consumototal_tarjetas / limite_tarjetas_total)]
+}
+if (all(c("Visa_status", "Master_status") %in% colnames(dataset))) {
+  dataset[, tarjetas_activas_count := as.integer(Visa_status == 0) + as.integer(Master_status == 0)]
+}
+
+agregar_si_existen(dataset, "ingresos_payroll_total", c("mpayroll", "mpayroll2"), suma_filas)
+agregar_si_existen(dataset, "prestamos_sin_personales_total",
+                    c("mprestamos_prendarios", "mprestamos_hipotecarios"), suma_filas)
+agregar_si_existen(dataset, "inversiones_totales",
+                    c("minversion1_pesos", "minversion1_dolares", "minversion2"), suma_filas)
+agregar_si_existen(dataset, "plazo_fijo_total", c("mplazo_fijo_dolares", "mplazo_fijo_pesos"), suma_filas)
+
+if (all(c("mtransferencias_recibidas", "mtransferencias_emitidas") %in% colnames(dataset))) {
+  dataset[, transferencias_netas := mtransferencias_recibidas - mtransferencias_emitidas]
+}
+agregar_si_existen(dataset, "comisiones_totales_manual", c("mcomisiones_mantenimiento", "mcomisiones_otras"), suma_filas)
+
+campos_compuestos <- c("consumo_tarjetas_total", "consumototal_tarjetas", "saldo_tarjetas_total",
+                        "limite_tarjetas_total", "pagado_tarjetas_total", "pagominimo_tarjetas_total",
+                        "descuentos_tarjetas_total", "utilizacion_tarjetas", "tarjetas_activas_count",
+                        "ingresos_payroll_total", "prestamos_sin_personales_total", "inversiones_totales",
+                        "plazo_fijo_total", "transferencias_netas", "comisiones_totales_manual")
+campos_compuestos <- campos_compuestos[campos_compuestos %in% colnames(dataset)]
+cat("Compuestas disponibles:", length(campos_compuestos), "de 15\n")
+
+#%% celda 6 [código]
+campos_no_usar <- c("numero_de_cliente", "foto_mes", "clase_ternaria", "clase01",
+                     "cprestamos_personales", "mprestamos_personales")
+
+campos_candidatos <- setdiff(colnames(dataset), campos_no_usar)
+dataset_train <- dataset[foto_mes %in% c(202103, 202104)]
+rm(dataset)
+gc(full = TRUE, verbose = FALSE)
+
+cat("Variables candidatas:", length(campos_candidatos), "\n")
+
+#%% celda 7 [texto]
+### Paso 1: agrego 20% de canaritos (respecto a la cantidad de columnas)
+
+#%% celda 8 [código]
+set.seed(SEMILLA)
+
+N_COLUMNAS <- length(campos_candidatos)
+N_CANARITOS <- round(0.20 * N_COLUMNAS)
+cat("Columnas reales:", N_COLUMNAS, "-> agrego", N_CANARITOS, "canaritos (20%)\n")
+
+dt_con_canaritos <- copy(dataset_train[, c(campos_candidatos, "clase01"), with = FALSE])
+for (i in 1:N_CANARITOS) {
+  dt_con_canaritos[, paste0("canarito_", i) := runif(.N)]
+}
+campos_con_canaritos <- c(campos_candidatos, paste0("canarito_", 1:N_CANARITOS))
+cat("Total de columnas para entrenar:", length(campos_con_canaritos), "\n")
+
+#%% celda 9 [texto]
+### Paso 2: entreno un LightGBM razonable (hiperparámetros manuales, min_data_in_leaf=4000)
+
+#%% celda 10 [código]
+param_manual <- list(
+  boosting = "gbdt",
+  objective = "binary",
+  metric = "auc",
+  first_metric_only = TRUE,
+  boost_from_average = TRUE,
+  feature_pre_filter = FALSE,
+  verbosity = -100,
+  seed = SEMILLA,
+
+  learning_rate = 0.02,
+  feature_fraction = 0.1541961,
+  feature_fraction_bynode = 1,
+  min_data_in_leaf = 4000,
+  num_leaves = 1684,
+  max_depth = -1,
+  lambda_l1 = 1.520327,
+  lambda_l2 = 7.548036,
+  min_gain_to_split = 0.2158453,
+  max_delta_step = 0,
+  bagging_fraction = 0.8425105,
+  bagging_freq = 6,
+  min_sum_hessian_in_leaf = 0.001,
+  pos_bagging_fraction = 1,
+  neg_bagging_fraction = 1,
+  extra_trees = FALSE,
+  path_smooth = 0,
+  cat_l2 = 10,
+  cat_smooth = 10,
+  max_cat_to_onehot = 4,
+  use_missing = TRUE,
+  is_unbalance = FALSE,
+  num_iterations = 600,
+  early_stopping_rounds = 0,
+  max_bin = 31,
+  scale_pos_weight = 0.5,
+  force_row_wise = TRUE
+)
+
+matriz_train <- data.matrix(dt_con_canaritos[, campos_con_canaritos, with = FALSE])
+
+t0 <- Sys.time()
+dtrain <- lgb.Dataset(data = matriz_train, label = dt_con_canaritos$clase01, free_raw_data = FALSE)
+modelo <- lgb.train(data = dtrain, param = param_manual, verbose = -1)
+cat("Entrenado en", round(as.numeric(Sys.time()-t0, units="secs"),1), "seg\n")
+
+rm(dt_con_canaritos, matriz_train)
+gc(full = TRUE, verbose = FALSE)
+
+#%% celda 11 [texto]
+### Paso 3-4: Feature Importance + id ordinal
+
+`lgb.importance()` ya devuelve la tabla ordenada por Gain descendente -- el id ordinal es simplemente la posición
+en esa tabla. Una variable que nunca se usó en ningún split ni siquiera aparece acá (no tiene Gain > 0), así que
+queda automáticamente "matada" -- no hace falta tratarla aparte.
+
+#%% celda 12 [código]
+imp <- as.data.table(lgb.importance(modelo))
+imp[, id := .I]
+
+cat("Variables que aparecen en el Feature Importance (Gain > 0 en algún split):", nrow(imp), "de", length(campos_con_canaritos), "\n")
+
+#%% celda 13 [texto]
+### Paso 5-7: media, desvío y punto de asesinato
+
+#%% celda 14 [código]
+imp[, es_canarito := grepl("^canarito_", Feature)]
+
+ids_canaritos <- imp[es_canarito == TRUE, id]
+media_canaritos <- mean(ids_canaritos)
+sd_canaritos <- sd(ids_canaritos)
+
+punto_asesinato_1sd <- media_canaritos + sd_canaritos
+punto_asesinato_2sd <- media_canaritos + 2 * sd_canaritos
+
+cat("Media de los ids de los canaritos:", round(media_canaritos, 1), "\n")
+cat("Desvio estandar de los ids de los canaritos:", round(sd_canaritos, 1), "\n")
+cat("Punto de asesinato (media + 1 desvio):", round(punto_asesinato_1sd, 1), "\n")
+cat("Punto de asesinato (media + 2 desvios):", round(punto_asesinato_2sd, 1), "\n")
+
+#%% celda 15 [texto]
+### Paso 8-9: mato lo que corresponda, me quedo con las reales por debajo del punto de asesinato
+
+#%% celda 16 [código]
+campos_sobrevivientes_1sd <- imp[es_canarito == FALSE & id < punto_asesinato_1sd, Feature]
+campos_sobrevivientes_2sd <- imp[es_canarito == FALSE & id < punto_asesinato_2sd, Feature]
+
+cat("Sobreviven con criterio 'media + 1 desvio':", length(campos_sobrevivientes_1sd), "de", length(campos_candidatos), "candidatas\n")
+cat("Sobreviven con criterio 'media + 2 desvios':", length(campos_sobrevivientes_2sd), "de", length(campos_candidatos), "candidatas\n")
+
+cat("\nComparar contra:\n")
+cat("  poda v1 (max, 1 modelo): 110 variables -> 439.2M\n")
+cat("  poda v2 (percentil 75, 3 modelos): 161 variables -> 449.46M\n")
+cat("  sin podar: 1619 variables -> 465.7M\n")
+
+#%% celda 17 [texto]
+### Guardo las dos listas (para comparar cuál cutoff conviene)
+
+#%% celda 18 [código]
+fwrite(data.table(variable = campos_sobrevivientes_1sd), paste0(PARAM_carpeta_exp, "campos_canaritos_asesinos_1sd.txt"))
+fwrite(data.table(variable = campos_sobrevivientes_2sd), paste0(PARAM_carpeta_exp, "campos_canaritos_asesinos_2sd.txt"))
+fwrite(imp[order(id)], paste0(PARAM_carpeta_exp, "importancia_canaritos_asesinos_completo.txt"))
+
+cat("Guardados: campos_canaritos_asesinos_1sd.txt, campos_canaritos_asesinos_2sd.txt\n")
+
+#%% celda 19 [texto]
+### Próximo paso (se hizo en otras notebooks)
+
+Evaluar la ganancia real de las dos listas (1sd y 2sd) con el mismo protocolo de siempre (3 semillas de screening,
+después 10 si se ve bien) y compararlas contra las podas v1/v2 y el set completo.

@@ -1,0 +1,44 @@
+{
+  "experimento": 3005,
+  "nombre": "fe_rank_luego_lag",
+  "descripcion": "Orden alternativo de la receta: primero rank por mes con cero fijo, despues lag y delta del ranking (posicion del mes anterior y cambio de posicion). Mismas 6 variables del proceso de muerte que 03c, rankeadas.",
+  "dataset_entrada": "ds1001_base.parquet",
+  "dataset_salida": "ds3005_rank_luego_lag.parquet",
+  "orden": "rank_luego_lag",
+  "extras": "conteo",
+  "rankear_extras": true,
+  "lags": [
+    1,
+    2
+  ],
+  "deltas": [
+    1,
+    2
+  ],
+  "claves": [
+    "ctrx_quarter",
+    "mpasivos_margen",
+    "mcaja_ahorro",
+    "mcuentas_saldo",
+    "ctarjeta_visa_transacciones",
+    "ctarjeta_master_transacciones",
+    "ctarjeta_debito_transacciones",
+    "mprestamos_personales",
+    "mpayroll",
+    "cmobile_app_trx",
+    "chomebanking_transacciones",
+    "mcomisiones",
+    "cdescubierto_preacordado",
+    "mcuenta_corriente",
+    "Visa_msaldototal",
+    "Master_msaldototal"
+  ],
+  "relativas_max3": [
+    "ctrx_quarter",
+    "mcaja_ahorro"
+  ],
+  "_config": "3005_fe_rank_luego_lag.json",
+  "_fecha_inicio": "2026-10-09 15:15:20",
+  "_script": "03d_fe_variantes.py",
+  "_git_commit": "sin_git"
+}

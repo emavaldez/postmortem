@@ -1,0 +1,62 @@
+{
+  "experimento": 4107,
+  "nombre": "bo_profesor_mar_abr",
+  "descripcion": "Bayesiana con las indicaciones del profesor: entrena con TODA la informacion disponible antes de la brecha de 2 meses (202103 + 202104, aunque marzo no tenga lags y abril no tenga lag2) y mide en la mitad A de 202106; confirma en la mitad B con 20 semillas. Dataset ds3003 (receta: lags y deltas 1 y 2, luego rank por mes con cero fijo, + proceso de muerte) con lag2. Rangos del profesor: num_leaves 8-2000, min_data_in_leaf 1-20000, feature_fraction 0.05-0.9, bagging_fraction 0.05-1, learning_rate 0.01-0.2; max_bin 31 fijo. 50 pruebas (15 al azar), 1 semilla por prueba. Referencias: z601 y p23 de 4104 (min_data x2 por tener 2 meses).",
+  "dataset": "ds3003_rank_extra.parquet",
+  "variables": null,
+  "usar_lag2": true,
+  "meses_train": [
+    202103,
+    202104
+  ],
+  "mes_test": 202106,
+  "mitades_desde": "4102_bo_fuera_de_tiempo/4102_mitades_junio.csv",
+  "semilla_sampler": 571369,
+  "n_trials": 50,
+  "n_startup_trials": 15,
+  "espacio": {
+    "num_leaves": [
+      8,
+      2000,
+      "log"
+    ],
+    "min_data_in_leaf": [
+      1,
+      20000,
+      "log"
+    ],
+    "feature_fraction": [
+      0.05,
+      0.9,
+      "lineal"
+    ],
+    "bagging_fraction": [
+      0.05,
+      1.0,
+      "lineal"
+    ],
+    "learning_rate": [
+      0.01,
+      0.2,
+      "log"
+    ]
+  },
+  "referencias_extra": [
+    {
+      "nombre": "p23_4104",
+      "params": {
+        "learning_rate": 0.0678,
+        "num_leaves": 41,
+        "min_data_in_leaf": 10124,
+        "feature_fraction": 0.1798,
+        "bagging_fraction": 0.3124,
+        "lambda_l1": 0.001,
+        "lambda_l2": 0.001
+      },
+      "arboles": 580
+    }
+  ],
+  "top_confirmar": 5,
+  "semillas_confirmacion": 20,
+  "regla_minimo_semillas_ganadas": 14
+}

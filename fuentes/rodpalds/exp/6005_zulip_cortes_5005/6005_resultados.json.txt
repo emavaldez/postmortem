@@ -1,0 +1,10 @@
+{
+  "archivos": [
+    "Z6005_5005_e10000_semillerio.csv",
+    "Z6005_5005_e11000_semillerio.csv",
+    "Z6005_5005_e12000_semillerio.csv",
+    "Z6005_5005_e14000_semillerio.csv"
+  ],
+  "cuerpo": "submit 6005zulipcortes5005",
+  "_minutos": 0.01
+}
